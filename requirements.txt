@@ -1,2 +1,0 @@
-asyncinotify
-qbittorrent-api
