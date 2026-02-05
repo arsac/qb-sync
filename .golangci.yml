@@ -25,7 +25,7 @@ formatters:
   settings:
     goimports:
       local-prefixes:
-        - github.com/mailoarsac/qb-router
+        - github.com/arsac/qb-sync
 
     golines:
       max-len: 120
@@ -294,3 +294,13 @@ linters:
         path: 'internal/utils/'
         linters:
           - revive
+      # BitTorrent protocol mandates SHA1 for piece verification - not a security issue.
+      # G115 int overflow is handled by clamping to MaxInt64 before conversion.
+      - text: 'G401|G505|G115'
+        path: 'internal/(streaming|cold|hot)/'
+        linters:
+          - gosec
+      # Prometheus metrics use package-level variables by convention.
+      - path: 'internal/metrics/'
+        linters:
+          - gochecknoglobals
