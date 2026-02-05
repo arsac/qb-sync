@@ -1,22 +1,19 @@
-FROM docker.io/library/python:3.13-alpine AS base
+FROM golang:1.25-alpine AS builder
 
-FROM base AS pip
-WORKDIR /install
-COPY requirements.txt /requirements.txt
-RUN pip install --no-cache-dir --prefix=/install --requirement /requirements.txt \
-    && python -c "import compileall; compileall.compile_path(maxlevels=10)"
+RUN apk add --no-cache git ca-certificates
 
-FROM base AS app
 WORKDIR /app
-COPY src/ .
-RUN python -m compileall qbrouter/
+COPY go.mod go.sum ./
+RUN go mod download
 
-FROM base AS final
-RUN apk add --no-cache rsync
-WORKDIR /app
-COPY --from=pip /install /usr/local
-COPY --from=app /app .
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /qbsync ./cmd/qbsync
 
-ENV PYTHONPATH "${PYTHONPATH}:/app"
-ENTRYPOINT ["python3", "qbrouter"]
+FROM scratch
 
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /qbsync /qbsync
+
+USER 1000:1000
+
+ENTRYPOINT ["/qbsync"]

@@ -8,17 +8,15 @@ services:
     volumes:
       - ./tmp/src:/src
       - ./tmp/dest:/dest
-      - ./src:/app
     environment:
-      - DEBUG=1
-      - SRC_PATH=/src/
-      - DEST_PATH=/dest
-      - QB_SRC_URL=http://qb-src:8081
-      - QB_SRC_USERNAME=admin
-      - QB_SRC_PASSWORD=V4KuCr9th
-      - QB_DEST_URL=http://qb-dest:8082
-      - QB_DEST_USERNAME=admin
-      - QB_DEST_PASSWORD=ALRcICwJa
+      - SRC=/src
+      - DEST=/dest
+      - SRC_URL=http://qb-src:8081
+      - SRC_USERNAME=admin
+      - SRC_PASSWORD=V4KuCr9th
+      - DEST_URL=http://qb-dest:8082
+      - DEST_USERNAME=admin
+      - DEST_PASSWORD=ALRcICwJa
       - MIN_SPACE=20000
       - MIN_SEEDING_TIME=30
       - SLEEP=10

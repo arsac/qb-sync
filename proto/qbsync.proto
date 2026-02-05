@@ -1,0 +1,184 @@
+syntax = "proto3";
+
+package qbsync;
+
+option go_package = "github.com/arsac/qb-sync/proto";
+
+// QBSyncService handles torrent synchronization between hot and cold storage.
+// It manages the full lifecycle: initialization, piece transfer,
+// hardlink deduplication, and finalization.
+service QBSyncService {
+  // WritePiece sends a single piece to the receiver (for simple cases).
+  rpc WritePiece(WritePieceRequest) returns (WritePieceResponse);
+
+  // StreamPiecesBidi provides full-duplex streaming for maximum throughput.
+  // Client streams pieces, server streams back acknowledgments as pieces are written.
+  // This allows immediate retry on failure without waiting for batch completion.
+  rpc StreamPiecesBidi(stream WritePieceRequest) returns (stream PieceAck);
+
+  // GetWrittenPieces returns which pieces have been written for a torrent.
+  rpc GetWrittenPieces(GetWrittenPiecesRequest) returns (GetWrittenPiecesResponse);
+
+  // InitTorrent initializes tracking for a new torrent.
+  rpc InitTorrent(InitTorrentRequest) returns (InitTorrentResponse);
+
+  // CreateHardlink creates a hardlink from an existing file to a new path.
+  // Used when source files are hardlinked to avoid re-sending duplicate data.
+  rpc CreateHardlink(CreateHardlinkRequest) returns (CreateHardlinkResponse);
+
+  // GetFileByInode checks if a file with the given inode has been received.
+  // Returns the path if found, allowing the sender to use CreateHardlink.
+  rpc GetFileByInode(GetFileByInodeRequest) returns (GetFileByInodeResponse);
+
+  // RegisterFile registers a completed file's inode for hardlink tracking.
+  rpc RegisterFile(RegisterFileRequest) returns (RegisterFileResponse);
+
+  // FinalizeTorrent completes torrent transfer: renames partial files,
+  // adds to local qBittorrent, triggers recheck, and waits for verification.
+  rpc FinalizeTorrent(FinalizeTorrentRequest) returns (FinalizeTorrentResponse);
+
+  // AbortTorrent aborts an in-progress torrent transfer and cleans up partial files.
+  // Called when a torrent is removed from hot before streaming completes.
+  rpc AbortTorrent(AbortTorrentRequest) returns (AbortTorrentResponse);
+}
+
+message WritePieceRequest {
+  string torrent_hash = 1;
+  int32 piece_index = 2;
+  int64 offset = 3;
+  int64 size = 4;
+  string piece_hash = 5;  // SHA1 hash for verification
+  bytes data = 6;
+}
+
+message WritePieceResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+// PieceAck is sent by the receiver for each piece in bidirectional streaming.
+message PieceAck {
+  string torrent_hash = 1;
+  int32 piece_index = 2;
+  bool success = 3;
+  string error = 4;
+}
+
+message GetWrittenPiecesRequest {
+  string torrent_hash = 1;
+}
+
+message GetWrittenPiecesResponse {
+  repeated bool written = 1;  // Boolean array indexed by piece number
+  int32 total_pieces = 2;
+  int32 written_count = 3;
+}
+
+message InitTorrentRequest {
+  string torrent_hash = 1;
+  string name = 2;
+  int64 piece_size = 3;
+  int64 total_size = 4;
+  int32 num_pieces = 5;
+  repeated FileInfo files = 6;
+  bytes torrent_file = 7;           // Raw .torrent file for resume state and verification
+  repeated string piece_hashes = 8; // SHA1 hashes per piece (hex-encoded)
+}
+
+message FileInfo {
+  string path = 1;
+  int64 size = 2;
+  int64 offset = 3;
+  uint64 inode = 4;  // Source filesystem inode for hardlink detection
+}
+
+message InitTorrentResponse {
+  bool success = 1;
+  string error = 2;
+  // Hardlink results - which files were hardlinked and which pieces are covered
+  repeated HardlinkResult hardlink_results = 3;
+  repeated bool pieces_covered = 4;  // Pieces fully covered by hardlinked files
+}
+
+// HardlinkResult describes the result of hardlink detection for a single file.
+message HardlinkResult {
+  int32 file_index = 1;        // Index in files array
+  bool hardlinked = 2;         // Whether hardlink was created
+  string source_path = 3;      // Path of existing file used (if hardlinked)
+  string error = 4;            // Error message if hardlink failed
+  bool pending = 5;            // Waiting for another torrent to finish this file
+}
+
+// Hardlink support messages
+
+message CreateHardlinkRequest {
+  // Source file path (relative to base path) that already exists on receiver
+  string source_path = 1;
+  // Target file path (relative to base path) to create as hardlink
+  string target_path = 2;
+}
+
+message CreateHardlinkResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message GetFileByInodeRequest {
+  // Inode from the source filesystem (used as unique file identifier)
+  uint64 inode = 1;
+}
+
+message GetFileByInodeResponse {
+  // Whether a file with this inode has been registered
+  bool found = 1;
+  // Path to the existing file (relative to base path) if found
+  string path = 2;
+}
+
+message RegisterFileRequest {
+  // Inode from the source filesystem
+  uint64 inode = 1;
+  // Path where the file was written (relative to base path)
+  string path = 2;
+  // File size for verification
+  int64 size = 3;
+}
+
+message RegisterFileResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message FinalizeTorrentRequest {
+  string torrent_hash = 1;
+  string save_path = 2;    // Destination path for qBittorrent
+  string category = 3;     // Optional category
+  string tags = 4;         // Optional tags (comma-separated)
+}
+
+message FinalizeTorrentResponse {
+  bool success = 1;
+  string error = 2;
+  string state = 3;        // Final qBittorrent state
+}
+
+message AbortTorrentRequest {
+  string torrent_hash = 1;
+  bool delete_files = 2;   // If true, delete partial files; if false, just stop tracking
+}
+
+message AbortTorrentResponse {
+  bool success = 1;
+  string error = 2;
+  int32 files_deleted = 3; // Number of partial files deleted
+}
+
+// Piece is a lightweight reference to a piece (no data).
+// Used for internal signaling/queueing between hot components.
+message Piece {
+  string torrent_hash = 1;
+  int32 index = 2;
+  int64 offset = 3;
+  int64 size = 4;
+  string hash = 5;  // SHA1 hash for verification
+}
