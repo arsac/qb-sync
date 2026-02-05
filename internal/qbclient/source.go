@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -126,6 +127,11 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 		numPieces = int((torrent.Size + pieceSize - 1) / pieceSize)
 	}
 
+	// Validate piece count fits in int32 (protobuf field type)
+	if numPieces > math.MaxInt32 {
+		return nil, fmt.Errorf("piece count %d exceeds maximum supported value", numPieces)
+	}
+
 	// Export the raw .torrent file (with retry)
 	torrentFile, exportErr := s.client.ExportTorrentCtx(ctx, hash)
 	if exportErr != nil {
@@ -144,7 +150,7 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 			Name:        torrent.Name,
 			PieceSize:   pieceSize,
 			TotalSize:   torrent.Size,
-			NumPieces:   int32(numPieces), //nolint:gosec // Piece counts are bounded by practical torrent limits (<2B)
+			NumPieces:   int32(numPieces),
 			Files:       files,
 			TorrentFile: torrentFile,
 			PieceHashes: pieceHashes,
