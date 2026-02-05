@@ -19,8 +19,6 @@ import (
 // adding to qBittorrent, and verifying via recheck.
 // This operation is idempotent: file renaming checks for existing files,
 // and qB operations handle already-added torrents.
-//
-//nolint:funlen // Complex orchestration logic is clearer as single function
 func (s *Server) FinalizeTorrent(
 	ctx context.Context,
 	req *pb.FinalizeTorrentRequest,
@@ -28,35 +26,10 @@ func (s *Server) FinalizeTorrent(
 	startTime := time.Now()
 	hash := req.GetTorrentHash()
 
-	s.mu.RLock()
-	state, exists := s.torrents[hash]
-	s.mu.RUnlock()
-
-	if !exists {
-		// Try to recover state from disk (after server restart)
-		recoveredState, recoverErr := s.recoverTorrentState(ctx, hash)
-		if recoverErr != nil {
-			s.logger.DebugContext(ctx, "failed to recover torrent state",
-				"hash", hash,
-				"error", recoverErr,
-			)
-			return &pb.FinalizeTorrentResponse{
-				Success: false,
-				Error:   "torrent not found",
-			}, nil
-		}
-
-		// Register recovered state
-		s.mu.Lock()
-		s.torrents[hash] = recoveredState
-		s.mu.Unlock()
-
-		state = recoveredState
-		s.logger.InfoContext(ctx, "recovered torrent state from disk",
-			"hash", hash,
-			"pieces", len(state.written),
-			"files", len(state.files),
-		)
+	state, stateErr := s.getOrRecoverState(ctx, hash)
+	if stateErr != nil {
+		//nolint:nilerr // gRPC returns errors in response body
+		return &pb.FinalizeTorrentResponse{Success: false, Error: stateErr.Error()}, nil
 	}
 
 	// Set finalizing flag to prevent concurrent writes
@@ -135,6 +108,40 @@ func (s *Server) cleanupFinalizedTorrent(hash string) {
 	s.mu.Lock()
 	delete(s.torrents, hash)
 	s.mu.Unlock()
+}
+
+// getOrRecoverState gets the torrent state from memory, or recovers it from disk.
+func (s *Server) getOrRecoverState(ctx context.Context, hash string) (*serverTorrentState, error) {
+	s.mu.RLock()
+	state, exists := s.torrents[hash]
+	s.mu.RUnlock()
+
+	if exists {
+		return state, nil
+	}
+
+	// Try to recover state from disk (after server restart)
+	recoveredState, recoverErr := s.recoverTorrentState(ctx, hash)
+	if recoverErr != nil {
+		s.logger.DebugContext(ctx, "failed to recover torrent state",
+			"hash", hash,
+			"error", recoverErr,
+		)
+		return nil, errors.New("torrent not found")
+	}
+
+	// Register recovered state
+	s.mu.Lock()
+	s.torrents[hash] = recoveredState
+	s.mu.Unlock()
+
+	s.logger.InfoContext(ctx, "recovered torrent state from disk",
+		"hash", hash,
+		"pieces", len(recoveredState.written),
+		"files", len(recoveredState.files),
+	)
+
+	return recoveredState, nil
 }
 
 // finalizeFiles syncs all file handles, closes them, and renames from .partial to final.
