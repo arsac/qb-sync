@@ -1,7 +1,7 @@
 package utils
 
 import (
-	"crypto/sha1"
+	"crypto/sha1" //nolint:gosec // SHA1 is required by BitTorrent protocol for piece verification
 	"encoding/hex"
 	"fmt"
 )
@@ -14,7 +14,7 @@ func VerifyPieceHash(data []byte, expectedHash string) error {
 		return nil
 	}
 
-	hash := sha1.Sum(data)
+	hash := sha1.Sum(data) //nolint:gosec // Required by BitTorrent protocol
 	actual := hex.EncodeToString(hash[:])
 	if actual != expectedHash {
 		return fmt.Errorf("hash mismatch: expected %s, got %s", expectedHash, actual)
@@ -24,6 +24,6 @@ func VerifyPieceHash(data []byte, expectedHash string) error {
 
 // ComputeSHA1 computes the SHA1 hash of data and returns it as a hex string.
 func ComputeSHA1(data []byte) string {
-	hash := sha1.Sum(data)
+	hash := sha1.Sum(data) //nolint:gosec // Required by BitTorrent protocol
 	return hex.EncodeToString(hash[:])
 }

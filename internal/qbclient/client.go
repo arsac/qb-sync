@@ -3,10 +3,19 @@ package qbclient
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/autobrr/go-qbittorrent"
 
 	"github.com/arsac/qb-sync/internal/utils"
+)
+
+// Default retry configuration for qBittorrent client.
+const (
+	defaultMaxAttempts  = 3
+	defaultInitialDelay = 500 * time.Millisecond
+	defaultMaxDelay     = 5 * time.Second
+	defaultMultiplier   = 2.0
 )
 
 // Config configures the resilient qBittorrent client.
@@ -20,10 +29,10 @@ func DefaultConfig() Config {
 	cbConfig := utils.DefaultCircuitBreakerConfig()
 	return Config{
 		Retry: utils.RetryConfig{
-			MaxAttempts:      3,
-			InitialDelay:     500 * 1e6, // 500ms in nanoseconds for time.Duration
-			MaxDelay:         5 * 1e9,   // 5s
-			Multiplier:       2.0,
+			MaxAttempts:      defaultMaxAttempts,
+			InitialDelay:     defaultInitialDelay,
+			MaxDelay:         defaultMaxDelay,
+			Multiplier:       defaultMultiplier,
 			RetriableChecker: IsRetriableError,
 		},
 		CircuitBreaker: &cbConfig,

@@ -19,6 +19,8 @@ import (
 // adding to qBittorrent, and verifying via recheck.
 // This operation is idempotent: file renaming checks for existing files,
 // and qB operations handle already-added torrents.
+//
+//nolint:funlen // Complex orchestration logic is clearer as single function
 func (s *Server) FinalizeTorrent(
 	ctx context.Context,
 	req *pb.FinalizeTorrentRequest,

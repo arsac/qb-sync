@@ -40,7 +40,7 @@ const (
 	// Prevents anomalous first samples from affecting behavior.
 	minRTTSamples = 3
 
-	// Default timeout for stale in-flight pieces.
+	// DefaultPieceTimeout is the timeout for stale in-flight pieces.
 	DefaultPieceTimeout = 60 * time.Second
 )
 
