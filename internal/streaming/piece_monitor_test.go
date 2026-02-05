@@ -1,7 +1,6 @@
 package streaming
 
 import (
-	"context"
 	"errors"
 	"log/slog"
 	"os"
@@ -155,11 +154,9 @@ func TestPieceMonitor_CloseChannels(t *testing.T) {
 
 		var wg sync.WaitGroup
 		for range 10 {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				monitor.closeChannels() // Should not panic
-			}()
+			})
 		}
 		wg.Wait()
 
@@ -204,7 +201,7 @@ func TestPieceMonitor_Untrack(t *testing.T) {
 		}
 	})
 
-	t.Run("untracking non-existent torrent is safe", func(t *testing.T) {
+	t.Run("untracking non-existent torrent is safe", func(_ *testing.T) {
 		monitor := &PieceMonitor{
 			logger:    logger,
 			torrents:  make(map[string]*torrentState),
@@ -282,7 +279,7 @@ func TestPieceMonitor_MarkStreamed(t *testing.T) {
 		}
 	})
 
-	t.Run("marking untracked torrent is safe", func(t *testing.T) {
+	t.Run("marking untracked torrent is safe", func(_ *testing.T) {
 		monitor := &PieceMonitor{
 			logger:    logger,
 			torrents:  make(map[string]*torrentState),
@@ -538,8 +535,7 @@ func TestPieceMonitor_RemovalNotification_Integration(t *testing.T) {
 			removed:   make(chan string, removedChannelBufSize),
 		}
 
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
+		ctx := t.Context()
 
 		// Track a torrent
 		hash := "test123"

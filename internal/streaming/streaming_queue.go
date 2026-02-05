@@ -333,6 +333,8 @@ func (q *BidiQueue) runSenderPool(ctx context.Context, pool *StreamPool, stopSen
 }
 
 // sendPiecePool reads piece data and sends it over the best available stream.
+//
+//nolint:gocognit,nestif,funlen // Complex initialization and retry logic is clearer as single function
 func (q *BidiQueue) sendPiecePool(ctx context.Context, pool *StreamPool, piece *pb.Piece) error {
 	sendStart := time.Now()
 	hash := piece.GetTorrentHash()

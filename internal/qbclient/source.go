@@ -144,7 +144,7 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 			Name:        torrent.Name,
 			PieceSize:   pieceSize,
 			TotalSize:   torrent.Size,
-			NumPieces:   int32(numPieces),
+			NumPieces:   int32(numPieces), //nolint:gosec // Piece counts are bounded by practical torrent limits (<2B)
 			Files:       files,
 			TorrentFile: torrentFile,
 			PieceHashes: pieceHashes,

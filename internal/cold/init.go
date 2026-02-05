@@ -224,6 +224,8 @@ func (s *Server) waitForAbortComplete(ctx context.Context, hash string) error {
 }
 
 // InitTorrent initializes tracking for a new torrent.
+//
+//nolint:funlen // Complex initialization with hardlink detection is clearer as single function
 func (s *Server) InitTorrent(
 	ctx context.Context,
 	req *pb.InitTorrentRequest,

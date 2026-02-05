@@ -36,6 +36,8 @@ func tryRemoveWithLog(
 
 // AbortTorrent aborts an in-progress torrent transfer and optionally cleans up partial files.
 // This is called when a torrent is removed from hot before streaming completes.
+//
+//nolint:gocognit,funlen // Complex cleanup with proper lock ordering is clearer as single function
 func (s *Server) AbortTorrent(
 	ctx context.Context,
 	req *pb.AbortTorrentRequest,

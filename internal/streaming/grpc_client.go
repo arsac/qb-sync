@@ -23,6 +23,10 @@ import (
 
 const (
 	ackChannelSize = 1000 // Buffer size for incoming acks
+
+	// gRPC keepalive parameters.
+	keepaliveTime    = 30 * time.Second // Send pings every 30 seconds if no activity
+	keepaliveTimeout = 10 * time.Second // Wait 10 seconds for ping ack
 )
 
 // successResponse is implemented by gRPC response types that have Success/Error fields.
@@ -54,9 +58,9 @@ type GRPCDestination struct {
 func NewGRPCDestination(addr string) (*GRPCDestination, error) {
 	// Configure keepalive for better connection management
 	kaParams := keepalive.ClientParameters{
-		Time:                30 * time.Second, // Send pings every 30 seconds if no activity
-		Timeout:             10 * time.Second, // Wait 10 seconds for ping ack
-		PermitWithoutStream: true,             // Send pings even without active streams
+		Time:                keepaliveTime,
+		Timeout:             keepaliveTimeout,
+		PermitWithoutStream: true, // Send pings even without active streams
 	}
 
 	conn, err := grpc.NewClient(
@@ -146,7 +150,11 @@ func (d *GRPCDestination) InitTorrent(ctx context.Context, req *pb.InitTorrentRe
 	if err != nil {
 		return nil, err
 	}
-	return v.(*InitTorrentResult), nil
+	result, ok := v.(*InitTorrentResult)
+	if !ok {
+		return nil, fmt.Errorf("unexpected type from singleflight: %T", v)
+	}
+	return result, nil
 }
 
 // IsInitialized returns whether a torrent has been initialized.
@@ -321,11 +329,13 @@ func IsTransientError(err error) bool {
 	if !ok {
 		return false
 	}
+	//nolint:exhaustive // Only specific transient codes are relevant
 	switch s.Code() {
 	case codes.Unavailable, codes.ResourceExhausted, codes.Aborted, codes.DeadlineExceeded:
 		return true
+	default:
+		return false
 	}
-	return false
 }
 
 // GRPCErrorCode extracts the gRPC status code from an error, if present.

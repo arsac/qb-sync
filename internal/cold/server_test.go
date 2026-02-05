@@ -182,6 +182,7 @@ func TestIsOrphanedTorrent(t *testing.T) {
 	})
 }
 
+//nolint:gocognit // Test functions have inherent complexity from setup and assertions
 func TestCleanupOrphan(t *testing.T) {
 	ctx := context.Background()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -420,6 +421,7 @@ func TestCleanupOrphanedTorrents(t *testing.T) {
 	})
 }
 
+//nolint:gocognit,gocyclo,cyclop // Test functions have inherent complexity from setup and assertions
 func TestAbortTorrent(t *testing.T) {
 	ctx := context.Background()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -657,9 +659,7 @@ func TestAbortTorrent(t *testing.T) {
 		results := make(chan *pb.AbortTorrentResponse, 10)
 
 		for range 10 {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				resp, err := s.AbortTorrent(ctx, &pb.AbortTorrentRequest{
 					TorrentHash: hash,
 					DeleteFiles: false,
@@ -669,7 +669,7 @@ func TestAbortTorrent(t *testing.T) {
 					return
 				}
 				results <- resp
-			}()
+			})
 		}
 
 		wg.Wait()
@@ -723,9 +723,7 @@ func TestAbortTorrent(t *testing.T) {
 		var wg sync.WaitGroup
 
 		// Start AbortTorrent first
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			// Manually register the abort before signaling and sleeping.
 			// This simulates the behavior where AbortTorrent takes a long time.
 			s.mu.Lock()
@@ -754,15 +752,13 @@ func TestAbortTorrent(t *testing.T) {
 			close(abortCh)
 
 			abortFinished = time.Now()
-		}()
+		})
 
 		// Wait for AbortTorrent to register before starting InitTorrent
 		<-abortStartedCh
 
 		// Start InitTorrent - it should wait for AbortTorrent to complete
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			_, initErr = s.InitTorrent(ctx, &pb.InitTorrentRequest{
 				TorrentHash: hash,
 				Name:        "test",
@@ -774,7 +770,7 @@ func TestAbortTorrent(t *testing.T) {
 				},
 			})
 			initFinished = time.Now()
-		}()
+		})
 
 		wg.Wait()
 

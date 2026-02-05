@@ -145,7 +145,7 @@ func TestFinalizeBackoff(t *testing.T) {
 func TestTrackedTorrentsMap(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 
-	t.Run("concurrent map access is safe", func(t *testing.T) {
+	t.Run("concurrent map access is safe", func(_ *testing.T) {
 		task := &QBTask{
 			cfg:             &config.HotConfig{},
 			logger:          logger,
@@ -169,13 +169,11 @@ func TestTrackedTorrentsMap(t *testing.T) {
 
 		// Concurrent reads
 		for range numOps {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				task.trackedMu.RLock()
 				_ = len(task.trackedTorrents)
 				task.trackedMu.RUnlock()
-			}()
+			})
 		}
 
 		// Concurrent deletes
@@ -197,7 +195,7 @@ func TestTrackedTorrentsMap(t *testing.T) {
 func TestConcurrentBackoffAccess(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 
-	t.Run("concurrent backoff operations are safe", func(t *testing.T) {
+	t.Run("concurrent backoff operations are safe", func(_ *testing.T) {
 		task := &QBTask{
 			cfg:              &config.HotConfig{},
 			logger:           logger,

@@ -247,6 +247,8 @@ func (t *PieceMonitor) closeChannels() {
 
 // trySend safely sends a value to a channel with optional blocking behavior.
 // Returns true if sent successfully, false if channel is closed, full (non-blocking), or context cancelled.
+//
+//nolint:nonamedreturns // Named return required for panic recovery
 func trySend[T any](ctx context.Context, closed *atomic.Bool, ch chan<- T, val T, blocking bool) (sent bool) {
 	if closed.Load() {
 		return false

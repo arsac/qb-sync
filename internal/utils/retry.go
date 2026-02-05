@@ -10,6 +10,21 @@ import (
 	"time"
 )
 
+// Default retry configuration values.
+const (
+	defaultMaxAttempts  = 3
+	defaultInitialDelay = 500 * time.Millisecond
+	defaultMaxDelay     = 5 * time.Second
+	defaultMultiplier   = 2.0
+)
+
+// Default circuit breaker configuration values.
+const (
+	defaultCBMaxFailures         = 5
+	defaultCBResetTimeout        = 30 * time.Second
+	defaultCBHalfOpenMaxAttempts = 2
+)
+
 // RetryConfig configures retry behavior with exponential backoff.
 type RetryConfig struct {
 	MaxAttempts      int           // Maximum number of attempts (including first try)
@@ -22,10 +37,10 @@ type RetryConfig struct {
 // DefaultRetryConfig returns sensible defaults for retry configuration.
 func DefaultRetryConfig() RetryConfig {
 	return RetryConfig{
-		MaxAttempts:      3,
-		InitialDelay:     500 * time.Millisecond,
-		MaxDelay:         5 * time.Second,
-		Multiplier:       2.0,
+		MaxAttempts:      defaultMaxAttempts,
+		InitialDelay:     defaultInitialDelay,
+		MaxDelay:         defaultMaxDelay,
+		Multiplier:       defaultMultiplier,
 		RetriableChecker: IsRetriableError,
 	}
 }
@@ -199,9 +214,9 @@ type CircuitBreakerConfig struct {
 // DefaultCircuitBreakerConfig returns sensible defaults.
 func DefaultCircuitBreakerConfig() CircuitBreakerConfig {
 	return CircuitBreakerConfig{
-		MaxFailures:         5,
-		ResetTimeout:        30 * time.Second,
-		HalfOpenMaxAttempts: 2,
+		MaxFailures:         defaultCBMaxFailures,
+		ResetTimeout:        defaultCBResetTimeout,
+		HalfOpenMaxAttempts: defaultCBHalfOpenMaxAttempts,
 	}
 }
 
