@@ -6,12 +6,41 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	pb "github.com/arsac/qb-sync/proto"
 )
+
+func TestServerConfig_GetSavePath(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   ServerConfig
+		expected string
+	}{
+		{
+			name:     "returns SavePath when set",
+			config:   ServerConfig{BasePath: "/data/cold", SavePath: "/downloads"},
+			expected: "/downloads",
+		},
+		{
+			name:     "falls back to BasePath when SavePath empty",
+			config:   ServerConfig{BasePath: "/data/cold"},
+			expected: "/data/cold",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.config.GetSavePath()
+			if got != tt.expected {
+				t.Errorf("GetSavePath() = %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
 
 func TestServerConfig_Validate(t *testing.T) {
 	tests := []struct {
@@ -81,7 +110,7 @@ func TestServerConfig_Validate(t *testing.T) {
 				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
 			}
 			if tt.wantErr && tt.errMsg != "" && err != nil {
-				if !contains(err.Error(), tt.errMsg) {
+				if !strings.Contains(err.Error(), tt.errMsg) {
 					t.Errorf("Validate() error = %v, want error containing %q", err, tt.errMsg)
 				}
 			}
@@ -197,7 +226,7 @@ func TestCleanupOrphan(t *testing.T) {
 		}
 
 		hash := "abc123"
-		metaDir := filepath.Join(tmpDir, ".meta", hash)
+		metaDir := filepath.Join(tmpDir, metaDirName, hash)
 		partialFile := filepath.Join(tmpDir, "test.txt.partial")
 
 		// Create metadata and partial file
@@ -250,7 +279,7 @@ func TestCleanupOrphan(t *testing.T) {
 		}
 
 		// Meta directory should be deleted
-		metaDir := filepath.Join(tmpDir, ".meta", hash)
+		metaDir := filepath.Join(tmpDir, metaDirName, hash)
 		if _, err := os.Stat(metaDir); !os.IsNotExist(err) {
 			t.Error("meta directory should be deleted")
 		}
@@ -293,7 +322,7 @@ func TestCleanupOrphan(t *testing.T) {
 		}
 	})
 
-	t.Run("skips cleanup when metadata unreadable", func(t *testing.T) {
+	t.Run("cleans up metadata directory even when files.json is unreadable", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		s := &Server{
 			config:         ServerConfig{BasePath: tmpDir},
@@ -303,7 +332,7 @@ func TestCleanupOrphan(t *testing.T) {
 		}
 
 		hash := "abc123"
-		metaDir := filepath.Join(tmpDir, ".meta", hash)
+		metaDir := filepath.Join(tmpDir, metaDirName, hash)
 
 		// Create meta dir with invalid files.json
 		if err := os.MkdirAll(metaDir, 0o755); err != nil {
@@ -315,9 +344,11 @@ func TestCleanupOrphan(t *testing.T) {
 
 		s.cleanupOrphan(ctx, hash)
 
-		// Meta directory should still exist (cleanup skipped)
-		if _, err := os.Stat(metaDir); os.IsNotExist(err) {
-			t.Error("meta directory should not be deleted when metadata is unreadable")
+		// Meta directory should be deleted to prevent unbounded growth.
+		// Partial files can't be located without valid files.json but are
+		// identifiable by .partial suffix for manual cleanup.
+		if _, err := os.Stat(metaDir); !os.IsNotExist(err) {
+			t.Error("meta directory should be deleted even when files.json is unreadable")
 		}
 	})
 }
@@ -349,7 +380,7 @@ func TestCleanupOrphanedTorrents(t *testing.T) {
 		}
 		createTestFilesInfoWithPaths(t, tmpDir, orphanHash, []string{orphanPartial})
 		// Backdate the metadata
-		metaDir := filepath.Join(tmpDir, ".meta", orphanHash)
+		metaDir := filepath.Join(tmpDir, metaDirName, orphanHash)
 		setModTime(t, filepath.Join(metaDir, filesInfoFileName), time.Now().Add(-2*time.Hour))
 
 		// Create a fresh torrent (recent metadata)
@@ -366,7 +397,7 @@ func TestCleanupOrphanedTorrents(t *testing.T) {
 		if _, err := os.Stat(orphanPartial); !os.IsNotExist(err) {
 			t.Error("orphan partial file should be deleted")
 		}
-		if _, err := os.Stat(filepath.Join(tmpDir, ".meta", orphanHash)); !os.IsNotExist(err) {
+		if _, err := os.Stat(filepath.Join(tmpDir, metaDirName, orphanHash)); !os.IsNotExist(err) {
 			t.Error("orphan meta directory should be deleted")
 		}
 
@@ -374,7 +405,7 @@ func TestCleanupOrphanedTorrents(t *testing.T) {
 		if _, err := os.Stat(freshPartial); os.IsNotExist(err) {
 			t.Error("fresh partial file should not be deleted")
 		}
-		if _, err := os.Stat(filepath.Join(tmpDir, ".meta", freshHash)); os.IsNotExist(err) {
+		if _, err := os.Stat(filepath.Join(tmpDir, metaDirName, freshHash)); os.IsNotExist(err) {
 			t.Error("fresh meta directory should not be deleted")
 		}
 	})
@@ -404,7 +435,7 @@ func TestCleanupOrphanedTorrents(t *testing.T) {
 		}
 
 		// Create meta directory with a regular file
-		metaDir := filepath.Join(tmpDir, ".meta")
+		metaDir := filepath.Join(tmpDir, metaDirName)
 		if err := os.MkdirAll(metaDir, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -494,8 +525,8 @@ func TestAbortTorrent(t *testing.T) {
 
 		hash := "abc123"
 		partialFile := filepath.Join(tmpDir, "data", "test.partial")
-		stateFile := filepath.Join(tmpDir, ".meta", hash, ".state")
-		torrentFile := filepath.Join(tmpDir, ".meta", hash, "test.torrent")
+		stateFile := filepath.Join(tmpDir, metaDirName, hash, ".state")
+		torrentFile := filepath.Join(tmpDir, metaDirName, hash, "test.torrent")
 
 		// Create files
 		if err := os.MkdirAll(filepath.Dir(partialFile), 0o755); err != nil {
@@ -798,19 +829,6 @@ func TestAbortTorrent(t *testing.T) {
 
 // Helper functions
 
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsAt(s, substr, 0))
-}
-
-func containsAt(s, substr string, start int) bool {
-	for i := start; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}
-
 func createTestMetadata(t *testing.T, basePath, hash string, modTime time.Time) {
 	t.Helper()
 	createTestStateFile(t, basePath, hash, modTime)
@@ -819,7 +837,7 @@ func createTestMetadata(t *testing.T, basePath, hash string, modTime time.Time) 
 
 func createTestStateFile(t *testing.T, basePath, hash string, modTime time.Time) {
 	t.Helper()
-	metaDir := filepath.Join(basePath, ".meta", hash)
+	metaDir := filepath.Join(basePath, metaDirName, hash)
 	if err := os.MkdirAll(metaDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -833,13 +851,13 @@ func createTestStateFile(t *testing.T, basePath, hash string, modTime time.Time)
 func createTestFilesInfo(t *testing.T, basePath, hash string, modTime time.Time) {
 	t.Helper()
 	createTestFilesInfoWithPaths(t, basePath, hash, []string{})
-	filesPath := filepath.Join(basePath, ".meta", hash, filesInfoFileName)
+	filesPath := filepath.Join(basePath, metaDirName, hash, filesInfoFileName)
 	setModTime(t, filesPath, modTime)
 }
 
 func createTestFilesInfoWithPaths(t *testing.T, basePath, hash string, filePaths []string) {
 	t.Helper()
-	metaDir := filepath.Join(basePath, ".meta", hash)
+	metaDir := filepath.Join(basePath, metaDirName, hash)
 	if err := os.MkdirAll(metaDir, 0o755); err != nil {
 		t.Fatal(err)
 	}

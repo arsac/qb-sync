@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,8 +23,6 @@ import (
 )
 
 const (
-	ackChannelSize = 1000 // Buffer size for incoming acks
-
 	// gRPC keepalive parameters.
 	keepaliveTime    = 30 * time.Second // Send pings every 30 seconds if no activity
 	keepaliveTimeout = 10 * time.Second // Wait 10 seconds for ping ack
@@ -42,6 +41,9 @@ func checkRPCResponse(resp successResponse, operation string) error {
 	}
 	return nil
 }
+
+var _ PieceDestination = (*GRPCDestination)(nil)
+var _ HardlinkDestination = (*GRPCDestination)(nil)
 
 // GRPCDestination sends pieces to a remote gRPC server.
 // It provides PieceDestination-like functionality plus additional features
@@ -82,10 +84,11 @@ func NewGRPCDestination(addr string) (*GRPCDestination, error) {
 // ValidateConnection checks that the cold server is reachable.
 // This should be called before starting the main loop to fail fast.
 func (d *GRPCDestination) ValidateConnection(ctx context.Context) error {
-	// Use GetWrittenPieces with a dummy hash as a health check.
+	// Use GetFileByInode with inode 0 as a health check.
 	// This validates the gRPC connection is working and the server is responsive.
-	_, err := d.client.GetWrittenPieces(ctx, &pb.GetWrittenPiecesRequest{
-		TorrentHash: "__health_check__",
+	// Inode 0 is invalid so it will always return not found, but that's fine for validation.
+	_, err := d.client.GetFileByInode(ctx, &pb.GetFileByInodeRequest{
+		Inode: 0,
 	})
 	if err != nil {
 		return fmt.Errorf("cold server not reachable: %w", err)
@@ -93,14 +96,28 @@ func (d *GRPCDestination) ValidateConnection(ctx context.Context) error {
 	return nil
 }
 
-// InitTorrentResult contains the result of InitTorrent including hardlink information.
+// InitTorrentResult contains the result of InitTorrent including sync status and hardlink information.
 type InitTorrentResult struct {
-	HardlinkResults []*pb.HardlinkResult
-	PiecesCovered   []bool
+	Status            pb.TorrentSyncStatus
+	PiecesNeeded      []bool
+	PiecesNeededCount int32
+	PiecesHaveCount   int32
+	HardlinkResults   []*pb.HardlinkResult
+}
+
+// initTorrentResultFromProto converts a proto response to InitTorrentResult.
+func initTorrentResultFromProto(resp *pb.InitTorrentResponse) *InitTorrentResult {
+	return &InitTorrentResult{
+		Status:            resp.GetStatus(),
+		PiecesNeeded:      resp.GetPiecesNeeded(),
+		PiecesNeededCount: resp.GetPiecesNeededCount(),
+		PiecesHaveCount:   resp.GetPiecesHaveCount(),
+		HardlinkResults:   resp.GetHardlinkResults(),
+	}
 }
 
 // InitTorrent initializes a torrent on the remote server.
-// Returns hardlink results indicating which files were hardlinked and which pieces are covered.
+// Returns sync status, pieces needed for streaming, and hardlink results.
 // Results are cached and returned on subsequent calls for the same torrent.
 // Uses singleflight to deduplicate concurrent requests for the same torrent.
 func (d *GRPCDestination) InitTorrent(ctx context.Context, req *pb.InitTorrentRequest) (*InitTorrentResult, error) {
@@ -130,14 +147,11 @@ func (d *GRPCDestination) InitTorrent(ctx context.Context, req *pb.InitTorrentRe
 			return nil, fmt.Errorf("init torrent RPC failed: %w", rpcErr)
 		}
 
-		if !resp.GetSuccess() {
-			return nil, fmt.Errorf("init torrent failed: %s", resp.GetError())
+		if err := checkRPCResponse(resp, "init torrent"); err != nil {
+			return nil, err
 		}
 
-		result := &InitTorrentResult{
-			HardlinkResults: resp.GetHardlinkResults(),
-			PiecesCovered:   resp.GetPiecesCovered(),
-		}
+		result := initTorrentResultFromProto(resp)
 
 		// Cache the result
 		d.mu.Lock()
@@ -165,6 +179,34 @@ func (d *GRPCDestination) IsInitialized(hash string) bool {
 	return ok
 }
 
+// CheckTorrentStatus queries the cold server for a torrent's current sync status.
+// Unlike InitTorrent, this does NOT cache results and does NOT require full torrent info.
+// Use this for status checking (is torrent complete/verifying/ready on cold?).
+// For full initialization with file tracking and hardlink detection, use InitTorrent.
+//
+// Note: This sends a minimal request with just the hash. Cold server will check:
+// 1. qBittorrent status (returns COMPLETE/VERIFYING if found).
+// 2. Existing tracking state (returns READY with pieces_needed if found).
+// 3. If neither, returns READY with empty state (caller should do full InitTorrent).
+func (d *GRPCDestination) CheckTorrentStatus(ctx context.Context, hash string) (*InitTorrentResult, error) {
+	// Create minimal request with just the hash
+	req := &pb.InitTorrentRequest{
+		TorrentHash: hash,
+	}
+
+	resp, err := d.client.InitTorrent(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("check status RPC failed: %w", err)
+	}
+
+	if respErr := checkRPCResponse(resp, "check status"); respErr != nil {
+		return nil, respErr
+	}
+
+	// Return result WITHOUT caching - BidiQueue should still do full InitTorrent
+	return initTorrentResultFromProto(resp), nil
+}
+
 // WritePiece sends a piece to the remote server (unary, for simple cases).
 func (d *GRPCDestination) WritePiece(ctx context.Context, req *pb.WritePieceRequest) error {
 	resp, err := d.client.WritePiece(ctx, req)
@@ -185,7 +227,7 @@ func (d *GRPCDestination) OpenStream(ctx context.Context, logger *slog.Logger) (
 		ctx:      ctx,
 		stream:   stream,
 		logger:   logger,
-		acks:     make(chan *pb.PieceAck, ackChannelSize),
+		acks:     make(chan *pb.PieceAck, DefaultAckChannelSize),
 		ackReady: make(chan struct{}, 1), // Signal when acks are processed
 		done:     make(chan struct{}),
 		errors:   make(chan error, 1),
@@ -195,18 +237,6 @@ func (d *GRPCDestination) OpenStream(ctx context.Context, logger *slog.Logger) (
 	go ps.receiveAcks()
 
 	return ps, nil
-}
-
-// GetWrittenPieces returns which pieces have been written on the remote server.
-func (d *GRPCDestination) GetWrittenPieces(ctx context.Context, hash string) ([]bool, error) {
-	resp, err := d.client.GetWrittenPieces(ctx, &pb.GetWrittenPiecesRequest{
-		TorrentHash: hash,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("get written pieces RPC failed: %w", err)
-	}
-
-	return resp.GetWritten(), nil
 }
 
 // GetFileByInode checks if a file with the given inode exists on the receiver.
@@ -267,7 +297,7 @@ func (d *GRPCDestination) FinalizeTorrent(
 	}
 
 	// Clean up cached init result to prevent memory leak
-	d.clearInitResult(hash)
+	d.ClearInitResult(hash)
 	return nil
 }
 
@@ -277,7 +307,7 @@ func (d *GRPCDestination) FinalizeTorrent(
 func (d *GRPCDestination) AbortTorrent(ctx context.Context, hash string, deleteFiles bool) (int32, error) {
 	// Always clear init results - the server removes tracking regardless of deletion success,
 	// and if RPC fails the torrent needs re-initialization anyway
-	defer d.clearInitResult(hash)
+	defer d.ClearInitResult(hash)
 
 	resp, err := d.client.AbortTorrent(ctx, &pb.AbortTorrentRequest{
 		TorrentHash: hash,
@@ -293,8 +323,23 @@ func (d *GRPCDestination) AbortTorrent(ctx context.Context, hash string, deleteF
 	return resp.GetFilesDeleted(), nil
 }
 
-// clearInitResult removes a cached init result for a torrent hash.
-func (d *GRPCDestination) clearInitResult(hash string) {
+// StartTorrent resumes a stopped torrent on the cold server.
+// Called during disk pressure cleanup after hot stops seeding,
+// to ensure cold takes over before hot deletes.
+func (d *GRPCDestination) StartTorrent(ctx context.Context, hash string) error {
+	resp, err := d.client.StartTorrent(ctx, &pb.StartTorrentRequest{
+		TorrentHash: hash,
+	})
+	if err != nil {
+		return fmt.Errorf("start torrent RPC failed: %w", err)
+	}
+	return checkRPCResponse(resp, "start torrent")
+}
+
+// ClearInitResult removes a cached init result for a torrent hash.
+// Use this when a piece ack indicates the torrent is not initialized on cold,
+// so the next send triggers re-initialization.
+func (d *GRPCDestination) ClearInitResult(hash string) {
 	d.mu.Lock()
 	delete(d.initResults, hash)
 	d.mu.Unlock()
@@ -322,12 +367,25 @@ func (d *GRPCDestination) CleanupStaleEntries(activeHashes map[string]struct{}) 
 	return removed
 }
 
+// grpcStatusProvider is implemented by errors that wrap a gRPC status
+// (e.g., fmt.Errorf("...: %w", statusErr)). status.FromError only checks
+// the outermost error, so we fall back to errors.As for wrapped errors.
+type grpcStatusProvider interface {
+	GRPCStatus() *status.Status
+}
+
 // IsTransientError returns true if the error is a transient gRPC error that may
 // succeed on retry (e.g., network issues, server overload).
 func IsTransientError(err error) bool {
 	s, ok := status.FromError(err)
 	if !ok {
-		return false
+		// Fall back to unwrapping wrapped gRPC errors
+		var provider grpcStatusProvider
+		if errors.As(err, &provider) {
+			s = provider.GRPCStatus()
+		} else {
+			return false
+		}
 	}
 	//nolint:exhaustive // Only specific transient codes are relevant
 	switch s.Code() {
@@ -343,6 +401,11 @@ func IsTransientError(err error) bool {
 func GRPCErrorCode(err error) codes.Code {
 	if s, ok := status.FromError(err); ok {
 		return s.Code()
+	}
+	// Fall back to unwrapping wrapped gRPC errors
+	var provider grpcStatusProvider
+	if errors.As(err, &provider) {
+		return provider.GRPCStatus().Code()
 	}
 	return codes.Unknown
 }
@@ -370,8 +433,20 @@ func pieceKey(hash string, index int32) string {
 
 // receiveAcks reads acknowledgments from the stream.
 // Exits when context is cancelled or stream ends.
-func (ps *PieceStream) receiveAcks() {
+func (ps *PieceStream) receiveAcks() { //nolint:gocognit // complexity from panic recovery
 	defer close(ps.done)
+	defer func() {
+		if r := recover(); r != nil {
+			ps.logger.Error("panic in receiveAcks",
+				"panic", r,
+				"stack", string(debug.Stack()),
+			)
+			select {
+			case ps.errors <- fmt.Errorf("panic in receiveAcks: %v", r):
+			default:
+			}
+		}
+	}()
 
 	for {
 		// Check for context cancellation before blocking on Recv

@@ -16,6 +16,17 @@ const (
 	LabelComponent = "component" // qb_client, stream_queue
 )
 
+// Label value constants for consistent usage across the codebase.
+const (
+	ModeHot  = "hot"
+	ModeCold = "cold"
+
+	ResultSuccess = "success"
+	ResultFailure = "failure"
+
+	ComponentStreamQueue = "stream_queue"
+)
+
 // Counters track cumulative values that only increase.
 var (
 	// TorrentsSyncedTotal counts torrents successfully synced.
@@ -34,6 +45,26 @@ var (
 			Namespace: namespace,
 			Name:      "finalization_errors_total",
 			Help:      "Total finalization failures",
+		},
+		[]string{LabelMode},
+	)
+
+	// TorrentStopErrorsTotal counts failures when stopping torrents before finalization.
+	TorrentStopErrorsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "torrent_stop_errors_total",
+			Help:      "Total failures stopping torrents before finalization",
+		},
+		[]string{LabelMode},
+	)
+
+	// TorrentResumeErrorsTotal counts failures when resuming torrents after finalization failure.
+	TorrentResumeErrorsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "torrent_resume_errors_total",
+			Help:      "Total failures resuming torrents after finalization failure",
 		},
 		[]string{LabelMode},
 	)
@@ -129,6 +160,52 @@ var (
 			Help:      "Total stream reconnections",
 		},
 	)
+
+	// StalePiecesTotal counts pieces that timed out in-flight.
+	StalePiecesTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "stale_pieces_total",
+			Help:      "Total pieces that timed out in-flight",
+		},
+	)
+
+	// DrainTimeoutPiecesLostTotal counts pieces lost due to drain timeout at shutdown.
+	DrainTimeoutPiecesLostTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "drain_timeout_pieces_lost_total",
+			Help:      "Total pieces lost due to drain timeout at shutdown",
+		},
+	)
+
+	// HardlinksCreatedTotal counts hardlinks created on cold server.
+	HardlinksCreatedTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "hardlinks_created_total",
+			Help:      "Total hardlinks created on cold server",
+		},
+	)
+
+	// PieceHashMismatchTotal counts pieces rejected due to hash mismatch (retried automatically).
+	PieceHashMismatchTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "piece_hash_mismatch_total",
+			Help:      "Total pieces rejected due to hash mismatch on cold (retried automatically)",
+		},
+	)
+
+	// TagApplicationErrorsTotal counts failures when applying tags to torrents.
+	TagApplicationErrorsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "tag_application_errors_total",
+			Help:      "Total failures applying tags to torrents in qBittorrent",
+		},
+		[]string{LabelMode},
+	)
 )
 
 // Gauges track values that can go up or down.
@@ -197,6 +274,60 @@ var (
 			Help:      "Whether stream pool scaling is paused (1=paused, 0=active)",
 		},
 	)
+
+	// TransferThroughputBytesPerSecond tracks current transfer throughput.
+	TransferThroughputBytesPerSecond = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "transfer_throughput_bytes_per_second",
+			Help:      "Current transfer throughput in bytes per second",
+		},
+	)
+
+	// TorrentsWithDirtyState tracks torrents with unflushed state on cold.
+	TorrentsWithDirtyState = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "torrents_with_dirty_state",
+			Help:      "Torrents with state not yet flushed to disk on cold server",
+		},
+	)
+
+	// ActiveFinalizationBackoffs tracks torrents in finalization backoff on hot.
+	ActiveFinalizationBackoffs = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "active_finalization_backoffs",
+			Help:      "Torrents currently in finalization backoff on hot server",
+		},
+	)
+
+	// OldestPendingSyncSeconds tracks the age of the longest-waiting torrent sync.
+	OldestPendingSyncSeconds = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "oldest_pending_sync_seconds",
+			Help:      "Age in seconds of the oldest torrent waiting to sync from hot to cold",
+		},
+	)
+
+	// CompletedOnColdCacheSize tracks the size of the completed-on-cold cache on hot.
+	CompletedOnColdCacheSize = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "completed_on_cold_cache_size",
+			Help:      "Number of torrents cached as complete on cold",
+		},
+	)
+
+	// InodeRegistrySize tracks the number of registered inodes on cold.
+	InodeRegistrySize = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "inode_registry_size",
+			Help:      "Number of registered inodes for hardlink deduplication",
+		},
+	)
 )
 
 // Histograms track distributions of values.
@@ -242,6 +373,26 @@ var (
 		},
 		[]string{LabelMode, LabelOperation},
 	)
+
+	// StateFlushDuration tracks the time to flush dirty state to disk on cold.
+	StateFlushDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: namespace,
+			Name:      "state_flush_duration_seconds",
+			Help:      "Time to flush dirty torrent state to disk",
+			Buckets:   []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5},
+		},
+	)
+
+	// TorrentSyncLatencySeconds tracks end-to-end sync duration from download completion to cold finalization.
+	TorrentSyncLatencySeconds = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: namespace,
+			Name:      "torrent_sync_latency_seconds",
+			Help:      "End-to-end sync duration from download completion on hot to finalization on cold",
+			Buckets:   []float64{10, 30, 60, 120, 300, 600, 1800, 3600, 7200},
+		},
+	)
 )
 
 // Circuit breaker state constants.
@@ -251,16 +402,3 @@ const (
 	CircuitStateHalfOpen = 2
 )
 
-// CircuitStateToFloat converts a circuit breaker state string to a float64.
-func CircuitStateToFloat(state string) float64 {
-	switch state {
-	case "closed":
-		return CircuitStateClosed
-	case "open":
-		return CircuitStateOpen
-	case "half-open":
-		return CircuitStateHalfOpen
-	default:
-		return -1
-	}
-}

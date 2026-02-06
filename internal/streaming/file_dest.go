@@ -12,9 +12,8 @@ import (
 )
 
 const (
-	defaultWrittenSliceSize = 10000
-	dirPermissions          = 0o750
-	filePermissions         = 0o600
+	dirPermissions  = 0o750
+	filePermissions = 0o600
 )
 
 // FileDestination implements PieceDestination writing to local files.
@@ -31,6 +30,24 @@ type destinationFile struct {
 	mu      sync.Mutex
 }
 
+// computePiecesNeeded returns a slice where true = piece not yet written.
+// Also returns count of pieces needed and count already written.
+func (df *destinationFile) computePiecesNeeded() ([]bool, int32, int32) {
+	df.mu.Lock()
+	defer df.mu.Unlock()
+
+	piecesNeeded := make([]bool, len(df.written))
+	var needCount int32
+	for i, written := range df.written {
+		if !written {
+			piecesNeeded[i] = true
+			needCount++
+		}
+	}
+	haveCount := int32(len(df.written)) - needCount
+	return piecesNeeded, needCount, haveCount
+}
+
 // NewFileDestination creates a destination that writes to local files.
 func NewFileDestination(basePath string) *FileDestination {
 	return &FileDestination{
@@ -39,28 +56,44 @@ func NewFileDestination(basePath string) *FileDestination {
 	}
 }
 
-// InitTorrent initializes a torrent on the destination (no-op for file dest).
-func (d *FileDestination) InitTorrent(_ context.Context, req *pb.InitTorrentRequest) error {
+// InitTorrent initializes a torrent on the destination.
+// For FileDestination, always returns READY status since there's no cold qBittorrent to check.
+func (d *FileDestination) InitTorrent(_ context.Context, req *pb.InitTorrentRequest) (*InitTorrentResult, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	hash := req.GetTorrentHash()
-	if _, ok := d.files[hash]; ok {
-		return nil // Already initialized
+	numPieces := int(req.GetNumPieces())
+
+	// Check if already initialized
+	if df, ok := d.files[hash]; ok {
+		piecesNeeded, needCount, haveCount := df.computePiecesNeeded()
+		return &InitTorrentResult{
+			Status:            pb.TorrentSyncStatus_SYNC_STATUS_READY,
+			PiecesNeeded:      piecesNeeded,
+			PiecesNeededCount: needCount,
+			PiecesHaveCount:   haveCount,
+		}, nil
 	}
 
 	// Pre-create the file entry with proper piece count
 	df, err := d.createFile(hash)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	numPieces := int(req.GetNumPieces())
 	if numPieces > 0 {
 		df.written = make([]bool, numPieces)
 	}
 
-	return nil
+	// All pieces needed for new torrent - use computePiecesNeeded for consistency
+	piecesNeeded, needCount, haveCount := df.computePiecesNeeded()
+	return &InitTorrentResult{
+		Status:            pb.TorrentSyncStatus_SYNC_STATUS_READY,
+		PiecesNeeded:      piecesNeeded,
+		PiecesNeededCount: needCount,
+		PiecesHaveCount:   haveCount,
+	}, nil
 }
 
 // WritePiece writes a piece to the destination file.
@@ -94,24 +127,6 @@ func (d *FileDestination) WritePiece(_ context.Context, req *pb.WritePieceReques
 	}
 
 	return nil
-}
-
-// GetWrittenPieces returns which pieces have been successfully written.
-func (d *FileDestination) GetWrittenPieces(_ context.Context, hash string) ([]bool, error) {
-	d.mu.Lock()
-	df, ok := d.files[hash]
-	d.mu.Unlock()
-
-	if !ok {
-		return nil, nil
-	}
-
-	df.mu.Lock()
-	defer df.mu.Unlock()
-
-	result := make([]bool, len(df.written))
-	copy(result, df.written)
-	return result, nil
 }
 
 // Close closes all open files.
@@ -155,8 +170,7 @@ func (d *FileDestination) createFile(hash string) (*destinationFile, error) {
 	}
 
 	df := &destinationFile{
-		file:    file,
-		written: make([]bool, defaultWrittenSliceSize),
+		file: file,
 	}
 
 	d.files[hash] = df

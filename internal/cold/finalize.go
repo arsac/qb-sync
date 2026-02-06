@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/arsac/qb-sync/internal/metrics"
 	"github.com/arsac/qb-sync/internal/utils"
@@ -42,7 +44,7 @@ func (s *Server) FinalizeTorrent(
 		}, nil
 	}
 	state.finalizing = true
-	writtenCount := countWritten(state.written)
+	writtenCount := state.writtenCount
 	totalPieces := len(state.written)
 	state.mu.Unlock()
 
@@ -56,8 +58,8 @@ func (s *Server) FinalizeTorrent(
 	// Helper to record failure metrics and return error response
 	failureResponse := func(errMsg string) *pb.FinalizeTorrentResponse {
 		clearFinalizing()
-		metrics.FinalizationDuration.WithLabelValues("failure").Observe(time.Since(startTime).Seconds())
-		metrics.FinalizationErrorsTotal.WithLabelValues("cold").Inc()
+		metrics.FinalizationDuration.WithLabelValues(metrics.ResultFailure).Observe(time.Since(startTime).Seconds())
+		metrics.FinalizationErrorsTotal.WithLabelValues(metrics.ModeCold).Inc()
 		return &pb.FinalizeTorrentResponse{Success: false, Error: errMsg}
 	}
 
@@ -83,19 +85,32 @@ func (s *Server) FinalizeTorrent(
 
 	// Helper to record success metrics and clean up
 	successResponse := func(stateStr string) *pb.FinalizeTorrentResponse {
-		metrics.FinalizationDuration.WithLabelValues("success").Observe(time.Since(startTime).Seconds())
-		metrics.TorrentsSyncedTotal.WithLabelValues("cold").Inc()
+		metrics.FinalizationDuration.WithLabelValues(metrics.ResultSuccess).Observe(time.Since(startTime).Seconds())
+		metrics.TorrentsSyncedTotal.WithLabelValues(metrics.ModeCold).Inc()
 		s.logger.InfoContext(ctx, "torrent finalized", "hash", hash, "state", stateStr)
 		s.cleanupFinalizedTorrent(hash)
 		return &pb.FinalizeTorrentResponse{Success: true, State: stateStr}
 	}
 
-	// Add to qBittorrent if configured
-	if s.qbClient != nil {
+	// Add to qBittorrent if configured and not in dry-run mode
+	if s.qbClient != nil && !s.config.DryRun {
 		finalState, qbErr := s.addAndVerifyTorrent(ctx, hash, state, req)
 		if qbErr != nil {
 			return failureResponse(fmt.Sprintf("qBittorrent: %v", qbErr)), nil
 		}
+
+		// Apply synced tag for visibility (not used as source of truth)
+		if s.config.SyncedTag != "" {
+			if tagErr := s.qbClient.AddTagsCtx(ctx, []string{hash}, s.config.SyncedTag); tagErr != nil {
+				metrics.TagApplicationErrorsTotal.WithLabelValues(metrics.ModeCold).Inc()
+				s.logger.ErrorContext(ctx, "failed to add synced tag",
+					"hash", hash,
+					"tag", s.config.SyncedTag,
+					"error", tagErr,
+				)
+			}
+		}
+
 		return successResponse(string(finalState)), nil
 	}
 
@@ -117,6 +132,9 @@ func (s *Server) getOrRecoverState(ctx context.Context, hash string) (*serverTor
 	s.mu.RUnlock()
 
 	if exists {
+		if state.initializing {
+			return nil, errors.New("torrent initialization in progress")
+		}
 		return state, nil
 	}
 
@@ -130,8 +148,14 @@ func (s *Server) getOrRecoverState(ctx context.Context, hash string) (*serverTor
 		return nil, errors.New("torrent not found")
 	}
 
-	// Register recovered state
+	// Check-and-insert atomically to prevent TOCTOU race — another concurrent
+	// FinalizeTorrent could have recovered and inserted state between our
+	// RUnlock above and this Lock.
 	s.mu.Lock()
+	if existing, alreadyInserted := s.torrents[hash]; alreadyInserted {
+		s.mu.Unlock()
+		return existing, nil
+	}
 	s.torrents[hash] = recoveredState
 	s.mu.Unlock()
 
@@ -147,16 +171,15 @@ func (s *Server) getOrRecoverState(ctx context.Context, hash string) (*serverTor
 // finalizeFiles syncs all file handles, closes them, and renames from .partial to final.
 // Also resolves pending hardlinks by waiting for source files to complete.
 func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTorrentState) error {
-	state.mu.Lock()
-	defer state.mu.Unlock()
-
-	// First, resolve pending hardlinks
+	// Phase 1: Resolve pending hardlinks without holding state.mu.
+	// Waiting on hardlink channels can block for up to defaultHardlinkWaitTimeout,
+	// and holding the lock would block all WritePiece calls for that duration.
+	// Safe because: files slice is immutable after init, and finalizing=true prevents writes.
 	for _, fi := range state.files {
-		if !fi.pendingHardlink {
+		if fi.hlState != hlStatePending {
 			continue
 		}
 
-		// Wait for source file to be finalized with timeout
 		s.logger.DebugContext(ctx, "waiting for pending hardlink source",
 			"hash", hash,
 			"target", fi.path,
@@ -173,10 +196,8 @@ func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTo
 			// Source is ready
 		}
 
-		// Create hardlink (hardlinkSource is relative, join with BasePath)
 		sourcePath := filepath.Join(s.config.BasePath, fi.hardlinkSource)
 		if linkErr := os.Link(sourcePath, fi.path); linkErr != nil {
-			// Check if target already exists (idempotent)
 			if os.IsExist(linkErr) {
 				s.logger.DebugContext(ctx, "pending hardlink target already exists",
 					"hash", hash,
@@ -187,6 +208,7 @@ func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTo
 					sourcePath, fi.path, linkErr)
 			}
 		} else {
+			metrics.HardlinksCreatedTotal.Inc()
 			s.logger.InfoContext(ctx, "created pending hardlink",
 				"hash", hash,
 				"source", sourcePath,
@@ -194,20 +216,27 @@ func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTo
 			)
 		}
 
-		fi.hardlinked = true
-		fi.pendingHardlink = false
+		fi.hlState = hlStateComplete
 	}
 
-	// Close all file handles first to ensure no leaks even if rename fails
+	// Phase 2: Sync, close, and rename under lock.
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	// Sync and close all file handles before rename.
+	// Fail early if any file can't be flushed — renaming unflushed files
+	// risks data loss, especially on NFS where sync is less reliable.
 	for _, fi := range state.files {
-		if !fi.hardlinked {
-			s.closeFileHandle(ctx, hash, fi)
+		if fi.hlState != hlStateComplete {
+			if err := s.closeFileHandle(ctx, hash, fi); err != nil {
+				return fmt.Errorf("flushing before rename: %w", err)
+			}
 		}
 	}
 
 	// Then rename partial files
 	for _, fi := range state.files {
-		if fi.hardlinked {
+		if fi.hlState == hlStateComplete {
 			continue
 		}
 		if err := s.renamePartialFile(ctx, hash, fi); err != nil {
@@ -220,12 +249,14 @@ func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTo
 }
 
 // closeFileHandle syncs and closes an open file handle.
-func (s *Server) closeFileHandle(ctx context.Context, hash string, fi *serverFileInfo) {
+// Returns an error if sync or close fails (data may not be durable).
+func (s *Server) closeFileHandle(ctx context.Context, hash string, fi *serverFileInfo) error {
 	if fi.file == nil {
-		return
+		return nil
 	}
 
-	if syncErr := fi.file.Sync(); syncErr != nil {
+	var syncErr error
+	if syncErr = fi.file.Sync(); syncErr != nil {
 		s.logger.WarnContext(ctx, "failed to sync file",
 			"hash", hash,
 			"path", fi.path,
@@ -233,14 +264,21 @@ func (s *Server) closeFileHandle(ctx context.Context, hash string, fi *serverFil
 		)
 	}
 
-	if closeErr := fi.file.Close(); closeErr != nil {
+	closeErr := fi.file.Close()
+	fi.file = nil
+	if closeErr != nil {
 		s.logger.WarnContext(ctx, "failed to close file",
 			"hash", hash,
 			"path", fi.path,
 			"error", closeErr,
 		)
+		return fmt.Errorf("closing %s: %w", fi.path, closeErr)
 	}
-	fi.file = nil
+
+	if syncErr != nil {
+		return fmt.Errorf("syncing %s: %w", fi.path, syncErr)
+	}
+	return nil
 }
 
 // renamePartialFile renames a .partial file to its final path.
@@ -300,8 +338,8 @@ func (s *Server) registerFinalizedInodes(ctx context.Context, hash string, state
 
 	var registered int
 	for _, f := range state.files {
-		// Skip files that were hardlinked (either from registration or pending)
-		if f.hardlinked || f.sourceInode == 0 {
+		// Skip files that were hardlinked (either from registration or pending) or have no inode
+		if f.hlState == hlStateComplete || f.sourceInode == 0 {
 			continue
 		}
 
@@ -319,19 +357,10 @@ func (s *Server) registerFinalizedInodes(ctx context.Context, hash string, state
 			continue
 		}
 
-		// Register in persistent map
-		s.inodeMu.Lock()
-		s.inodeToPath[f.sourceInode] = relPath
-		s.inodeMu.Unlock()
+		// Register in persistent map and signal waiters
+		s.inodes.Register(f.sourceInode, relPath)
+		s.inodes.CompleteInProgress(f.sourceInode, hash)
 		registered++
-
-		// Signal waiters and clean up in-progress tracking
-		s.inodeProgressMu.Lock()
-		if inProgress, ok := s.inodeInProgress[f.sourceInode]; ok {
-			inProgress.close() // Signal waiters (safe for double-close)
-			delete(s.inodeInProgress, f.sourceInode)
-		}
-		s.inodeProgressMu.Unlock()
 	}
 
 	if registered > 0 {
@@ -341,7 +370,7 @@ func (s *Server) registerFinalizedInodes(ctx context.Context, hash string, state
 		)
 
 		// Persist inode map
-		if saveErr := s.saveInodeMap(); saveErr != nil {
+		if saveErr := s.inodes.Save(); saveErr != nil {
 			s.logger.WarnContext(ctx, "failed to save inode map", "error", saveErr)
 		}
 	}
@@ -351,12 +380,14 @@ func (s *Server) registerFinalizedInodes(ctx context.Context, hash string, state
 // This ensures data integrity before telling hot it's safe to delete.
 func (s *Server) verifyFinalizedPieces(ctx context.Context, hash string, state *serverTorrentState) error {
 	if len(state.pieceHashes) == 0 {
-		s.logger.WarnContext(ctx, "no piece hashes available for verification", "hash", hash)
-		return nil // Can't verify without hashes
+		return fmt.Errorf("no piece hashes available for verification — refusing to finalize without integrity check")
+	}
+	if state.pieceLength <= 0 || state.totalSize <= 0 {
+		return fmt.Errorf("missing piece size or total size metadata — refusing to finalize without integrity check")
 	}
 
-	pieceSize := state.info.GetPieceSize()
-	totalSize := state.info.GetTotalSize()
+	pieceSize := state.pieceLength
+	totalSize := state.totalSize
 	numPieces := len(state.pieceHashes)
 
 	s.logger.InfoContext(ctx, "verifying finalized pieces",
@@ -365,28 +396,45 @@ func (s *Server) verifyFinalizedPieces(ctx context.Context, hash string, state *
 		"pieceSize", pieceSize,
 	)
 
+	// Verify pieces in parallel — all accessed state fields (pieceHashes,
+	// pieceLength, totalSize, files) are immutable at this point (finalizing=true).
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(runtime.NumCPU())
+
 	for i, expectedHash := range state.pieceHashes {
 		if expectedHash == "" {
 			continue
 		}
 
-		// Calculate piece offset and size
-		offset := int64(i) * pieceSize
-		size := pieceSize
-		if offset+size > totalSize {
-			size = totalSize - offset
-		}
+		g.Go(func() error {
+			if gCtx.Err() != nil {
+				return gCtx.Err()
+			}
 
-		// Read piece from finalized files
-		data, readErr := s.readPieceFromFinalizedFiles(state, offset, size)
-		if readErr != nil {
-			return fmt.Errorf("reading piece %d: %w", i, readErr)
-		}
+			// Calculate piece offset and size
+			offset := int64(i) * pieceSize
+			size := pieceSize
+			if offset+size > totalSize {
+				size = totalSize - offset
+			}
 
-		// Verify hash
-		if err := utils.VerifyPieceHash(data, expectedHash); err != nil {
-			return fmt.Errorf("piece %d: %w", i, err)
-		}
+			// Read piece from finalized files
+			data, readErr := s.readPieceFromFinalizedFiles(state, offset, size)
+			if readErr != nil {
+				return fmt.Errorf("reading piece %d: %w", i, readErr)
+			}
+
+			// Verify hash
+			if err := utils.VerifyPieceHash(data, expectedHash); err != nil {
+				return fmt.Errorf("piece %d: %w", i, err)
+			}
+
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return err
 	}
 
 	s.logger.InfoContext(ctx, "all pieces verified successfully", "hash", hash, "pieces", numPieces)
@@ -395,55 +443,10 @@ func (s *Server) verifyFinalizedPieces(ctx context.Context, hash string, state *
 
 // readPieceFromFinalizedFiles reads piece data from finalized (non-.partial) files.
 func (s *Server) readPieceFromFinalizedFiles(state *serverTorrentState, offset, size int64) ([]byte, error) {
-	data := make([]byte, 0, size)
-	remaining := size
-	currentOffset := offset
-
-	for _, fi := range state.files {
-		if remaining <= 0 {
-			break
-		}
-
-		fileEnd := fi.offset + fi.size
-		if fileEnd <= currentOffset {
-			continue
-		}
-
-		// Calculate read position within this file
-		fileReadOffset := max(currentOffset-fi.offset, 0)
-		availableInFile := fi.size - fileReadOffset
-		toRead := min(remaining, availableInFile)
-
-		// Get final path (remove .partial suffix if present)
-		filePath, _ := strings.CutSuffix(fi.path, partialSuffix)
-
-		// Read from file
-		chunk, readErr := s.readChunkFromFile(filePath, fileReadOffset, toRead)
-		if readErr != nil {
-			return nil, fmt.Errorf("reading from %s at offset %d: %w", filePath, fileReadOffset, readErr)
-		}
-
-		data = append(data, chunk...)
-		remaining -= int64(len(chunk))
-		currentOffset += int64(len(chunk))
+	regions := make([]utils.FileRegion, len(state.files))
+	for i, fi := range state.files {
+		path, _ := strings.CutSuffix(fi.path, partialSuffix)
+		regions[i] = utils.FileRegion{Path: path, Offset: fi.offset, Size: fi.size}
 	}
-
-	return data, nil
-}
-
-// readChunkFromFile reads a chunk of data from a file at a specific offset.
-func (s *Server) readChunkFromFile(path string, offset, size int64) ([]byte, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	data := make([]byte, size)
-	n, err := file.ReadAt(data, offset)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return nil, err
-	}
-
-	return data[:n], nil
+	return utils.ReadPieceFromFiles(regions, offset, size)
 }

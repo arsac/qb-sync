@@ -20,8 +20,7 @@ const (
 	defaultStreamRetryDelay = 5 * time.Second
 
 	// streamingRateLimiterBurst is the burst size for rate limiting (1MB).
-	// This allows short bursts of traffic up to 1MB before rate limiting kicks in.
-	streamingRateLimiterBurst = 1024 * 1024
+	streamingRateLimiterBurst = bytesPerMB
 
 	drainTimeout                  = 30 * time.Second
 	reconnectBaseDelay            = 1 * time.Second
@@ -199,8 +198,8 @@ func (q *BidiQueue) Run(ctx context.Context) error {
 
 		// Circuit breaker: after too many consecutive failures, pause longer.
 		if consecutiveFailures >= q.config.MaxConsecutiveFailures {
-			metrics.CircuitBreakerTripsTotal.WithLabelValues("hot", "stream_queue").Inc()
-			metrics.CircuitBreakerState.WithLabelValues("hot", "stream_queue").Set(metrics.CircuitStateOpen)
+			metrics.CircuitBreakerTripsTotal.WithLabelValues(metrics.ModeHot, metrics.ComponentStreamQueue).Inc()
+			metrics.CircuitBreakerState.WithLabelValues(metrics.ModeHot, metrics.ComponentStreamQueue).Set(metrics.CircuitStateOpen)
 			q.logger.ErrorContext(ctx, "circuit breaker triggered, pausing reconnection",
 				"failures", consecutiveFailures,
 				"pause", q.config.CircuitBreakerPause,
@@ -210,7 +209,7 @@ func (q *BidiQueue) Run(ctx context.Context) error {
 				return ctx.Err()
 			case <-time.After(q.config.CircuitBreakerPause):
 			}
-			metrics.CircuitBreakerState.WithLabelValues("hot", "stream_queue").Set(metrics.CircuitStateClosed)
+			metrics.CircuitBreakerState.WithLabelValues(metrics.ModeHot, metrics.ComponentStreamQueue).Set(metrics.CircuitStateClosed)
 			consecutiveFailures = 0
 			reconnectDelay = reconnectBaseDelay
 			continue
@@ -332,56 +331,63 @@ func (q *BidiQueue) runSenderPool(ctx context.Context, pool *StreamPool, stopSen
 	}
 }
 
+// ensureTorrentInitialized initializes the torrent on cold if not already done,
+// and marks pieces already present on cold as streamed.
+func (q *BidiQueue) ensureTorrentInitialized(ctx context.Context, hash string) error {
+	if q.dest.IsInitialized(hash) {
+		return nil
+	}
+
+	meta, ok := q.tracker.GetTorrentMetadata(hash)
+	if !ok {
+		return fmt.Errorf("torrent metadata not found: %s", hash)
+	}
+	result, initErr := q.dest.InitTorrent(ctx, meta.InitTorrentRequest)
+	if initErr != nil {
+		return fmt.Errorf("initializing torrent: %w", initErr)
+	}
+
+	if result == nil || len(result.PiecesNeeded) == 0 {
+		return nil
+	}
+
+	// Mark pieces NOT needed (already on cold) as already streamed
+	// PiecesNeeded[i] = false means piece i is already written on cold
+	var alreadyOnCold int
+	for i, needed := range result.PiecesNeeded {
+		if !needed {
+			q.tracker.MarkStreamed(hash, i)
+			alreadyOnCold++
+		}
+	}
+	if alreadyOnCold > 0 {
+		q.logger.InfoContext(ctx, "marked pieces already on cold as streamed",
+			"hash", hash,
+			"count", alreadyOnCold,
+		)
+	}
+
+	return nil
+}
+
 // sendPiecePool reads piece data and sends it over the best available stream.
-//
-//nolint:gocognit,nestif,funlen // Complex initialization and retry logic is clearer as single function
 func (q *BidiQueue) sendPiecePool(ctx context.Context, pool *StreamPool, piece *pb.Piece) error {
 	sendStart := time.Now()
 	hash := piece.GetTorrentHash()
 	index := piece.GetIndex()
 	key := pieceKey(hash, index)
 
-	if !q.dest.IsInitialized(hash) {
-		meta, ok := q.tracker.GetTorrentMetadata(hash)
-		if !ok {
-			return fmt.Errorf("torrent metadata not found: %s", hash)
-		}
-		result, initErr := q.dest.InitTorrent(ctx, meta.InitTorrentRequest)
-		if initErr != nil {
-			return fmt.Errorf("initializing torrent: %w", initErr)
-		}
-
-		// Mark pieces covered by hardlinks as already streamed
-		if result != nil && len(result.PiecesCovered) > 0 {
-			var coveredCount int
-			for i, covered := range result.PiecesCovered {
-				if covered {
-					q.tracker.MarkStreamed(hash, i)
-					coveredCount++
-				}
-			}
-			if coveredCount > 0 {
-				q.logger.InfoContext(ctx, "marked hardlink-covered pieces as streamed",
-					"hash", hash,
-					"count", coveredCount,
-				)
-			}
-		}
+	if err := q.ensureTorrentInitialized(ctx, hash); err != nil {
+		return err
 	}
 
-	// Check if this piece is already covered (hardlinked on cold)
-	// This can happen if the piece was queued before InitTorrent completed
-	progress, _ := q.tracker.GetProgress(hash)
-	if progress.TotalPieces > 0 && int(index) < progress.TotalPieces {
-		// If the piece is marked as streamed after the hardlink marking above,
-		// we can skip it
-		if q.tracker.IsPieceStreamed(hash, int(index)) {
-			q.logger.DebugContext(ctx, "skipping piece covered by hardlink",
-				"hash", hash,
-				"piece", index,
-			)
-			return nil
-		}
+	// Skip pieces already covered (e.g. hardlinked on cold before this piece was dequeued)
+	if q.tracker.IsPieceStreamed(hash, int(index)) {
+		q.logger.DebugContext(ctx, "skipping piece covered by hardlink",
+			"hash", hash,
+			"piece", index,
+		)
+		return nil
 	}
 
 	data, err := q.source.ReadPiece(ctx, piece)
@@ -494,6 +500,7 @@ func (q *BidiQueue) handleStalePiecesPool(ctx context.Context, pool *StreamPool)
 		return
 	}
 
+	metrics.StalePiecesTotal.Add(float64(len(staleKeys)))
 	q.logger.WarnContext(ctx, "found stale in-flight pieces, marking as failed",
 		"count", len(staleKeys),
 	)
@@ -574,15 +581,38 @@ func (q *BidiQueue) processAck(ctx context.Context, ack *pb.PieceAck) {
 		}
 
 		metrics.PiecesFailedTotal.Inc()
-		q.tracker.MarkFailed(hash, index)
 		q.piecesFail.Add(1)
+		q.tracker.MarkFailed(hash, index)
 
-		q.logger.WarnContext(ctx, "piece write failed",
-			"hash", hash,
-			"piece", index,
-			"stream", streamID,
-			"error", ack.GetError(),
-		)
+		switch ack.GetErrorCode() {
+		case pb.PieceErrorCode_PIECE_ERROR_HASH_MISMATCH:
+			metrics.PieceHashMismatchTotal.Inc()
+			q.logger.ErrorContext(ctx, "piece hash mismatch, will retry",
+				"hash", hash,
+				"piece", index,
+				"stream", streamID,
+				"error", ack.GetError(),
+			)
+
+		case pb.PieceErrorCode_PIECE_ERROR_NOT_INITIALIZED:
+			// Clear init cache so next send triggers re-init
+			q.dest.ClearInitResult(hash)
+			q.logger.WarnContext(ctx, "piece write failed, torrent not initialized",
+				"hash", hash,
+				"piece", index,
+				"stream", streamID,
+				"error", ack.GetError(),
+			)
+
+		default: // IO, FINALIZING, NONE (old cold), unknown
+			q.logger.WarnContext(ctx, "piece write failed",
+				"hash", hash,
+				"piece", index,
+				"stream", streamID,
+				"error", ack.GetError(),
+				"errorCode", ack.GetErrorCode(),
+			)
+		}
 	}
 }
 
@@ -602,6 +632,7 @@ func (q *BidiQueue) drainInFlightPool(ctx context.Context, pool *StreamPool) {
 		select {
 		case <-drainCtx.Done():
 			remaining := pool.TotalInFlight()
+			metrics.DrainTimeoutPiecesLostTotal.Add(float64(remaining))
 			q.logger.WarnContext(ctx, "drain timeout, marking remaining pieces as failed",
 				"remaining", remaining,
 			)
