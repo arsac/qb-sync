@@ -9,13 +9,27 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/autobrr/go-qbittorrent"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/arsac/qb-sync/internal/health"
+	"github.com/arsac/qb-sync/internal/qbclient"
 	pb "github.com/arsac/qb-sync/proto"
 
 	"google.golang.org/grpc"
+)
+
+const (
+	// healthCheckCacheTTL is how long a qBittorrent health check result is cached
+	// before re-running the actual check. Prevents excessive login calls on every
+	// K8s probe request.
+	healthCheckCacheTTL = 30 * time.Second
+
+	// maxGRPCMessageSize is the maximum gRPC message size for piece transfers.
+	// Torrent pieces are commonly 1-16 MB; the default gRPC limit of 4 MB is too small.
+	maxGRPCMessageSize = 20 * 1024 * 1024 // 20 MB
 )
 
 // Server receives pieces over gRPC and writes them to disk.
@@ -23,8 +37,8 @@ import (
 // Lock ordering (to prevent deadlocks):
 //  1. s.mu - server-level lock for torrents map and abortingHashes
 //  2. state.mu - per-torrent lock for torrent state
-//  3. s.inodeMu - lock for inode-to-path mapping
-//  4. s.inodeProgressMu - lock for in-progress inode tracking
+//  3. s.inodes.registeredMu - lock for inode-to-path mapping
+//  4. s.inodes.inProgressMu - lock for in-progress inode tracking
 //
 // Always acquire locks in the order above. Release s.mu before acquiring
 // state.mu when possible to reduce contention. The inode locks (3, 4) may
@@ -44,46 +58,49 @@ type Server struct {
 	// AbortTorrent closes the channel when cleanup is complete.
 	abortingHashes map[string]chan struct{}
 
-	// Hardlink tracking: source inode -> path on receiver
-	inodeToPath map[uint64]string
-	inodeMu     sync.RWMutex // Protects inodeToPath
-
-	// In-progress inode tracking for parallel torrent coordination.
-	// When a torrent starts writing a file with a given source inode,
-	// it registers here. Other torrents with the same inode can wait
-	// for the file to be finalized and then create a hardlink.
-	inodeInProgress map[uint64]*inProgressInode
-	inodeProgressMu sync.RWMutex // Protects inodeInProgress
+	// Inode registry for hardlink deduplication
+	inodes *InodeRegistry
 
 	// qBittorrent client for adding verified torrents (cold server only)
-	qbClient *qbittorrent.Client
+	qbClient qbclient.Client
+
+	// Global memory budget for buffered piece data
+	memBudget *semaphore.Weighted
 
 	// Health server for K8s probes
 	healthServer *health.Server
+
+	// saveStateFunc overrides saveState for testing. nil in production.
+	saveStateFunc func(path string, written []bool) error
 }
 
 // NewServer creates a new gRPC piece receiver server.
 func NewServer(config ServerConfig, logger *slog.Logger) *Server {
-	s := &Server{
-		config:          config,
-		logger:          logger,
-		torrents:        make(map[string]*serverTorrentState),
-		abortingHashes:  make(map[string]chan struct{}),
-		inodeToPath:     make(map[uint64]string),
-		inodeInProgress: make(map[uint64]*inProgressInode),
+	bufferBytes := config.MaxStreamBufferBytes
+	if bufferBytes <= 0 {
+		bufferBytes = defaultMaxStreamBufferMB * 1024 * 1024
 	}
 
-	// Initialize qBittorrent client if configured
+	s := &Server{
+		config:         config,
+		logger:         logger,
+		torrents:       make(map[string]*serverTorrentState),
+		abortingHashes: make(map[string]chan struct{}),
+		inodes:         NewInodeRegistry(config.BasePath, logger),
+		memBudget:      semaphore.NewWeighted(bufferBytes),
+	}
+
 	if config.ColdQB != nil && config.ColdQB.URL != "" {
-		s.qbClient = qbittorrent.NewClient(qbittorrent.Config{
+		rawClient := qbittorrent.NewClient(qbittorrent.Config{
 			Host:     config.ColdQB.URL,
 			Username: config.ColdQB.Username,
 			Password: config.ColdQB.Password,
 		})
+		qbConfig := qbclient.DefaultConfig()
+		s.qbClient = qbclient.NewResilientClient(rawClient, qbConfig, logger.With("component", "cold-qb-client"))
 	}
 
-	// Load persisted inode tracking
-	if loadErr := s.loadInodeMap(); loadErr != nil {
+	if loadErr := s.inodes.Load(); loadErr != nil {
 		logger.Warn("failed to load inode map, starting fresh", "error", loadErr)
 	}
 
@@ -114,7 +131,10 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 
-	s.server = grpc.NewServer()
+	s.server = grpc.NewServer(
+		grpc.MaxRecvMsgSize(maxGRPCMessageSize),
+		grpc.MaxSendMsgSize(maxGRPCMessageSize),
+	)
 	pb.RegisterQBSyncServiceServer(s.server, s)
 
 	// Start background state flusher
@@ -129,7 +149,8 @@ func (s *Server) Run(ctx context.Context) error {
 	// Register health checks if health server is configured
 	if s.healthServer != nil {
 		if s.qbClient != nil {
-			s.healthServer.RegisterCheck("qbittorrent", health.QBHealthCheck(s.qbClient.LoginCtx))
+			s.healthServer.RegisterCheck("qbittorrent",
+				health.CachedCheck(health.QBHealthCheck(s.qbClient.LoginCtx), healthCheckCacheTTL))
 		}
 		s.healthServer.SetReady(true)
 	}
@@ -154,16 +175,13 @@ func (s *Server) Run(ctx context.Context) error {
 
 // cleanup closes all file handles and saves state before shutdown.
 func (s *Server) cleanup() {
-	// Collect all torrent references and clear the map atomically
 	s.mu.Lock()
 	torrents := s.collectTorrents()
 	s.torrents = make(map[string]*serverTorrentState)
 	s.mu.Unlock()
 
-	// Process each torrent individually with only state.mu held
 	for _, t := range torrents {
 		t.state.mu.Lock()
-		// Save dirty state before closing
 		if t.state.dirty && t.state.statePath != "" {
 			if saveErr := s.saveState(t.state.statePath, t.state.written); saveErr != nil {
 				s.logger.Warn("failed to save state on cleanup",
@@ -172,7 +190,6 @@ func (s *Server) cleanup() {
 				)
 			}
 		}
-		// Close all open file handles
 		for _, fi := range t.state.files {
 			if fi.file != nil {
 				if closeErr := fi.file.Close(); closeErr != nil {
@@ -187,8 +204,7 @@ func (s *Server) cleanup() {
 		t.state.mu.Unlock()
 	}
 
-	// Persist inode tracking before shutdown
-	if saveErr := s.saveInodeMap(); saveErr != nil {
+	if saveErr := s.inodes.Save(); saveErr != nil {
 		s.logger.Warn("failed to save inode map on cleanup", "error", saveErr)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/arsac/qb-sync/internal/metrics"
 	"github.com/arsac/qb-sync/internal/utils"
@@ -45,32 +46,27 @@ func (s *Server) writePieceData(state *serverTorrentState, offset int64, data []
 
 		fileEnd := fi.offset + fi.size
 
-		// Skip files before our offset
 		if fileEnd <= currentOffset {
 			continue
 		}
 
-		// Calculate position within this file
 		fileWriteOffset := max(currentOffset-fi.offset, 0)
-
-		// Calculate how much data belongs to this file
 		availableInFile := fi.size - fileWriteOffset
 		toProcess := min(int64(len(remaining)), availableInFile)
 
-		// Skip hardlinked or pending hardlink files
-		if fi.hardlinked || fi.pendingHardlink {
+		if fi.hlState == hlStateComplete || fi.hlState == hlStatePending {
 			remaining = remaining[toProcess:]
 			currentOffset += toProcess
 			continue
 		}
 
-		// Open file if needed
 		file, openErr := s.openFile(fi)
 		if openErr != nil {
 			return fmt.Errorf("opening %s: %w", fi.path, openErr)
 		}
-
-		// Write data
+		// No per-piece fsync: data integrity is guaranteed by verifyFinalizedPieces
+		// which reads back and SHA1-verifies every piece before finalization.
+		// Per-piece fsync would severely degrade write throughput on NFS/spinning disks.
 		if _, writeErr := file.WriteAt(remaining[:toProcess], fileWriteOffset); writeErr != nil {
 			return fmt.Errorf("writing to %s: %w", fi.path, writeErr)
 		}
@@ -80,6 +76,15 @@ func (s *Server) writePieceData(state *serverTorrentState, offset int64, data []
 	}
 
 	return nil
+}
+
+// writePieceError builds a failure response with the given message and error code.
+func writePieceError(msg string, code pb.PieceErrorCode) *pb.WritePieceResponse {
+	return &pb.WritePieceResponse{
+		Success:   false,
+		Error:     msg,
+		ErrorCode: code,
+	}
 }
 
 // verifyPieceHash checks the piece data against expected hash.
@@ -107,6 +112,7 @@ func (s *Server) markPieceWritten(ctx context.Context, hash string, state *serve
 	}
 
 	state.written[pieceIndex] = true
+	state.writtenCount++
 	state.dirty = true
 	state.piecesSinceFlush++
 
@@ -115,13 +121,11 @@ func (s *Server) markPieceWritten(ctx context.Context, hash string, state *serve
 		flushCount = defaultStateFlushCount
 	}
 
-	// Count-based flush: safety net between time-based flushes
-	// Also flush immediately when transfer is complete
-	writtenCount := countWritten(state.written)
-	shouldFlush := state.piecesSinceFlush >= flushCount || writtenCount == len(state.written)
+	shouldFlush := state.piecesSinceFlush >= flushCount || state.writtenCount == len(state.written)
 
 	if shouldFlush && state.statePath != "" {
 		if saveErr := s.saveState(state.statePath, state.written); saveErr != nil {
+			metrics.StateSaveErrorsTotal.WithLabelValues(metrics.ModeCold).Inc()
 			s.logger.WarnContext(ctx, "failed to save state", "hash", hash, "error", saveErr)
 		} else {
 			state.dirty = false
@@ -135,6 +139,10 @@ func (s *Server) WritePiece(
 	ctx context.Context,
 	req *pb.WritePieceRequest,
 ) (*pb.WritePieceResponse, error) {
+	if s.config.DryRun {
+		return &pb.WritePieceResponse{Success: true}, nil
+	}
+
 	torrentHash := req.GetTorrentHash()
 
 	s.mu.RLock()
@@ -142,7 +150,11 @@ func (s *Server) WritePiece(
 	s.mu.RUnlock()
 
 	if !exists {
-		return &pb.WritePieceResponse{Success: false, Error: "torrent not initialized"}, nil
+		return writePieceError("torrent not initialized", pb.PieceErrorCode_PIECE_ERROR_NOT_INITIALIZED), nil
+	}
+
+	if state.initializing {
+		return writePieceError("torrent not initialized", pb.PieceErrorCode_PIECE_ERROR_NOT_INITIALIZED), nil
 	}
 
 	pieceIndex := req.GetPieceIndex()
@@ -161,13 +173,15 @@ func (s *Server) WritePiece(
 
 	// Early rejection during finalization (optimization to skip expensive hash verification)
 	if isFinalizing {
-		return &pb.WritePieceResponse{Success: false, Error: "torrent is being finalized"}, nil
+		return writePieceError("torrent is being finalized", pb.PieceErrorCode_PIECE_ERROR_FINALIZING), nil
 	}
 
 	// Verify piece hash outside lock (pieceHashes is immutable after init).
 	// This is CPU-intensive so we don't hold the lock during verification.
+	writeStart := time.Now()
 	if hashErr := s.verifyPieceHash(state, pieceIndex, data, req.GetPieceHash()); hashErr != "" {
-		return &pb.WritePieceResponse{Success: false, Error: hashErr}, nil
+		metrics.PieceWriteDuration.Observe(time.Since(writeStart).Seconds())
+		return writePieceError(hashErr, pb.PieceErrorCode_PIECE_ERROR_HASH_MISMATCH), nil
 	}
 
 	state.mu.Lock()
@@ -176,29 +190,30 @@ func (s *Server) WritePiece(
 	// CORRECTNESS CHECK: Re-verify finalizing flag under lock.
 	// Even if finalization started between the early check and now, this prevents the write.
 	if state.finalizing {
-		return &pb.WritePieceResponse{Success: false, Error: "torrent is being finalized"}, nil
+		return writePieceError("torrent is being finalized", pb.PieceErrorCode_PIECE_ERROR_FINALIZING), nil
 	}
 
-	// Double-check after acquiring lock to prevent duplicate writes
 	if int(pieceIndex) < len(state.written) && state.written[pieceIndex] {
 		return &pb.WritePieceResponse{Success: true}, nil
 	}
 
-	// Write piece to correct file(s)
 	if writeErr := s.writePieceData(state, req.GetOffset(), data); writeErr != nil {
-		return &pb.WritePieceResponse{Success: false, Error: fmt.Sprintf("write failed: %v", writeErr)}, nil
+		metrics.PieceWriteErrorsTotal.WithLabelValues(metrics.ModeCold).Inc()
+		return writePieceError(fmt.Sprintf("write failed: %v", writeErr), pb.PieceErrorCode_PIECE_ERROR_IO), nil
 	}
 
 	s.markPieceWritten(ctx, torrentHash, state, pieceIndex)
+	metrics.PieceWriteDuration.Observe(time.Since(writeStart).Seconds())
 
 	metrics.PiecesReceivedTotal.Inc()
 	metrics.BytesReceivedTotal.Add(float64(len(data)))
 
-	s.logger.DebugContext(ctx, "wrote piece",
-		"hash", torrentHash,
-		"piece", pieceIndex,
-		"size", len(data),
-	)
+	if state.writtenCount%50 == 0 || state.writtenCount == len(state.written) {
+		s.logger.InfoContext(ctx, "write progress",
+			"hash", torrentHash,
+			"progress", fmt.Sprintf("%d/%d", state.writtenCount, len(state.written)),
+		)
+	}
 
 	return &pb.WritePieceResponse{Success: true}, nil
 }

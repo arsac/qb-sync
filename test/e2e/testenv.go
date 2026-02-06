@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/autobrr/go-qbittorrent"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go/modules/compose"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -32,6 +33,10 @@ const (
 	// Test torrent - Sintel (small, legal test torrent).
 	testTorrentURL = "https://webtorrent.io/torrents/sintel.torrent"
 	sintelHash     = "08ada5a7a6183aae1e09d831df6748d566095a10"
+
+	// Shared test constants used by both testenv.go and test files.
+	torrentAppearTimeout = 30 * time.Second
+	progressTolerance    = 0.001 // For float comparisons
 )
 
 // TestEnv holds the complete test environment for hot/cold e2e tests.
@@ -102,7 +107,7 @@ services:
   qb-cold:
     image: ghcr.io/home-operations/qbittorrent:5.1.4
     volumes:
-      - %s:/downloads
+      - %s:/cold-data
       - %s:/config
     ports:
       - "%d:8080"
@@ -162,6 +167,15 @@ services:
 		return coldClient.LoginCtx(ctx) == nil
 	}, 60*time.Second, 2*time.Second, "cold qBittorrent should be ready")
 
+	// Configure qBittorrent save paths to match volume mounts.
+	// The home-operations image defaults to /config/Downloads, but we mount data at /downloads.
+	require.NoError(t, hotClient.SetPreferencesCtx(ctx, map[string]interface{}{
+		"save_path": "/downloads",
+	}))
+	require.NoError(t, coldClient.SetPreferencesCtx(ctx, map[string]interface{}{
+		"save_path": "/cold-data",
+	}))
+
 	// Find a free port for gRPC server
 	grpcAddr := findFreePort(t)
 
@@ -169,6 +183,8 @@ services:
 	coldServerConfig := cold.ServerConfig{
 		ListenAddr: grpcAddr,
 		BasePath:   coldPath,
+		SavePath:   "/cold-data",
+		SyncedTag:  "synced",
 		ColdQB: &cold.QBConfig{
 			URL:      coldURL,
 			Username: testUsername,
@@ -309,7 +325,13 @@ func (env *TestEnv) AddTorrentToHot(ctx context.Context, url string, opts map[st
 
 // AddTorrentToCold adds a test torrent to cold qBittorrent from URL.
 func (env *TestEnv) AddTorrentToCold(ctx context.Context, url string, opts map[string]string) error {
-	return env.addTorrent(ctx, env.coldClient, url, opts)
+	if opts == nil {
+		opts = make(map[string]string)
+	}
+	if _, ok := opts["savepath"]; !ok {
+		opts["savepath"] = "/cold-data"
+	}
+	return env.coldClient.AddTorrentFromUrlCtx(ctx, url, opts)
 }
 
 func (env *TestEnv) addTorrent(
@@ -435,6 +457,52 @@ func (env *TestEnv) isTorrentComplete(state qbittorrent.TorrentState) bool {
 	}
 }
 
+// IsTorrentCompleteOnCold checks if a torrent is complete on cold qBittorrent.
+// This is the new way to verify sync completion - checking cold qB status
+// instead of the old "synced" tag approach.
+func (env *TestEnv) IsTorrentCompleteOnCold(ctx context.Context, hash string) bool {
+	torrents, err := env.coldClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+		Hashes: []string{hash},
+	})
+	if err != nil || len(torrents) == 0 {
+		return false
+	}
+	torrent := torrents[0]
+	return torrent.Progress >= 1.0 || env.isTorrentComplete(torrent.State)
+}
+
+// WaitForTorrentCompleteOnCold waits for a torrent to be complete on cold qBittorrent.
+func (env *TestEnv) WaitForTorrentCompleteOnCold(
+	ctx context.Context,
+	hash string,
+	timeout time.Duration,
+	msg string,
+) {
+	env.t.Helper()
+	require.Eventually(env.t, func() bool {
+		return env.IsTorrentCompleteOnCold(ctx, hash)
+	}, timeout, 2*time.Second, msg)
+}
+
+// IsTorrentStopped checks if a torrent on hot qBittorrent is in a stopped/paused state.
+func (env *TestEnv) IsTorrentStopped(ctx context.Context, client *qbittorrent.Client, hash string) bool {
+	torrents, err := client.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+		Hashes: []string{hash},
+	})
+	if err != nil || len(torrents) == 0 {
+		return false
+	}
+	switch torrents[0].State {
+	case qbittorrent.TorrentStateStoppedUp,
+		qbittorrent.TorrentStatePausedUp,
+		qbittorrent.TorrentStateStoppedDl,
+		qbittorrent.TorrentStatePausedDl:
+		return true
+	default:
+		return false
+	}
+}
+
 // CreateGRPCDestination creates a gRPC destination for testing.
 func (env *TestEnv) CreateGRPCDestination() (*streaming.GRPCDestination, error) {
 	return streaming.NewGRPCDestination(env.grpcAddr)
@@ -443,14 +511,16 @@ func (env *TestEnv) CreateGRPCDestination() (*streaming.GRPCDestination, error) 
 // CreateHotConfig creates a hot config for testing.
 func (env *TestEnv) CreateHotConfig(opts ...HotConfigOption) *config.HotConfig {
 	cfg := &config.HotConfig{
-		QBURL:          env.hotURL,
-		QBUsername:     testUsername,
-		QBPassword:     testPassword,
-		DataPath:       env.hotPath,
+		BaseConfig: config.BaseConfig{
+			QBURL:      env.hotURL,
+			QBUsername:  testUsername,
+			QBPassword: testPassword,
+			DataPath:   env.hotPath,
+			SyncedTag:  "synced",
+		},
 		MinSpaceGB:     1,
 		MinSeedingTime: 0,
 		SleepInterval:  time.Second,
-		DryRun:         false,
 		Force:          false,
 	}
 	for _, opt := range opts {
@@ -639,4 +709,43 @@ func (env *TestEnv) RestartColdServer() {
 	env.t.Helper()
 	env.StopColdServer()
 	env.StartColdServer()
+}
+
+// CleanupBothSides removes torrents from both hot and cold qBittorrent instances.
+func (env *TestEnv) CleanupBothSides(ctx context.Context, hashes ...string) {
+	env.t.Helper()
+	for _, hash := range hashes {
+		env.CleanupTorrent(ctx, env.hotClient, hash)
+		env.CleanupTorrent(ctx, env.coldClient, hash)
+	}
+}
+
+// DownloadTorrentOnHot adds a torrent to hot, waits for it to appear, and waits
+// for it to finish downloading. Returns the torrent metadata.
+func (env *TestEnv) DownloadTorrentOnHot(ctx context.Context, url, hash string, downloadTimeout time.Duration) *qbittorrent.Torrent {
+	env.t.Helper()
+	err := env.AddTorrentToHot(ctx, url, nil)
+	require.NoError(env.t, err)
+
+	torrent := env.WaitForTorrent(env.hotClient, hash, torrentAppearTimeout)
+	require.NotNil(env.t, torrent)
+
+	env.t.Logf("Torrent added: %s, waiting for download...", torrent.Name)
+	env.WaitForTorrentComplete(env.hotClient, hash, downloadTimeout)
+	env.t.Log("Torrent download complete")
+
+	return torrent
+}
+
+// AssertTorrentCompleteOnCold verifies the torrent exists on cold qBittorrent
+// and is 100% complete.
+func (env *TestEnv) AssertTorrentCompleteOnCold(ctx context.Context, hash string) {
+	env.t.Helper()
+	coldTorrents, err := env.coldClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+		Hashes: []string{hash},
+	})
+	require.NoError(env.t, err)
+	require.Len(env.t, coldTorrents, 1, "torrent should exist on cold qBittorrent")
+	assert.InDelta(env.t, 1.0, coldTorrents[0].Progress, progressTolerance,
+		"torrent should be 100% complete on cold")
 }

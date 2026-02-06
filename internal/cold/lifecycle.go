@@ -2,44 +2,26 @@ package cold
 
 import (
 	"context"
-	"maps"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
 
 	"github.com/arsac/qb-sync/internal/metrics"
 )
 
-// runPeriodic runs a function periodically with optional initial delay.
-// If initialDelay is true, waits interval before first execution.
-// Returns when ctx is cancelled.
-func runPeriodic(ctx context.Context, interval time.Duration, initialDelay bool, fn func(context.Context)) {
-	if initialDelay {
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(interval):
-		}
-	}
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		fn(ctx)
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
-}
-
-// runPeriodicWaitFirst runs a function periodically, waiting before each execution.
-// Returns when ctx is cancelled.
-func runPeriodicWaitFirst(ctx context.Context, interval time.Duration, fn func(context.Context)) {
+// runPeriodic runs fn periodically, waiting interval before each execution.
+// Returns when ctx is cancelled. Recovers from panics to keep the background
+// loop running — a panic in one tick should not crash the server.
+func runPeriodic(
+	ctx context.Context,
+	interval time.Duration,
+	logger *slog.Logger,
+	name string,
+	fn func(context.Context),
+) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -48,7 +30,18 @@ func runPeriodicWaitFirst(ctx context.Context, interval time.Duration, fn func(c
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			fn(ctx)
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						logger.ErrorContext(ctx, "panic in periodic task",
+							"task", name,
+							"panic", r,
+							"stack", string(debug.Stack()),
+						)
+					}
+				}()
+				fn(ctx)
+			}()
 		}
 	}
 }
@@ -60,7 +53,7 @@ func (s *Server) runStateFlusher(ctx context.Context) {
 		interval = defaultStateFlushInterval
 	}
 
-	runPeriodicWaitFirst(ctx, interval, s.flushDirtyStates)
+	runPeriodic(ctx, interval, s.logger, "state-flusher", s.flushDirtyStates)
 }
 
 // flushDirtyStates saves state for all torrents marked as dirty.
@@ -71,26 +64,54 @@ func (s *Server) flushDirtyStates(ctx context.Context) {
 	torrents := s.collectTorrents()
 	s.mu.RUnlock()
 
-	// Process each torrent individually with only state.mu held
+	// Process each torrent: snapshot state under lock, then do I/O outside it.
+	// This prevents a slow/hung filesystem from holding state.mu and blocking
+	// WritePiece or FinalizeTorrent for the same torrent.
+	var dirtyAfterFlush int
 	for _, t := range torrents {
 		t.state.mu.Lock()
-		if t.state.dirty && t.state.statePath != "" {
-			if saveErr := s.saveState(t.state.statePath, t.state.written); saveErr != nil {
-				s.logger.WarnContext(ctx, "failed to flush state",
-					"hash", t.hash,
-					"error", saveErr,
-				)
-			} else {
-				t.state.dirty = false
-				t.state.piecesSinceFlush = 0
-				s.logger.DebugContext(ctx, "flushed state",
-					"hash", t.hash,
-					"written", countWritten(t.state.written),
-				)
+		if !t.state.dirty || t.state.statePath == "" {
+			if t.state.dirty {
+				dirtyAfterFlush++
 			}
+			t.state.mu.Unlock()
+			continue
+		}
+		statePath := t.state.statePath
+		snapshot := make([]bool, len(t.state.written))
+		copy(snapshot, t.state.written)
+		flushedCount := t.state.piecesSinceFlush
+		t.state.mu.Unlock()
+
+		flushStart := time.Now()
+		if saveErr := s.doSaveState(statePath, snapshot); saveErr != nil {
+			metrics.StateSaveErrorsTotal.WithLabelValues(metrics.ModeCold).Inc()
+			s.logger.WarnContext(ctx, "failed to flush state",
+				"hash", t.hash,
+				"error", saveErr,
+			)
+			dirtyAfterFlush++
+			continue
+		}
+
+		metrics.StateFlushDuration.Observe(time.Since(flushStart).Seconds())
+
+		t.state.mu.Lock()
+		t.state.piecesSinceFlush -= flushedCount
+		if t.state.piecesSinceFlush <= 0 {
+			t.state.dirty = false
+			t.state.piecesSinceFlush = 0
+		} else {
+			dirtyAfterFlush++
 		}
 		t.state.mu.Unlock()
+
+		s.logger.DebugContext(ctx, "flushed state",
+			"hash", t.hash,
+			"written", countWritten(snapshot),
+		)
 	}
+	metrics.TorrentsWithDirtyState.Set(float64(dirtyAfterFlush))
 }
 
 // runOrphanCleaner periodically scans for and cleans up orphaned torrents.
@@ -104,17 +125,17 @@ func (s *Server) runOrphanCleaner(ctx context.Context) {
 		interval = defaultOrphanCleanupInterval
 	}
 
-	runPeriodic(ctx, interval, true, s.cleanupOrphanedTorrents)
+	runPeriodic(ctx, interval, s.logger, "orphan-cleaner", s.cleanupOrphanedTorrents)
 }
 
-// cleanupOrphanedTorrents scans the .meta directory for orphaned torrents.
+// cleanupOrphanedTorrents scans the metadata directory for orphaned torrents.
 func (s *Server) cleanupOrphanedTorrents(ctx context.Context) {
 	timeout := s.config.OrphanTimeout
 	if timeout == 0 {
 		timeout = defaultOrphanTimeout
 	}
 
-	metaDir := filepath.Join(s.config.BasePath, ".meta")
+	metaDir := filepath.Join(s.config.BasePath, metaDirName)
 
 	entries, readErr := os.ReadDir(metaDir)
 	if readErr != nil {
@@ -150,12 +171,12 @@ func (s *Server) isOrphanedTorrent(ctx context.Context, hash string, timeout tim
 	}
 
 	// Check state file modification time
-	statePath := filepath.Join(s.config.BasePath, ".meta", hash, ".state")
+	statePath := filepath.Join(s.config.BasePath, metaDirName, hash, ".state")
 	info, statErr := os.Stat(statePath)
 	if statErr != nil {
 		if os.IsNotExist(statErr) {
 			// No state file - check files.json for creation time
-			filesPath := filepath.Join(s.config.BasePath, ".meta", hash, filesInfoFileName)
+			filesPath := filepath.Join(s.config.BasePath, metaDirName, hash, filesInfoFileName)
 			filesInfo, filesStatErr := os.Stat(filesPath)
 			if filesStatErr != nil {
 				// No metadata at all - probably already cleaned up or corrupted
@@ -223,45 +244,44 @@ func (s *Server) cleanupOrphan(ctx context.Context, hash string) {
 		s.mu.Unlock()
 	}()
 
-	metaDir := filepath.Join(s.config.BasePath, ".meta", hash)
+	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
 
 	// Load file info to find partial files
+	var filesDeleted int
 	info, loadErr := s.loadFilesInfo(metaDir)
 	if loadErr != nil {
-		// Don't delete meta dir if we can't load file info - we'd leave partial files orphaned
-		// with no way to find them. Leave meta dir for next cleanup cycle or manual intervention.
-		s.logger.WarnContext(ctx, "skipping orphan cleanup, cannot load file info (may need manual cleanup)",
+		// Can't load file info - still clean up metadata directory to prevent unbounded growth.
+		// Any .partial files will remain on disk but are identifiable by suffix for manual cleanup.
+		s.logger.WarnContext(ctx, "orphan cleanup without file info, .partial files may remain on disk",
 			"hash", hash,
 			"metaDir", metaDir,
 			"error", loadErr,
 		)
-		return
-	}
-
-	// Delete partial files
-	var filesDeleted int
-	for _, f := range info.Files {
-		// f.Path is the partial file path
-		if err := os.Remove(f.Path); err == nil {
-			filesDeleted++
-		} else if !os.IsNotExist(err) {
-			s.logger.DebugContext(ctx, "failed to remove orphan partial file",
-				"hash", hash,
-				"path", f.Path,
-				"error", err,
-			)
-		}
-
-		// Also try to remove the non-partial version (may have been partially finalized)
-		finalPath := strings.TrimSuffix(f.Path, partialSuffix)
-		if finalPath != f.Path {
-			if err := os.Remove(finalPath); err == nil {
+	} else {
+		// Delete partial files
+		for _, f := range info.Files {
+			// f.Path is the partial file path
+			if err := os.Remove(f.Path); err == nil {
 				filesDeleted++
+			} else if !os.IsNotExist(err) {
+				s.logger.DebugContext(ctx, "failed to remove orphan partial file",
+					"hash", hash,
+					"path", f.Path,
+					"error", err,
+				)
+			}
+
+			// Also try to remove the non-partial version (may have been partially finalized)
+			finalPath := strings.TrimSuffix(f.Path, partialSuffix)
+			if finalPath != f.Path {
+				if err := os.Remove(finalPath); err == nil {
+					filesDeleted++
+				}
 			}
 		}
 	}
 
-	// Remove meta directory
+	// Always remove meta directory to prevent unbounded growth
 	if err := os.RemoveAll(metaDir); err != nil && !os.IsNotExist(err) {
 		s.logger.WarnContext(ctx, "failed to remove orphan meta directory",
 			"hash", hash,
@@ -287,46 +307,5 @@ func (s *Server) runInodeCleaner(ctx context.Context) {
 		interval = defaultInodeCleanupInterval
 	}
 
-	runPeriodic(ctx, interval, true, s.cleanupStaleInodes)
-}
-
-// cleanupStaleInodes removes entries from inodeToPath where the file no longer exists.
-func (s *Server) cleanupStaleInodes(ctx context.Context) {
-	// Collect all entries to check (avoid holding lock during file stat operations)
-	s.inodeMu.RLock()
-	entries := make(map[uint64]string, len(s.inodeToPath))
-	maps.Copy(entries, s.inodeToPath)
-	s.inodeMu.RUnlock()
-
-	if len(entries) == 0 {
-		return
-	}
-
-	// Check each entry
-	staleInodes := make([]uint64, 0)
-	for inode, relPath := range entries {
-		fullPath := filepath.Join(s.config.BasePath, relPath)
-		if _, err := os.Stat(fullPath); os.IsNotExist(err) {
-			staleInodes = append(staleInodes, inode)
-		}
-	}
-
-	if len(staleInodes) == 0 {
-		return
-	}
-
-	// Remove stale entries
-	s.inodeMu.Lock()
-	for _, inode := range staleInodes {
-		// Double-check the path hasn't changed since we read it
-		if currentPath, ok := s.inodeToPath[inode]; ok && currentPath == entries[inode] {
-			delete(s.inodeToPath, inode)
-		}
-	}
-	s.inodeMu.Unlock()
-
-	s.logger.InfoContext(ctx, "cleaned up stale inode entries",
-		"removed", len(staleInodes),
-		"remaining", len(s.inodeToPath),
-	)
+	runPeriodic(ctx, interval, s.logger, "inode-cleaner", s.inodes.CleanupStale)
 }

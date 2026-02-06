@@ -20,33 +20,31 @@ func TestHotConfig_Validate(t *testing.T) {
 		{
 			name: "valid config",
 			cfg: HotConfig{
-				DataPath: "/data",
-				QBURL:    "http://qb:8080",
-				ColdAddr: "cold:50051",
+				BaseConfig: BaseConfig{DataPath: "/data", QBURL: "http://qb:8080"},
+				ColdAddr:   "cold:50051",
 			},
 			wantErr: "",
 		},
 		{
 			name: "missing data path",
 			cfg: HotConfig{
-				QBURL:    "http://qb:8080",
-				ColdAddr: "cold:50051",
+				BaseConfig: BaseConfig{QBURL: "http://qb:8080"},
+				ColdAddr:   "cold:50051",
 			},
 			wantErr: "data path is required",
 		},
 		{
 			name: "missing qb URL",
 			cfg: HotConfig{
-				DataPath: "/data",
-				ColdAddr: "cold:50051",
+				BaseConfig: BaseConfig{DataPath: "/data"},
+				ColdAddr:   "cold:50051",
 			},
 			wantErr: "qBittorrent URL is required",
 		},
 		{
 			name: "missing cold addr",
 			cfg: HotConfig{
-				DataPath: "/data",
-				QBURL:    "http://qb:8080",
+				BaseConfig: BaseConfig{DataPath: "/data", QBURL: "http://qb:8080"},
 			},
 			wantErr: "cold server address is required",
 		},
@@ -76,7 +74,7 @@ func TestColdConfig_Validate(t *testing.T) {
 		{
 			name: "valid config",
 			cfg: ColdConfig{
-				DataPath:   "/data",
+				BaseConfig: BaseConfig{DataPath: "/data"},
 				ListenAddr: ":50051",
 			},
 			wantErr: "",
@@ -91,9 +89,35 @@ func TestColdConfig_Validate(t *testing.T) {
 		{
 			name: "missing listen addr",
 			cfg: ColdConfig{
-				DataPath: "/data",
+				BaseConfig: BaseConfig{DataPath: "/data"},
 			},
 			wantErr: "listen address is required",
+		},
+		{
+			name: "negative max stream buffer",
+			cfg: ColdConfig{
+				BaseConfig:        BaseConfig{DataPath: "/data"},
+				ListenAddr:        ":50051",
+				MaxStreamBufferMB: -1,
+			},
+			wantErr: "max stream buffer cannot be negative",
+		},
+		{
+			name: "zero max stream buffer uses default",
+			cfg: ColdConfig{
+				BaseConfig: BaseConfig{DataPath: "/data"},
+				ListenAddr: ":50051",
+			},
+			wantErr: "",
+		},
+		{
+			name: "positive max stream buffer",
+			cfg: ColdConfig{
+				BaseConfig:        BaseConfig{DataPath: "/data"},
+				ListenAddr:        ":50051",
+				MaxStreamBufferMB: 256,
+			},
+			wantErr: "",
 		},
 	}
 
@@ -127,6 +151,7 @@ func TestLoadHot(t *testing.T) {
 		v.Set("dry-run", true)
 		v.Set("sleep", 60)
 		v.Set("rate-limit", int64(1000000))
+		v.Set("synced-tag", "my-synced")
 
 		cfg, err := LoadHot(v)
 		require.NoError(t, err)
@@ -142,6 +167,20 @@ func TestLoadHot(t *testing.T) {
 		assert.True(t, cfg.DryRun)
 		assert.Equal(t, 60, int(cfg.SleepInterval.Seconds()))
 		assert.Equal(t, int64(1000000), cfg.MaxBytesPerSec)
+		assert.Equal(t, "my-synced", cfg.SyncedTag)
+	})
+
+	t.Run("synced-tag can be empty to disable tagging", func(t *testing.T) {
+		t.Parallel()
+		v := viper.New()
+		v.Set("data", "/data/path")
+		v.Set("qb-url", "http://qb:8080")
+		v.Set("cold-addr", "cold:50051")
+		v.Set("synced-tag", "")
+
+		cfg, err := LoadHot(v)
+		require.NoError(t, err)
+		assert.Empty(t, cfg.SyncedTag)
 	})
 }
 
@@ -153,11 +192,14 @@ func TestLoadCold(t *testing.T) {
 		v := viper.New()
 		v.Set("listen", ":50051")
 		v.Set("data", "/data/path")
+		v.Set("save-path", "/downloads")
 		v.Set("qb-url", "http://qb:8080")
 		v.Set("qb-username", "admin")
 		v.Set("qb-password", "secret")
 		v.Set("poll-interval", 5)
 		v.Set("poll-timeout", 600)
+		v.Set("synced-tag", "cold-synced")
+		v.Set("max-stream-buffer", 256)
 		v.Set("dry-run", true)
 
 		cfg, err := LoadCold(v)
@@ -165,12 +207,38 @@ func TestLoadCold(t *testing.T) {
 
 		assert.Equal(t, ":50051", cfg.ListenAddr)
 		assert.Equal(t, "/data/path", cfg.DataPath)
+		assert.Equal(t, "/downloads", cfg.SavePath)
 		assert.Equal(t, "http://qb:8080", cfg.QBURL)
 		assert.Equal(t, "admin", cfg.QBUsername)
 		assert.Equal(t, "secret", cfg.QBPassword)
 		assert.Equal(t, 5, int(cfg.PollInterval.Seconds()))
 		assert.Equal(t, 600, int(cfg.PollTimeout.Seconds()))
+		assert.Equal(t, 256, cfg.MaxStreamBufferMB)
+		assert.Equal(t, "cold-synced", cfg.SyncedTag)
 		assert.True(t, cfg.DryRun)
+	})
+
+	t.Run("save-path defaults to empty", func(t *testing.T) {
+		t.Parallel()
+		v := viper.New()
+		v.Set("listen", ":50051")
+		v.Set("data", "/data/path")
+
+		cfg, err := LoadCold(v)
+		require.NoError(t, err)
+		assert.Empty(t, cfg.SavePath, "SavePath should be empty when not explicitly set")
+	})
+
+	t.Run("synced-tag can be empty to disable tagging", func(t *testing.T) {
+		t.Parallel()
+		v := viper.New()
+		v.Set("listen", ":50051")
+		v.Set("data", "/data/path")
+		v.Set("synced-tag", "")
+
+		cfg, err := LoadCold(v)
+		require.NoError(t, err)
+		assert.Empty(t, cfg.SyncedTag)
 	})
 }
 
@@ -183,12 +251,16 @@ func TestSetupHotFlags(t *testing.T) {
 	flags := []string{
 		"data", "qb-url", "qb-username", "qb-password",
 		"cold-addr", "min-space", "min-seeding-time",
-		"force", "dry-run", "sleep", "rate-limit",
+		"force", "dry-run", "sleep", "rate-limit", "synced-tag",
 	}
 
 	for _, flag := range flags {
 		assert.NotNil(t, cmd.Flags().Lookup(flag), "flag %s should exist", flag)
 	}
+
+	// Verify synced-tag default value
+	syncedTagFlag := cmd.Flags().Lookup("synced-tag")
+	assert.Equal(t, "synced", syncedTagFlag.DefValue)
 }
 
 func TestSetupColdFlags(t *testing.T) {
@@ -198,13 +270,22 @@ func TestSetupColdFlags(t *testing.T) {
 	SetupColdFlags(cmd)
 
 	flags := []string{
-		"listen", "data", "qb-url", "qb-username", "qb-password",
-		"poll-interval", "poll-timeout", "dry-run",
+		"listen", "data", "save-path", "qb-url", "qb-username", "qb-password",
+		"poll-interval", "poll-timeout", "stream-workers", "max-stream-buffer",
+		"dry-run", "synced-tag",
 	}
 
 	for _, flag := range flags {
 		assert.NotNil(t, cmd.Flags().Lookup(flag), "flag %s should exist", flag)
 	}
+
+	// Verify synced-tag default value
+	syncedTagFlag := cmd.Flags().Lookup("synced-tag")
+	assert.Equal(t, "synced", syncedTagFlag.DefValue)
+
+	// Verify max-stream-buffer default value
+	bufferFlag := cmd.Flags().Lookup("max-stream-buffer")
+	assert.Equal(t, "512", bufferFlag.DefValue)
 }
 
 func TestGetEnvWithFallbacks(t *testing.T) {

@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/arsac/qb-sync/internal/metrics"
 )
 
 const (
@@ -193,6 +195,28 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, resp Response) {
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		s.logger.Warn("failed to write health response", "error", err)
+	}
+}
+
+// CachedCheck wraps a CheckFunc with time-based caching. Repeated calls within
+// the TTL return the cached result without invoking the underlying check.
+func CachedCheck(check CheckFunc, ttl time.Duration) CheckFunc {
+	var (
+		mu         sync.Mutex
+		lastCheck  time.Time
+		lastResult error
+	)
+	return func(ctx context.Context) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if time.Since(lastCheck) < ttl {
+			metrics.HealthCheckCacheTotal.WithLabelValues(metrics.ResultHit).Inc()
+			return lastResult
+		}
+		metrics.HealthCheckCacheTotal.WithLabelValues(metrics.ResultMiss).Inc()
+		lastResult = check(ctx)
+		lastCheck = time.Now()
+		return lastResult
 	}
 }
 

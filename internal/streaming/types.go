@@ -53,14 +53,11 @@ type PieceSource interface {
 type PieceDestination interface {
 	// InitTorrent initializes a torrent on the destination.
 	// Must be called before WritePiece for a given torrent.
-	InitTorrent(ctx context.Context, req *pb.InitTorrentRequest) error
+	// Returns sync status and pieces_needed for resume.
+	InitTorrent(ctx context.Context, req *pb.InitTorrentRequest) (*InitTorrentResult, error)
 
 	// WritePiece writes a piece to the destination.
 	WritePiece(ctx context.Context, req *pb.WritePieceRequest) error
-
-	// GetWrittenPieces returns which pieces have been successfully written.
-	// Used for resumption after restart.
-	GetWrittenPieces(ctx context.Context, hash string) ([]bool, error)
 
 	// Close closes the destination.
 	Close() error

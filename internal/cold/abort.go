@@ -96,7 +96,6 @@ func (s *Server) AbortTorrent(
 		}, nil
 	}
 
-	// Close file handles and optionally delete files
 	filesDeleted := int32(0)
 	var deleteErrors []string
 
@@ -106,26 +105,13 @@ func (s *Server) AbortTorrent(
 	// Clean up in-progress inode entries for this torrent's files.
 	// Signal waiters so they can handle the abort (their hardlink attempt will fail).
 	for _, fi := range state.files {
-		if fi.sourceInode == 0 || fi.hardlinked || fi.pendingHardlink {
+		if fi.sourceInode == 0 || fi.hlState == hlStateComplete || fi.hlState == hlStatePending {
 			continue
 		}
-
-		s.inodeProgressMu.Lock()
-		if inProgress, ok := s.inodeInProgress[fi.sourceInode]; ok {
-			if inProgress.torrentHash == hash {
-				inProgress.close() // Wake up any waiters (safe for double-close)
-				delete(s.inodeInProgress, fi.sourceInode)
-				s.logger.DebugContext(ctx, "cleaned up in-progress inode on abort",
-					"hash", hash,
-					"inode", fi.sourceInode,
-				)
-			}
-		}
-		s.inodeProgressMu.Unlock()
+		s.inodes.AbortInProgress(ctx, fi.sourceInode, hash)
 	}
 
 	for _, fi := range state.files {
-		// Close any open file handle (sync first to flush pending writes)
 		if fi.file != nil {
 			_ = fi.file.Sync()
 			_ = fi.file.Close()
@@ -140,18 +126,13 @@ func (s *Server) AbortTorrent(
 	}
 
 	if deleteFiles {
-		// Delete state file
 		if state.statePath != "" {
 			tryRemoveWithLog(ctx, s.logger, state.statePath, "state file", hash, &deleteErrors)
 		}
-
-		// Delete torrent file
 		if state.torrentPath != "" {
 			tryRemoveWithLog(ctx, s.logger, state.torrentPath, "torrent file", hash, &deleteErrors)
 		}
-
-		// Delete metadata directory
-		metaDir := filepath.Join(s.config.BasePath, ".meta", hash)
+		metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
 		if err := os.RemoveAll(metaDir); err != nil && !os.IsNotExist(err) {
 			deleteErrors = append(deleteErrors, fmt.Sprintf("meta directory: %v", err))
 			s.logger.WarnContext(ctx, "failed to delete meta directory",

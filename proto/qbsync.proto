@@ -5,8 +5,8 @@ package qbsync;
 option go_package = "github.com/arsac/qb-sync/proto";
 
 // QBSyncService handles torrent synchronization between hot and cold storage.
-// It manages the full lifecycle: initialization, piece transfer,
-// hardlink deduplication, and finalization.
+// Cold qBittorrent is the single source of truth for sync status.
+// InitTorrent determines what needs syncing by checking qB, active syncs, and filesystem.
 service QBSyncService {
   // WritePiece sends a single piece to the receiver (for simple cases).
   rpc WritePiece(WritePieceRequest) returns (WritePieceResponse);
@@ -16,10 +16,13 @@ service QBSyncService {
   // This allows immediate retry on failure without waiting for batch completion.
   rpc StreamPiecesBidi(stream WritePieceRequest) returns (stream PieceAck);
 
-  // GetWrittenPieces returns which pieces have been written for a torrent.
-  rpc GetWrittenPieces(GetWrittenPiecesRequest) returns (GetWrittenPiecesResponse);
-
-  // InitTorrent initializes tracking for a new torrent.
+  // InitTorrent initializes or resumes a torrent sync.
+  // This is the primary entry point - it checks:
+  // 1. If torrent is already complete in cold qBittorrent -> COMPLETE
+  // 2. If sync is in progress -> returns remaining pieces_needed
+  // 3. If files exist on disk -> triggers qB verification, returns verified pieces
+  // 4. Fresh torrent -> all pieces needed
+  // This RPC is idempotent - safe to call multiple times.
   rpc InitTorrent(InitTorrentRequest) returns (InitTorrentResponse);
 
   // CreateHardlink creates a hardlink from an existing file to a new path.
@@ -40,6 +43,20 @@ service QBSyncService {
   // AbortTorrent aborts an in-progress torrent transfer and cleans up partial files.
   // Called when a torrent is removed from hot before streaming completes.
   rpc AbortTorrent(AbortTorrentRequest) returns (AbortTorrentResponse);
+
+  // StartTorrent resumes a stopped torrent on cold qBittorrent.
+  // Called by hot during disk pressure cleanup after stopping the torrent on hot,
+  // ensuring cold takes over seeding before hot deletes the torrent.
+  rpc StartTorrent(StartTorrentRequest) returns (StartTorrentResponse);
+}
+
+// PieceErrorCode categorizes piece-level failures for retry decisions.
+enum PieceErrorCode {
+  PIECE_ERROR_NONE = 0;            // Default / unknown (backward-compatible with old cold)
+  PIECE_ERROR_IO = 1;              // Disk I/O, permission, disk full
+  PIECE_ERROR_HASH_MISMATCH = 2;   // SHA1 verification failed
+  PIECE_ERROR_NOT_INITIALIZED = 3; // Torrent not tracked on cold
+  PIECE_ERROR_FINALIZING = 4;      // Torrent is being finalized
 }
 
 message WritePieceRequest {
@@ -54,6 +71,7 @@ message WritePieceRequest {
 message WritePieceResponse {
   bool success = 1;
   string error = 2;
+  PieceErrorCode error_code = 3;
 }
 
 // PieceAck is sent by the receiver for each piece in bidirectional streaming.
@@ -62,16 +80,7 @@ message PieceAck {
   int32 piece_index = 2;
   bool success = 3;
   string error = 4;
-}
-
-message GetWrittenPiecesRequest {
-  string torrent_hash = 1;
-}
-
-message GetWrittenPiecesResponse {
-  repeated bool written = 1;  // Boolean array indexed by piece number
-  int32 total_pieces = 2;
-  int32 written_count = 3;
+  PieceErrorCode error_code = 5;  // Structured error code for retry decisions
 }
 
 message InitTorrentRequest {
@@ -92,12 +101,41 @@ message FileInfo {
   uint64 inode = 4;  // Source filesystem inode for hardlink detection
 }
 
+// TorrentSyncStatus indicates the current state of a torrent on cold.
+enum TorrentSyncStatus {
+  // READY: Torrent initialized, stream pieces where pieces_needed[i] is true.
+  // If all pieces_needed are false, just call FinalizeTorrent.
+  SYNC_STATUS_READY = 0;
+
+  // COMPLETE: Torrent already exists in cold qBittorrent and is verified.
+  // No action needed - hot can delete this torrent if space is needed.
+  SYNC_STATUS_COMPLETE = 1;
+
+  // VERIFYING: Files exist on disk, qBittorrent recheck is in progress.
+  // Hot should wait and retry InitTorrent after a delay.
+  SYNC_STATUS_VERIFYING = 2;
+}
+
 message InitTorrentResponse {
   bool success = 1;
   string error = 2;
-  // Hardlink results - which files were hardlinked and which pieces are covered
-  repeated HardlinkResult hardlink_results = 3;
-  repeated bool pieces_covered = 4;  // Pieces fully covered by hardlinked files
+
+  // Status indicates what action hot should take
+  TorrentSyncStatus status = 3;
+
+  // pieces_needed[i] = true means piece i needs to be streamed.
+  // Only populated when status is SYNC_STATUS_READY.
+  // Empty if status is SYNC_STATUS_COMPLETE or SYNC_STATUS_VERIFYING.
+  repeated bool pieces_needed = 4;
+
+  // Hardlink results - which files were hardlinked (for logging/debugging)
+  repeated HardlinkResult hardlink_results = 5;
+
+  // Count of pieces that need streaming (convenience field)
+  int32 pieces_needed_count = 6;
+
+  // Count of pieces already present (hardlinked, verified, or previously received)
+  int32 pieces_have_count = 7;
 }
 
 // HardlinkResult describes the result of hardlink detection for a single file.
@@ -107,6 +145,7 @@ message HardlinkResult {
   string source_path = 3;      // Path of existing file used (if hardlinked)
   string error = 4;            // Error message if hardlink failed
   bool pending = 5;            // Waiting for another torrent to finish this file
+  bool pre_existing = 6;       // File already existed on disk with correct size
 }
 
 // Hardlink support messages
@@ -171,6 +210,15 @@ message AbortTorrentResponse {
   bool success = 1;
   string error = 2;
   int32 files_deleted = 3; // Number of partial files deleted
+}
+
+message StartTorrentRequest {
+  string torrent_hash = 1;
+}
+
+message StartTorrentResponse {
+  bool success = 1;
+  string error = 2;
 }
 
 // Piece is a lightweight reference to a piece (no data).

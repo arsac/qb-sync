@@ -27,6 +27,47 @@ func (s *Server) loadState(path string, numPieces int) ([]bool, error) {
 	return written, nil
 }
 
+// atomicWriteFile writes data to a file atomically using write-to-temp + fsync + rename.
+// This prevents corruption from crashes or NFS connection drops mid-write.
+//
+//nolint:unparam // perm kept as parameter for API correctness even though callers currently use the same value
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return fmt.Errorf("creating temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+
+	// Clean up temp file on any failure path
+	success := false
+	defer func() {
+		if !success {
+			_ = tmp.Close()
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, writeErr := tmp.Write(data); writeErr != nil {
+		return fmt.Errorf("writing temp file: %w", writeErr)
+	}
+	if syncErr := tmp.Sync(); syncErr != nil {
+		return fmt.Errorf("syncing temp file: %w", syncErr)
+	}
+	if closeErr := tmp.Close(); closeErr != nil {
+		return fmt.Errorf("closing temp file: %w", closeErr)
+	}
+	if chmodErr := os.Chmod(tmpPath, perm); chmodErr != nil {
+		return fmt.Errorf("setting permissions: %w", chmodErr)
+	}
+	if renameErr := os.Rename(tmpPath, path); renameErr != nil {
+		return fmt.Errorf("renaming temp file: %w", renameErr)
+	}
+
+	success = true
+	return nil
+}
+
 // saveState persists the written pieces state to disk.
 func (s *Server) saveState(path string, written []bool) error {
 	data := make([]byte, len(written))
@@ -35,7 +76,15 @@ func (s *Server) saveState(path string, written []bool) error {
 			data[i] = 1
 		}
 	}
-	return os.WriteFile(path, data, serverFilePermissions)
+	return atomicWriteFile(path, data, serverFilePermissions)
+}
+
+// doSaveState calls saveStateFunc if set (testing), otherwise saveState.
+func (s *Server) doSaveState(path string, written []bool) error {
+	if s.saveStateFunc != nil {
+		return s.saveStateFunc(path, written)
+	}
+	return s.saveState(path, written)
 }
 
 // saveFilesInfo saves file metadata for recovery after restart.
@@ -45,7 +94,7 @@ func (s *Server) saveFilesInfo(metaDir string, info *persistedTorrentInfo) error
 	if err != nil {
 		return fmt.Errorf("marshaling files info: %w", err)
 	}
-	return os.WriteFile(path, data, serverFilePermissions)
+	return atomicWriteFile(path, data, serverFilePermissions)
 }
 
 // loadFilesInfo loads file metadata for recovery after restart.
@@ -62,57 +111,11 @@ func (s *Server) loadFilesInfo(metaDir string) (*persistedTorrentInfo, error) {
 	return &info, nil
 }
 
-// inodeMapPath returns the path to the inode map persistence file.
-func (s *Server) inodeMapPath() string {
-	return filepath.Join(s.config.BasePath, ".inode_map.json")
-}
-
-// loadInodeMap loads the persisted inode-to-path mapping from disk.
-func (s *Server) loadInodeMap() error {
-	data, err := os.ReadFile(s.inodeMapPath())
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil // No persisted state yet
-		}
-		return err
-	}
-
-	// Unmarshal to temp variable first to avoid partial modification on error
-	var loaded map[uint64]string
-	if unmarshalErr := json.Unmarshal(data, &loaded); unmarshalErr != nil {
-		return fmt.Errorf("unmarshaling inode map: %w", unmarshalErr)
-	}
-
-	s.inodeMu.Lock()
-	s.inodeToPath = loaded
-	s.inodeMu.Unlock()
-
-	return nil
-}
-
-// saveInodeMap persists the inode-to-path mapping to disk.
-func (s *Server) saveInodeMap() error {
-	s.inodeMu.RLock()
-	data, err := json.Marshal(s.inodeToPath)
-	s.inodeMu.RUnlock()
-
-	if err != nil {
-		return err
-	}
-
-	// Ensure base path exists
-	if mkdirErr := os.MkdirAll(s.config.BasePath, serverDirPermissions); mkdirErr != nil {
-		return mkdirErr
-	}
-
-	return os.WriteFile(s.inodeMapPath(), data, serverFilePermissions)
-}
-
 // recoverTorrentState attempts to recover torrent state from disk after a server restart.
 // This enables FinalizeTorrent to work even if the torrent was initialized in a previous
 // server instance.
 func (s *Server) recoverTorrentState(ctx context.Context, hash string) (*serverTorrentState, error) {
-	metaDir := filepath.Join(s.config.BasePath, ".meta", hash)
+	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
 
 	// Load persisted file info
 	info, loadErr := s.loadFilesInfo(metaDir)
@@ -151,34 +154,27 @@ func (s *Server) recoverTorrentState(ctx context.Context, hash string) (*serverT
 			path:   f.Path,
 			size:   f.Size,
 			offset: f.Offset,
-			file:   nil, // Lazy open
 		}
 	}
 
+	writtenCount := countWritten(written)
+
 	s.logger.InfoContext(ctx, "recovering torrent state",
 		"hash", hash,
-		"written", countWritten(written),
+		"written", writtenCount,
 		"total", info.NumPieces,
 		"files", len(files),
 	)
 
 	return &serverTorrentState{
-		info:        nil, // Not needed for finalization
-		written:     written,
-		pieceHashes: nil, // Not needed for finalization
-		files:       files,
-		torrentPath: torrentPath,
-		statePath:   statePath,
+		info:         nil, // Not needed for finalization
+		written:      written,
+		writtenCount: writtenCount,
+		pieceHashes:  info.PieceHashes,
+		pieceLength:  info.PieceLength,
+		totalSize:    info.TotalSize,
+		files:        files,
+		torrentPath:  torrentPath,
+		statePath:    statePath,
 	}, nil
-}
-
-// countWritten counts the number of written pieces.
-func countWritten(written []bool) int {
-	count := 0
-	for _, w := range written {
-		if w {
-			count++
-		}
-	}
-	return count
 }
