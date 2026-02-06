@@ -7,7 +7,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -123,10 +122,8 @@ func TestE2E_DryRunDoesNotDelete(t *testing.T) {
 	// Cleanup any existing torrents
 	env.CleanupTorrent(ctx, env.HotClient(), sintelHash)
 
-	// Add torrent with synced tag
-	err := env.AddTorrentToHot(ctx, testTorrentURL, map[string]string{
-		"tags": "synced",
-	})
+	// Add torrent to hot
+	err := env.AddTorrentToHot(ctx, testTorrentURL, nil)
 	require.NoError(t, err)
 
 	// Wait for torrent
@@ -142,6 +139,9 @@ func TestE2E_DryRunDoesNotDelete(t *testing.T) {
 	// Login to source client
 	err = task.Login(ctx)
 	require.NoError(t, err)
+
+	// Mark torrent as complete on cold (simulates sync without actually syncing)
+	task.MarkCompletedOnCold(sintelHash)
 
 	// Run maybeMoveToCold in dry run mode
 	err = task.MaybeMoveToCold(ctx)
@@ -236,32 +236,16 @@ func TestE2E_FullSyncFlow(t *testing.T) {
 	env := SetupTestEnv(t)
 	ctx := context.Background()
 
-	// Cleanup any existing torrents on both hot and cold
-	env.CleanupTorrent(ctx, env.HotClient(), bigBuckBunnyHash)
-	env.CleanupTorrent(ctx, env.ColdClient(), bigBuckBunnyHash)
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
 
-	// Add torrent to hot and wait for download
 	t.Log("Adding Big Buck Bunny torrent to hot...")
-	err := env.AddTorrentToHot(ctx, bigBuckBunnyURL, nil)
-	require.NoError(t, err)
+	env.DownloadTorrentOnHot(ctx, bigBuckBunnyURL, bigBuckBunnyHash, 5*time.Minute)
 
-	// Wait for torrent to appear
-	torrent := env.WaitForTorrent(env.HotClient(), bigBuckBunnyHash, 30*time.Second)
-	require.NotNil(t, torrent)
-	t.Logf("Torrent added: %s", torrent.Name)
-
-	// Wait for torrent to complete downloading
-	t.Log("Waiting for torrent to complete downloading...")
-	env.WaitForTorrentComplete(env.HotClient(), bigBuckBunnyHash, 5*time.Minute)
-	t.Log("Torrent download complete")
-
-	// Create hot task and run the orchestrator
 	cfg := env.CreateHotConfig()
 	task, dest, err := env.CreateHotTask(cfg)
 	require.NoError(t, err)
 	defer dest.Close()
 
-	// Run the orchestrator in background with timeout
 	orchestratorCtx, cancelOrchestrator := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancelOrchestrator()
 
@@ -270,45 +254,172 @@ func TestE2E_FullSyncFlow(t *testing.T) {
 		orchestratorDone <- task.Run(orchestratorCtx)
 	}()
 
-	// Wait for torrent to be synced (has synced tag on hot)
 	t.Log("Waiting for torrent to be synced to cold...")
-	require.Eventually(t, func() bool {
-		torrents, getErr := env.HotClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
-			Hashes: []string{bigBuckBunnyHash},
-		})
-		if getErr != nil || len(torrents) == 0 {
-			return false
-		}
-		return strings.Contains(torrents[0].Tags, "synced")
-	}, 3*time.Minute, 2*time.Second, "torrent should have synced tag on hot")
+	env.WaitForTorrentCompleteOnCold(ctx, bigBuckBunnyHash, 3*time.Minute, "torrent should be complete on cold")
 
-	t.Log("Torrent has synced tag on hot")
-
-	// Stop the orchestrator
 	cancelOrchestrator()
 	<-orchestratorDone
 
-	// Verify torrent exists on cold qBittorrent
+	env.AssertTorrentCompleteOnCold(ctx, bigBuckBunnyHash)
+
+	// Verify cold qBittorrent's savePath is the container mount point, not the hot's path.
 	coldTorrents, err := env.ColdClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
 		Hashes: []string{bigBuckBunnyHash},
 	})
 	require.NoError(t, err)
-	require.Len(t, coldTorrents, 1, "torrent should exist on cold qBittorrent")
-
-	coldTorrent := coldTorrents[0]
-	t.Logf("Torrent on cold: %s (progress: %.2f%%)", coldTorrent.Name, coldTorrent.Progress*100)
-
-	// Verify torrent is complete on cold (100% progress)
-	assert.InDelta(t, 1.0, coldTorrent.Progress, progressTolerance, "torrent should be 100% complete on cold")
-
-	// Verify torrent hash matches
-	assert.Equal(t, bigBuckBunnyHash, coldTorrent.Hash, "torrent hash should match")
+	require.Len(t, coldTorrents, 1)
+	assert.Equal(t, "/cold-data", coldTorrents[0].SavePath,
+		"cold torrent savePath should be the container mount point")
 
 	t.Log("Full sync flow completed successfully!")
 
-	// Cleanup
-	env.CleanupTorrent(ctx, env.HotClient(), bigBuckBunnyHash)
-	env.CleanupTorrent(ctx, env.ColdClient(), bigBuckBunnyHash)
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
+}
+
+// TestE2E_TorrentSeedsOnHotAfterSync verifies that after a regular sync the
+// torrent continues seeding on hot (no stop). The stop only happens during
+// disk pressure cleanup in maybeMoveToCold.
+func TestE2E_TorrentSeedsOnHotAfterSync(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+
+	env := SetupTestEnv(t)
+	ctx := context.Background()
+
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
+
+	t.Log("Adding Big Buck Bunny torrent to hot...")
+	env.DownloadTorrentOnHot(ctx, bigBuckBunnyURL, bigBuckBunnyHash, 5*time.Minute)
+
+	// No Force, no space pressure → torrent should stay on hot after sync
+	cfg := env.CreateHotConfig()
+	task, dest, err := env.CreateHotTask(cfg)
+	require.NoError(t, err)
+	defer dest.Close()
+
+	orchestratorCtx, cancelOrchestrator := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancelOrchestrator()
+
+	orchestratorDone := make(chan error, 1)
+	go func() {
+		orchestratorDone <- task.Run(orchestratorCtx)
+	}()
+
+	t.Log("Waiting for torrent to be synced to cold...")
+	env.WaitForTorrentCompleteOnCold(ctx, bigBuckBunnyHash, 3*time.Minute, "torrent should be complete on cold")
+
+	cancelOrchestrator()
+	<-orchestratorDone
+
+	// Torrent should still exist on hot and NOT be stopped
+	torrents, err := env.HotClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+		Hashes: []string{bigBuckBunnyHash},
+	})
+	require.NoError(t, err)
+	require.Len(t, torrents, 1, "torrent should still exist on hot after sync")
+
+	assert.False(t, env.IsTorrentStopped(ctx, env.HotClient(), bigBuckBunnyHash),
+		"torrent on hot should still be seeding after sync (state: %s)", torrents[0].State)
+
+	env.AssertTorrentCompleteOnCold(ctx, bigBuckBunnyHash)
+
+	// Cold torrent should be STOPPED (explicitly stopped during finalization, not yet started).
+	// Use Eventually because the stop may still be propagating through qBittorrent.
+	require.Eventually(t, func() bool {
+		return env.IsTorrentStopped(ctx, env.ColdClient(), bigBuckBunnyHash)
+	}, 15*time.Second, time.Second,
+		"torrent on cold should be stopped after sync (no dual seeding)")
+
+	t.Log("Torrent correctly continues seeding on hot after sync, cold is stopped!")
+
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
+}
+
+// TestE2E_StopBeforeDeleteOnDiskPressure verifies that during disk pressure
+// cleanup, torrents are stopped on hot before being deleted. This ensures
+// a clean handoff: cold is already seeding, hot stops, then hot deletes.
+func TestE2E_StopBeforeDeleteOnDiskPressure(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+
+	env := SetupTestEnv(t)
+	ctx := context.Background()
+
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
+
+	t.Log("Adding Big Buck Bunny torrent to hot...")
+	env.DownloadTorrentOnHot(ctx, bigBuckBunnyURL, bigBuckBunnyHash, 5*time.Minute)
+
+	// First: sync to cold without Force (torrent stays on hot)
+	cfg := env.CreateHotConfig()
+	task, dest, err := env.CreateHotTask(cfg)
+	require.NoError(t, err)
+	defer dest.Close()
+
+	orchestratorCtx, cancelOrchestrator := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancelOrchestrator()
+
+	orchestratorDone := make(chan error, 1)
+	go func() {
+		orchestratorDone <- task.Run(orchestratorCtx)
+	}()
+
+	t.Log("Waiting for torrent to be synced to cold...")
+	env.WaitForTorrentCompleteOnCold(ctx, bigBuckBunnyHash, 3*time.Minute, "torrent should be complete on cold")
+
+	cancelOrchestrator()
+	<-orchestratorDone
+
+	env.AssertTorrentCompleteOnCold(ctx, bigBuckBunnyHash)
+
+	// Verify torrent is still seeding on hot (not stopped yet)
+	torrents, err := env.HotClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+		Hashes: []string{bigBuckBunnyHash},
+	})
+	require.NoError(t, err)
+	require.Len(t, torrents, 1, "torrent should still exist on hot")
+	assert.False(t, env.IsTorrentStopped(ctx, env.HotClient(), bigBuckBunnyHash),
+		"torrent should be seeding on hot before disk pressure cleanup")
+
+	// Verify cold torrent is STOPPED before handoff (explicitly stopped during finalization).
+	// Use Eventually because the stop may still be propagating through qBittorrent.
+	require.Eventually(t, func() bool {
+		return env.IsTorrentStopped(ctx, env.ColdClient(), bigBuckBunnyHash)
+	}, 15*time.Second, time.Second,
+		"cold torrent should be stopped before disk pressure handoff")
+
+	// Now: simulate disk pressure with Force + no min seeding time
+	t.Log("Running disk pressure cleanup (Force mode)...")
+	forceCfg := env.CreateHotConfig(WithForce(true), WithMinSeedingTime(0))
+	forceTask, forceDest, err := env.CreateHotTask(forceCfg)
+	require.NoError(t, err)
+	defer forceDest.Close()
+
+	err = forceTask.Login(ctx)
+	require.NoError(t, err)
+
+	// Mark as completed on cold so maybeMoveToCold picks it up
+	forceTask.MarkCompletedOnCold(bigBuckBunnyHash)
+
+	err = forceTask.MaybeMoveToCold(ctx)
+	require.NoError(t, err)
+
+	// Torrent should now be deleted from hot (stop → start cold → delete)
+	env.WaitForTorrentDeleted(ctx, env.HotClient(), bigBuckBunnyHash, 10*time.Second,
+		"torrent should be deleted from hot after disk pressure cleanup")
+
+	// Cold torrent should now be SEEDING (started during handoff).
+	// qBittorrent may take a moment to transition from stoppedUP to an active state.
+	require.Eventually(t, func() bool {
+		return !env.IsTorrentStopped(ctx, env.ColdClient(), bigBuckBunnyHash)
+	}, 15*time.Second, time.Second,
+		"torrent on cold should be seeding after disk pressure handoff")
+
+	t.Log("Torrent handed off: hot deleted, cold now seeding!")
+
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
 }
 
 // TestE2E_ColdServerRestart tests that streaming can recover after the cold gRPC server restarts.
@@ -321,29 +432,16 @@ func TestE2E_ColdServerRestart(t *testing.T) {
 	env := SetupTestEnv(t)
 	ctx := context.Background()
 
-	// Cleanup any existing torrents
-	env.CleanupTorrent(ctx, env.HotClient(), bigBuckBunnyHash)
-	env.CleanupTorrent(ctx, env.ColdClient(), bigBuckBunnyHash)
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
 
-	// Add torrent to hot and wait for download
 	t.Log("Adding Big Buck Bunny torrent to hot...")
-	err := env.AddTorrentToHot(ctx, bigBuckBunnyURL, nil)
-	require.NoError(t, err)
+	env.DownloadTorrentOnHot(ctx, bigBuckBunnyURL, bigBuckBunnyHash, 5*time.Minute)
 
-	torrent := env.WaitForTorrent(env.HotClient(), bigBuckBunnyHash, 30*time.Second)
-	require.NotNil(t, torrent)
-
-	t.Log("Waiting for torrent to complete downloading...")
-	env.WaitForTorrentComplete(env.HotClient(), bigBuckBunnyHash, 5*time.Minute)
-	t.Log("Torrent download complete")
-
-	// Create hot task
 	cfg := env.CreateHotConfig()
 	task, dest, err := env.CreateHotTask(cfg)
 	require.NoError(t, err)
 	defer dest.Close()
 
-	// Run orchestrator in background
 	orchestratorCtx, cancelOrchestrator := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancelOrchestrator()
 
@@ -352,7 +450,6 @@ func TestE2E_ColdServerRestart(t *testing.T) {
 		orchestratorDone <- task.Run(orchestratorCtx)
 	}()
 
-	// Wait for streaming to actually start and make some progress
 	t.Log("Waiting for streaming to start and make progress...")
 	require.Eventually(t, func() bool {
 		progress, progressErr := task.Progress(ctx, bigBuckBunnyHash)
@@ -360,50 +457,25 @@ func TestE2E_ColdServerRestart(t *testing.T) {
 			return false
 		}
 		t.Logf("Streaming progress: %d/%d pieces", progress.Streamed, progress.TotalPieces)
-		// Wait for at least 10% progress before stopping
 		return progress.Streamed > 0 && progress.Streamed >= progress.TotalPieces/10
 	}, 2*time.Minute, time.Second, "streaming should start and make progress")
 
 	t.Log("Stopping cold gRPC server mid-stream...")
 	env.StopColdServer()
-
-	// Wait a bit while cold server is down
-	t.Log("Cold server is down, waiting...")
 	time.Sleep(5 * time.Second)
 
-	// Restart cold server
 	t.Log("Restarting cold gRPC server...")
 	env.StartColdServer()
 
-	// Wait for sync to complete
 	t.Log("Waiting for sync to complete after cold server restart...")
-	require.Eventually(t, func() bool {
-		torrents, getErr := env.HotClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
-			Hashes: []string{bigBuckBunnyHash},
-		})
-		if getErr != nil || len(torrents) == 0 {
-			return false
-		}
-		return strings.Contains(torrents[0].Tags, "synced")
-	}, 3*time.Minute, 2*time.Second, "torrent should have synced tag after cold server restart")
+	env.WaitForTorrentCompleteOnCold(ctx, bigBuckBunnyHash, 3*time.Minute, "torrent should be complete on cold after restart")
 
-	t.Log("Torrent synced successfully after cold server restart!")
-
-	// Stop orchestrator
 	cancelOrchestrator()
 	<-orchestratorDone
 
-	// Verify torrent on cold
-	coldTorrents, err := env.ColdClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
-		Hashes: []string{bigBuckBunnyHash},
-	})
-	require.NoError(t, err)
-	require.Len(t, coldTorrents, 1)
-	assert.InDelta(t, 1.0, coldTorrents[0].Progress, progressTolerance, "torrent should be 100% on cold")
+	env.AssertTorrentCompleteOnCold(ctx, bigBuckBunnyHash)
 
-	// Cleanup
-	env.CleanupTorrent(ctx, env.HotClient(), bigBuckBunnyHash)
-	env.CleanupTorrent(ctx, env.ColdClient(), bigBuckBunnyHash)
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
 }
 
 // TestE2E_ColdQBittorrentRestart tests that finalization can recover after cold qBittorrent restarts.
@@ -416,28 +488,15 @@ func TestE2E_ColdQBittorrentRestart(t *testing.T) {
 	env := SetupTestEnv(t)
 	ctx := context.Background()
 
-	// Cleanup any existing torrents
-	env.CleanupTorrent(ctx, env.HotClient(), bigBuckBunnyHash)
-	env.CleanupTorrent(ctx, env.ColdClient(), bigBuckBunnyHash)
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
 
-	// Add torrent to hot and wait for download
 	t.Log("Adding Big Buck Bunny torrent to hot...")
-	err := env.AddTorrentToHot(ctx, bigBuckBunnyURL, nil)
-	require.NoError(t, err)
+	env.DownloadTorrentOnHot(ctx, bigBuckBunnyURL, bigBuckBunnyHash, 5*time.Minute)
 
-	torrent := env.WaitForTorrent(env.HotClient(), bigBuckBunnyHash, 30*time.Second)
-	require.NotNil(t, torrent)
-
-	t.Log("Waiting for torrent to complete downloading...")
-	env.WaitForTorrentComplete(env.HotClient(), bigBuckBunnyHash, 5*time.Minute)
-	t.Log("Torrent download complete")
-
-	// Stop cold qBittorrent before starting sync
 	t.Log("Stopping cold qBittorrent before sync...")
-	err = env.StopColdQBittorrent(ctx)
+	err := env.StopColdQBittorrent(ctx)
 	require.NoError(t, err)
 
-	// Create hot task and start orchestrator
 	cfg := env.CreateHotConfig()
 	task, dest, err := env.CreateHotTask(cfg)
 	require.NoError(t, err)
@@ -451,44 +510,22 @@ func TestE2E_ColdQBittorrentRestart(t *testing.T) {
 		orchestratorDone <- task.Run(orchestratorCtx)
 	}()
 
-	// Wait for streaming to complete (pieces can still be written to disk)
 	t.Log("Waiting for streaming to complete (cold qB is down)...")
 	time.Sleep(15 * time.Second)
 
-	// Restart cold qBittorrent
 	t.Log("Restarting cold qBittorrent...")
 	err = env.StartColdQBittorrent(ctx)
 	require.NoError(t, err)
 
-	// Wait for sync to complete
 	t.Log("Waiting for sync to complete after cold qBittorrent restart...")
-	require.Eventually(t, func() bool {
-		torrents, getErr := env.HotClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
-			Hashes: []string{bigBuckBunnyHash},
-		})
-		if getErr != nil || len(torrents) == 0 {
-			return false
-		}
-		return strings.Contains(torrents[0].Tags, "synced")
-	}, 3*time.Minute, 2*time.Second, "torrent should have synced tag after cold qBittorrent restart")
+	env.WaitForTorrentCompleteOnCold(ctx, bigBuckBunnyHash, 3*time.Minute, "torrent should be complete on cold after qBittorrent restart")
 
-	t.Log("Torrent synced successfully after cold qBittorrent restart!")
-
-	// Stop orchestrator
 	cancelOrchestrator()
 	<-orchestratorDone
 
-	// Verify torrent on cold
-	coldTorrents, err := env.ColdClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
-		Hashes: []string{bigBuckBunnyHash},
-	})
-	require.NoError(t, err)
-	require.Len(t, coldTorrents, 1)
-	assert.InDelta(t, 1.0, coldTorrents[0].Progress, progressTolerance, "torrent should be 100% on cold")
+	env.AssertTorrentCompleteOnCold(ctx, bigBuckBunnyHash)
 
-	// Cleanup
-	env.CleanupTorrent(ctx, env.HotClient(), bigBuckBunnyHash)
-	env.CleanupTorrent(ctx, env.ColdClient(), bigBuckBunnyHash)
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
 }
 
 // TestE2E_HotQBittorrentRestart tests that the orchestrator can recover after hot qBittorrent restarts.
@@ -501,29 +538,16 @@ func TestE2E_HotQBittorrentRestart(t *testing.T) {
 	env := SetupTestEnv(t)
 	ctx := context.Background()
 
-	// Cleanup any existing torrents
-	env.CleanupTorrent(ctx, env.HotClient(), bigBuckBunnyHash)
-	env.CleanupTorrent(ctx, env.ColdClient(), bigBuckBunnyHash)
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
 
-	// Add torrent to hot and wait for download
 	t.Log("Adding Big Buck Bunny torrent to hot...")
-	err := env.AddTorrentToHot(ctx, bigBuckBunnyURL, nil)
-	require.NoError(t, err)
+	env.DownloadTorrentOnHot(ctx, bigBuckBunnyURL, bigBuckBunnyHash, 5*time.Minute)
 
-	torrent := env.WaitForTorrent(env.HotClient(), bigBuckBunnyHash, 30*time.Second)
-	require.NotNil(t, torrent)
-
-	t.Log("Waiting for torrent to complete downloading...")
-	env.WaitForTorrentComplete(env.HotClient(), bigBuckBunnyHash, 5*time.Minute)
-	t.Log("Torrent download complete")
-
-	// Create hot task
 	cfg := env.CreateHotConfig()
 	task, dest, err := env.CreateHotTask(cfg)
 	require.NoError(t, err)
 	defer dest.Close()
 
-	// Run orchestrator in background
 	orchestratorCtx, cancelOrchestrator := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancelOrchestrator()
 
@@ -532,57 +556,31 @@ func TestE2E_HotQBittorrentRestart(t *testing.T) {
 		orchestratorDone <- task.Run(orchestratorCtx)
 	}()
 
-	// Wait for streaming to start
 	t.Log("Waiting for streaming to start...")
 	time.Sleep(2 * time.Second)
 
-	// Stop hot qBittorrent mid-stream
 	t.Log("Stopping hot qBittorrent mid-stream...")
 	err = env.StopHotQBittorrent(ctx)
 	require.NoError(t, err)
 
-	// Wait a bit while hot qBittorrent is down
-	t.Log("Hot qBittorrent is down, waiting...")
 	time.Sleep(5 * time.Second)
 
-	// Restart hot qBittorrent
 	t.Log("Restarting hot qBittorrent...")
 	err = env.StartHotQBittorrent(ctx)
 	require.NoError(t, err)
 
-	// The torrent should still be there after restart
-	torrent = env.WaitForTorrent(env.HotClient(), bigBuckBunnyHash, 30*time.Second)
+	torrent := env.WaitForTorrent(env.HotClient(), bigBuckBunnyHash, 30*time.Second)
 	require.NotNil(t, torrent, "torrent should still exist after hot qBittorrent restart")
 
-	// Wait for sync to complete
 	t.Log("Waiting for sync to complete after hot qBittorrent restart...")
-	require.Eventually(t, func() bool {
-		torrents, getErr := env.HotClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
-			Hashes: []string{bigBuckBunnyHash},
-		})
-		if getErr != nil || len(torrents) == 0 {
-			return false
-		}
-		return strings.Contains(torrents[0].Tags, "synced")
-	}, 3*time.Minute, 2*time.Second, "torrent should have synced tag after hot qBittorrent restart")
+	env.WaitForTorrentCompleteOnCold(ctx, bigBuckBunnyHash, 3*time.Minute, "torrent should be complete on cold after hot qBittorrent restart")
 
-	t.Log("Torrent synced successfully after hot qBittorrent restart!")
-
-	// Stop orchestrator
 	cancelOrchestrator()
 	<-orchestratorDone
 
-	// Verify torrent on cold
-	coldTorrents, err := env.ColdClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
-		Hashes: []string{bigBuckBunnyHash},
-	})
-	require.NoError(t, err)
-	require.Len(t, coldTorrents, 1)
-	assert.InDelta(t, 1.0, coldTorrents[0].Progress, progressTolerance, "torrent should be 100% on cold")
+	env.AssertTorrentCompleteOnCold(ctx, bigBuckBunnyHash)
 
-	// Cleanup
-	env.CleanupTorrent(ctx, env.HotClient(), bigBuckBunnyHash)
-	env.CleanupTorrent(ctx, env.ColdClient(), bigBuckBunnyHash)
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
 }
 
 // TestE2E_OrchestratorRestart tests that a new orchestrator can resume syncing.
@@ -595,28 +593,15 @@ func TestE2E_OrchestratorRestart(t *testing.T) {
 	env := SetupTestEnv(t)
 	ctx := context.Background()
 
-	// Cleanup any existing torrents
-	env.CleanupTorrent(ctx, env.HotClient(), bigBuckBunnyHash)
-	env.CleanupTorrent(ctx, env.ColdClient(), bigBuckBunnyHash)
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
 
-	// Add torrent to hot and wait for download
 	t.Log("Adding Big Buck Bunny torrent to hot...")
-	err := env.AddTorrentToHot(ctx, bigBuckBunnyURL, nil)
-	require.NoError(t, err)
+	env.DownloadTorrentOnHot(ctx, bigBuckBunnyURL, bigBuckBunnyHash, 5*time.Minute)
 
-	torrent := env.WaitForTorrent(env.HotClient(), bigBuckBunnyHash, 30*time.Second)
-	require.NotNil(t, torrent)
-
-	t.Log("Waiting for torrent to complete downloading...")
-	env.WaitForTorrentComplete(env.HotClient(), bigBuckBunnyHash, 5*time.Minute)
-	t.Log("Torrent download complete")
-
-	// Create first orchestrator
 	cfg := env.CreateHotConfig()
 	task1, dest1, err := env.CreateHotTask(cfg)
 	require.NoError(t, err)
 
-	// Run first orchestrator briefly
 	orchestratorCtx1, cancelOrchestrator1 := context.WithTimeout(ctx, 30*time.Second)
 
 	orchestratorDone1 := make(chan error, 1)
@@ -624,17 +609,14 @@ func TestE2E_OrchestratorRestart(t *testing.T) {
 		orchestratorDone1 <- task1.Run(orchestratorCtx1)
 	}()
 
-	// Wait for some streaming to happen
 	t.Log("Running first orchestrator for a few seconds...")
 	time.Sleep(5 * time.Second)
 
-	// Stop first orchestrator
 	t.Log("Stopping first orchestrator...")
 	cancelOrchestrator1()
 	<-orchestratorDone1
 	dest1.Close()
 
-	// Create second orchestrator
 	t.Log("Starting second orchestrator...")
 	task2, dest2, err := env.CreateHotTask(cfg)
 	require.NoError(t, err)
@@ -648,35 +630,15 @@ func TestE2E_OrchestratorRestart(t *testing.T) {
 		orchestratorDone2 <- task2.Run(orchestratorCtx2)
 	}()
 
-	// Wait for sync to complete with second orchestrator
 	t.Log("Waiting for sync to complete with second orchestrator...")
-	require.Eventually(t, func() bool {
-		torrents, getErr := env.HotClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
-			Hashes: []string{bigBuckBunnyHash},
-		})
-		if getErr != nil || len(torrents) == 0 {
-			return false
-		}
-		return strings.Contains(torrents[0].Tags, "synced")
-	}, 3*time.Minute, 2*time.Second, "torrent should have synced tag after orchestrator restart")
+	env.WaitForTorrentCompleteOnCold(ctx, bigBuckBunnyHash, 3*time.Minute, "torrent should be complete on cold after orchestrator restart")
 
-	t.Log("Torrent synced successfully after orchestrator restart!")
-
-	// Stop second orchestrator
 	cancelOrchestrator2()
 	<-orchestratorDone2
 
-	// Verify torrent on cold
-	coldTorrents, err := env.ColdClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
-		Hashes: []string{bigBuckBunnyHash},
-	})
-	require.NoError(t, err)
-	require.Len(t, coldTorrents, 1)
-	assert.InDelta(t, 1.0, coldTorrents[0].Progress, progressTolerance, "torrent should be 100% on cold")
+	env.AssertTorrentCompleteOnCold(ctx, bigBuckBunnyHash)
 
-	// Cleanup
-	env.CleanupTorrent(ctx, env.HotClient(), bigBuckBunnyHash)
-	env.CleanupTorrent(ctx, env.ColdClient(), bigBuckBunnyHash)
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
 }
 
 // TestE2E_HardlinkDetection verifies that hardlink detection works in the Docker test environment.
@@ -721,7 +683,7 @@ func TestE2E_HardlinkDetection(t *testing.T) {
 }
 
 // TestE2E_HardlinkGroupDeletion tests that hardlinked torrents are deleted together.
-// Scenario: Two torrents share a hardlinked file, both tagged "synced",
+// Scenario: Two torrents share a hardlinked file, both complete on cold,
 // when space cleanup runs, both should be deleted as a group.
 func TestE2E_HardlinkGroupDeletion(t *testing.T) {
 	if testing.Short() {
@@ -735,13 +697,8 @@ func TestE2E_HardlinkGroupDeletion(t *testing.T) {
 	// After they download, we'll hardlink a file between their directories
 	// to simulate cross-seeded content
 
-	// Cleanup any existing torrents
-	env.CleanupTorrent(ctx, env.HotClient(), bigBuckBunnyHash)
-	env.CleanupTorrent(ctx, env.HotClient(), sintelHash)
-	env.CleanupTorrent(ctx, env.ColdClient(), bigBuckBunnyHash)
-	env.CleanupTorrent(ctx, env.ColdClient(), sintelHash)
+	env.CleanupBothSides(ctx, bigBuckBunnyHash, sintelHash)
 
-	// Add both torrents to hot
 	t.Log("Adding Big Buck Bunny and Sintel torrents to hot...")
 	err := env.AddTorrentToHot(ctx, bigBuckBunnyURL, nil)
 	require.NoError(t, err)
@@ -771,34 +728,18 @@ func TestE2E_HardlinkGroupDeletion(t *testing.T) {
 	require.NotNil(t, sintelFiles)
 	require.NotEmpty(t, *sintelFiles)
 
-	// Refresh torrent info to get save paths
-	torrents, err := env.HotClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
-		Hashes: []string{bigBuckBunnyHash},
-	})
-	require.NoError(t, err)
-	require.Len(t, torrents, 1)
-	bbbSavePath := torrents[0].SavePath
-
-	torrents, err = env.HotClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
-		Hashes: []string{sintelHash},
-	})
-	require.NoError(t, err)
-	require.Len(t, torrents, 1)
-	sintelSavePath := torrents[0].SavePath
-
 	// Create hardlink between a BBB file and a Sintel file
 	// We need to hardlink FROM a BBB file TO a path that Sintel expects
 	// Since they have different file structures, we'll add an extra hardlinked file
 	// to BBB's directory that matches one of Sintel's files
 
-	// Get first Sintel file info
+	// Get first file from each torrent - use env.HotPath() for host filesystem access
+	// (qBittorrent's SavePath is the container path, not accessible from host)
 	sintelFirstFile := (*sintelFiles)[0]
-	sintelFilePath := filepath.Join(sintelSavePath, sintelFirstFile.Name)
+	sintelFilePath := filepath.Join(env.HotPath(), sintelFirstFile.Name)
 
-	// Create a hardlink of Sintel's file into BBB's directory structure
-	// This simulates a cross-seed scenario where both torrents share a file
 	bbbFirstFile := (*bbbFiles)[0]
-	bbbFilePath := filepath.Join(bbbSavePath, bbbFirstFile.Name)
+	bbbFilePath := filepath.Join(env.HotPath(), bbbFirstFile.Name)
 
 	t.Logf("BBB file: %s", bbbFilePath)
 	t.Logf("Sintel file: %s", sintelFilePath)
@@ -824,13 +765,6 @@ func TestE2E_HardlinkGroupDeletion(t *testing.T) {
 	require.True(t, linked, "files should now be hardlinked")
 	t.Log("Successfully created hardlink between torrent files")
 
-	// Tag both as synced (prerequisite for deletion)
-	err = env.HotClient().AddTagsCtx(ctx, []string{bigBuckBunnyHash}, "synced")
-	require.NoError(t, err)
-	err = env.HotClient().AddTagsCtx(ctx, []string{sintelHash}, "synced")
-	require.NoError(t, err)
-	t.Log("Both torrents tagged as synced")
-
 	// Create hot task with Force mode (to bypass space check) and no min seeding time
 	cfg := env.CreateHotConfig(WithForce(true), WithMinSeedingTime(0))
 	task, dest, err := env.CreateHotTask(cfg)
@@ -840,6 +774,11 @@ func TestE2E_HardlinkGroupDeletion(t *testing.T) {
 	// Login
 	err = task.Login(ctx)
 	require.NoError(t, err)
+
+	// Mark both as complete on cold (simulates sync without actually syncing)
+	task.MarkCompletedOnCold(bigBuckBunnyHash)
+	task.MarkCompletedOnCold(sintelHash)
+	t.Log("Both torrents marked as complete on cold")
 
 	// Run maybeMoveToCold - this should detect the hardlink group and delete both
 	t.Log("Running maybeMoveToCold...")
@@ -854,11 +793,7 @@ func TestE2E_HardlinkGroupDeletion(t *testing.T) {
 
 	t.Log("Both hardlinked torrents were deleted together as expected!")
 
-	// Cleanup (already deleted, but just in case)
-	env.CleanupTorrent(ctx, env.HotClient(), bigBuckBunnyHash)
-	env.CleanupTorrent(ctx, env.HotClient(), sintelHash)
-	env.CleanupTorrent(ctx, env.ColdClient(), bigBuckBunnyHash)
-	env.CleanupTorrent(ctx, env.ColdClient(), sintelHash)
+	env.CleanupBothSides(ctx, bigBuckBunnyHash, sintelHash)
 }
 
 // TestE2E_ColdHardlinkDeduplication tests that the cold server creates hardlinks
@@ -877,21 +812,11 @@ func TestE2E_ColdHardlinkDeduplication(t *testing.T) {
 	env := SetupTestEnv(t)
 	ctx := context.Background()
 
-	// Cleanup any existing torrents
-	env.CleanupTorrent(ctx, env.HotClient(), bigBuckBunnyHash)
-	env.CleanupTorrent(ctx, env.ColdClient(), bigBuckBunnyHash)
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
 
 	// Step 1: Sync Big Buck Bunny to cold (this registers the file inodes)
 	t.Log("Adding Big Buck Bunny torrent to hot...")
-	err := env.AddTorrentToHot(ctx, bigBuckBunnyURL, nil)
-	require.NoError(t, err)
-
-	torrent := env.WaitForTorrent(env.HotClient(), bigBuckBunnyHash, 30*time.Second)
-	require.NotNil(t, torrent)
-
-	t.Log("Waiting for torrent to complete downloading...")
-	env.WaitForTorrentComplete(env.HotClient(), bigBuckBunnyHash, 5*time.Minute)
-	t.Log("Torrent download complete")
+	torrent := env.DownloadTorrentOnHot(ctx, bigBuckBunnyURL, bigBuckBunnyHash, 5*time.Minute)
 
 	// Get file info and inodes from HOT filesystem BEFORE sync
 	// These are the SOURCE inodes that will be registered on cold during sync
@@ -935,17 +860,9 @@ func TestE2E_ColdHardlinkDeduplication(t *testing.T) {
 		orchestratorDone <- task.Run(orchestratorCtx)
 	}()
 
-	// Wait for sync to complete
+	// Wait for sync to complete (torrent complete on cold qBittorrent)
 	t.Log("Waiting for Big Buck Bunny to sync to cold...")
-	require.Eventually(t, func() bool {
-		torrents, getErr := env.HotClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
-			Hashes: []string{bigBuckBunnyHash},
-		})
-		if getErr != nil || len(torrents) == 0 {
-			return false
-		}
-		return strings.Contains(torrents[0].Tags, "synced")
-	}, 3*time.Minute, 2*time.Second, "torrent should have synced tag on hot")
+	env.WaitForTorrentCompleteOnCold(ctx, bigBuckBunnyHash, 3*time.Minute, "torrent should be complete on cold")
 
 	// Stop orchestrator
 	cancelOrchestrator()
@@ -1009,15 +926,15 @@ func TestE2E_ColdHardlinkDeduplication(t *testing.T) {
 	assert.Equal(t, len(pbFiles), hardlinkedCount,
 		"all %d files should be hardlinked (got %d)", len(pbFiles), hardlinkedCount)
 
-	// Verify pieces are covered
+	// Verify pieces are covered (not needed = covered by hardlinks)
 	coveredCount := 0
-	for _, covered := range initResult.PiecesCovered {
-		if covered {
+	for _, needed := range initResult.PiecesNeeded {
+		if !needed {
 			coveredCount++
 		}
 	}
-	t.Logf("Pieces covered by hardlinks: %d/%d", coveredCount, len(initResult.PiecesCovered))
-	assert.Equal(t, len(initResult.PiecesCovered), coveredCount,
+	t.Logf("Pieces covered by hardlinks: %d/%d", coveredCount, len(initResult.PiecesNeeded))
+	assert.Equal(t, len(initResult.PiecesNeeded), coveredCount,
 		"all pieces should be covered by hardlinked files")
 
 	// Step 5: Verify the files on cold filesystem are actual hardlinks
@@ -1051,12 +968,10 @@ func TestE2E_ColdHardlinkDeduplication(t *testing.T) {
 
 	t.Log("Cold hardlink deduplication test completed successfully!")
 	t.Logf("  - Files hardlinked: %d/%d", hardlinkedCount, len(pbFiles))
-	t.Logf("  - Pieces covered: %d/%d", coveredCount, len(initResult.PiecesCovered))
+	t.Logf("  - Pieces covered: %d/%d", coveredCount, len(initResult.PiecesNeeded))
 	t.Log("  - All hardlinks verified on filesystem")
 
-	// Cleanup
-	env.CleanupTorrent(ctx, env.HotClient(), bigBuckBunnyHash)
-	env.CleanupTorrent(ctx, env.ColdClient(), bigBuckBunnyHash)
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
 }
 
 // TestE2E_NonHardlinkedDeletedIndependently verifies that non-hardlinked torrents
@@ -1087,13 +1002,7 @@ func TestE2E_NonHardlinkedDeletedIndependently(t *testing.T) {
 	// Wait for download (we don't need full download for this test, but need some progress)
 	t.Log("Waiting for torrents to download...")
 	env.WaitForTorrentComplete(env.HotClient(), bigBuckBunnyHash, 5*time.Minute)
-	// Don't wait for Sintel - just tag it anyway
-
-	// Tag both as synced
-	err = env.HotClient().AddTagsCtx(ctx, []string{bigBuckBunnyHash}, "synced")
-	require.NoError(t, err)
-	err = env.HotClient().AddTagsCtx(ctx, []string{sintelHash}, "synced")
-	require.NoError(t, err)
+	// Don't wait for Sintel - just mark it as complete anyway
 
 	// Verify they're NOT hardlinked (they shouldn't be - different files)
 	torrents, err := env.HotClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
@@ -1107,6 +1016,10 @@ func TestE2E_NonHardlinkedDeletedIndependently(t *testing.T) {
 	task, dest, err := env.CreateHotTask(cfg)
 	require.NoError(t, err)
 	defer dest.Close()
+
+	// Mark both as complete on cold (simulates sync without actually syncing)
+	task.MarkCompletedOnCold(bigBuckBunnyHash)
+	task.MarkCompletedOnCold(sintelHash)
 
 	err = task.Login(ctx)
 	require.NoError(t, err)
@@ -1124,7 +1037,6 @@ func TestE2E_NonHardlinkedDeletedIndependently(t *testing.T) {
 
 	t.Log("Non-hardlinked torrents were deleted independently as expected!")
 
-	// Cleanup
 	env.CleanupTorrent(ctx, env.HotClient(), bigBuckBunnyHash)
 	env.CleanupTorrent(ctx, env.HotClient(), sintelHash)
 }
@@ -1140,16 +1052,12 @@ func TestE2E_FullSyncFlowSintel(t *testing.T) {
 	env := SetupTestEnv(t)
 	ctx := context.Background()
 
-	// Cleanup any existing torrents on both hot and cold
-	env.CleanupTorrent(ctx, env.HotClient(), sintelHash)
-	env.CleanupTorrent(ctx, env.ColdClient(), sintelHash)
+	env.CleanupBothSides(ctx, sintelHash)
 
-	// Add Sintel torrent to hot and wait for download
 	t.Log("Adding Sintel torrent to hot (11 files)...")
 	err := env.AddTorrentToHot(ctx, testTorrentURL, nil)
 	require.NoError(t, err)
 
-	// Wait for torrent to appear
 	torrent := env.WaitForTorrent(env.HotClient(), sintelHash, 30*time.Second)
 	require.NotNil(t, torrent)
 	t.Logf("Torrent added: %s", torrent.Name)
@@ -1181,39 +1089,17 @@ func TestE2E_FullSyncFlowSintel(t *testing.T) {
 		orchestratorDone <- task.Run(orchestratorCtx)
 	}()
 
-	// Wait for torrent to be synced (has synced tag on hot)
+	// Wait for torrent to be synced (complete on cold qBittorrent)
 	t.Log("Waiting for torrent to be synced to cold...")
-	require.Eventually(t, func() bool {
-		torrents, getErr := env.HotClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
-			Hashes: []string{sintelHash},
-		})
-		if getErr != nil || len(torrents) == 0 {
-			return false
-		}
-		return strings.Contains(torrents[0].Tags, "synced")
-	}, 5*time.Minute, 2*time.Second, "torrent should have synced tag on hot")
+	env.WaitForTorrentCompleteOnCold(ctx, sintelHash, 5*time.Minute, "torrent should be complete on cold")
 
-	t.Log("Torrent has synced tag on hot")
+	t.Log("Torrent is complete on cold qBittorrent")
 
 	// Stop the orchestrator
 	cancelOrchestrator()
 	<-orchestratorDone
 
-	// Verify torrent exists on cold qBittorrent
-	coldTorrents, err := env.ColdClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
-		Hashes: []string{sintelHash},
-	})
-	require.NoError(t, err)
-	require.Len(t, coldTorrents, 1, "torrent should exist on cold qBittorrent")
-
-	coldTorrent := coldTorrents[0]
-	t.Logf("Torrent on cold: %s (progress: %.2f%%)", coldTorrent.Name, coldTorrent.Progress*100)
-
-	// Verify torrent is complete on cold (100% progress)
-	assert.InDelta(t, 1.0, coldTorrent.Progress, progressTolerance, "torrent should be 100% complete on cold")
-
-	// Verify torrent hash matches
-	assert.Equal(t, sintelHash, coldTorrent.Hash, "torrent hash should match")
+	env.AssertTorrentCompleteOnCold(ctx, sintelHash)
 
 	// Verify all files exist on cold
 	coldFiles, err := env.ColdClient().GetFilesInformationCtx(ctx, sintelHash)
@@ -1223,9 +1109,7 @@ func TestE2E_FullSyncFlowSintel(t *testing.T) {
 
 	t.Logf("Full sync flow with Sintel (%d files) completed successfully!", len(*coldFiles))
 
-	// Cleanup
-	env.CleanupTorrent(ctx, env.HotClient(), sintelHash)
-	env.CleanupTorrent(ctx, env.ColdClient(), sintelHash)
+	env.CleanupBothSides(ctx, sintelHash)
 }
 
 // TestE2E_OrphanCleanupOnTorrentRemoval tests that partial files are cleaned up
@@ -1239,21 +1123,10 @@ func TestE2E_OrphanCleanupOnTorrentRemoval(t *testing.T) {
 	env := SetupTestEnv(t)
 	ctx := context.Background()
 
-	// Cleanup any existing torrents
-	env.CleanupTorrent(ctx, env.HotClient(), bigBuckBunnyHash)
-	env.CleanupTorrent(ctx, env.ColdClient(), bigBuckBunnyHash)
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
 
-	// Add torrent to hot and wait for download
 	t.Log("Adding Big Buck Bunny torrent to hot...")
-	err := env.AddTorrentToHot(ctx, bigBuckBunnyURL, nil)
-	require.NoError(t, err)
-
-	torrent := env.WaitForTorrent(env.HotClient(), bigBuckBunnyHash, 30*time.Second)
-	require.NotNil(t, torrent)
-
-	t.Log("Waiting for torrent to complete downloading...")
-	env.WaitForTorrentComplete(env.HotClient(), bigBuckBunnyHash, 5*time.Minute)
-	t.Log("Torrent download complete")
+	env.DownloadTorrentOnHot(ctx, bigBuckBunnyURL, bigBuckBunnyHash, 5*time.Minute)
 
 	// Create hot task
 	cfg := env.CreateHotConfig()
@@ -1287,7 +1160,7 @@ func TestE2E_OrphanCleanupOnTorrentRemoval(t *testing.T) {
 	t.Logf("Streaming started with %d pieces transferred, now removing torrent from hot...", initialProgress)
 
 	// Check that partial files exist on cold before removal
-	coldMetaDir := filepath.Join(env.ColdPath(), ".meta", bigBuckBunnyHash)
+	coldMetaDir := filepath.Join(env.ColdPath(), ".qbsync", bigBuckBunnyHash)
 	_, metaErr := os.Stat(coldMetaDir)
 	require.NoError(t, metaErr, "cold meta directory should exist during streaming")
 	t.Logf("Cold meta directory exists: %s", coldMetaDir)
@@ -1338,7 +1211,5 @@ func TestE2E_OrphanCleanupOnTorrentRemoval(t *testing.T) {
 
 	t.Log("Orphan cleanup on torrent removal test completed successfully!")
 
-	// Final cleanup (should be no-op, but ensure clean state)
-	env.CleanupTorrent(ctx, env.HotClient(), bigBuckBunnyHash)
-	env.CleanupTorrent(ctx, env.ColdClient(), bigBuckBunnyHash)
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
 }

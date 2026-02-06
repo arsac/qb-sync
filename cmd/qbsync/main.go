@@ -38,7 +38,7 @@ Run as cold server to receive pieces and manage destination qBittorrent.`,
 	hotCmd := &cobra.Command{
 		Use:   "hot",
 		Short: "Run as hot (source) server",
-		Long:  "Stream pieces from local qBittorrent to cold server, manage synced tags.",
+		Long:  "Stream pieces from local qBittorrent to cold server.",
 		RunE:  runHot,
 	}
 
@@ -128,6 +128,7 @@ func runCold(cmd *cobra.Command, _ []string) error {
 	log.Info("starting cold server",
 		"listen", cfg.ListenAddr,
 		"data", cfg.DataPath,
+		"savePath", cfg.SavePath,
 		"qbURL", cfg.QBURL,
 		"healthAddr", cfg.HealthAddr,
 		"dryRun", cfg.DryRun,
@@ -149,6 +150,9 @@ func runCold(cmd *cobra.Command, _ []string) error {
 	serverCfg := cold.ServerConfig{
 		ListenAddr: cfg.ListenAddr,
 		BasePath:   cfg.DataPath,
+		SavePath:   cfg.SavePath,
+		SyncedTag:  cfg.SyncedTag,
+		DryRun:     cfg.DryRun,
 	}
 
 	// Add qBittorrent config if provided

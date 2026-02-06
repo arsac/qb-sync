@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -222,8 +223,21 @@ func (p *StreamPool) Open(ctx context.Context, numStreams int) error {
 
 // forwardAcks reads acks from a single stream and forwards them to the pool's
 // aggregated channels. Also forwards errors from the stream.
-func (p *StreamPool) forwardAcks(ps *PooledStream) {
+func (p *StreamPool) forwardAcks(ps *PooledStream) { //nolint:gocognit // complexity from panic recovery
 	defer p.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			p.logger.Error("panic in forwardAcks",
+				"streamID", ps.id,
+				"panic", r,
+				"stack", string(debug.Stack()),
+			)
+			select {
+			case p.errs <- fmt.Errorf("panic in forwardAcks (stream %d): %v", ps.id, r):
+			default:
+			}
+		}
+	}()
 
 	for {
 		select {
@@ -667,6 +681,7 @@ func (p *StreamPool) Stats() StreamPoolStats {
 
 	// Update Prometheus metrics
 	metrics.InflightPieces.Set(float64(stats.TotalInFlight))
+	metrics.TransferThroughputBytesPerSecond.Set(p.lastThroughput)
 	if len(p.streams) > 0 {
 		metrics.AdaptiveWindowSize.Set(float64(totalWindow) / float64(len(p.streams)))
 	}

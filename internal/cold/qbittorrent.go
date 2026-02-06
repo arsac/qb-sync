@@ -4,13 +4,34 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
+	"time"
 
 	"github.com/autobrr/go-qbittorrent"
 
 	"github.com/arsac/qb-sync/internal/utils"
 	pb "github.com/arsac/qb-sync/proto"
 )
+
+// getQBTorrent logs in to qBittorrent and fetches a torrent by hash.
+// Returns (torrent, found, error). If the torrent does not exist, found is false with nil error.
+func (s *Server) getQBTorrent(ctx context.Context, hash string) (*qbittorrent.Torrent, bool, error) {
+	if loginErr := s.qbClient.LoginCtx(ctx); loginErr != nil {
+		return nil, false, fmt.Errorf("login failed: %w", loginErr)
+	}
+
+	torrents, getErr := s.qbClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+		Hashes: []string{hash},
+	})
+	if getErr != nil {
+		return nil, false, fmt.Errorf("fetching torrent: %w", getErr)
+	}
+
+	if len(torrents) == 0 {
+		return nil, false, nil
+	}
+
+	return &torrents[0], true, nil
+}
 
 // addAndVerifyTorrent adds the torrent to qBittorrent and waits for verification.
 func (s *Server) addAndVerifyTorrent(
@@ -19,23 +40,12 @@ func (s *Server) addAndVerifyTorrent(
 	state *serverTorrentState,
 	req *pb.FinalizeTorrentRequest,
 ) (qbittorrent.TorrentState, error) {
-	// Login to qBittorrent
-	if loginErr := s.qbClient.LoginCtx(ctx); loginErr != nil {
-		return "", fmt.Errorf("login failed: %w", loginErr)
-	}
-
-	// Check if torrent already exists
-	existing, getErr := s.qbClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
-		Hashes: []string{hash},
-	})
+	existingTorrent, found, getErr := s.getQBTorrent(ctx, hash)
 	if getErr != nil {
 		return "", fmt.Errorf("checking existing: %w", getErr)
 	}
 
-	if len(existing) > 0 {
-		// Torrent already exists - check its state
-		existingTorrent := existing[0]
-
+	if found {
 		// If it's in error state, return error
 		if isErrorState(existingTorrent.State) {
 			return existingTorrent.State, fmt.Errorf("torrent in error state: %s", existingTorrent.State)
@@ -54,22 +64,22 @@ func (s *Server) addAndVerifyTorrent(
 		return existingTorrent.State, nil
 	}
 
+
 	// Torrent doesn't exist - add it
 	torrentData, readErr := os.ReadFile(state.torrentPath)
 	if readErr != nil {
 		return "", fmt.Errorf("reading torrent file: %w", readErr)
 	}
 
-	// Calculate save path
-	savePath := req.GetSavePath()
-	if savePath == "" {
-		savePath = filepath.Join(s.config.BasePath, hash)
-	}
+	// Use the cold-side save path (container mount point, e.g., "/downloads").
+	// The hot's save path from req is meaningless on the cold side.
+	savePath := s.config.GetSavePath()
 
 	opts := map[string]string{
 		"savepath":           savePath,
-		"skip_checking":      "true", // We verified pieces on write via SHA1 hash
-		"paused":             "false",
+		"skip_checking":      "true",  // We verified pieces on write via SHA1 hash
+		"stopped":            "true",  // Add stopped so hot controls when cold starts seeding (qB v5+)
+		"paused":             "true",  // Compat alias for qB v4.x
 		"autoTMM":            "false",
 		"sequentialDownload": "false",
 	}
@@ -92,11 +102,20 @@ func (s *Server) addAndVerifyTorrent(
 
 	// Wait for torrent to be ready (skip_checking=true so should be immediate)
 	finalState, waitErr := s.waitForTorrentReady(ctx, hash)
-	if waitErr != nil {
-		return finalState, waitErr
+
+	// Always stop the torrent after adding, even if waitForTorrentReady was
+	// interrupted by context cancellation. Uses a detached context because the
+	// gRPC caller may cancel before the wait completes, but the stop must succeed
+	// to prevent dual seeding. qBittorrent may also briefly transition through an
+	// active state (e.g. stalledUP) even with stopped=true+skip_checking=true.
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer stopCancel()
+	if stopErr := s.qbClient.StopCtx(stopCtx, []string{hash}); stopErr != nil {
+		s.logger.WarnContext(ctx, "failed to stop torrent after add (may already be stopped)",
+			"hash", hash, "error", stopErr)
 	}
 
-	return finalState, nil
+	return finalState, waitErr
 }
 
 // waitForTorrentReady polls until the torrent is verified and ready.
@@ -168,6 +187,43 @@ func (s *Server) waitForTorrentReady(ctx context.Context, hash string) (qbittorr
 	}, interval, timeout)
 
 	return finalState, waitErr
+}
+
+// StartTorrent resumes a stopped torrent on cold qBittorrent.
+func (s *Server) StartTorrent(ctx context.Context, req *pb.StartTorrentRequest) (*pb.StartTorrentResponse, error) {
+	hash := req.GetTorrentHash()
+
+	if s.qbClient == nil {
+		return &pb.StartTorrentResponse{
+			Success: false,
+			Error:   "cold qBittorrent not configured",
+		}, nil
+	}
+
+	_, found, getErr := s.getQBTorrent(ctx, hash)
+	if getErr != nil {
+		return &pb.StartTorrentResponse{
+			Success: false,
+			Error:   fmt.Sprintf("checking torrent: %v", getErr),
+		}, nil
+	}
+	if !found {
+		return &pb.StartTorrentResponse{
+			Success: false,
+			Error:   "torrent does not exist on cold qBittorrent",
+		}, nil
+	}
+
+	if resumeErr := s.qbClient.ResumeCtx(ctx, []string{hash}); resumeErr != nil {
+		return &pb.StartTorrentResponse{
+			Success: false,
+			Error:   fmt.Sprintf("resume failed: %v", resumeErr),
+		}, nil
+	}
+
+	s.logger.InfoContext(ctx, "started torrent on cold qBittorrent", "hash", hash)
+
+	return &pb.StartTorrentResponse{Success: true}, nil
 }
 
 // isErrorState returns true if the torrent state indicates an error.

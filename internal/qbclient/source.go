@@ -2,14 +2,12 @@ package qbclient
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io"
 	"math"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/autobrr/go-qbittorrent"
 
@@ -18,10 +16,13 @@ import (
 	pb "github.com/arsac/qb-sync/proto"
 )
 
+var _ streaming.PieceSource = (*Source)(nil)
+
 // Source implements streaming.PieceSource using qBittorrent API.
 type Source struct {
 	client      *ResilientClient
-	contentPath string // Base path where torrent content is stored
+	contentPath string   // Base path where torrent content is stored
+	fileCache   sync.Map // hash -> []*pb.FileInfo — cached file lists for ReadPiece
 }
 
 // NewSource creates a new qBittorrent piece source with resilient client.
@@ -163,40 +164,35 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 
 // ReadPiece reads a piece's data from disk.
 func (s *Source) ReadPiece(ctx context.Context, piece *pb.Piece) ([]byte, error) {
-	// Get torrent metadata to find content path
-	meta, err := s.GetTorrentMetadata(ctx, piece.GetTorrentHash())
+	hash := piece.GetTorrentHash()
+
+	files, err := s.cachedFiles(ctx, hash)
 	if err != nil {
 		return nil, err
 	}
 
-	// For single-file torrents, ContentDir is the file itself
-	// For multi-file torrents, ContentDir is the directory
-	contentPath := meta.ContentDir
-	files := meta.GetFiles()
-
-	// If it's a single file torrent (one file that matches total size)
-	if len(files) == 1 && files[0].GetSize() == meta.GetTotalSize() {
-		return s.readPieceFromFile(contentPath, piece.GetOffset(), piece.GetSize())
-	}
-
-	// Multi-file torrent: piece may span multiple files
-	return s.readPieceMultiFile(contentPath, files, piece.GetOffset(), piece.GetSize())
+	return s.readPieceMultiFile(s.contentPath, files, piece.GetOffset(), piece.GetSize())
 }
 
-func (s *Source) readPieceFromFile(path string, offset, size int64) ([]byte, error) {
-	file, err := os.Open(path)
+// cachedFiles returns the file list for a torrent, fetching and caching on first access.
+func (s *Source) cachedFiles(ctx context.Context, hash string) ([]*pb.FileInfo, error) {
+	if cached, ok := s.fileCache.Load(hash); ok {
+		return cached.([]*pb.FileInfo), nil
+	}
+
+	meta, err := s.GetTorrentMetadata(ctx, hash)
 	if err != nil {
-		return nil, fmt.Errorf("opening file: %w", err)
-	}
-	defer file.Close()
-
-	data := make([]byte, size)
-	n, err := file.ReadAt(data, offset)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("reading piece: %w", err)
+		return nil, err
 	}
 
-	return data[:n], nil
+	files := meta.GetFiles()
+	s.fileCache.Store(hash, files)
+	return files, nil
+}
+
+// EvictCache removes cached file metadata for a torrent after finalization.
+func (s *Source) EvictCache(hash string) {
+	s.fileCache.Delete(hash)
 }
 
 func (s *Source) readPieceMultiFile(
@@ -204,41 +200,13 @@ func (s *Source) readPieceMultiFile(
 	files []*pb.FileInfo,
 	offset, size int64,
 ) ([]byte, error) {
-	data := make([]byte, 0, size)
-	remaining := size
-	currentOffset := offset
-
-	for _, file := range files {
-		fileEnd := file.GetOffset() + file.GetSize()
-
-		// Skip files before our offset
-		if fileEnd <= currentOffset {
-			continue
+	regions := make([]utils.FileRegion, len(files))
+	for i, f := range files {
+		regions[i] = utils.FileRegion{
+			Path:   filepath.Join(basePath, f.GetPath()),
+			Offset: f.GetOffset(),
+			Size:   f.GetSize(),
 		}
-
-		// Stop if we've read everything
-		if remaining <= 0 {
-			break
-		}
-
-		// Calculate read position within this file
-		fileReadOffset := max(currentOffset-file.GetOffset(), 0)
-
-		// Calculate how much to read from this file
-		availableInFile := file.GetSize() - fileReadOffset
-		toRead := min(remaining, availableInFile)
-
-		// Read from file
-		filePath := filepath.Join(basePath, file.GetPath())
-		chunk, err := s.readPieceFromFile(filePath, fileReadOffset, toRead)
-		if err != nil {
-			return nil, fmt.Errorf("reading from %s: %w", file.GetPath(), err)
-		}
-
-		data = append(data, chunk...)
-		remaining -= int64(len(chunk))
-		currentOffset += int64(len(chunk))
 	}
-
-	return data, nil
+	return utils.ReadPieceFromFiles(regions, offset, size)
 }
