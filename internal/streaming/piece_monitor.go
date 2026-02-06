@@ -10,6 +10,7 @@ import (
 
 	"github.com/autobrr/go-qbittorrent"
 
+	"github.com/arsac/qb-sync/internal/metrics"
 	"github.com/arsac/qb-sync/internal/utils"
 	pb "github.com/arsac/qb-sync/proto"
 )
@@ -24,6 +25,11 @@ const (
 	completedChannelBufSize = 1000
 	removedChannelBufSize   = 100
 	completeProgress        = 1.0
+
+	idleThreshold  = 5 // consecutive polls with no new pieces before slowing down
+	idleSlowFactor = 5 // poll idle torrents every Nth tick (10s instead of 2s)
+
+	queueFullLogInterval = 30 * time.Second // minimum interval between "queue full" warnings
 )
 
 // PieceMonitorConfig configures the piece tracker.
@@ -45,6 +51,7 @@ type torrentState struct {
 	lastStates []PieceState
 	streamed   []bool // pieces successfully streamed
 	failed     []bool // pieces that failed (for retry logic)
+	idleTicks  int    // consecutive polls with no new pieces completed
 	mu         sync.RWMutex
 }
 
@@ -59,8 +66,9 @@ type PieceMonitor struct {
 	retryConfig utils.RetryConfig     // Retry config for MainData.Update
 	mainData    *qbittorrent.MainData // Cached maindata with rid for incremental updates
 
-	torrents map[string]*torrentState
-	mu       sync.RWMutex
+	torrents  map[string]*torrentState
+	mu        sync.RWMutex
+	tickCount uint64 // monotonic counter for idle skip modulo
 
 	// Channel to signal newly completed pieces
 	completed chan *pb.Piece
@@ -71,6 +79,8 @@ type PieceMonitor struct {
 
 	closed    atomic.Bool // Prevents sends after channel close
 	closeOnce sync.Once   // Ensures channel is closed exactly once
+
+	queueFullLogTime time.Time // last time we logged "piece queue full"
 }
 
 // NewPieceMonitor creates a new piece tracker.
@@ -469,6 +479,8 @@ func (t *PieceMonitor) startTracking(ctx context.Context, hash string, alreadyWr
 
 // pollActiveTorrents fetches piece states for all tracked torrents.
 func (t *PieceMonitor) pollActiveTorrents(ctx context.Context) {
+	t.tickCount++
+
 	t.mu.RLock()
 	hashes := make([]string, 0, len(t.torrents))
 	for hash := range t.torrents {
@@ -477,6 +489,11 @@ func (t *PieceMonitor) pollActiveTorrents(ctx context.Context) {
 	t.mu.RUnlock()
 
 	for _, hash := range hashes {
+		if t.shouldSkipIdleTorrent(hash) {
+			metrics.IdlePollSkipsTotal.Inc()
+			continue
+		}
+
 		if err := t.pollTorrentPieces(ctx, hash); err != nil {
 			// If the torrent is no longer found, treat it as removed.
 			// This handles cases where the torrent was deleted between maindata syncs.
@@ -490,6 +507,23 @@ func (t *PieceMonitor) pollActiveTorrents(ctx context.Context) {
 			)
 		}
 	}
+}
+
+// shouldSkipIdleTorrent returns true if the torrent has been idle long enough
+// to skip this poll tick. Idle torrents are polled every idleSlowFactor ticks.
+func (t *PieceMonitor) shouldSkipIdleTorrent(hash string) bool {
+	t.mu.RLock()
+	state, ok := t.torrents[hash]
+	t.mu.RUnlock()
+	if !ok {
+		return false
+	}
+
+	state.mu.RLock()
+	idle := state.idleTicks
+	state.mu.RUnlock()
+
+	return idle >= idleThreshold && t.tickCount%idleSlowFactor != 0
 }
 
 // handleTorrentNotFound handles detection of a removed torrent via 404 error.
@@ -525,23 +559,29 @@ func (t *PieceMonitor) pollTorrentPieces(ctx context.Context, hash string) error
 		return ErrTorrentNotTracked
 	}
 
-	t.queueCompletedPieces(ctx, state, states)
+	newPieces := t.queueCompletedPieces(ctx, state, states)
 
 	state.mu.Lock()
 	state.lastStates = states
+	if newPieces > 0 {
+		state.idleTicks = 0
+	} else {
+		state.idleTicks++
+	}
 	state.mu.Unlock()
 
 	return nil
 }
 
-func (t *PieceMonitor) queueCompletedPieces(ctx context.Context, state *torrentState, current []PieceState) {
+func (t *PieceMonitor) queueCompletedPieces(ctx context.Context, state *torrentState, current []PieceState) int {
 	if t.closed.Load() {
-		return
+		return 0
 	}
 
 	state.mu.RLock()
 	defer state.mu.RUnlock()
 
+	var queued, skipped int
 	for i, pieceState := range current {
 		if pieceState != PieceStateDownloaded {
 			continue
@@ -554,19 +594,27 @@ func (t *PieceMonitor) queueCompletedPieces(ctx context.Context, state *torrentS
 
 		switch {
 		case t.trySendCompletedNonBlocking(ctx, piece):
+			queued++
 			t.logger.DebugContext(ctx, "queued piece",
 				"hash", state.meta.GetTorrentHash(),
 				"piece", i,
 			)
 		case ctx.Err() != nil:
-			return
+			return queued
 		case !t.closed.Load():
-			t.logger.WarnContext(ctx, "piece queue full, will retry",
-				"hash", state.meta.GetTorrentHash(),
-				"piece", i,
-			)
+			skipped++
 		}
 	}
+
+	if skipped > 0 && time.Since(t.queueFullLogTime) >= queueFullLogInterval {
+		t.logger.WarnContext(ctx, "piece queue full, will retry",
+			"hash", state.meta.GetTorrentHash(),
+			"skipped", skipped,
+		)
+		t.queueFullLogTime = time.Now()
+	}
+
+	return queued
 }
 
 func (t *PieceMonitor) buildPiece(state *torrentState, index int) *pb.Piece {

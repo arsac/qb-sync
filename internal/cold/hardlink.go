@@ -3,10 +3,10 @@ package cold
 import (
 	"context"
 	"fmt"
-	"math"
 	"os"
 	"path/filepath"
 
+	"github.com/arsac/qb-sync/internal/metrics"
 	pb "github.com/arsac/qb-sync/proto"
 )
 
@@ -64,6 +64,7 @@ func (s *Server) CreateHardlink(
 		}, nil
 	}
 
+	metrics.HardlinksCreatedTotal.Inc()
 	s.logger.InfoContext(ctx, "created hardlink",
 		"source", req.GetSourcePath(),
 		"target", req.GetTargetPath(),
@@ -77,10 +78,7 @@ func (s *Server) GetFileByInode(
 	_ context.Context,
 	req *pb.GetFileByInodeRequest,
 ) (*pb.GetFileByInodeResponse, error) {
-	s.inodeMu.RLock()
-	path, found := s.inodeToPath[req.GetInode()]
-	s.inodeMu.RUnlock()
-
+	path, found := s.inodes.GetRegistered(Inode(req.GetInode()))
 	return &pb.GetFileByInodeResponse{
 		Found: found,
 		Path:  path,
@@ -92,7 +90,7 @@ func (s *Server) RegisterFile(
 	ctx context.Context,
 	req *pb.RegisterFileRequest,
 ) (*pb.RegisterFileResponse, error) {
-	inode := req.GetInode()
+	inode := Inode(req.GetInode())
 	path := req.GetPath()
 
 	// Verify the file exists and has expected size
@@ -112,12 +110,10 @@ func (s *Server) RegisterFile(
 		}, nil
 	}
 
-	s.inodeMu.Lock()
-	s.inodeToPath[inode] = path
-	s.inodeMu.Unlock()
+	s.inodes.Register(inode, path)
 
 	// Persist inode map after registration
-	if saveErr := s.saveInodeMap(); saveErr != nil {
+	if saveErr := s.inodes.Save(); saveErr != nil {
 		s.logger.WarnContext(ctx, "failed to persist inode map", "error", saveErr)
 	}
 
@@ -127,39 +123,4 @@ func (s *Server) RegisterFile(
 	)
 
 	return &pb.RegisterFileResponse{Success: true}, nil
-}
-
-// GetWrittenPieces returns which pieces have been written for a torrent.
-func (s *Server) GetWrittenPieces(
-	_ context.Context,
-	req *pb.GetWrittenPiecesRequest,
-) (*pb.GetWrittenPiecesResponse, error) {
-	s.mu.RLock()
-	state, exists := s.torrents[req.GetTorrentHash()]
-	s.mu.RUnlock()
-
-	if !exists {
-		return &pb.GetWrittenPiecesResponse{}, nil
-	}
-
-	state.mu.Lock()
-	defer state.mu.Unlock()
-
-	written := make([]bool, len(state.written))
-	copy(written, state.written)
-
-	var count int32
-	for _, w := range written {
-		if w {
-			count++
-		}
-	}
-
-	totalPieces := min(len(written), math.MaxInt32)
-
-	return &pb.GetWrittenPiecesResponse{
-		Written:      written,
-		TotalPieces:  int32(totalPieces),
-		WrittenCount: count,
-	}, nil
 }

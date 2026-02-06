@@ -115,6 +115,39 @@ func IsRetriableError(err error) bool {
 	return false
 }
 
+// IsCircuitBreakerFailure determines if an error should count against the circuit breaker.
+// Some errors (like 404 Not Found) indicate the resource doesn't exist, not that the
+// service is unavailable. These should NOT trip the circuit breaker.
+func IsCircuitBreakerFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Context errors indicate caller cancellation, not service failure
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
+	errStr := strings.ToLower(err.Error())
+
+	// 404 errors indicate resource not found (e.g., deleted torrent).
+	// This is expected behavior, not a service availability issue.
+	if strings.Contains(errStr, "404") || strings.Contains(errStr, "not found") {
+		return false
+	}
+
+	// qBittorrent returns "Not Found" as plain text for missing torrents.
+	// The go-qbittorrent library tries to unmarshal this as JSON, resulting in:
+	// "could not unmarshal body: invalid character 'n' looking for beginning of value"
+	// (Note: lowercase 'n' after strings.ToLower normalization)
+	if strings.Contains(errStr, "could not unmarshal body: invalid character 'n'") {
+		return false
+	}
+
+	// All other errors are considered circuit breaker failures
+	return true
+}
+
 // Retry executes the given function with exponential backoff retry logic.
 // Returns the result and final error after all retries are exhausted.
 func Retry[T any](
@@ -328,7 +361,11 @@ func RetryWithCircuitBreaker[T any](
 
 	result, err := Retry(ctx, config, logger, operation, fn)
 	if err != nil {
-		cb.RecordFailure()
+		// Only record failures that indicate service unavailability.
+		// 404 errors (resource not found) don't mean the service is down.
+		if IsCircuitBreakerFailure(err) {
+			cb.RecordFailure()
+		}
 		return zero, err
 	}
 

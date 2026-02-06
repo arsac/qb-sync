@@ -4,7 +4,6 @@ package e2e
 
 import (
 	"context"
-	"strings"
 	"testing"
 	"time"
 
@@ -12,7 +11,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/arsac/qb-sync/internal/hot"
-	"github.com/arsac/qb-sync/internal/streaming"
 )
 
 // PerfMetrics holds performance measurements during a sync test.
@@ -119,18 +117,18 @@ func TestE2E_PerfActiveTorrent(t *testing.T) {
 	ticker := time.NewTicker(sampleInterval)
 	defer ticker.Stop()
 
-	syncComplete := false
-	for !syncComplete {
+loop:
+	for {
 		select {
 		case <-orchestratorCtx.Done():
 			t.Log("Orchestrator context cancelled")
-			goto done
+			break loop
 
 		case err := <-orchestratorDone:
 			if err != nil && ctx.Err() == nil {
 				t.Logf("Orchestrator finished: %v", err)
 			}
-			goto done
+			break loop
 
 		case <-ticker.C:
 			metrics := collectPerfMetrics(ctx, env, task, torrentHash, report.TotalPieces, startTime, lastBytesSent, sampleInterval)
@@ -155,21 +153,17 @@ func TestE2E_PerfActiveTorrent(t *testing.T) {
 
 			// Check if sync is complete
 			if metrics.HotPieces == report.TotalPieces && metrics.SyncLag == 0 {
-				syncComplete = true
 				report.SyncCompleteAt = time.Since(startTime)
+				break loop
 			}
 
-			// Check for synced tag (streaming complete)
-			torrents, _ := env.HotClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
-				Hashes: []string{torrentHash},
-			})
-			if len(torrents) > 0 && strings.Contains(torrents[0].Tags, "synced") {
-				syncComplete = true
+			// Check if torrent is complete on cold (streaming complete)
+			if env.IsTorrentCompleteOnCold(ctx, torrentHash) {
+				break loop
 			}
 		}
 	}
 
-done:
 	report.Duration = time.Since(startTime)
 	cancelOrchestrator()
 	<-orchestratorDone
@@ -253,14 +247,14 @@ func TestE2E_PerfPreDownloaded(t *testing.T) {
 	ticker := time.NewTicker(sampleInterval)
 	defer ticker.Stop()
 
-	syncComplete := false
-	for !syncComplete {
+loop:
+	for {
 		select {
 		case <-orchestratorCtx.Done():
-			goto done
+			break loop
 
 		case <-orchestratorDone:
-			goto done
+			break loop
 
 		case <-ticker.C:
 			progress, err := task.Progress(ctx, torrentHash)
@@ -296,18 +290,14 @@ func TestE2E_PerfPreDownloaded(t *testing.T) {
 				throughput,
 			)
 
-			// Check for synced tag
-			torrents, _ := env.HotClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
-				Hashes: []string{torrentHash},
-			})
-			if len(torrents) > 0 && strings.Contains(torrents[0].Tags, "synced") {
-				syncComplete = true
+			// Check if torrent is complete on cold (streaming complete)
+			if env.IsTorrentCompleteOnCold(ctx, torrentHash) {
 				report.SyncCompleteAt = elapsed
+				break loop
 			}
 		}
 	}
 
-done:
 	report.Duration = time.Since(startTime)
 	cancelOrchestrator()
 	<-orchestratorDone
@@ -439,5 +429,3 @@ func printPerfReport(t *testing.T, report *PerfReport) {
 	t.Log("===========================")
 }
 
-// Ensure streaming.StreamProgress is used to avoid import error
-var _ = streaming.StreamProgress{}

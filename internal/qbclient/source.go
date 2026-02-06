@@ -2,14 +2,12 @@ package qbclient
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io"
 	"math"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/autobrr/go-qbittorrent"
 
@@ -18,18 +16,51 @@ import (
 	pb "github.com/arsac/qb-sync/proto"
 )
 
+var _ streaming.PieceSource = (*Source)(nil)
+
+// cachedMeta holds per-torrent cached metadata for ReadPiece.
+type cachedMeta struct {
+	files      []*pb.FileInfo
+	contentDir string // resolved content directory for this torrent
+}
+
 // Source implements streaming.PieceSource using qBittorrent API.
 type Source struct {
-	client      *ResilientClient
-	contentPath string // Base path where torrent content is stored
+	client            *ResilientClient
+	dataPath          string   // Local path where torrent content is accessible
+	qbDefaultSavePath string   // qBittorrent's default save path (queried at init)
+	fileCache         sync.Map // hash -> *cachedMeta
 }
 
 // NewSource creates a new qBittorrent piece source with resilient client.
-func NewSource(client *ResilientClient, contentPath string) *Source {
+// dataPath is the local path where torrent content is accessible.
+func NewSource(client *ResilientClient, dataPath string) *Source {
 	return &Source{
-		client:      client,
-		contentPath: contentPath,
+		client:   client,
+		dataPath: dataPath,
 	}
+}
+
+// Init queries qBittorrent for its configured save path. Must be called after Login.
+func (s *Source) Init(ctx context.Context) error {
+	prefs, err := s.client.GetAppPreferencesCtx(ctx)
+	if err != nil {
+		return fmt.Errorf("getting qBittorrent preferences: %w", err)
+	}
+	s.qbDefaultSavePath = filepath.Clean(prefs.SavePath)
+	return nil
+}
+
+// ResolveContentDir maps a torrent's save_path to the local content directory.
+// When ATM + categories are enabled, save_path includes a category subdirectory
+// (e.g., /downloads/movies instead of /downloads). This method computes the
+// relative subdirectory and applies it to the local dataPath.
+func (s *Source) ResolveContentDir(torrentSavePath string) string {
+	rel, err := filepath.Rel(s.qbDefaultSavePath, torrentSavePath)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return s.dataPath
+	}
+	return filepath.Join(s.dataPath, rel)
 }
 
 // GetPieceStates returns the current state of all pieces for a torrent.
@@ -67,13 +98,11 @@ func (s *Source) GetPieceHashes(ctx context.Context, hash string) ([]string, err
 // GetTorrentMetadata returns metadata needed for streaming.
 // Uses resilient client with automatic retry for transient errors.
 func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streaming.TorrentMetadata, error) {
-	// Get torrent properties (with retry)
 	props, err := s.client.GetTorrentPropertiesCtx(ctx, hash)
 	if err != nil {
 		return nil, fmt.Errorf("getting torrent properties: %w", err)
 	}
 
-	// Get torrent info from list (with retry)
 	torrents, err := s.client.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
 		Hashes: []string{hash},
 	})
@@ -85,7 +114,8 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 	}
 	torrent := torrents[0]
 
-	// Get files (with retry)
+	contentDir := s.ResolveContentDir(torrent.SavePath)
+
 	qbFiles, err := s.client.GetFilesInformationCtx(ctx, hash)
 	if err != nil {
 		return nil, fmt.Errorf("getting torrent files: %w", err)
@@ -110,10 +140,7 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 			Offset: offset,
 		}
 
-		// Get inode for hardlink detection
-		// Use contentPath (host path) instead of torrent.ContentPath (container path)
-		// f.Name is relative to save_path, which maps to contentPath on the host
-		filePath := filepath.Join(s.contentPath, f.Name)
+		filePath := filepath.Join(contentDir, f.Name)
 		if inode, inodeErr := utils.GetInode(filePath); inodeErr == nil {
 			files[i].Inode = inode
 		}
@@ -132,13 +159,11 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 		return nil, fmt.Errorf("piece count %d exceeds maximum supported value", numPieces)
 	}
 
-	// Export the raw .torrent file (with retry)
 	torrentFile, exportErr := s.client.ExportTorrentCtx(ctx, hash)
 	if exportErr != nil {
 		return nil, fmt.Errorf("exporting torrent: %w", exportErr)
 	}
 
-	// Get piece hashes for verification (with retry)
 	pieceHashes, hashErr := s.client.GetTorrentPieceHashesCtx(ctx, hash)
 	if hashErr != nil {
 		return nil, fmt.Errorf("getting piece hashes: %w", hashErr)
@@ -155,48 +180,44 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 			TorrentFile: torrentFile,
 			PieceHashes: pieceHashes,
 		},
-		// Use contentPath (host path) instead of torrent.ContentPath (container path).
-		// File paths in files[] are relative to this directory.
-		ContentDir: s.contentPath,
+		ContentDir: contentDir,
 	}, nil
 }
 
 // ReadPiece reads a piece's data from disk.
 func (s *Source) ReadPiece(ctx context.Context, piece *pb.Piece) ([]byte, error) {
-	// Get torrent metadata to find content path
-	meta, err := s.GetTorrentMetadata(ctx, piece.GetTorrentHash())
+	hash := piece.GetTorrentHash()
+
+	cached, err := s.cachedTorrentMeta(ctx, hash)
 	if err != nil {
 		return nil, err
 	}
 
-	// For single-file torrents, ContentDir is the file itself
-	// For multi-file torrents, ContentDir is the directory
-	contentPath := meta.ContentDir
-	files := meta.GetFiles()
-
-	// If it's a single file torrent (one file that matches total size)
-	if len(files) == 1 && files[0].GetSize() == meta.GetTotalSize() {
-		return s.readPieceFromFile(contentPath, piece.GetOffset(), piece.GetSize())
-	}
-
-	// Multi-file torrent: piece may span multiple files
-	return s.readPieceMultiFile(contentPath, files, piece.GetOffset(), piece.GetSize())
+	return s.readPieceMultiFile(cached.contentDir, cached.files, piece.GetOffset(), piece.GetSize())
 }
 
-func (s *Source) readPieceFromFile(path string, offset, size int64) ([]byte, error) {
-	file, err := os.Open(path)
+// cachedTorrentMeta returns the cached metadata for a torrent, fetching on first access.
+func (s *Source) cachedTorrentMeta(ctx context.Context, hash string) (*cachedMeta, error) {
+	if cached, ok := s.fileCache.Load(hash); ok {
+		return cached.(*cachedMeta), nil
+	}
+
+	meta, err := s.GetTorrentMetadata(ctx, hash)
 	if err != nil {
-		return nil, fmt.Errorf("opening file: %w", err)
-	}
-	defer file.Close()
-
-	data := make([]byte, size)
-	n, err := file.ReadAt(data, offset)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("reading piece: %w", err)
+		return nil, err
 	}
 
-	return data[:n], nil
+	cm := &cachedMeta{
+		files:      meta.GetFiles(),
+		contentDir: meta.ContentDir,
+	}
+	s.fileCache.Store(hash, cm)
+	return cm, nil
+}
+
+// EvictCache removes cached file metadata for a torrent after finalization.
+func (s *Source) EvictCache(hash string) {
+	s.fileCache.Delete(hash)
 }
 
 func (s *Source) readPieceMultiFile(
@@ -204,41 +225,13 @@ func (s *Source) readPieceMultiFile(
 	files []*pb.FileInfo,
 	offset, size int64,
 ) ([]byte, error) {
-	data := make([]byte, 0, size)
-	remaining := size
-	currentOffset := offset
-
-	for _, file := range files {
-		fileEnd := file.GetOffset() + file.GetSize()
-
-		// Skip files before our offset
-		if fileEnd <= currentOffset {
-			continue
+	regions := make([]utils.FileRegion, len(files))
+	for i, f := range files {
+		regions[i] = utils.FileRegion{
+			Path:   filepath.Join(basePath, f.GetPath()),
+			Offset: f.GetOffset(),
+			Size:   f.GetSize(),
 		}
-
-		// Stop if we've read everything
-		if remaining <= 0 {
-			break
-		}
-
-		// Calculate read position within this file
-		fileReadOffset := max(currentOffset-file.GetOffset(), 0)
-
-		// Calculate how much to read from this file
-		availableInFile := file.GetSize() - fileReadOffset
-		toRead := min(remaining, availableInFile)
-
-		// Read from file
-		filePath := filepath.Join(basePath, file.GetPath())
-		chunk, err := s.readPieceFromFile(filePath, fileReadOffset, toRead)
-		if err != nil {
-			return nil, fmt.Errorf("reading from %s: %w", file.GetPath(), err)
-		}
-
-		data = append(data, chunk...)
-		remaining -= int64(len(chunk))
-		currentOffset += int64(len(chunk))
 	}
-
-	return data, nil
+	return utils.ReadPieceFromFiles(regions, offset, size)
 }

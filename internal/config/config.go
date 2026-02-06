@@ -18,19 +18,35 @@ const (
 	defaultSleepIntervalSec  = 30
 	defaultPollIntervalSec   = 2
 	defaultPollTimeoutSec    = 300 // 5 minutes
+	defaultPieceTimeoutSec   = 60
 	defaultListenAddr        = ":50051"
 	defaultHealthAddr        = ":8080"
+	defaultSyncedTag             = "synced"
+	defaultReconnectMaxDelaySec  = 30
 )
 
-// HotConfig contains configuration for the hot (source) server.
-type HotConfig struct {
-	// qBittorrent (source)
+// BaseConfig contains configuration shared between hot and cold servers.
+type BaseConfig struct {
+	// qBittorrent connection
 	QBURL      string
 	QBUsername string
 	QBPassword string
 
-	// Data path where torrent content is stored
+	// Data path where torrent content is stored/written
 	DataPath string
+
+	// Health server
+	HealthAddr string // HTTP health endpoint address (e.g., ":8080")
+
+	// Tag to apply to synced torrents (for visibility in qBittorrent UI)
+	SyncedTag string
+
+	DryRun bool
+}
+
+// HotConfig contains configuration for the hot (source) server.
+type HotConfig struct {
+	BaseConfig
 
 	// Streaming destination
 	ColdAddr string // gRPC address of cold server
@@ -41,19 +57,24 @@ type HotConfig struct {
 	Force          bool
 	SleepInterval  time.Duration
 
-	// Rate limiting
-	MaxBytesPerSec int64
+	// Streaming tuning
+	PieceTimeout      time.Duration // Timeout for stale in-flight pieces (default: 60s)
+	MaxBytesPerSec    int64
+	ReconnectMaxDelay time.Duration // Max reconnect backoff delay (default: 30s)
+}
 
-	// Health server
-	HealthAddr string // HTTP health endpoint address (e.g., ":8080")
-
-	DryRun bool
+// Validate validates the base configuration shared by hot and cold.
+func (c *BaseConfig) Validate() error {
+	if c.DataPath == "" {
+		return errors.New("data path is required")
+	}
+	return nil
 }
 
 // Validate validates the hot configuration.
 func (c *HotConfig) Validate() error {
-	if c.DataPath == "" {
-		return errors.New("data path is required")
+	if err := c.BaseConfig.Validate(); err != nil {
+		return err
 	}
 	if c.QBURL == "" {
 		return errors.New("qBittorrent URL is required")
@@ -67,39 +88,41 @@ func (c *HotConfig) Validate() error {
 	if c.SleepInterval < 0 {
 		return errors.New("sleep interval cannot be negative")
 	}
+	if c.PieceTimeout < 0 {
+		return errors.New("piece timeout cannot be negative")
+	}
 	if c.MaxBytesPerSec < 0 {
 		return errors.New("max bytes per second cannot be negative")
+	}
+	if c.ReconnectMaxDelay < 0 {
+		return errors.New("reconnect max delay cannot be negative")
 	}
 	return nil
 }
 
 // ColdConfig contains configuration for the cold (destination) server.
 type ColdConfig struct {
+	BaseConfig
+
 	// gRPC server
 	ListenAddr string
 
-	// Data path where torrent content will be written
-	DataPath string
-
-	// qBittorrent (destination) - optional, for auto-adding verified torrents
-	QBURL      string
-	QBUsername string
-	QBPassword string
+	// SavePath is the path as cold qBittorrent sees it (container mount point).
+	// Defaults to DataPath when empty.
+	SavePath string
 
 	// Polling settings for torrent verification
 	PollInterval time.Duration
 	PollTimeout  time.Duration
 
-	// Health server
-	HealthAddr string // HTTP health endpoint address (e.g., ":8080")
-
-	DryRun bool
+	// Streaming tuning
+	StreamWorkers int // Number of concurrent piece writers (0 = use default 8)
 }
 
 // Validate validates the cold configuration.
 func (c *ColdConfig) Validate() error {
-	if c.DataPath == "" {
-		return errors.New("data path is required")
+	if err := c.BaseConfig.Validate(); err != nil {
+		return err
 	}
 	if c.ListenAddr == "" {
 		return errors.New("listen address is required")
@@ -109,6 +132,9 @@ func (c *ColdConfig) Validate() error {
 	}
 	if c.PollTimeout < 0 {
 		return errors.New("poll timeout cannot be negative")
+	}
+	if c.StreamWorkers < 0 {
+		return errors.New("stream workers cannot be negative")
 	}
 	return nil
 }
@@ -127,7 +153,10 @@ func SetupHotFlags(cmd *cobra.Command) {
 	flags.Bool("force", false, "Force move torrents regardless of space")
 	flags.Int("sleep", defaultSleepIntervalSec, "Sleep interval between checks in seconds")
 	flags.Int64("rate-limit", 0, "Max bytes/sec for streaming (0 = unlimited)")
+	flags.Int("piece-timeout", defaultPieceTimeoutSec, "Timeout in seconds for stale in-flight pieces (increase for high-latency links)")
+	flags.Int("reconnect-max-delay", defaultReconnectMaxDelaySec, "Max reconnect backoff delay in seconds (decrease for unstable links)")
 	flags.String("health-addr", defaultHealthAddr, "HTTP health endpoint address (empty to disable)")
+	flags.String("synced-tag", defaultSyncedTag, "Tag to apply to synced torrents (empty to disable)")
 	flags.Bool("dry-run", false, "Run without making changes")
 }
 
@@ -137,12 +166,15 @@ func SetupColdFlags(cmd *cobra.Command) {
 
 	flags.String("listen", defaultListenAddr, "gRPC listen address")
 	flags.String("data", "", "Data directory path where torrent content will be written")
+	flags.String("save-path", "", "Save path as cold qBittorrent sees it (defaults to --data)")
 	flags.String("qb-url", "", "qBittorrent WebUI URL (for adding verified torrents)")
 	flags.String("qb-username", "", "qBittorrent username")
 	flags.String("qb-password", "", "qBittorrent password")
 	flags.Int("poll-interval", defaultPollIntervalSec, "Poll interval in seconds for torrent verification")
 	flags.Int("poll-timeout", defaultPollTimeoutSec, "Poll timeout in seconds for torrent verification")
+	flags.Int("stream-workers", 0, "Number of concurrent piece writers (0 = auto: 8, increase for SSD/NVMe)")
 	flags.String("health-addr", defaultHealthAddr, "HTTP health endpoint address (empty to disable)")
+	flags.String("synced-tag", defaultSyncedTag, "Tag to apply to synced torrents (empty to disable)")
 	flags.Bool("dry-run", false, "Run without making changes")
 }
 
@@ -155,7 +187,8 @@ func BindHotFlags(cmd *cobra.Command, v *viper.Viper) error {
 	flags := []string{
 		"data", "qb-url", "qb-username", "qb-password",
 		"cold-addr", "min-space", "min-seeding-time",
-		"force", "sleep", "rate-limit", "health-addr", "dry-run",
+		"force", "sleep", "rate-limit", "piece-timeout",
+		"reconnect-max-delay", "health-addr", "synced-tag", "dry-run",
 	}
 
 	for _, flag := range flags {
@@ -174,8 +207,9 @@ func BindColdFlags(cmd *cobra.Command, v *viper.Viper) error {
 	v.AutomaticEnv()
 
 	flags := []string{
-		"listen", "data", "qb-url", "qb-username", "qb-password",
-		"poll-interval", "poll-timeout", "health-addr", "dry-run",
+		"listen", "data", "save-path", "qb-url", "qb-username", "qb-password",
+		"poll-interval", "poll-timeout", "stream-workers",
+		"health-addr", "synced-tag", "dry-run",
 	}
 
 	for _, flag := range flags {
@@ -187,21 +221,31 @@ func BindColdFlags(cmd *cobra.Command, v *viper.Viper) error {
 	return nil
 }
 
+// loadBase loads the base configuration shared by hot and cold.
+func loadBase(v *viper.Viper) BaseConfig {
+	return BaseConfig{
+		QBURL:      v.GetString("qb-url"),
+		QBUsername: v.GetString("qb-username"),
+		QBPassword: v.GetString("qb-password"),
+		DataPath:   v.GetString("data"),
+		HealthAddr: v.GetString("health-addr"),
+		SyncedTag:  v.GetString("synced-tag"),
+		DryRun:     v.GetBool("dry-run"),
+	}
+}
+
 // LoadHot loads the hot server configuration from viper.
 func LoadHot(v *viper.Viper) (*HotConfig, error) {
 	cfg := &HotConfig{
-		DataPath:       v.GetString("data"),
-		QBURL:          v.GetString("qb-url"),
-		QBUsername:     v.GetString("qb-username"),
-		QBPassword:     v.GetString("qb-password"),
+		BaseConfig:     loadBase(v),
 		ColdAddr:       v.GetString("cold-addr"),
 		MinSpaceGB:     v.GetInt64("min-space"),
 		MinSeedingTime: time.Duration(v.GetInt("min-seeding-time")) * time.Second,
 		Force:          v.GetBool("force"),
 		SleepInterval:  time.Duration(v.GetInt("sleep")) * time.Second,
-		MaxBytesPerSec: v.GetInt64("rate-limit"),
-		HealthAddr:     v.GetString("health-addr"),
-		DryRun:         v.GetBool("dry-run"),
+		PieceTimeout:      time.Duration(v.GetInt("piece-timeout")) * time.Second,
+		MaxBytesPerSec:    v.GetInt64("rate-limit"),
+		ReconnectMaxDelay: time.Duration(v.GetInt("reconnect-max-delay")) * time.Second,
 	}
 
 	// Support conventional env vars as fallbacks
@@ -219,15 +263,12 @@ func LoadHot(v *viper.Viper) (*HotConfig, error) {
 // LoadCold loads the cold server configuration from viper.
 func LoadCold(v *viper.Viper) (*ColdConfig, error) {
 	cfg := &ColdConfig{
-		ListenAddr:   v.GetString("listen"),
-		DataPath:     v.GetString("data"),
-		QBURL:        v.GetString("qb-url"),
-		QBUsername:   v.GetString("qb-username"),
-		QBPassword:   v.GetString("qb-password"),
-		PollInterval: time.Duration(v.GetInt("poll-interval")) * time.Second,
-		PollTimeout:  time.Duration(v.GetInt("poll-timeout")) * time.Second,
-		HealthAddr:   v.GetString("health-addr"),
-		DryRun:       v.GetBool("dry-run"),
+		BaseConfig:    loadBase(v),
+		ListenAddr:    v.GetString("listen"),
+		SavePath:      v.GetString("save-path"),
+		PollInterval:  time.Duration(v.GetInt("poll-interval")) * time.Second,
+		PollTimeout:   time.Duration(v.GetInt("poll-timeout")) * time.Second,
+		StreamWorkers: v.GetInt("stream-workers"),
 	}
 
 	// Support conventional env vars as fallbacks

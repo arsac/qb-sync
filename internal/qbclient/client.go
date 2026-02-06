@@ -3,20 +3,33 @@ package qbclient
 import (
 	"context"
 	"log/slog"
-	"time"
 
 	"github.com/autobrr/go-qbittorrent"
 
+	"github.com/arsac/qb-sync/internal/metrics"
 	"github.com/arsac/qb-sync/internal/utils"
 )
 
-// Default retry configuration for qBittorrent client.
-const (
-	defaultMaxAttempts  = 3
-	defaultInitialDelay = 500 * time.Millisecond
-	defaultMaxDelay     = 5 * time.Second
-	defaultMultiplier   = 2.0
-)
+// Client defines the interface for qBittorrent client operations.
+// This interface allows for mocking in tests.
+type Client interface {
+	LoginCtx(ctx context.Context) error
+	GetAppPreferencesCtx(ctx context.Context) (qbittorrent.AppPreferences, error)
+	GetTorrentsCtx(ctx context.Context, opts qbittorrent.TorrentFilterOptions) ([]qbittorrent.Torrent, error)
+	GetTorrentPieceStatesCtx(ctx context.Context, hash string) ([]qbittorrent.PieceState, error)
+	GetTorrentPieceHashesCtx(ctx context.Context, hash string) ([]string, error)
+	GetTorrentPropertiesCtx(ctx context.Context, hash string) (qbittorrent.TorrentProperties, error)
+	GetFilesInformationCtx(ctx context.Context, hash string) (*qbittorrent.TorrentFiles, error)
+	ExportTorrentCtx(ctx context.Context, hash string) ([]byte, error)
+	DeleteTorrentsCtx(ctx context.Context, hashes []string, deleteFiles bool) error
+	AddTagsCtx(ctx context.Context, hashes []string, tags string) error
+	StopCtx(ctx context.Context, hashes []string) error
+	ResumeCtx(ctx context.Context, hashes []string) error
+	AddTorrentFromMemoryCtx(ctx context.Context, buf []byte, options map[string]string) error
+}
+
+// Ensure ResilientClient implements Client interface.
+var _ Client = (*ResilientClient)(nil)
 
 // Config configures the resilient qBittorrent client.
 type Config struct {
@@ -27,34 +40,11 @@ type Config struct {
 // DefaultConfig returns sensible defaults.
 func DefaultConfig() Config {
 	cbConfig := utils.DefaultCircuitBreakerConfig()
+	retry := utils.DefaultRetryConfig()
 	return Config{
-		Retry: utils.RetryConfig{
-			MaxAttempts:      defaultMaxAttempts,
-			InitialDelay:     defaultInitialDelay,
-			MaxDelay:         defaultMaxDelay,
-			Multiplier:       defaultMultiplier,
-			RetriableChecker: IsRetriableError,
-		},
+		Retry:          retry,
 		CircuitBreaker: &cbConfig,
 	}
-}
-
-// IsRetriableError determines if a qBittorrent error is retriable.
-func IsRetriableError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	// Use the generic check first
-	if utils.IsRetriableError(err) {
-		return true
-	}
-
-	// qBittorrent-specific: 404 on piece states means torrent was deleted
-	// This is NOT retriable - it's a signal that we should handle elsewhere
-	// Already handled by IsRetriableError returning false for 404
-
-	return false
 }
 
 // ResilientClient wraps a qBittorrent client with retry and circuit breaker logic.
@@ -94,6 +84,14 @@ func (r *ResilientClient) LoginCtx(ctx context.Context) error {
 	return r.doVoid(ctx, "Login", func(ctx context.Context) error {
 		return r.client.LoginCtx(ctx)
 	})
+}
+
+// GetAppPreferencesCtx gets qBittorrent application preferences with retry.
+func (r *ResilientClient) GetAppPreferencesCtx(ctx context.Context) (qbittorrent.AppPreferences, error) {
+	return doWithRetry(ctx, r.cb, r.config.Retry, r.logger, "GetAppPreferences",
+		func(ctx context.Context) (qbittorrent.AppPreferences, error) {
+			return r.client.GetAppPreferencesCtx(ctx)
+		})
 }
 
 // GetTorrentsCtx gets torrents with retry.
@@ -184,6 +182,37 @@ func (r *ResilientClient) AddTagsCtx(
 	})
 }
 
+// StopCtx pauses torrents with retry.
+func (r *ResilientClient) StopCtx(
+	ctx context.Context,
+	hashes []string,
+) error {
+	return r.doVoid(ctx, "Stop", func(ctx context.Context) error {
+		return r.client.StopCtx(ctx, hashes)
+	})
+}
+
+// ResumeCtx resumes torrents with retry.
+func (r *ResilientClient) ResumeCtx(
+	ctx context.Context,
+	hashes []string,
+) error {
+	return r.doVoid(ctx, "Resume", func(ctx context.Context) error {
+		return r.client.ResumeCtx(ctx, hashes)
+	})
+}
+
+// AddTorrentFromMemoryCtx adds a torrent from memory with retry.
+func (r *ResilientClient) AddTorrentFromMemoryCtx(
+	ctx context.Context,
+	buf []byte,
+	options map[string]string,
+) error {
+	return r.doVoid(ctx, "AddTorrentFromMemory", func(ctx context.Context) error {
+		return r.client.AddTorrentFromMemoryCtx(ctx, buf, options)
+	})
+}
+
 // doVoid executes a void operation with retry and optional circuit breaker.
 func (r *ResilientClient) doVoid(
 	ctx context.Context,
@@ -206,6 +235,7 @@ func doWithRetry[T any](
 	operation string,
 	fn func(ctx context.Context) (T, error),
 ) (T, error) {
+	metrics.QBAPICallsTotal.WithLabelValues(operation).Inc()
 	if cb != nil {
 		return utils.RetryWithCircuitBreaker(ctx, cb, config, logger, operation, fn)
 	}

@@ -14,11 +14,12 @@ const (
 	defaultStateFlushInterval = 30 * time.Second // Time-based: flush dirty state every 30s
 	defaultStateFlushCount    = 100              // Count-based: flush after N pieces as safety net
 
-	// Metadata file names for recovery after restart.
+	// Metadata directory and file names for recovery after restart.
+	metaDirName       = ".qbsync"
 	filesInfoFileName = "files.json"
 
 	// Concurrent streaming settings.
-	defaultStreamWorkers = 4   // Number of concurrent piece writers
+	defaultStreamWorkers = 8   // Number of concurrent piece writers (tuned for NFS/ZFS)
 	streamWorkQueueSize  = 100 // Buffer size for pending work
 
 	// Default polling settings for waitForTorrentReady.
@@ -53,6 +54,7 @@ type QBConfig struct {
 type ServerConfig struct {
 	ListenAddr         string        // Address to listen on (e.g., ":50051")
 	BasePath           string        // Base path for writing torrent data
+	SavePath           string        // Path as cold qBittorrent sees it (container mount, e.g., "/downloads"). Defaults to BasePath.
 	StateFlushInterval time.Duration // How often to flush dirty state (0 = use default)
 	StateFlushCount    int           // Flush after this many pieces written (0 = use default)
 	StreamWorkers      int           // Number of concurrent piece writers (0 = use default)
@@ -67,6 +69,22 @@ type ServerConfig struct {
 	// ColdQB holds qBittorrent config for auto-adding verified torrents.
 	// If nil, FinalizeTorrent only verifies pieces (no qB integration).
 	ColdQB *QBConfig
+
+	// SyncedTag is applied to torrents after successful finalization (for visibility).
+	// Empty string disables tagging.
+	SyncedTag string
+
+	// DryRun prevents modifications (no writes, no qB changes).
+	DryRun bool
+}
+
+// GetSavePath returns the save path for cold qBittorrent.
+// Falls back to BasePath when SavePath is not explicitly set.
+func (c *ServerConfig) GetSavePath() string {
+	if c.SavePath != "" {
+		return c.SavePath
+	}
+	return c.BasePath
 }
 
 // Validate validates the server configuration.

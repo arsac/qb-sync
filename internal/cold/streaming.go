@@ -6,6 +6,7 @@ import (
 	"io"
 	"sync"
 
+	"github.com/arsac/qb-sync/internal/metrics"
 	pb "github.com/arsac/qb-sync/proto"
 )
 
@@ -20,43 +21,32 @@ func (s *Server) StreamPiecesBidi(stream pb.QBSyncService_StreamPiecesBidiServer
 		numWorkers = defaultStreamWorkers
 	}
 
-	// Channels for coordination
-	workCh := make(chan streamWork, streamWorkQueueSize)
+	workCh := make(chan *pb.WritePieceRequest, streamWorkQueueSize)
 	ackCh := make(chan *pb.PieceAck, streamWorkQueueSize)
 	errCh := make(chan error, 1)
 
 	var wg sync.WaitGroup
 
-	// Start worker pool
 	for range numWorkers {
 		wg.Go(func() {
 			s.streamWorker(ctx, workCh, ackCh)
 		})
 	}
 
-	// Start ack sender goroutine (separate from worker WaitGroup to avoid deadlock)
+	// Ack sender runs separately from worker WaitGroup to avoid deadlock
 	ackDone := make(chan struct{})
 	go func() {
 		defer close(ackDone)
 		s.streamAckSender(ctx, stream, ackCh, errCh)
 	}()
 
-	// Receive pieces and dispatch to workers
 	recvErr := s.streamReceiver(ctx, stream, workCh)
-
-	// Close work channel to signal workers to finish
 	close(workCh)
-
-	// Wait for workers to drain their pending work
 	wg.Wait()
-
-	// Close ack channel after workers are done sending acks
 	close(ackCh)
-
-	// Wait for ack sender to finish sending remaining acks
 	<-ackDone
-
-	// Check for ack sender error
+	metrics.ColdWorkerQueueDepth.Set(0)
+	metrics.ColdWorkersBusy.Set(0)
 	select {
 	case sendErr := <-errCh:
 		if sendErr != nil {
@@ -72,7 +62,7 @@ func (s *Server) StreamPiecesBidi(stream pb.QBSyncService_StreamPiecesBidiServer
 func (s *Server) streamReceiver(
 	ctx context.Context,
 	stream pb.QBSyncService_StreamPiecesBidiServer,
-	workCh chan<- streamWork,
+	workCh chan<- *pb.WritePieceRequest,
 ) error {
 	for {
 		req, recvErr := stream.Recv()
@@ -84,7 +74,8 @@ func (s *Server) streamReceiver(
 		}
 
 		select {
-		case workCh <- streamWork{req: req}:
+		case workCh <- req:
+			metrics.ColdWorkerQueueDepth.Set(float64(len(workCh)))
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -94,16 +85,13 @@ func (s *Server) streamReceiver(
 // streamWorker processes pieces from the work channel.
 func (s *Server) streamWorker(
 	ctx context.Context,
-	workCh <-chan streamWork,
+	workCh <-chan *pb.WritePieceRequest,
 	ackCh chan<- *pb.PieceAck,
 ) {
-	for work := range workCh {
-		req := work.req
-
-		// Process the piece
+	for req := range workCh {
+		metrics.ColdWorkersBusy.Inc()
 		resp, writeErr := s.WritePiece(ctx, req)
-
-		// Build acknowledgment
+		metrics.ColdWorkersBusy.Dec()
 		ack := &pb.PieceAck{
 			TorrentHash: req.GetTorrentHash(),
 			PieceIndex:  req.GetPieceIndex(),
@@ -113,9 +101,11 @@ func (s *Server) streamWorker(
 		case writeErr != nil:
 			ack.Success = false
 			ack.Error = writeErr.Error()
+			ack.ErrorCode = pb.PieceErrorCode_PIECE_ERROR_IO
 		case !resp.GetSuccess():
 			ack.Success = false
 			ack.Error = resp.GetError()
+			ack.ErrorCode = resp.GetErrorCode()
 		default:
 			ack.Success = true
 		}

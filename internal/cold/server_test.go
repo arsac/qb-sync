@@ -6,12 +6,41 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	pb "github.com/arsac/qb-sync/proto"
 )
+
+func TestServerConfig_GetSavePath(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   ServerConfig
+		expected string
+	}{
+		{
+			name:     "returns SavePath when set",
+			config:   ServerConfig{BasePath: "/data/cold", SavePath: "/downloads"},
+			expected: "/downloads",
+		},
+		{
+			name:     "falls back to BasePath when SavePath empty",
+			config:   ServerConfig{BasePath: "/data/cold"},
+			expected: "/data/cold",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.config.GetSavePath()
+			if got != tt.expected {
+				t.Errorf("GetSavePath() = %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
 
 func TestServerConfig_Validate(t *testing.T) {
 	tests := []struct {
@@ -81,7 +110,7 @@ func TestServerConfig_Validate(t *testing.T) {
 				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
 			}
 			if tt.wantErr && tt.errMsg != "" && err != nil {
-				if !contains(err.Error(), tt.errMsg) {
+				if !strings.Contains(err.Error(), tt.errMsg) {
 					t.Errorf("Validate() error = %v, want error containing %q", err, tt.errMsg)
 				}
 			}
@@ -197,7 +226,7 @@ func TestCleanupOrphan(t *testing.T) {
 		}
 
 		hash := "abc123"
-		metaDir := filepath.Join(tmpDir, ".meta", hash)
+		metaDir := filepath.Join(tmpDir, metaDirName, hash)
 		partialFile := filepath.Join(tmpDir, "test.txt.partial")
 
 		// Create metadata and partial file
@@ -250,7 +279,7 @@ func TestCleanupOrphan(t *testing.T) {
 		}
 
 		// Meta directory should be deleted
-		metaDir := filepath.Join(tmpDir, ".meta", hash)
+		metaDir := filepath.Join(tmpDir, metaDirName, hash)
 		if _, err := os.Stat(metaDir); !os.IsNotExist(err) {
 			t.Error("meta directory should be deleted")
 		}
@@ -293,7 +322,7 @@ func TestCleanupOrphan(t *testing.T) {
 		}
 	})
 
-	t.Run("skips cleanup when metadata unreadable", func(t *testing.T) {
+	t.Run("cleans up metadata directory even when files.json is unreadable", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		s := &Server{
 			config:         ServerConfig{BasePath: tmpDir},
@@ -303,7 +332,7 @@ func TestCleanupOrphan(t *testing.T) {
 		}
 
 		hash := "abc123"
-		metaDir := filepath.Join(tmpDir, ".meta", hash)
+		metaDir := filepath.Join(tmpDir, metaDirName, hash)
 
 		// Create meta dir with invalid files.json
 		if err := os.MkdirAll(metaDir, 0o755); err != nil {
@@ -315,9 +344,11 @@ func TestCleanupOrphan(t *testing.T) {
 
 		s.cleanupOrphan(ctx, hash)
 
-		// Meta directory should still exist (cleanup skipped)
-		if _, err := os.Stat(metaDir); os.IsNotExist(err) {
-			t.Error("meta directory should not be deleted when metadata is unreadable")
+		// Meta directory should be deleted to prevent unbounded growth.
+		// Partial files can't be located without valid files.json but are
+		// identifiable by .partial suffix for manual cleanup.
+		if _, err := os.Stat(metaDir); !os.IsNotExist(err) {
+			t.Error("meta directory should be deleted even when files.json is unreadable")
 		}
 	})
 }
@@ -349,7 +380,7 @@ func TestCleanupOrphanedTorrents(t *testing.T) {
 		}
 		createTestFilesInfoWithPaths(t, tmpDir, orphanHash, []string{orphanPartial})
 		// Backdate the metadata
-		metaDir := filepath.Join(tmpDir, ".meta", orphanHash)
+		metaDir := filepath.Join(tmpDir, metaDirName, orphanHash)
 		setModTime(t, filepath.Join(metaDir, filesInfoFileName), time.Now().Add(-2*time.Hour))
 
 		// Create a fresh torrent (recent metadata)
@@ -366,7 +397,7 @@ func TestCleanupOrphanedTorrents(t *testing.T) {
 		if _, err := os.Stat(orphanPartial); !os.IsNotExist(err) {
 			t.Error("orphan partial file should be deleted")
 		}
-		if _, err := os.Stat(filepath.Join(tmpDir, ".meta", orphanHash)); !os.IsNotExist(err) {
+		if _, err := os.Stat(filepath.Join(tmpDir, metaDirName, orphanHash)); !os.IsNotExist(err) {
 			t.Error("orphan meta directory should be deleted")
 		}
 
@@ -374,7 +405,7 @@ func TestCleanupOrphanedTorrents(t *testing.T) {
 		if _, err := os.Stat(freshPartial); os.IsNotExist(err) {
 			t.Error("fresh partial file should not be deleted")
 		}
-		if _, err := os.Stat(filepath.Join(tmpDir, ".meta", freshHash)); os.IsNotExist(err) {
+		if _, err := os.Stat(filepath.Join(tmpDir, metaDirName, freshHash)); os.IsNotExist(err) {
 			t.Error("fresh meta directory should not be deleted")
 		}
 	})
@@ -404,7 +435,7 @@ func TestCleanupOrphanedTorrents(t *testing.T) {
 		}
 
 		// Create meta directory with a regular file
-		metaDir := filepath.Join(tmpDir, ".meta")
+		metaDir := filepath.Join(tmpDir, metaDirName)
 		if err := os.MkdirAll(metaDir, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -494,8 +525,8 @@ func TestAbortTorrent(t *testing.T) {
 
 		hash := "abc123"
 		partialFile := filepath.Join(tmpDir, "data", "test.partial")
-		stateFile := filepath.Join(tmpDir, ".meta", hash, ".state")
-		torrentFile := filepath.Join(tmpDir, ".meta", hash, "test.torrent")
+		stateFile := filepath.Join(tmpDir, metaDirName, hash, ".state")
+		torrentFile := filepath.Join(tmpDir, metaDirName, hash, "test.torrent")
 
 		// Create files
 		if err := os.MkdirAll(filepath.Dir(partialFile), 0o755); err != nil {
@@ -796,20 +827,299 @@ func TestAbortTorrent(t *testing.T) {
 	})
 }
 
-// Helper functions
+func TestSetupFile_PreExisting(t *testing.T) {
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsAt(s, substr, 0))
-}
-
-func containsAt(s, substr string, start int) bool {
-	for i := start; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
+	t.Run("detects pre-existing file with correct size", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		s := &Server{
+			config: ServerConfig{BasePath: tmpDir},
+			logger: logger,
+			inodes: NewInodeRegistry(tmpDir, logger),
 		}
-	}
-	return false
+
+		// Create a file at the target path with the expected size
+		filePath := "data/test.mp4"
+		targetPath := filepath.Join(tmpDir, filePath)
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		fileData := make([]byte, 1024)
+		if err := os.WriteFile(targetPath, fileData, 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		fileInfo, result, err := s.setupFile(ctx, "abc123", &pb.FileInfo{
+			Path:   filePath,
+			Size:   1024,
+			Offset: 0,
+			Inode:  12345,
+		}, 0)
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if fileInfo.hlState != hlStateComplete {
+			t.Errorf("expected hlStateComplete, got %v", fileInfo.hlState)
+		}
+		if fileInfo.path != targetPath {
+			t.Errorf("expected path %q, got %q", targetPath, fileInfo.path)
+		}
+		if !result.GetPreExisting() {
+			t.Error("expected PreExisting to be true")
+		}
+		if result.GetHardlinked() {
+			t.Error("expected Hardlinked to be false for pre-existing files")
+		}
+	})
+
+	t.Run("falls through when file exists with wrong size", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		s := &Server{
+			config: ServerConfig{BasePath: tmpDir},
+			logger: logger,
+			inodes: NewInodeRegistry(tmpDir, logger),
+		}
+
+		// Create a file with the wrong size
+		filePath := "data/test.mp4"
+		targetPath := filepath.Join(tmpDir, filePath)
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(targetPath, []byte("short"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		fileInfo, result, err := s.setupFile(ctx, "abc123", &pb.FileInfo{
+			Path:   filePath,
+			Size:   1024,
+			Offset: 0,
+		}, 0)
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if fileInfo.hlState == hlStateComplete {
+			t.Error("should not be hlStateComplete when size doesn't match")
+		}
+		if result.GetPreExisting() {
+			t.Error("expected PreExisting to be false when size doesn't match")
+		}
+		if !strings.HasSuffix(fileInfo.path, ".partial") {
+			t.Errorf("expected .partial path, got %q", fileInfo.path)
+		}
+	})
+
+	t.Run("falls through when file does not exist", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		s := &Server{
+			config: ServerConfig{BasePath: tmpDir},
+			logger: logger,
+			inodes: NewInodeRegistry(tmpDir, logger),
+		}
+
+		fileInfo, result, err := s.setupFile(ctx, "abc123", &pb.FileInfo{
+			Path:   "data/test.mp4",
+			Size:   1024,
+			Offset: 0,
+		}, 0)
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if fileInfo.hlState == hlStateComplete {
+			t.Error("should not be hlStateComplete when file doesn't exist")
+		}
+		if result.GetPreExisting() {
+			t.Error("expected PreExisting to be false when file doesn't exist")
+		}
+		if !strings.HasSuffix(fileInfo.path, ".partial") {
+			t.Errorf("expected .partial path, got %q", fileInfo.path)
+		}
+	})
 }
+
+func TestInitTorrent_PreExistingFiles(t *testing.T) {
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	t.Run("all files pre-existing yields zero pieces needed", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		s := &Server{
+			config:         ServerConfig{BasePath: tmpDir},
+			logger:         logger,
+			torrents:       make(map[string]*serverTorrentState),
+			abortingHashes: make(map[string]chan struct{}),
+			inodes:         NewInodeRegistry(tmpDir, logger),
+		}
+
+		// Pre-create both files at their final paths with correct sizes
+		file1Path := filepath.Join(tmpDir, "data/file1.bin")
+		file2Path := filepath.Join(tmpDir, "data/file2.bin")
+		if err := os.MkdirAll(filepath.Join(tmpDir, "data"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(file1Path, make([]byte, 512), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(file2Path, make([]byte, 512), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		resp, err := s.InitTorrent(ctx, &pb.InitTorrentRequest{
+			TorrentHash: "preexist1",
+			Name:        "test-torrent",
+			NumPieces:   2,
+			PieceSize:   512,
+			TotalSize:   1024,
+			Files: []*pb.FileInfo{
+				{Path: "data/file1.bin", Size: 512, Offset: 0},
+				{Path: "data/file2.bin", Size: 512, Offset: 512},
+			},
+		})
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !resp.GetSuccess() {
+			t.Fatalf("expected success, got error: %s", resp.GetError())
+		}
+		if resp.GetPiecesNeededCount() != 0 {
+			t.Errorf("expected 0 pieces needed, got %d", resp.GetPiecesNeededCount())
+		}
+		if resp.GetPiecesHaveCount() != 2 {
+			t.Errorf("expected 2 pieces have, got %d", resp.GetPiecesHaveCount())
+		}
+
+		// Verify hardlink results report pre-existing
+		for i, hr := range resp.GetHardlinkResults() {
+			if !hr.GetPreExisting() {
+				t.Errorf("file %d: expected PreExisting=true", i)
+			}
+		}
+	})
+
+	t.Run("mix of pre-existing and missing files", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		s := &Server{
+			config:         ServerConfig{BasePath: tmpDir},
+			logger:         logger,
+			torrents:       make(map[string]*serverTorrentState),
+			abortingHashes: make(map[string]chan struct{}),
+			inodes:         NewInodeRegistry(tmpDir, logger),
+		}
+
+		// Only pre-create the first file
+		if err := os.MkdirAll(filepath.Join(tmpDir, "data"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(tmpDir, "data/file1.bin"), make([]byte, 512), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		// data/file2.bin intentionally not created
+
+		resp, err := s.InitTorrent(ctx, &pb.InitTorrentRequest{
+			TorrentHash: "preexist2",
+			Name:        "test-torrent",
+			NumPieces:   2,
+			PieceSize:   512,
+			TotalSize:   1024,
+			Files: []*pb.FileInfo{
+				{Path: "data/file1.bin", Size: 512, Offset: 0},
+				{Path: "data/file2.bin", Size: 512, Offset: 512},
+			},
+		})
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !resp.GetSuccess() {
+			t.Fatalf("expected success, got error: %s", resp.GetError())
+		}
+		if resp.GetPiecesNeededCount() != 1 {
+			t.Errorf("expected 1 piece needed, got %d", resp.GetPiecesNeededCount())
+		}
+		if resp.GetPiecesHaveCount() != 1 {
+			t.Errorf("expected 1 piece have, got %d", resp.GetPiecesHaveCount())
+		}
+
+		results := resp.GetHardlinkResults()
+		if !results[0].GetPreExisting() {
+			t.Error("file 0: expected PreExisting=true")
+		}
+		if results[1].GetPreExisting() {
+			t.Error("file 1: expected PreExisting=false")
+		}
+	})
+
+	t.Run("wrong size file is not treated as pre-existing", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		s := &Server{
+			config:         ServerConfig{BasePath: tmpDir},
+			logger:         logger,
+			torrents:       make(map[string]*serverTorrentState),
+			abortingHashes: make(map[string]chan struct{}),
+			inodes:         NewInodeRegistry(tmpDir, logger),
+		}
+
+		// Create file with wrong size
+		if err := os.MkdirAll(filepath.Join(tmpDir, "data"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(tmpDir, "data/file1.bin"), []byte("short"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		resp, err := s.InitTorrent(ctx, &pb.InitTorrentRequest{
+			TorrentHash: "preexist3",
+			Name:        "test-torrent",
+			NumPieces:   1,
+			PieceSize:   1024,
+			TotalSize:   1024,
+			Files: []*pb.FileInfo{
+				{Path: "data/file1.bin", Size: 1024, Offset: 0},
+			},
+		})
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !resp.GetSuccess() {
+			t.Fatalf("expected success, got error: %s", resp.GetError())
+		}
+		if resp.GetPiecesNeededCount() != 1 {
+			t.Errorf("expected 1 piece needed (wrong size should not match), got %d", resp.GetPiecesNeededCount())
+		}
+		if resp.GetHardlinkResults()[0].GetPreExisting() {
+			t.Error("wrong-size file should not be marked pre-existing")
+		}
+	})
+}
+
+func TestCountHardlinkResults_PreExisting(t *testing.T) {
+	results := []*pb.HardlinkResult{
+		{Hardlinked: true, SourcePath: "/some/path"},
+		{PreExisting: true},
+		{Pending: true},
+		{PreExisting: true},
+	}
+
+	hardlinked, pending, preExisting := countHardlinkResults(results)
+
+	if hardlinked != 1 {
+		t.Errorf("expected 1 hardlinked, got %d", hardlinked)
+	}
+	if pending != 1 {
+		t.Errorf("expected 1 pending, got %d", pending)
+	}
+	if preExisting != 2 {
+		t.Errorf("expected 2 preExisting, got %d", preExisting)
+	}
+}
+
+// Helper functions
 
 func createTestMetadata(t *testing.T, basePath, hash string, modTime time.Time) {
 	t.Helper()
@@ -819,7 +1129,7 @@ func createTestMetadata(t *testing.T, basePath, hash string, modTime time.Time) 
 
 func createTestStateFile(t *testing.T, basePath, hash string, modTime time.Time) {
 	t.Helper()
-	metaDir := filepath.Join(basePath, ".meta", hash)
+	metaDir := filepath.Join(basePath, metaDirName, hash)
 	if err := os.MkdirAll(metaDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -833,13 +1143,13 @@ func createTestStateFile(t *testing.T, basePath, hash string, modTime time.Time)
 func createTestFilesInfo(t *testing.T, basePath, hash string, modTime time.Time) {
 	t.Helper()
 	createTestFilesInfoWithPaths(t, basePath, hash, []string{})
-	filesPath := filepath.Join(basePath, ".meta", hash, filesInfoFileName)
+	filesPath := filepath.Join(basePath, metaDirName, hash, filesInfoFileName)
 	setModTime(t, filesPath, modTime)
 }
 
 func createTestFilesInfoWithPaths(t *testing.T, basePath, hash string, filePaths []string) {
 	t.Helper()
-	metaDir := filepath.Join(basePath, ".meta", hash)
+	metaDir := filepath.Join(basePath, metaDirName, hash)
 	if err := os.MkdirAll(metaDir, 0o755); err != nil {
 		t.Fatal(err)
 	}

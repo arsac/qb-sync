@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -211,19 +212,30 @@ func (p *StreamPool) Open(ctx context.Context, numStreams int) error {
 	p.lastMeasureTime = time.Now()
 	p.lastBytesSent = p.getTotalBytesSentLocked()
 
-	// Start adaptive scaling monitor if enabled
-	if p.adaptive {
-		p.wg.Add(1)
-		go p.runScalingMonitor()
-	}
+	// Start throughput monitor (always runs; scaling decisions gated by p.adaptive)
+	p.wg.Add(1)
+	go p.runThroughputMonitor()
 
 	return nil
 }
 
 // forwardAcks reads acks from a single stream and forwards them to the pool's
 // aggregated channels. Also forwards errors from the stream.
-func (p *StreamPool) forwardAcks(ps *PooledStream) {
+func (p *StreamPool) forwardAcks(ps *PooledStream) { //nolint:gocognit // complexity from panic recovery
 	defer p.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			p.logger.Error("panic in forwardAcks",
+				"streamID", ps.id,
+				"panic", r,
+				"stack", string(debug.Stack()),
+			)
+			select {
+			case p.errs <- fmt.Errorf("panic in forwardAcks (stream %d): %v", ps.id, r):
+			default:
+			}
+		}
+	}()
 
 	for {
 		select {
@@ -322,8 +334,8 @@ func (p *StreamPool) RemoveStream() error {
 	return p.removeStreamLocked()
 }
 
-// runScalingMonitor periodically checks throughput and adjusts stream count.
-func (p *StreamPool) runScalingMonitor() {
+// runThroughputMonitor periodically measures throughput and adjusts stream count if adaptive.
+func (p *StreamPool) runThroughputMonitor() {
 	defer p.wg.Done()
 
 	ticker := time.NewTicker(p.scaleInterval)
@@ -334,35 +346,33 @@ func (p *StreamPool) runScalingMonitor() {
 		case <-p.ctx.Done():
 			return
 		case <-ticker.C:
-			p.checkAndScale()
+			p.updateThroughput()
 		}
 	}
 }
 
-// checkAndScale evaluates throughput and decides whether to add/remove streams.
-func (p *StreamPool) checkAndScale() {
+// updateThroughput measures throughput, updates the gauge, and optionally makes scaling decisions.
+func (p *StreamPool) updateThroughput() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Check closed inside lock
 	if p.closed.Load() {
 		return
 	}
 
-	// Check if still in cooldown period
-	if p.isInCooldown() {
+	currentThroughput, ok := p.measureThroughput()
+	if !ok {
 		return
 	}
 
-	// Calculate current throughput
-	currentThroughput, ok := p.measureThroughput()
-	if !ok {
-		return // Too soon or first measurement
-	}
-
-	// Make scaling decision based on throughput change
-	p.applyScalingDecision(currentThroughput)
+	// Always update throughput gauge
 	p.lastThroughput = currentThroughput
+	metrics.TransferThroughputBytesPerSecond.Set(currentThroughput)
+
+	// Only make scaling decisions if adaptive
+	if p.adaptive && !p.isInCooldown() {
+		p.applyScalingDecision(currentThroughput)
+	}
 }
 
 // isInCooldown checks if scaling is paused and handles cooldown expiry.
