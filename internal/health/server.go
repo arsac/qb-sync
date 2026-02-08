@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/arsac/qb-sync/internal/metrics"
 )
@@ -200,23 +201,51 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, resp Response) {
 
 // CachedCheck wraps a CheckFunc with time-based caching. Repeated calls within
 // the TTL return the cached result without invoking the underlying check.
+// Uses singleflight to prevent head-of-line blocking: concurrent callers that
+// arrive while the cache is stale share a single in-flight check rather than
+// serializing behind a mutex.
 func CachedCheck(check CheckFunc, ttl time.Duration) CheckFunc {
 	var (
-		mu         sync.Mutex
+		mu         sync.RWMutex
 		lastCheck  time.Time
 		lastResult error
+		group      singleflight.Group
 	)
 	return func(ctx context.Context) error {
-		mu.Lock()
-		defer mu.Unlock()
+		mu.RLock()
 		if time.Since(lastCheck) < ttl {
+			result := lastResult
+			mu.RUnlock()
 			metrics.HealthCheckCacheTotal.WithLabelValues(metrics.ResultHit).Inc()
-			return lastResult
+			return result
 		}
+		mu.RUnlock()
+
 		metrics.HealthCheckCacheTotal.WithLabelValues(metrics.ResultMiss).Inc()
-		lastResult = check(ctx)
-		lastCheck = time.Now()
-		return lastResult
+		v, err, _ := group.Do("check", func() (any, error) {
+			// Double-check cache inside singleflight
+			mu.RLock()
+			if time.Since(lastCheck) < ttl {
+				result := lastResult
+				mu.RUnlock()
+				return result, nil
+			}
+			mu.RUnlock()
+
+			result := check(ctx)
+			mu.Lock()
+			lastResult = result
+			lastCheck = time.Now()
+			mu.Unlock()
+			return result, nil
+		})
+		if err != nil {
+			return err
+		}
+		if v == nil {
+			return nil
+		}
+		return v.(error)
 	}
 }
 

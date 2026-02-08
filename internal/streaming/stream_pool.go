@@ -258,6 +258,20 @@ func (p *StreamPool) forwardAcks(ps *PooledStream) { //nolint:gocognit // comple
 					)
 				}
 			default:
+				// Stream closed without an explicit error (e.g., send timeout
+				// cancelled context). Notify pool so ack processor can trigger
+				// reconnection. Skip during clean shutdown (pool.Close cancels p.ctx).
+				if p.ctx.Err() == nil {
+					select {
+					case p.errs <- fmt.Errorf("stream %d closed unexpectedly", ps.id):
+					case <-p.ctx.Done():
+						// Pool closing between the check and send — no need to report.
+					default:
+						p.logger.WarnContext(p.ctx, "error channel full, dropping synthetic error on silent stream close",
+							"streamID", ps.id,
+						)
+					}
+				}
 			}
 			return
 
@@ -636,6 +650,20 @@ func (p *StreamPool) Acks() <-chan *pb.PieceAck {
 // AckReady returns a channel that signals when acks are available.
 func (p *StreamPool) AckReady() <-chan struct{} {
 	return p.ackReady
+}
+
+// NotifyAckProcessed signals that an ack has been processed and inflight
+// count reduced. This wakes the sender to re-check CanSend().
+//
+// forwardAcks signals ackReady when an ack is enqueued, but the sender
+// checks CanSend() which depends on OnAck having reduced inflight. Without
+// this post-processing signal, the sender can consume the enqueue signal
+// before OnAck fires, see CanSend()=false, and wait forever.
+func (p *StreamPool) NotifyAckProcessed() {
+	select {
+	case p.ackReady <- struct{}{}:
+	default:
+	}
 }
 
 // Done returns a channel that's closed when any stream fails.

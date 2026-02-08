@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/autobrr/go-qbittorrent"
+	"github.com/failsafe-go/failsafe-go"
 
 	"github.com/arsac/qb-sync/internal/metrics"
 	"github.com/arsac/qb-sync/internal/utils"
@@ -63,7 +64,7 @@ type PieceMonitor struct {
 	source      PieceSource
 	logger      *slog.Logger
 	config      PieceMonitorConfig
-	retryConfig utils.RetryConfig     // Retry config for MainData.Update
+	retryExecutor failsafe.Executor[any] // Retry executor for MainData.Update
 	mainData    *qbittorrent.MainData // Cached maindata with rid for incremental updates
 
 	torrents  map[string]*torrentState
@@ -90,16 +91,20 @@ func NewPieceMonitor(
 	logger *slog.Logger,
 	config PieceMonitorConfig,
 ) *PieceMonitor {
+	retryExecutor := failsafe.With[any](
+		utils.NewRetryPolicy(utils.DefaultRetryConfig(), logger),
+	)
+
 	return &PieceMonitor{
-		client:      client,
-		source:      source,
-		logger:      logger,
-		config:      config,
-		retryConfig: utils.DefaultRetryConfig(),
-		mainData:    &qbittorrent.MainData{},
-		torrents:    make(map[string]*torrentState),
-		completed:   make(chan *pb.Piece, completedChannelBufSize),
-		removed:     make(chan string, removedChannelBufSize),
+		client:        client,
+		source:        source,
+		logger:        logger,
+		config:        config,
+		retryExecutor: retryExecutor,
+		mainData:      &qbittorrent.MainData{},
+		torrents:      make(map[string]*torrentState),
+		completed:     make(chan *pb.Piece, completedChannelBufSize),
+		removed:       make(chan string, removedChannelBufSize),
 	}
 }
 
@@ -323,10 +328,9 @@ func (t *PieceMonitor) poll(ctx context.Context) error {
 // Uses retry logic for transient network errors.
 func (t *PieceMonitor) pollMainData(ctx context.Context) error {
 	// MainData.Update requires raw client; wrap with retry for resilience
-	_, err := utils.Retry(ctx, t.retryConfig, t.logger, "MainData.Update",
-		func(ctx context.Context) (struct{}, error) {
-			return struct{}{}, t.mainData.Update(ctx, t.client)
-		})
+	err := t.retryExecutor.WithContext(ctx).Run(func() error {
+		return t.mainData.Update(ctx, t.client)
+	})
 	if err != nil {
 		return err
 	}
@@ -666,15 +670,15 @@ func (t *PieceMonitor) RetryFailed(ctx context.Context, hash string) error {
 			continue
 		}
 
-		state.failed[i] = false
 		piece := t.buildPiece(state, i)
 
-		if !t.trySendCompleted(ctx, piece) {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			// Channel closed, stop retrying
-			return nil
+		switch {
+		case t.trySendCompletedNonBlocking(ctx, piece):
+			state.failed[i] = false
+		case ctx.Err() != nil:
+			return ctx.Err()
+		case !t.closed.Load():
+			// Channel full — piece stays failed, will retry next cycle
 		}
 	}
 

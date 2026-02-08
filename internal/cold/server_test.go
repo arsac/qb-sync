@@ -915,7 +915,7 @@ func TestSetupFile_PreExisting(t *testing.T) {
 			Size:   1024,
 			Offset: 0,
 			Inode:  12345,
-		}, 0)
+		}, 0, "")
 
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -956,7 +956,7 @@ func TestSetupFile_PreExisting(t *testing.T) {
 			Path:   filePath,
 			Size:   1024,
 			Offset: 0,
-		}, 0)
+		}, 0, "")
 
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -984,7 +984,7 @@ func TestSetupFile_PreExisting(t *testing.T) {
 			Path:   "data/test.mp4",
 			Size:   1024,
 			Offset: 0,
-		}, 0)
+		}, 0, "")
 
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -1247,4 +1247,410 @@ func setModTime(t *testing.T, path string, modTime time.Time) {
 	if err := os.Chtimes(path, modTime, modTime); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// writeTestFile creates a file at path with the given content, creating parent directories as needed.
+func writeTestFile(t *testing.T, path string, content []byte) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// assertFileExists fails the test if the file does not exist.
+func assertFileExists(t *testing.T, path, msg string) {
+	t.Helper()
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		t.Errorf("%s: %s", msg, path)
+	}
+}
+
+// assertFileNotExists fails the test if the file exists.
+func assertFileNotExists(t *testing.T, path, msg string) {
+	t.Helper()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("%s: %s", msg, path)
+	}
+}
+
+// newRelocateInitRequest builds an InitTorrentRequest for relocation tests with a single file.
+func newRelocateInitRequest(hash, subPath string) *pb.InitTorrentRequest {
+	return &pb.InitTorrentRequest{
+		TorrentHash: hash,
+		Name:        "test-torrent",
+		NumPieces:   1,
+		PieceSize:   1024,
+		TotalSize:   512,
+		SaveSubPath: subPath,
+		Files: []*pb.FileInfo{
+			{Path: "data/file.bin", Size: 512, Offset: 0},
+		},
+	}
+}
+
+//nolint:gocognit // Test functions have inherent complexity from setup and assertions
+func TestRelocateFiles(t *testing.T) {
+	t.Parallel()
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	ctx := context.Background()
+
+	newServer := func(t *testing.T) (*Server, string) {
+		t.Helper()
+		tmpDir := t.TempDir()
+		s := &Server{
+			config: ServerConfig{BasePath: tmpDir},
+			logger: logger,
+		}
+		return s, tmpDir
+	}
+
+	t.Run("moves partial files to new sub-path", func(t *testing.T) {
+		t.Parallel()
+		s, tmpDir := newServer(t)
+
+		partialPath := filepath.Join(tmpDir, "data", "file.mkv.partial")
+		writeTestFile(t, partialPath, []byte("partial data"))
+
+		moved, err := s.relocateFiles(ctx, "hash1", []string{"data/file.mkv"}, "", "movies")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if moved != 1 {
+			t.Errorf("expected moved=1, got %d", moved)
+		}
+
+		newPath := filepath.Join(tmpDir, "movies", "data", "file.mkv.partial")
+		assertFileExists(t, newPath, "file should exist at new path")
+		assertFileNotExists(t, partialPath, "file should not exist at old path")
+	})
+
+	t.Run("moves finalized files to new sub-path", func(t *testing.T) {
+		t.Parallel()
+		s, tmpDir := newServer(t)
+
+		finalPath := filepath.Join(tmpDir, "data", "file.mkv")
+		writeTestFile(t, finalPath, []byte("final data"))
+
+		moved, err := s.relocateFiles(ctx, "hash2", []string{"data/file.mkv"}, "", "movies")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if moved != 1 {
+			t.Errorf("expected moved=1, got %d", moved)
+		}
+
+		assertFileExists(t, filepath.Join(tmpDir, "movies", "data", "file.mkv"), "file should exist at new path")
+		assertFileNotExists(t, finalPath, "file should not exist at old path")
+	})
+
+	t.Run("moves both partial and finalized", func(t *testing.T) {
+		t.Parallel()
+		s, tmpDir := newServer(t)
+
+		writeTestFile(t, filepath.Join(tmpDir, "data", "file.mkv.partial"), []byte("partial"))
+		writeTestFile(t, filepath.Join(tmpDir, "data", "file.mkv"), []byte("final"))
+
+		moved, err := s.relocateFiles(ctx, "hash3", []string{"data/file.mkv"}, "", "movies")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if moved != 2 {
+			t.Errorf("expected moved=2, got %d", moved)
+		}
+
+		newDir := filepath.Join(tmpDir, "movies", "data")
+		assertFileExists(t, filepath.Join(newDir, "file.mkv.partial"), "partial file should exist at new path")
+		assertFileExists(t, filepath.Join(newDir, "file.mkv"), "finalized file should exist at new path")
+	})
+
+	t.Run("skips missing files", func(t *testing.T) {
+		t.Parallel()
+		s, _ := newServer(t)
+
+		moved, err := s.relocateFiles(ctx, "hash4", []string{"data/nonexistent.mkv"}, "", "movies")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if moved != 0 {
+			t.Errorf("expected moved=0, got %d", moved)
+		}
+	})
+
+	t.Run("skips when target exists", func(t *testing.T) {
+		t.Parallel()
+		s, tmpDir := newServer(t)
+
+		oldPath := filepath.Join(tmpDir, "data", "file.mkv")
+		writeTestFile(t, oldPath, []byte("old"))
+
+		newPath := filepath.Join(tmpDir, "movies", "data", "file.mkv")
+		writeTestFile(t, newPath, []byte("already here"))
+
+		moved, err := s.relocateFiles(ctx, "hash5", []string{"data/file.mkv"}, "", "movies")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if moved != 0 {
+			t.Errorf("expected moved=0, got %d", moved)
+		}
+
+		assertFileExists(t, oldPath, "old file should still exist when target already present")
+	})
+
+	t.Run("noop when sub-paths equal", func(t *testing.T) {
+		t.Parallel()
+		s, _ := newServer(t)
+
+		moved, err := s.relocateFiles(ctx, "hash6", []string{"data/file.mkv"}, "movies", "movies")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if moved != 0 {
+			t.Errorf("expected moved=0, got %d", moved)
+		}
+	})
+}
+
+func TestUpdateStateAfterRelocate(t *testing.T) {
+	t.Parallel()
+
+	t.Run("updates file paths and saveSubPath", func(t *testing.T) {
+		t.Parallel()
+		basePath := "/data/cold"
+		state := &serverTorrentState{
+			saveSubPath: "",
+			files: []*serverFileInfo{
+				{path: filepath.Join(basePath, "data", "file.bin.partial"), size: 1024},
+				{path: filepath.Join(basePath, "data", "file2.bin"), size: 2048},
+			},
+		}
+
+		updateStateAfterRelocate(state, basePath, "", "movies")
+
+		if state.saveSubPath != "movies" {
+			t.Errorf("expected saveSubPath=movies, got %q", state.saveSubPath)
+		}
+
+		wantPaths := []string{
+			filepath.Join(basePath, "movies", "data", "file.bin.partial"),
+			filepath.Join(basePath, "movies", "data", "file2.bin"),
+		}
+		for i, want := range wantPaths {
+			if state.files[i].path != want {
+				t.Errorf("file[%d] path = %q, want %q", i, state.files[i].path, want)
+			}
+		}
+	})
+}
+
+func TestInitTorrent_RelocatesOnSubPathChange(t *testing.T) {
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	// initAndRestart calls InitTorrent, then removes in-memory state to simulate a cold restart.
+	initAndRestart := func(t *testing.T, s *Server, req *pb.InitTorrentRequest) {
+		t.Helper()
+		resp, err := s.InitTorrent(ctx, req)
+		if err != nil {
+			t.Fatalf("InitTorrent failed: %v", err)
+		}
+		if !resp.GetSuccess() {
+			t.Fatalf("InitTorrent not successful: %s", resp.GetError())
+		}
+		s.mu.Lock()
+		delete(s.torrents, req.GetTorrentHash())
+		s.mu.Unlock()
+	}
+
+	t.Run("relocates files from empty to category sub-path", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		s := &Server{
+			config:         ServerConfig{BasePath: tmpDir},
+			logger:         logger,
+			torrents:       make(map[string]*serverTorrentState),
+			abortingHashes: make(map[string]chan struct{}),
+			inodes:         NewInodeRegistry(tmpDir, logger),
+		}
+
+		hash := "relocinit1"
+
+		// Init with empty sub-path, then simulate cold restart
+		initAndRestart(t, s, newRelocateInitRequest(hash, ""))
+
+		// Simulate streamed data (files are lazily opened on WritePiece)
+		oldPartialPath := filepath.Join(tmpDir, "data", "file.bin.partial")
+		writeTestFile(t, oldPartialPath, make([]byte, 512))
+
+		// Re-init with new sub-path "movies"
+		resp, err := s.InitTorrent(ctx, newRelocateInitRequest(hash, "movies"))
+		if err != nil {
+			t.Fatalf("second InitTorrent failed: %v", err)
+		}
+		if !resp.GetSuccess() {
+			t.Fatalf("second InitTorrent not successful: %s", resp.GetError())
+		}
+
+		newPartialPath := filepath.Join(tmpDir, "movies", "data", "file.bin.partial")
+		assertFileExists(t, newPartialPath, "partial file should exist at new sub-path after re-init")
+		assertFileNotExists(t, oldPartialPath, "partial file should not exist at old path after relocation")
+
+		// Verify persisted info was updated with new sub-path
+		metaDir := filepath.Join(tmpDir, metaDirName, hash)
+		info, loadErr := s.loadFilesInfo(metaDir)
+		if loadErr != nil {
+			t.Fatalf("failed to load persisted info: %v", loadErr)
+		}
+		if info.SaveSubPath != "movies" {
+			t.Errorf("persisted SaveSubPath = %q, want %q", info.SaveSubPath, "movies")
+		}
+	})
+
+	t.Run("no relocation when sub-path unchanged", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		s := &Server{
+			config:         ServerConfig{BasePath: tmpDir},
+			logger:         logger,
+			torrents:       make(map[string]*serverTorrentState),
+			abortingHashes: make(map[string]chan struct{}),
+			inodes:         NewInodeRegistry(tmpDir, logger),
+		}
+
+		hash := "relocinit2"
+
+		// Init with sub-path "movies", then simulate cold restart
+		initAndRestart(t, s, newRelocateInitRequest(hash, "movies"))
+
+		// Simulate streamed data
+		partialPath := filepath.Join(tmpDir, "movies", "data", "file.bin.partial")
+		writeTestFile(t, partialPath, make([]byte, 512))
+
+		// Re-init with same sub-path
+		resp, err := s.InitTorrent(ctx, newRelocateInitRequest(hash, "movies"))
+		if err != nil {
+			t.Fatalf("second InitTorrent failed: %v", err)
+		}
+		if !resp.GetSuccess() {
+			t.Fatalf("second InitTorrent not successful: %s", resp.GetError())
+		}
+
+		assertFileExists(t, partialPath, "partial file should still exist at same path")
+	})
+}
+
+func TestFinalizeTorrent_RelocatesOnSubPathChange(t *testing.T) {
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	// newIncompleteState builds a serverTorrentState with incomplete pieces so that
+	// FinalizeTorrent aborts after the relocation check without triggering full finalization.
+	newIncompleteState := func(filePath, subPath string) *serverTorrentState {
+		return &serverTorrentState{
+			written:      []bool{true, false},
+			writtenCount: 1,
+			pieceLength:  1024,
+			totalSize:    int64(len("file content")),
+			saveSubPath:  subPath,
+			files: []*serverFileInfo{
+				{path: filePath, size: int64(len("file content")), offset: 0},
+			},
+		}
+	}
+
+	t.Run("relocates files before finalization", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		s := &Server{
+			config:         ServerConfig{BasePath: tmpDir},
+			logger:         logger,
+			torrents:       make(map[string]*serverTorrentState),
+			abortingHashes: make(map[string]chan struct{}),
+			inodes:         NewInodeRegistry(tmpDir, logger),
+		}
+
+		hash := "relocfin1"
+		oldFilePath := filepath.Join(tmpDir, "data", "file.bin.partial")
+		writeTestFile(t, oldFilePath, []byte("file content"))
+
+		state := newIncompleteState(oldFilePath, "")
+		s.mu.Lock()
+		s.torrents[hash] = state
+		s.mu.Unlock()
+
+		resp, err := s.FinalizeTorrent(ctx, &pb.FinalizeTorrentRequest{
+			TorrentHash: hash,
+			SaveSubPath: "movies",
+		})
+		if err != nil {
+			t.Fatalf("FinalizeTorrent RPC error: %v", err)
+		}
+		if resp.GetSuccess() {
+			t.Fatal("expected failure due to incomplete pieces")
+		}
+
+		// Verify state was updated by relocation
+		state.mu.Lock()
+		currentSubPath := state.saveSubPath
+		currentFilePath := state.files[0].path
+		state.mu.Unlock()
+
+		if currentSubPath != "movies" {
+			t.Errorf("state.saveSubPath = %q, want %q", currentSubPath, "movies")
+		}
+
+		expectedNewPath := filepath.Join(tmpDir, "movies", "data", "file.bin.partial")
+		if currentFilePath != expectedNewPath {
+			t.Errorf("state.files[0].path = %q, want %q", currentFilePath, expectedNewPath)
+		}
+
+		assertFileExists(t, expectedNewPath, "file should exist at new path after relocation")
+		assertFileNotExists(t, oldFilePath, "file should not exist at old path after relocation")
+	})
+
+	t.Run("no relocation when request sub-path is empty", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		s := &Server{
+			config:         ServerConfig{BasePath: tmpDir},
+			logger:         logger,
+			torrents:       make(map[string]*serverTorrentState),
+			abortingHashes: make(map[string]chan struct{}),
+			inodes:         NewInodeRegistry(tmpDir, logger),
+		}
+
+		hash := "relocfin2"
+		filePath := filepath.Join(tmpDir, "movies", "data", "file.bin.partial")
+		writeTestFile(t, filePath, []byte("file content"))
+
+		state := newIncompleteState(filePath, "movies")
+		s.mu.Lock()
+		s.torrents[hash] = state
+		s.mu.Unlock()
+
+		resp, err := s.FinalizeTorrent(ctx, &pb.FinalizeTorrentRequest{
+			TorrentHash: hash,
+			SaveSubPath: "",
+		})
+		if err != nil {
+			t.Fatalf("FinalizeTorrent RPC error: %v", err)
+		}
+		if resp.GetSuccess() {
+			t.Fatal("expected failure due to incomplete pieces")
+		}
+
+		// State should be unchanged
+		state.mu.Lock()
+		currentSubPath := state.saveSubPath
+		currentFilePath := state.files[0].path
+		state.mu.Unlock()
+
+		if currentSubPath != "movies" {
+			t.Errorf("state.saveSubPath = %q, want %q (should be unchanged)", currentSubPath, "movies")
+		}
+		if currentFilePath != filePath {
+			t.Errorf("state.files[0].path = %q, want %q (should be unchanged)", currentFilePath, filePath)
+		}
+
+		assertFileExists(t, filePath, "file should still exist at original path")
+	})
 }

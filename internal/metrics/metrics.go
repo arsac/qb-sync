@@ -14,6 +14,9 @@ const (
 	LabelResult    = "result"    // success, failure
 	LabelOperation = "operation" // GetTorrents, Login, etc.
 	LabelComponent = "component" // qb_client, stream_queue
+	LabelReason    = "reason"    // exit reason for goroutines
+	LabelHash      = "hash"      // torrent info hash
+	LabelName      = "name"      // torrent name
 )
 
 // Label value constants for consistent usage across the codebase.
@@ -28,6 +31,11 @@ const (
 	ResultMiss           = "miss"
 
 	ComponentStreamQueue = "stream_queue"
+
+	ReasonContextCancel    = "context_cancel"
+	ReasonEOF              = "eof"
+	ReasonStreamError      = "error"
+	ReasonAckChannelBlocked = "ack_channel_blocked"
 )
 
 // Counters track cumulative values that only increase.
@@ -39,7 +47,7 @@ var (
 			Name:      "torrents_synced_total",
 			Help:      "Total torrents successfully synced",
 		},
-		[]string{LabelMode},
+		[]string{LabelMode, LabelHash, LabelName},
 	)
 
 	// FinalizationErrorsTotal counts finalization failures.
@@ -49,7 +57,7 @@ var (
 			Name:      "finalization_errors_total",
 			Help:      "Total finalization failures",
 		},
-		[]string{LabelMode},
+		[]string{LabelMode, LabelHash, LabelName},
 	)
 
 	// TorrentStopErrorsTotal counts failures when stopping torrents before finalization.
@@ -59,7 +67,7 @@ var (
 			Name:      "torrent_stop_errors_total",
 			Help:      "Total failures stopping torrents before finalization",
 		},
-		[]string{LabelMode},
+		[]string{LabelMode, LabelHash, LabelName},
 	)
 
 	// TorrentResumeErrorsTotal counts failures when resuming torrents after finalization failure.
@@ -69,7 +77,7 @@ var (
 			Name:      "torrent_resume_errors_total",
 			Help:      "Total failures resuming torrents after finalization failure",
 		},
-		[]string{LabelMode},
+		[]string{LabelMode, LabelHash, LabelName},
 	)
 
 	// OrphanCleanupsTotal counts orphaned torrents cleaned up on cold.
@@ -136,13 +144,12 @@ var (
 	)
 
 	// QBClientRetriesTotal counts qBittorrent API retries.
-	QBClientRetriesTotal = promauto.NewCounterVec(
+	QBClientRetriesTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "qb_client_retries_total",
 			Help:      "Total qBittorrent API retries",
 		},
-		[]string{LabelMode, LabelOperation},
 	)
 
 	// CircuitBreakerTripsTotal counts circuit breaker trips.
@@ -317,6 +324,16 @@ var (
 		},
 	)
 
+	// TorrentBytesSyncedTotal counts bytes synced per torrent for Grafana completed-transfers table.
+	TorrentBytesSyncedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "torrent_bytes_synced_total",
+			Help:      "Total bytes synced per torrent from hot to cold",
+		},
+		[]string{LabelHash, LabelName},
+	)
+
 	// HealthCheckCacheTotal counts health check cache hits and misses.
 	HealthCheckCacheTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
@@ -333,6 +350,37 @@ var (
 			Namespace: namespace,
 			Name:      "window_full_total",
 			Help:      "Total times the sender blocked waiting for congestion window capacity",
+		},
+	)
+
+	// SendTimeoutTotal counts times Send() timed out waiting for gRPC stream.Send to complete.
+	// A spike indicates the receiver has stalled (cold stopped consuming / HTTP/2 flow control full).
+	SendTimeoutTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "send_timeout_total",
+			Help:      "Total times Send() timed out on HTTP/2 flow control backpressure",
+		},
+	)
+
+	// ReceiveAcksExitTotal counts receiveAcks goroutine exits by reason.
+	// Reasons: context_cancel, eof, error, ack_channel_blocked.
+	ReceiveAcksExitTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "receive_acks_exit_total",
+			Help:      "Total receiveAcks goroutine exits by reason",
+		},
+		[]string{LabelReason},
+	)
+
+	// AckChannelBlockedTotal counts times the ack channel was full for longer than the write timeout,
+	// forcing receiveAcks to exit. Indicates forwardAcks is too slow draining acks.
+	AckChannelBlockedTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "ack_channel_blocked_total",
+			Help:      "Total times receiveAcks exited because the ack channel was blocked too long",
 		},
 	)
 )
@@ -432,12 +480,13 @@ var (
 	)
 
 	// OldestPendingSyncSeconds tracks the age of the longest-waiting torrent sync.
-	OldestPendingSyncSeconds = promauto.NewGauge(
+	OldestPendingSyncSeconds = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "oldest_pending_sync_seconds",
 			Help:      "Age in seconds of the oldest torrent waiting to sync from hot to cold",
 		},
+		[]string{LabelHash, LabelName},
 	)
 
 	// CompletedOnColdCacheSize tracks the size of the completed-on-cold cache on hot.
@@ -520,15 +569,15 @@ var (
 		[]string{LabelResult},
 	)
 
-	// QBAPICallDuration tracks qBittorrent API call latency.
+	// QBAPICallDuration tracks qBittorrent API call latency (including retries).
 	QBAPICallDuration = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: namespace,
 			Name:      "qb_api_call_duration_seconds",
-			Help:      "qBittorrent API call latency",
+			Help:      "qBittorrent API call latency (including retries)",
 			Buckets:   []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
 		},
-		[]string{LabelMode, LabelOperation},
+		[]string{LabelOperation},
 	)
 
 	// StateFlushDuration tracks the time to flush dirty state to disk on cold.
@@ -542,13 +591,14 @@ var (
 	)
 
 	// TorrentSyncLatencySeconds tracks end-to-end sync duration from download completion to cold finalization.
-	TorrentSyncLatencySeconds = promauto.NewHistogram(
+	TorrentSyncLatencySeconds = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: namespace,
 			Name:      "torrent_sync_latency_seconds",
 			Help:      "End-to-end sync duration from download completion on hot to finalization on cold",
 			Buckets:   []float64{10, 30, 60, 120, 300, 600, 1800, 3600, 7200},
 		},
+		[]string{LabelHash, LabelName},
 	)
 )
 

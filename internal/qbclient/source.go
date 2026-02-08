@@ -51,16 +51,27 @@ func (s *Source) Init(ctx context.Context) error {
 	return nil
 }
 
+// ResolveSubPath computes the relative sub-path between qBittorrent's default
+// save path and a torrent's actual save path. When ATM + categories are enabled,
+// this captures the category subdirectory (e.g., "movies").
+// Returns "" when the torrent is at the default save path root.
+func (s *Source) ResolveSubPath(torrentSavePath string) string {
+	rel, err := filepath.Rel(s.qbDefaultSavePath, torrentSavePath)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return ""
+	}
+	return rel
+}
+
 // ResolveContentDir maps a torrent's save_path to the local content directory.
 // When ATM + categories are enabled, save_path includes a category subdirectory
 // (e.g., /downloads/movies instead of /downloads). This method computes the
 // relative subdirectory and applies it to the local dataPath.
 func (s *Source) ResolveContentDir(torrentSavePath string) string {
-	rel, err := filepath.Rel(s.qbDefaultSavePath, torrentSavePath)
-	if err != nil || strings.HasPrefix(rel, "..") {
-		return s.dataPath
+	if sub := s.ResolveSubPath(torrentSavePath); sub != "" {
+		return filepath.Join(s.dataPath, sub)
 	}
-	return filepath.Join(s.dataPath, rel)
+	return s.dataPath
 }
 
 // GetPieceStates returns the current state of all pieces for a torrent.
@@ -179,6 +190,7 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 			Files:       files,
 			TorrentFile: torrentFile,
 			PieceHashes: pieceHashes,
+			SaveSubPath: s.ResolveSubPath(torrent.SavePath),
 		},
 		ContentDir: contentDir,
 	}, nil

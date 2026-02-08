@@ -61,8 +61,8 @@ func (s *Server) InitTorrent(
 			s.mu.Unlock()
 			return initErrorResponse("torrent initialization already in progress"), nil
 		}
-		resp := s.resumeTorrent(ctx, hash, state, req)
 		s.mu.Unlock()
+		resp := s.resumeTorrent(ctx, hash, state, req)
 		return resp, nil
 	}
 
@@ -155,8 +155,25 @@ func (s *Server) initNewTorrent(
 		return initErrorResponse("%v", err)
 	}
 
+	// Check for existing files at a different sub-path and relocate if needed.
+	// This handles cold restart: persisted state may have files at the old path
+	// (e.g., no category prefix), while hot now sends the correct sub-path.
+	saveSubPath := req.GetSaveSubPath()
+	if persistedInfo, loadInfoErr := s.loadFilesInfo(metaDir); loadInfoErr == nil {
+		if persistedInfo.SaveSubPath != saveSubPath {
+			relPaths := make([]string, len(req.GetFiles()))
+			for i, f := range req.GetFiles() {
+				relPaths[i] = f.GetPath()
+			}
+			if _, relocErr := s.relocateFiles(ctx, hash, relPaths, persistedInfo.SaveSubPath, saveSubPath); relocErr != nil {
+				s.logger.WarnContext(ctx, "failed to relocate files, continuing with fresh setup",
+					"hash", hash, "error", relocErr)
+			}
+		}
+	}
+
 	// Set up files and check for hardlink opportunities
-	files, hardlinkResults, err := s.setupFiles(ctx, hash, req.GetFiles())
+	files, hardlinkResults, err := s.setupFiles(ctx, hash, req.GetFiles(), saveSubPath)
 	if err != nil {
 		return initErrorResponse("%v", err)
 	}
@@ -189,7 +206,7 @@ func (s *Server) initNewTorrent(
 	// Persist file info for recovery after restart.
 	// If this fails, the torrent would be unrecoverable after a server restart,
 	// so we return an error (caller will clean up the sentinel).
-	persistedInfo := buildPersistedInfo(name, numPieces, pieceSize, totalSize, files, req.GetPieceHashes())
+	persistedInfo := buildPersistedInfo(name, numPieces, pieceSize, totalSize, files, req.GetPieceHashes(), saveSubPath)
 	if saveErr := s.saveFilesInfo(metaDir, persistedInfo); saveErr != nil {
 		return initErrorResponse("failed to save files info for recovery: %v", saveErr)
 	}
@@ -205,11 +222,13 @@ func (s *Server) initNewTorrent(
 		files:           files,
 		torrentPath:     torrentPath,
 		statePath:       statePath,
+		saveSubPath:     saveSubPath,
 		hardlinkResults: hardlinkResults,
 	}
 	s.mu.Lock()
 	s.torrents[hash] = state
 	s.mu.Unlock()
+	metrics.ActiveTorrents.WithLabelValues(metrics.ModeCold).Inc()
 
 	// Log summary
 	hardlinkedCount, pendingCount, preExistingCount := countHardlinkResults(hardlinkResults)
@@ -352,7 +371,9 @@ func (s *Server) ensureTorrentFileWritten(
 		return fmt.Errorf("writing torrent file: %w", err)
 	}
 
+	state.mu.Lock()
 	state.torrentPath = torrentPath
+	state.mu.Unlock()
 	s.logger.InfoContext(ctx, "wrote torrent file for existing state", "hash", hash, "path", torrentPath)
 	return nil
 }
@@ -370,12 +391,13 @@ func (s *Server) setupFiles(
 	ctx context.Context,
 	hash string,
 	reqFiles []*pb.FileInfo,
+	saveSubPath string,
 ) ([]*serverFileInfo, []*pb.HardlinkResult, error) {
 	files := make([]*serverFileInfo, len(reqFiles))
 	results := make([]*pb.HardlinkResult, len(reqFiles))
 
 	for i, f := range reqFiles {
-		fileInfo, result, err := s.setupFile(ctx, hash, f, i)
+		fileInfo, result, err := s.setupFile(ctx, hash, f, i, saveSubPath)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -392,9 +414,10 @@ func (s *Server) setupFile(
 	hash string,
 	f *pb.FileInfo,
 	fileIndex int,
+	saveSubPath string,
 ) (*serverFileInfo, *pb.HardlinkResult, error) {
 	result := &pb.HardlinkResult{FileIndex: int32(fileIndex)}
-	targetPath := filepath.Join(s.config.BasePath, f.GetPath())
+	targetPath := filepath.Join(s.config.BasePath, saveSubPath, f.GetPath())
 
 	// Ensure parent directory exists
 	if err := os.MkdirAll(filepath.Dir(targetPath), serverDirPermissions); err != nil {

@@ -362,8 +362,9 @@ type InitTorrentRequest struct {
 	TotalSize     int64                  `protobuf:"varint,4,opt,name=total_size,json=totalSize,proto3" json:"total_size,omitempty"`
 	NumPieces     int32                  `protobuf:"varint,5,opt,name=num_pieces,json=numPieces,proto3" json:"num_pieces,omitempty"`
 	Files         []*FileInfo            `protobuf:"bytes,6,rep,name=files,proto3" json:"files,omitempty"`
-	TorrentFile   []byte                 `protobuf:"bytes,7,opt,name=torrent_file,json=torrentFile,proto3" json:"torrent_file,omitempty"` // Raw .torrent file for resume state and verification
-	PieceHashes   []string               `protobuf:"bytes,8,rep,name=piece_hashes,json=pieceHashes,proto3" json:"piece_hashes,omitempty"` // SHA1 hashes per piece (hex-encoded)
+	TorrentFile   []byte                 `protobuf:"bytes,7,opt,name=torrent_file,json=torrentFile,proto3" json:"torrent_file,omitempty"`   // Raw .torrent file for resume state and verification
+	PieceHashes   []string               `protobuf:"bytes,8,rep,name=piece_hashes,json=pieceHashes,proto3" json:"piece_hashes,omitempty"`   // SHA1 hashes per piece (hex-encoded)
+	SaveSubPath   string                 `protobuf:"bytes,9,opt,name=save_sub_path,json=saveSubPath,proto3" json:"save_sub_path,omitempty"` // Relative sub-path prefix for file storage (e.g., "movies" from category)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -452,6 +453,13 @@ func (x *InitTorrentRequest) GetPieceHashes() []string {
 		return x.PieceHashes
 	}
 	return nil
+}
+
+func (x *InitTorrentRequest) GetSaveSubPath() string {
+	if x != nil {
+		return x.SaveSubPath
+	}
+	return ""
 }
 
 type FileInfo struct {
@@ -1029,9 +1037,10 @@ func (x *RegisterFileResponse) GetError() string {
 type FinalizeTorrentRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	TorrentHash   string                 `protobuf:"bytes,1,opt,name=torrent_hash,json=torrentHash,proto3" json:"torrent_hash,omitempty"`
-	SavePath      string                 `protobuf:"bytes,2,opt,name=save_path,json=savePath,proto3" json:"save_path,omitempty"` // Destination path for qBittorrent
-	Category      string                 `protobuf:"bytes,3,opt,name=category,proto3" json:"category,omitempty"`                 // Optional category
-	Tags          string                 `protobuf:"bytes,4,opt,name=tags,proto3" json:"tags,omitempty"`                         // Optional tags (comma-separated)
+	SavePath      string                 `protobuf:"bytes,2,opt,name=save_path,json=savePath,proto3" json:"save_path,omitempty"`            // Destination path for qBittorrent
+	Category      string                 `protobuf:"bytes,3,opt,name=category,proto3" json:"category,omitempty"`                            // Optional category
+	Tags          string                 `protobuf:"bytes,4,opt,name=tags,proto3" json:"tags,omitempty"`                                    // Optional tags (comma-separated)
+	SaveSubPath   string                 `protobuf:"bytes,5,opt,name=save_sub_path,json=saveSubPath,proto3" json:"save_sub_path,omitempty"` // Relative sub-path prefix for file storage (e.g., "movies" from category)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1090,6 +1099,13 @@ func (x *FinalizeTorrentRequest) GetCategory() string {
 func (x *FinalizeTorrentRequest) GetTags() string {
 	if x != nil {
 		return x.Tags
+	}
+	return ""
+}
+
+func (x *FinalizeTorrentRequest) GetSaveSubPath() string {
+	if x != nil {
+		return x.SaveSubPath
 	}
 	return ""
 }
@@ -1466,7 +1482,7 @@ const file_qbsync_proto_rawDesc = "" +
 	"\asuccess\x18\x03 \x01(\bR\asuccess\x12\x14\n" +
 	"\x05error\x18\x04 \x01(\tR\x05error\x125\n" +
 	"\n" +
-	"error_code\x18\x05 \x01(\x0e2\x16.qbsync.PieceErrorCodeR\terrorCode\"\x96\x02\n" +
+	"error_code\x18\x05 \x01(\x0e2\x16.qbsync.PieceErrorCodeR\terrorCode\"\xba\x02\n" +
 	"\x12InitTorrentRequest\x12!\n" +
 	"\ftorrent_hash\x18\x01 \x01(\tR\vtorrentHash\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x1d\n" +
@@ -1478,7 +1494,8 @@ const file_qbsync_proto_rawDesc = "" +
 	"num_pieces\x18\x05 \x01(\x05R\tnumPieces\x12&\n" +
 	"\x05files\x18\x06 \x03(\v2\x10.qbsync.FileInfoR\x05files\x12!\n" +
 	"\ftorrent_file\x18\a \x01(\fR\vtorrentFile\x12!\n" +
-	"\fpiece_hashes\x18\b \x03(\tR\vpieceHashes\"`\n" +
+	"\fpiece_hashes\x18\b \x03(\tR\vpieceHashes\x12\"\n" +
+	"\rsave_sub_path\x18\t \x01(\tR\vsaveSubPath\"`\n" +
 	"\bFileInfo\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x12\n" +
 	"\x04size\x18\x02 \x01(\x03R\x04size\x12\x16\n" +
@@ -1522,12 +1539,13 @@ const file_qbsync_proto_rawDesc = "" +
 	"\x04size\x18\x03 \x01(\x03R\x04size\"F\n" +
 	"\x14RegisterFileResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\tR\x05error\"\x88\x01\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error\"\xac\x01\n" +
 	"\x16FinalizeTorrentRequest\x12!\n" +
 	"\ftorrent_hash\x18\x01 \x01(\tR\vtorrentHash\x12\x1b\n" +
 	"\tsave_path\x18\x02 \x01(\tR\bsavePath\x12\x1a\n" +
 	"\bcategory\x18\x03 \x01(\tR\bcategory\x12\x12\n" +
-	"\x04tags\x18\x04 \x01(\tR\x04tags\"_\n" +
+	"\x04tags\x18\x04 \x01(\tR\x04tags\x12\"\n" +
+	"\rsave_sub_path\x18\x05 \x01(\tR\vsaveSubPath\"_\n" +
 	"\x17FinalizeTorrentResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\x12\x14\n" +

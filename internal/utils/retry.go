@@ -6,8 +6,10 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/failsafe-go/failsafe-go"
+	"github.com/failsafe-go/failsafe-go/retrypolicy"
 )
 
 // Default retry configuration values.
@@ -15,14 +17,6 @@ const (
 	defaultMaxAttempts  = 3
 	defaultInitialDelay = 500 * time.Millisecond
 	defaultMaxDelay     = 5 * time.Second
-	defaultMultiplier   = 2.0
-)
-
-// Default circuit breaker configuration values.
-const (
-	defaultCBMaxFailures         = 5
-	defaultCBResetTimeout        = 30 * time.Second
-	defaultCBHalfOpenMaxAttempts = 2
 )
 
 // RetryConfig configures retry behavior with exponential backoff.
@@ -30,7 +24,6 @@ type RetryConfig struct {
 	MaxAttempts      int           // Maximum number of attempts (including first try)
 	InitialDelay     time.Duration // Initial delay between retries
 	MaxDelay         time.Duration // Maximum delay between retries
-	Multiplier       float64       // Multiplier for exponential backoff
 	RetriableChecker func(error) bool
 }
 
@@ -40,9 +33,42 @@ func DefaultRetryConfig() RetryConfig {
 		MaxAttempts:      defaultMaxAttempts,
 		InitialDelay:     defaultInitialDelay,
 		MaxDelay:         defaultMaxDelay,
-		Multiplier:       defaultMultiplier,
 		RetriableChecker: IsRetriableError,
 	}
+}
+
+// CircuitBreakerConfig configures the circuit breaker.
+type CircuitBreakerConfig struct {
+	MaxFailures  int           // Failures before opening circuit
+	ResetTimeout time.Duration // Time before trying again after opening
+}
+
+// NewRetryPolicy builds a failsafe-go retry policy from a RetryConfig.
+// Optional onRetry callbacks are invoked on each retry attempt (e.g., for metrics).
+func NewRetryPolicy(config RetryConfig, logger *slog.Logger, onRetry ...func()) retrypolicy.RetryPolicy[any] {
+	checker := config.RetriableChecker
+	if checker == nil {
+		checker = IsRetriableError
+	}
+
+	return retrypolicy.NewBuilder[any]().
+		WithMaxAttempts(config.MaxAttempts).
+		WithBackoff(config.InitialDelay, config.MaxDelay).
+		WithJitterFactor(0.1).
+		HandleIf(func(_ any, err error) bool {
+			return checker(err)
+		}).
+		OnRetry(func(e failsafe.ExecutionEvent[any]) {
+			logger.Warn("operation failed, retrying",
+				"attempt", e.Attempts(),
+				"error", e.LastError(),
+			)
+			for _, fn := range onRetry {
+				fn()
+			}
+		}).
+		ReturnLastFailure().
+		Build()
 }
 
 // isRetriableNetworkError checks if the error string indicates a network issue worth retrying.
@@ -146,229 +172,4 @@ func IsCircuitBreakerFailure(err error) bool {
 
 	// All other errors are considered circuit breaker failures
 	return true
-}
-
-// Retry executes the given function with exponential backoff retry logic.
-// Returns the result and final error after all retries are exhausted.
-func Retry[T any](
-	ctx context.Context,
-	config RetryConfig,
-	logger *slog.Logger,
-	operation string,
-	fn func(ctx context.Context) (T, error),
-) (T, error) {
-	var zero T
-	var lastErr error
-	delay := config.InitialDelay
-
-	checker := config.RetriableChecker
-	if checker == nil {
-		checker = IsRetriableError
-	}
-
-	for attempt := 1; attempt <= config.MaxAttempts; attempt++ {
-		result, err := fn(ctx)
-		if err == nil {
-			if attempt > 1 && logger != nil {
-				logger.DebugContext(ctx, "operation succeeded after retry",
-					"operation", operation,
-					"attempt", attempt,
-				)
-			}
-			return result, nil
-		}
-
-		lastErr = err
-
-		// Check if we should retry
-		if !checker(err) {
-			// Non-retriable error, fail immediately
-			return zero, err
-		}
-
-		// Check if this was the last attempt
-		if attempt >= config.MaxAttempts {
-			break
-		}
-
-		// Log retry attempt
-		if logger != nil {
-			logger.WarnContext(ctx, "operation failed, retrying",
-				"operation", operation,
-				"attempt", attempt,
-				"maxAttempts", config.MaxAttempts,
-				"error", err,
-				"nextDelay", delay,
-			)
-		}
-
-		// Wait before retrying
-		select {
-		case <-ctx.Done():
-			return zero, ctx.Err()
-		case <-time.After(delay):
-		}
-
-		// Increase delay for next iteration (exponential backoff)
-		delay = min(time.Duration(float64(delay)*config.Multiplier), config.MaxDelay)
-	}
-
-	return zero, lastErr
-}
-
-// CircuitBreaker provides circuit breaker functionality to prevent
-// hammering a failing service.
-type CircuitBreaker struct {
-	mu                  sync.Mutex
-	failures            int
-	lastFailure         time.Time
-	state               circuitState
-	maxFailures         int
-	resetTimeout        time.Duration
-	halfOpenMaxAttempts int
-	halfOpenAttempts    int
-}
-
-type circuitState int
-
-const (
-	circuitClosed circuitState = iota
-	circuitOpen
-	circuitHalfOpen
-)
-
-// CircuitBreakerConfig configures the circuit breaker.
-type CircuitBreakerConfig struct {
-	MaxFailures         int           // Failures before opening circuit
-	ResetTimeout        time.Duration // Time before trying again after opening
-	HalfOpenMaxAttempts int           // Max attempts in half-open state before closing
-}
-
-// DefaultCircuitBreakerConfig returns sensible defaults.
-func DefaultCircuitBreakerConfig() CircuitBreakerConfig {
-	return CircuitBreakerConfig{
-		MaxFailures:         defaultCBMaxFailures,
-		ResetTimeout:        defaultCBResetTimeout,
-		HalfOpenMaxAttempts: defaultCBHalfOpenMaxAttempts,
-	}
-}
-
-// NewCircuitBreaker creates a new circuit breaker.
-func NewCircuitBreaker(config CircuitBreakerConfig) *CircuitBreaker {
-	return &CircuitBreaker{
-		state:               circuitClosed,
-		maxFailures:         config.MaxFailures,
-		resetTimeout:        config.ResetTimeout,
-		halfOpenMaxAttempts: config.HalfOpenMaxAttempts,
-	}
-}
-
-// ErrCircuitOpen is returned when the circuit breaker is open.
-var ErrCircuitOpen = errors.New("circuit breaker is open")
-
-// Allow checks if a request should be allowed through.
-// Returns true if the request can proceed, false if circuit is open.
-func (cb *CircuitBreaker) Allow() bool {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
-
-	switch cb.state {
-	case circuitClosed:
-		return true
-	case circuitOpen:
-		// Check if reset timeout has passed
-		if time.Since(cb.lastFailure) > cb.resetTimeout {
-			cb.state = circuitHalfOpen
-			cb.halfOpenAttempts = 0
-			return true
-		}
-		return false
-	case circuitHalfOpen:
-		// Allow limited attempts in half-open state
-		if cb.halfOpenAttempts < cb.halfOpenMaxAttempts {
-			cb.halfOpenAttempts++
-			return true
-		}
-		return false
-	}
-	return false
-}
-
-// RecordSuccess records a successful request.
-func (cb *CircuitBreaker) RecordSuccess() {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
-
-	cb.failures = 0
-	cb.state = circuitClosed
-}
-
-// RecordFailure records a failed request.
-func (cb *CircuitBreaker) RecordFailure() {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
-
-	cb.failures++
-	cb.lastFailure = time.Now()
-
-	if cb.state == circuitHalfOpen {
-		// Any failure in half-open state opens the circuit
-		cb.state = circuitOpen
-		return
-	}
-
-	if cb.failures >= cb.maxFailures {
-		cb.state = circuitOpen
-	}
-}
-
-// State returns the current circuit state as a string.
-func (cb *CircuitBreaker) State() string {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
-
-	switch cb.state {
-	case circuitClosed:
-		return "closed"
-	case circuitOpen:
-		return "open"
-	case circuitHalfOpen:
-		return "half-open"
-	}
-	return "unknown"
-}
-
-// RetryWithCircuitBreaker combines retry logic with circuit breaker.
-func RetryWithCircuitBreaker[T any](
-	ctx context.Context,
-	cb *CircuitBreaker,
-	config RetryConfig,
-	logger *slog.Logger,
-	operation string,
-	fn func(ctx context.Context) (T, error),
-) (T, error) {
-	var zero T
-
-	if !cb.Allow() {
-		if logger != nil {
-			logger.WarnContext(ctx, "circuit breaker open, skipping operation",
-				"operation", operation,
-				"state", cb.State(),
-			)
-		}
-		return zero, ErrCircuitOpen
-	}
-
-	result, err := Retry(ctx, config, logger, operation, fn)
-	if err != nil {
-		// Only record failures that indicate service unavailability.
-		// 404 errors (resource not found) don't mean the service is down.
-		if IsCircuitBreakerFailure(err) {
-			cb.RecordFailure()
-		}
-		return zero, err
-	}
-
-	cb.RecordSuccess()
-	return result, nil
 }

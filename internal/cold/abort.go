@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/arsac/qb-sync/internal/metrics"
 	pb "github.com/arsac/qb-sync/proto"
 )
 
@@ -81,6 +82,9 @@ func (s *Server) AbortTorrent(
 		delete(s.torrents, hash)
 	}
 	s.mu.Unlock()
+	if exists && !state.initializing {
+		metrics.ActiveTorrents.WithLabelValues(metrics.ModeCold).Dec()
+	}
 
 	// Register cleanup IMMEDIATELY after releasing lock to minimize panic window.
 	// This ensures the abort tracking is cleaned up even if subsequent code panics.

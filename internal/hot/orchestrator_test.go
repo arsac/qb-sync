@@ -368,12 +368,13 @@ type mockColdDest struct {
 	checkStatusResults map[string]*streaming.InitTorrentResult
 	checkStatusErr     error
 
-	finalizeCalled   bool
-	finalizeHash     string
-	finalizeSavePath string
-	finalizeCategory string
-	finalizeTags     string
-	finalizeErr      error
+	finalizeCalled      bool
+	finalizeHash        string
+	finalizeSavePath    string
+	finalizeCategory    string
+	finalizeTags        string
+	finalizeSaveSubPath string
+	finalizeErr         error
 
 	abortCalled      bool
 	abortHash        string
@@ -398,12 +399,13 @@ func (m *mockColdDest) CheckTorrentStatus(_ context.Context, hash string) (*stre
 	return nil, errors.New("unknown hash")
 }
 
-func (m *mockColdDest) FinalizeTorrent(_ context.Context, hash, savePath, category, tags string) error {
+func (m *mockColdDest) FinalizeTorrent(_ context.Context, hash, savePath, category, tags, saveSubPath string) error {
 	m.finalizeCalled = true
 	m.finalizeHash = hash
 	m.finalizeSavePath = savePath
 	m.finalizeCategory = category
 	m.finalizeTags = tags
+	m.finalizeSaveSubPath = saveSubPath
 	return m.finalizeErr
 }
 
@@ -814,6 +816,7 @@ func TestFinalizeTorrent(t *testing.T) {
 			logger:    logger,
 			srcClient: mockClient,
 			grpcDest:  coldDest,
+			source:    qbclient.NewSource(nil, ""),
 		}
 
 		err := task.finalizeTorrent(context.Background(), "abc123")
@@ -892,6 +895,7 @@ func TestFinalizeTorrent(t *testing.T) {
 			logger:    logger,
 			srcClient: mockClient,
 			grpcDest:  coldDest,
+			source:    qbclient.NewSource(nil, ""),
 		}
 
 		err := task.finalizeTorrent(context.Background(), "abc123")
@@ -915,6 +919,7 @@ func TestFinalizeTorrent(t *testing.T) {
 			logger:    logger,
 			srcClient: mockClient,
 			grpcDest:  coldDest,
+			source:    qbclient.NewSource(nil, ""),
 		}
 
 		err := task.finalizeTorrent(context.Background(), "abc123")
@@ -1003,7 +1008,7 @@ func TestSyncedTagApplication(t *testing.T) {
 	})
 }
 
-func TestTryStartTrackingTransientError(t *testing.T) {
+func TestQueryColdStatus(t *testing.T) {
 	logger := testLogger(t)
 	makeTracker := func() *streaming.PieceMonitor {
 		return streaming.NewPieceMonitor(nil, nil, logger, streaming.DefaultPieceMonitorConfig())
@@ -1023,16 +1028,16 @@ func TestTryStartTrackingTransientError(t *testing.T) {
 		}
 
 		torrent := qbittorrent.Torrent{Hash: "abc123", Name: "test"}
-		started, err := task.tryStartTracking(context.Background(), torrent)
+		result, err := task.queryColdStatus(context.Background(), torrent)
 		if err == nil {
 			t.Error("expected transient error to be returned")
 		}
-		if started {
-			t.Error("should not have started tracking")
+		if result != nil {
+			t.Error("result should be nil on transient error")
 		}
 	})
 
-	t.Run("non-transient error returns (false, nil)", func(t *testing.T) {
+	t.Run("non-transient error returns (nil, nil)", func(t *testing.T) {
 		nonTransientErr := errors.New("some application error")
 		coldDest := &mockColdDest{checkStatusErr: nonTransientErr}
 		task := &QBTask{
@@ -1046,16 +1051,16 @@ func TestTryStartTrackingTransientError(t *testing.T) {
 		}
 
 		torrent := qbittorrent.Torrent{Hash: "abc123", Name: "test"}
-		started, err := task.tryStartTracking(context.Background(), torrent)
+		result, err := task.queryColdStatus(context.Background(), torrent)
 		if err != nil {
 			t.Errorf("non-transient error should not be returned: %v", err)
 		}
-		if started {
-			t.Error("should not have started tracking")
+		if result != nil {
+			t.Error("result should be nil for non-transient error")
 		}
 	})
 
-	t.Run("COMPLETE status returns (false, nil) and caches", func(t *testing.T) {
+	t.Run("COMPLETE status returns (nil, nil) and caches", func(t *testing.T) {
 		coldDest := &mockColdDest{
 			checkStatusResults: map[string]*streaming.InitTorrentResult{
 				"abc123": {Status: pb.TorrentSyncStatus_SYNC_STATUS_COMPLETE},
@@ -1074,12 +1079,12 @@ func TestTryStartTrackingTransientError(t *testing.T) {
 		}
 
 		torrent := qbittorrent.Torrent{Hash: "abc123", Name: "test"}
-		started, err := task.tryStartTracking(context.Background(), torrent)
+		result, err := task.queryColdStatus(context.Background(), torrent)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
-		if started {
-			t.Error("should not have started tracking for COMPLETE torrent")
+		if result != nil {
+			t.Error("result should be nil for COMPLETE torrent")
 		}
 
 		task.completedMu.RLock()
@@ -1216,5 +1221,173 @@ func TestCompletedCachePersistence(t *testing.T) {
 		if len(hashes) != 1 || hashes[0] != "hash_abc" {
 			t.Errorf("expected [hash_abc], got %v", hashes)
 		}
+	})
+}
+
+// mockPieceSource implements streaming.PieceSource for testing.
+type mockPieceSource struct {
+	numPieces int32
+}
+
+func (m *mockPieceSource) GetTorrentMetadata(_ context.Context, _ string) (*streaming.TorrentMetadata, error) {
+	return &streaming.TorrentMetadata{
+		InitTorrentRequest: &pb.InitTorrentRequest{
+			NumPieces: m.numPieces,
+			PieceSize: 1024,
+			Name:      "test",
+		},
+	}, nil
+}
+
+func (m *mockPieceSource) GetPieceHashes(_ context.Context, _ string) ([]string, error) {
+	hashes := make([]string, m.numPieces)
+	for i := range hashes {
+		hashes[i] = "deadbeef"
+	}
+	return hashes, nil
+}
+
+func (m *mockPieceSource) GetPieceStates(_ context.Context, _ string) ([]streaming.PieceState, error) {
+	states := make([]streaming.PieceState, m.numPieces)
+	for i := range states {
+		states[i] = streaming.PieceStateDownloaded
+	}
+	return states, nil
+}
+
+func (m *mockPieceSource) ReadPiece(_ context.Context, _ *pb.Piece) ([]byte, error) {
+	return nil, nil
+}
+
+func TestTrackNewTorrents_PrioritizesByProgress(t *testing.T) {
+	logger := testLogger(t)
+	const numPieces = 1000
+
+	makePiecesNeeded := func(haveCount int) []bool {
+		needed := make([]bool, numPieces)
+		for i := haveCount; i < numPieces; i++ {
+			needed[i] = true
+		}
+		return needed
+	}
+
+	t.Run("tracks torrents in descending progress order", func(t *testing.T) {
+		mockSource := &mockPieceSource{numPieces: numPieces}
+		tracker := streaming.NewPieceMonitor(nil, mockSource, logger, streaming.DefaultPieceMonitorConfig())
+
+		coldDest := &mockColdDest{
+			checkStatusResults: map[string]*streaming.InitTorrentResult{
+				"hashA": {
+					Status:          pb.TorrentSyncStatus_SYNC_STATUS_READY,
+					PiecesNeeded:    makePiecesNeeded(0),
+					PiecesHaveCount: 0,
+				},
+				"hashB": {
+					Status:          pb.TorrentSyncStatus_SYNC_STATUS_READY,
+					PiecesNeeded:    makePiecesNeeded(900),
+					PiecesHaveCount: 900,
+				},
+				"hashC": {
+					Status:          pb.TorrentSyncStatus_SYNC_STATUS_READY,
+					PiecesNeeded:    makePiecesNeeded(500),
+					PiecesHaveCount: 500,
+				},
+			},
+		}
+
+		// API returns A, B, C in arbitrary order
+		mockClient := &mockQBClient{
+			getTorrentsResult: []qbittorrent.Torrent{
+				{Hash: "hashA", Name: "torrentA", CompletionOn: 100},
+				{Hash: "hashB", Name: "torrentB", CompletionOn: 200},
+				{Hash: "hashC", Name: "torrentC", CompletionOn: 300},
+			},
+		}
+
+		tmpDir := t.TempDir()
+		task := &QBTask{
+			cfg:                &config.HotConfig{},
+			logger:             logger,
+			srcClient:          mockClient,
+			grpcDest:           coldDest,
+			tracker:            tracker,
+			trackedTorrents:    make(map[string]trackedTorrent),
+			completedOnCold:    make(map[string]bool),
+			completedCachePath: filepath.Join(tmpDir, "cache.json"),
+			finalizeBackoffs:   make(map[string]*finalizeBackoff),
+		}
+
+		var trackOrder []string
+		task.trackingOrderHook = func(hash string) {
+			trackOrder = append(trackOrder, hash)
+		}
+
+		err := task.trackNewTorrents(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// Expect B (900), C (500), A (0)
+		expected := []string{"hashB", "hashC", "hashA"}
+		if len(trackOrder) != len(expected) {
+			t.Fatalf("expected %d tracked, got %d: %v", len(expected), len(trackOrder), trackOrder)
+		}
+		for i, hash := range expected {
+			if trackOrder[i] != hash {
+				t.Errorf("position %d: expected %s, got %s (full order: %v)", i, hash, trackOrder[i], trackOrder)
+			}
+		}
+	})
+
+	t.Run("zero candidates when all COMPLETE or VERIFYING", func(t *testing.T) {
+		tracker := streaming.NewPieceMonitor(nil, nil, logger, streaming.DefaultPieceMonitorConfig())
+
+		coldDest := &mockColdDest{
+			checkStatusResults: map[string]*streaming.InitTorrentResult{
+				"hashX": {Status: pb.TorrentSyncStatus_SYNC_STATUS_COMPLETE},
+				"hashY": {Status: pb.TorrentSyncStatus_SYNC_STATUS_VERIFYING},
+			},
+		}
+
+		mockClient := &mockQBClient{
+			getTorrentsResult: []qbittorrent.Torrent{
+				{Hash: "hashX", Name: "torrentX"},
+				{Hash: "hashY", Name: "torrentY"},
+			},
+		}
+
+		tmpDir := t.TempDir()
+		task := &QBTask{
+			cfg:                &config.HotConfig{},
+			logger:             logger,
+			srcClient:          mockClient,
+			grpcDest:           coldDest,
+			tracker:            tracker,
+			trackedTorrents:    make(map[string]trackedTorrent),
+			completedOnCold:    make(map[string]bool),
+			completedCachePath: filepath.Join(tmpDir, "cache.json"),
+			finalizeBackoffs:   make(map[string]*finalizeBackoff),
+		}
+
+		var trackOrder []string
+		task.trackingOrderHook = func(hash string) {
+			trackOrder = append(trackOrder, hash)
+		}
+
+		err := task.trackNewTorrents(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if len(trackOrder) != 0 {
+			t.Errorf("expected no torrents tracked, got %v", trackOrder)
+		}
+
+		// hashX should be cached as complete
+		task.completedMu.RLock()
+		if !task.completedOnCold["hashX"] {
+			t.Error("COMPLETE torrent should be cached")
+		}
+		task.completedMu.RUnlock()
 	})
 }

@@ -49,6 +49,8 @@ type finalizeBackoff struct {
 // trackedTorrent holds metadata for a torrent being synced from hot to cold.
 type trackedTorrent struct {
 	completionTime time.Time // when the torrent finished downloading on hot (from qbittorrent CompletionOn)
+	name           string    // torrent name for metric labels
+	size           int64     // torrent size in bytes for TorrentBytesSyncedTotal metric
 }
 
 // completionTimeOrNow converts a qBittorrent CompletionOn unix timestamp to time.Time.
@@ -94,6 +96,9 @@ type QBTask struct {
 	// Set by trackNewTorrents, consumed by fetchTorrentsCompletedOnCold, reset each cycle.
 	// nil means not yet fetched this cycle; non-nil (even empty) means cached.
 	cycleCompletedTorrents []qbittorrent.Torrent
+
+	// trackingOrderHook is called with each hash when tracking starts. Test-only.
+	trackingOrderHook func(hash string)
 }
 
 // NewQBTask creates a new QBTask with streaming integration.
@@ -411,23 +416,28 @@ func (t *QBTask) runOnce(ctx context.Context) {
 	}
 }
 
-// updateSyncAgeGauge sets the oldest_pending_sync_seconds gauge to the age
-// of the longest-waiting tracked torrent. Resets to 0 when no torrents are tracked.
+// updateSyncAgeGauge sets the oldest_pending_sync_seconds gauge per tracked torrent.
+// Resets first to clear stale labels from previously finalized/removed torrents.
 func (t *QBTask) updateSyncAgeGauge() {
 	t.trackedMu.RLock()
 	defer t.trackedMu.RUnlock()
-	var oldest float64
-	for _, tt := range t.trackedTorrents {
+	metrics.OldestPendingSyncSeconds.Reset()
+	for hash, tt := range t.trackedTorrents {
 		age := time.Since(tt.completionTime).Seconds()
-		if age > oldest {
-			oldest = age
-		}
+		metrics.OldestPendingSyncSeconds.WithLabelValues(hash, tt.name).Set(age)
 	}
-	metrics.OldestPendingSyncSeconds.Set(oldest)
+}
+
+// candidateTorrent pairs a torrent with its cold status for priority sorting.
+type candidateTorrent struct {
+	torrent    qbittorrent.Torrent
+	coldResult *streaming.InitTorrentResult
 }
 
 // trackNewTorrents starts tracking new completed torrents.
-// Uses InitTorrent to check cold status - if already complete, skips tracking.
+// Uses a two-pass approach: first queries cold for status, then sorts candidates
+// by progress (most pieces on cold first) before tracking. This ensures
+// partially-streamed torrents are prioritized after restart.
 func (t *QBTask) trackNewTorrents(ctx context.Context) error {
 	torrents, err := t.srcClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
 		Filter: qbittorrent.TorrentFilterCompleted,
@@ -439,6 +449,8 @@ func (t *QBTask) trackNewTorrents(ctx context.Context) error {
 	// Cache for reuse by fetchTorrentsCompletedOnCold in the same cycle
 	t.cycleCompletedTorrents = torrents
 
+	// Pass 1: Query cold status for each untracked torrent, collect READY candidates.
+	var candidates []candidateTorrent
 	for _, torrent := range torrents {
 		// Check local cache first (fast path)
 		t.completedMu.RLock()
@@ -456,60 +468,68 @@ func (t *QBTask) trackNewTorrents(ctx context.Context) error {
 			continue
 		}
 
-		// Query cold for status via InitTorrent
-		started, coldErr := t.tryStartTracking(ctx, torrent)
+		result, coldErr := t.queryColdStatus(ctx, torrent)
 		if coldErr != nil {
 			t.logger.WarnContext(ctx, "cold server unreachable, skipping remaining torrents",
 				"error", coldErr,
 			)
 			break
 		}
-
-		if !started {
-			continue
+		if result != nil {
+			candidates = append(candidates, candidateTorrent{torrent: torrent, coldResult: result})
 		}
+	}
 
-		metrics.ActiveTorrents.WithLabelValues(metrics.ModeHot).Inc()
+	// Pass 2: Sort candidates by progress on cold (most complete first), then track.
+	slices.SortFunc(candidates, func(a, b candidateTorrent) int {
+		return cmp.Compare(b.coldResult.PiecesHaveCount, a.coldResult.PiecesHaveCount)
+	})
 
-		t.logger.InfoContext(ctx, "started tracking torrent",
-			"name", torrent.Name,
-			"hash", torrent.Hash,
-		)
+	for _, c := range candidates {
+		if t.startTrackingReady(ctx, c.torrent, c.coldResult) {
+			metrics.ActiveTorrents.WithLabelValues(metrics.ModeHot).Inc()
+
+			t.logger.InfoContext(ctx, "started tracking torrent",
+				"name", c.torrent.Name,
+				"hash", c.torrent.Hash,
+				"piecesOnCold", c.coldResult.PiecesHaveCount,
+			)
+		}
 	}
 
 	return nil
 }
 
-// tryStartTracking checks cold status and starts tracking if needed.
-// Returns (true, nil) if tracking was started, (false, nil) for non-transient skip,
-// (false, err) if cold is unreachable (caller should short-circuit remaining torrents).
-func (t *QBTask) tryStartTracking(ctx context.Context, torrent qbittorrent.Torrent) (bool, error) {
+// queryColdStatus checks a torrent's status on cold without starting tracking.
+// Returns:
+//   - (result, nil): READY status — caller should collect as candidate
+//   - (nil, err): transient error — caller should short-circuit
+//   - (nil, nil): non-transient error, already tracking, COMPLETE, or VERIFYING — skip
+func (t *QBTask) queryColdStatus(ctx context.Context, torrent qbittorrent.Torrent) (*streaming.InitTorrentResult, error) {
 	// Check if the tracker already knows about it
 	if t.tracker.IsTracking(torrent.Hash) {
 		t.trackedMu.Lock()
-		t.trackedTorrents[torrent.Hash] = trackedTorrent{completionTime: completionTimeOrNow(torrent.CompletionOn)}
+		t.trackedTorrents[torrent.Hash] = trackedTorrent{completionTime: completionTimeOrNow(torrent.CompletionOn), name: torrent.Name, size: torrent.Size}
 		t.trackedMu.Unlock()
 		t.logger.DebugContext(ctx, "synced tracker state to orchestrator",
 			"name", torrent.Name,
 			"hash", torrent.Hash,
 		)
-		return false, nil
+		return nil, nil
 	}
 
 	// Query cold via CheckTorrentStatus - this is the source of truth
-	// Note: We use CheckTorrentStatus (not InitTorrent) because we only need status.
-	// Full initialization with file tracking happens later in BidiQueue.
 	initResp, err := t.grpcDest.CheckTorrentStatus(ctx, torrent.Hash)
 	if err != nil {
 		if streaming.IsTransientError(err) {
-			return false, err
+			return nil, err
 		}
 		t.logger.WarnContext(ctx, "failed to check torrent status on cold",
 			"name", torrent.Name,
 			"hash", torrent.Hash,
 			"error", err,
 		)
-		return false, nil
+		return nil, nil
 	}
 
 	switch initResp.Status {
@@ -519,17 +539,17 @@ func (t *QBTask) tryStartTracking(ctx context.Context, torrent qbittorrent.Torre
 			"name", torrent.Name,
 			"hash", torrent.Hash,
 		)
-		return false, nil
+		return nil, nil
 
 	case pb.TorrentSyncStatus_SYNC_STATUS_VERIFYING:
 		t.logger.InfoContext(ctx, "torrent verifying on cold, will retry",
 			"name", torrent.Name,
 			"hash", torrent.Hash,
 		)
-		return false, nil
+		return nil, nil
 
 	case pb.TorrentSyncStatus_SYNC_STATUS_READY:
-		return t.startTrackingReady(ctx, torrent, initResp), nil
+		return initResp, nil
 
 	default:
 		t.logger.WarnContext(ctx, "unknown status from cold CheckTorrentStatus",
@@ -537,13 +557,17 @@ func (t *QBTask) tryStartTracking(ctx context.Context, torrent qbittorrent.Torre
 			"hash", torrent.Hash,
 			"status", initResp.Status,
 		)
-		return false, nil
+		return nil, nil
 	}
 }
 
 // startTrackingReady handles the READY status: converts cold's pieces_needed
 // into resume data and starts tracking the torrent for streaming.
 func (t *QBTask) startTrackingReady(ctx context.Context, torrent qbittorrent.Torrent, resp *streaming.InitTorrentResult) bool {
+	if t.trackingOrderHook != nil {
+		t.trackingOrderHook(torrent.Hash)
+	}
+
 	switch resp.PiecesNeededCount {
 	case -1:
 		t.logger.DebugContext(ctx, "torrent not initialized on cold, queuing for streaming",
@@ -578,7 +602,7 @@ func (t *QBTask) startTrackingReady(ctx context.Context, torrent qbittorrent.Tor
 		t.trackedMu.Unlock()
 		return false
 	}
-	t.trackedTorrents[torrent.Hash] = trackedTorrent{completionTime: completionTimeOrNow(torrent.CompletionOn)}
+	t.trackedTorrents[torrent.Hash] = trackedTorrent{completionTime: completionTimeOrNow(torrent.CompletionOn), name: torrent.Name, size: torrent.Size}
 	t.trackedMu.Unlock()
 
 	return true
@@ -624,7 +648,7 @@ func (t *QBTask) finalizeCompletedStreams(ctx context.Context) error {
 
 		// All pieces streamed - finalize on cold server
 		if finalizeErr := t.finalizeTorrent(ctx, hash); finalizeErr != nil {
-			metrics.FinalizationErrorsTotal.WithLabelValues(metrics.ModeHot).Inc()
+			metrics.FinalizationErrorsTotal.WithLabelValues(metrics.ModeHot, hash, tracked[hash].name).Inc()
 			t.logger.ErrorContext(ctx, "finalize failed",
 				"hash", hash,
 				"error", finalizeErr,
@@ -643,12 +667,13 @@ func (t *QBTask) finalizeCompletedStreams(ctx context.Context) error {
 		t.clearFinalizeBackoff(hash)
 
 		// Record sync latency (time from download completion to finalization)
-		metrics.TorrentSyncLatencySeconds.Observe(time.Since(tracked[hash].completionTime).Seconds())
+		metrics.TorrentSyncLatencySeconds.WithLabelValues(hash, tracked[hash].name).Observe(time.Since(tracked[hash].completionTime).Seconds())
 
 		// Mark as complete on cold (persisted cache)
 		t.markCompletedOnCold(hash)
 
 		// Stop tracking and evict cached metadata
+		name := tracked[hash].name
 		t.tracker.Untrack(hash)
 		t.source.EvictCache(hash)
 		t.trackedMu.Lock()
@@ -656,7 +681,9 @@ func (t *QBTask) finalizeCompletedStreams(ctx context.Context) error {
 		t.trackedMu.Unlock()
 
 		metrics.ActiveTorrents.WithLabelValues(metrics.ModeHot).Dec()
-		metrics.TorrentsSyncedTotal.WithLabelValues(metrics.ModeHot).Inc()
+		metrics.TorrentsSyncedTotal.WithLabelValues(metrics.ModeHot, hash, name).Inc()
+		metrics.TorrentBytesSyncedTotal.WithLabelValues(hash, name).Add(float64(tracked[hash].size))
+		metrics.OldestPendingSyncSeconds.DeleteLabelValues(hash, name)
 
 		t.logger.InfoContext(ctx, "torrent synced successfully", "hash", hash)
 
@@ -691,18 +718,20 @@ func (t *QBTask) finalizeTorrent(ctx context.Context, hash string) error {
 
 	torrent := torrents[0]
 	savePath := torrent.SavePath
+	saveSubPath := t.source.ResolveSubPath(torrent.SavePath)
 
 	t.logger.InfoContext(ctx, "finalizing torrent on cold",
 		"name", torrent.Name,
 		"hash", hash,
 		"savePath", savePath,
+		"saveSubPath", saveSubPath,
 	)
 
 	if t.cfg.DryRun {
 		return nil
 	}
 
-	return t.grpcDest.FinalizeTorrent(ctx, hash, savePath, torrent.Category, torrent.Tags)
+	return t.grpcDest.FinalizeTorrent(ctx, hash, savePath, torrent.Category, torrent.Tags, saveSubPath)
 }
 
 // maybeMoveToCold deletes torrents known to be complete on cold when space is low.
@@ -984,7 +1013,7 @@ func (t *QBTask) deleteGroupFromHot(ctx context.Context, group torrentGroup) (in
 
 		// Step 1: Stop seeding on hot
 		if stopErr := t.srcClient.StopCtx(ctx, []string{torrent.Hash}); stopErr != nil {
-			metrics.TorrentStopErrorsTotal.WithLabelValues(metrics.ModeHot).Inc()
+			metrics.TorrentStopErrorsTotal.WithLabelValues(metrics.ModeHot, torrent.Hash, torrent.Name).Inc()
 			t.logger.WarnContext(ctx, "failed to stop torrent on hot, skipping handoff",
 				"hash", torrent.Hash, "error", stopErr)
 			failed++
@@ -997,7 +1026,7 @@ func (t *QBTask) deleteGroupFromHot(ctx context.Context, group torrentGroup) (in
 				"hash", torrent.Hash, "error", startErr)
 			// Rollback: resume on hot so somebody is seeding
 			if resumeErr := t.srcClient.ResumeCtx(ctx, []string{torrent.Hash}); resumeErr != nil {
-				metrics.TorrentResumeErrorsTotal.WithLabelValues(metrics.ModeHot).Inc()
+				metrics.TorrentResumeErrorsTotal.WithLabelValues(metrics.ModeHot, torrent.Hash, torrent.Name).Inc()
 				t.logger.WarnContext(ctx, "failed to resume torrent on hot after cold start failure",
 					"hash", torrent.Hash, "error", resumeErr)
 			}
@@ -1098,7 +1127,7 @@ func (t *QBTask) handleTorrentRemoval(ctx context.Context, hash string) {
 
 	// Remove from local tracking first
 	t.trackedMu.Lock()
-	_, wasTracked := t.trackedTorrents[hash]
+	tt, wasTracked := t.trackedTorrents[hash]
 	delete(t.trackedTorrents, hash)
 	t.trackedMu.Unlock()
 
@@ -1115,6 +1144,7 @@ func (t *QBTask) handleTorrentRemoval(ctx context.Context, hash string) {
 
 	if wasTracked {
 		metrics.ActiveTorrents.WithLabelValues(metrics.ModeHot).Dec()
+		metrics.OldestPendingSyncSeconds.DeleteLabelValues(hash, tt.name)
 	} else {
 		t.logger.DebugContext(ctx, "removed torrent was not in tracked list",
 			"hash", hash,

@@ -59,8 +59,40 @@ func (s *Server) FinalizeTorrent(
 	failureResponse := func(errMsg string) *pb.FinalizeTorrentResponse {
 		clearFinalizing()
 		metrics.FinalizationDuration.WithLabelValues(metrics.ResultFailure).Observe(time.Since(startTime).Seconds())
-		metrics.FinalizationErrorsTotal.WithLabelValues(metrics.ModeCold).Inc()
+		metrics.FinalizationErrorsTotal.WithLabelValues(metrics.ModeCold, hash, "").Inc()
 		return &pb.FinalizeTorrentResponse{Success: false, Error: errMsg}
+	}
+
+	// Relocate files if save_sub_path changed (e.g., hot moved torrent to different category).
+	// Only relocate when request carries a non-empty sub-path to avoid accidental relocation
+	// from an old hot version that doesn't send this field.
+	if newSubPath := req.GetSaveSubPath(); newSubPath != "" && newSubPath != state.saveSubPath {
+		oldSubPath := state.saveSubPath
+		oldBase := filepath.Join(s.config.BasePath, oldSubPath)
+
+		relPaths := make([]string, len(state.files))
+		for i, fi := range state.files {
+			rel, relErr := filepath.Rel(oldBase, strings.TrimSuffix(fi.path, partialSuffix))
+			if relErr != nil {
+				clearFinalizing()
+				return &pb.FinalizeTorrentResponse{
+					Success: false,
+					Error:   fmt.Sprintf("computing relative path: %v", relErr),
+				}, nil
+			}
+			relPaths[i] = rel
+		}
+
+		if _, relocErr := s.relocateFiles(ctx, hash, relPaths, oldSubPath, newSubPath); relocErr != nil {
+			clearFinalizing()
+			return &pb.FinalizeTorrentResponse{
+				Success: false,
+				Error:   fmt.Sprintf("relocating files: %v", relocErr),
+			}, nil
+		}
+
+		updateStateAfterRelocate(state, s.config.BasePath, oldSubPath, newSubPath)
+		s.updatePersistedInfoAfterRelocate(hash, s.config.BasePath, oldSubPath, newSubPath)
 	}
 
 	// Verify all pieces are written
@@ -86,7 +118,7 @@ func (s *Server) FinalizeTorrent(
 	// Helper to record success metrics and clean up
 	successResponse := func(stateStr string) *pb.FinalizeTorrentResponse {
 		metrics.FinalizationDuration.WithLabelValues(metrics.ResultSuccess).Observe(time.Since(startTime).Seconds())
-		metrics.TorrentsSyncedTotal.WithLabelValues(metrics.ModeCold).Inc()
+		metrics.TorrentsSyncedTotal.WithLabelValues(metrics.ModeCold, hash, "").Inc()
 		s.logger.InfoContext(ctx, "torrent finalized", "hash", hash, "state", stateStr)
 		s.cleanupFinalizedTorrent(hash)
 		return &pb.FinalizeTorrentResponse{Success: true, State: stateStr}
@@ -123,16 +155,18 @@ func (s *Server) cleanupFinalizedTorrent(hash string) {
 	s.mu.Lock()
 	delete(s.torrents, hash)
 	s.mu.Unlock()
+	metrics.ActiveTorrents.WithLabelValues(metrics.ModeCold).Dec()
 }
 
 // getOrRecoverState gets the torrent state from memory, or recovers it from disk.
 func (s *Server) getOrRecoverState(ctx context.Context, hash string) (*serverTorrentState, error) {
 	s.mu.RLock()
 	state, exists := s.torrents[hash]
+	initializing := exists && state.initializing
 	s.mu.RUnlock()
 
 	if exists {
-		if state.initializing {
+		if initializing {
 			return nil, errors.New("torrent initialization in progress")
 		}
 		return state, nil

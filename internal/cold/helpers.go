@@ -53,6 +53,7 @@ func buildPersistedInfo(
 	pieceSize, totalSize int64,
 	files []*serverFileInfo,
 	pieceHashes []string,
+	saveSubPath string,
 ) *persistedTorrentInfo {
 	persistedFiles := make([]persistedFileInfo, len(files))
 	for i, f := range files {
@@ -69,6 +70,7 @@ func buildPersistedInfo(
 		TotalSize:   totalSize,
 		Files:       persistedFiles,
 		PieceHashes: pieceHashes,
+		SaveSubPath: saveSubPath,
 	}
 }
 

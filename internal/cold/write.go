@@ -147,13 +147,10 @@ func (s *Server) WritePiece(
 
 	s.mu.RLock()
 	state, exists := s.torrents[torrentHash]
+	initializing := exists && state.initializing
 	s.mu.RUnlock()
 
-	if !exists {
-		return writePieceError("torrent not initialized", pb.PieceErrorCode_PIECE_ERROR_NOT_INITIALIZED), nil
-	}
-
-	if state.initializing {
+	if !exists || initializing {
 		return writePieceError("torrent not initialized", pb.PieceErrorCode_PIECE_ERROR_NOT_INITIALIZED), nil
 	}
 

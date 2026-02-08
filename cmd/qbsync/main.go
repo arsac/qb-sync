@@ -69,7 +69,7 @@ func runHot(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	log := logger.New("hot")
+	log := logger.New("hot", logger.ParseLevel(cfg.LogLevel))
 	log.Info("starting hot server",
 		"data", cfg.DataPath,
 		"qbURL", cfg.QBURL,
@@ -124,7 +124,7 @@ func runCold(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	log := logger.New("cold")
+	log := logger.New("cold", logger.ParseLevel(cfg.LogLevel))
 	log.Info("starting cold server",
 		"listen", cfg.ListenAddr,
 		"data", cfg.DataPath,

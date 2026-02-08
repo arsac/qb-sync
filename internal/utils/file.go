@@ -8,6 +8,9 @@ import (
 	"syscall"
 )
 
+// inodesUnsupportedErr is returned when the platform does not support inodes.
+var inodesUnsupportedErr = errors.New("inodes not supported on this platform")
+
 // FileRegion describes a contiguous region within a file for multi-file piece reading.
 type FileRegion struct {
 	Path   string // Absolute path to the file
@@ -89,7 +92,7 @@ func GetInode(path string) (uint64, error) {
 
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
-		return 0, nil // Platform doesn't support inodes
+		return 0, inodesUnsupportedErr
 	}
 
 	return stat.Ino, nil

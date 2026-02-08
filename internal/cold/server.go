@@ -19,6 +19,9 @@ import (
 	pb "github.com/arsac/qb-sync/proto"
 
 	"google.golang.org/grpc"
+	grpchealth "google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/keepalive"
 )
 
 const (
@@ -134,8 +137,21 @@ func (s *Server) Run(ctx context.Context) error {
 	s.server = grpc.NewServer(
 		grpc.MaxRecvMsgSize(maxGRPCMessageSize),
 		grpc.MaxSendMsgSize(maxGRPCMessageSize),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:    30 * time.Second, // Send pings every 30s if no activity
+			Timeout: 10 * time.Second, // Wait 10s for ping ack
+		}),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             15 * time.Second, // Allow client pings as frequent as 15s
+			PermitWithoutStream: true,             // Allow pings even when no active streams
+		}),
 	)
 	pb.RegisterQBSyncServiceServer(s.server, s)
+
+	// Register standard gRPC health service
+	grpcHealthServer := grpchealth.NewServer()
+	healthpb.RegisterHealthServer(s.server, grpcHealthServer)
+	grpcHealthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 
 	// Start background state flusher
 	go s.runStateFlusher(ctx)

@@ -176,5 +176,6 @@ func (s *Server) recoverTorrentState(ctx context.Context, hash string) (*serverT
 		files:        files,
 		torrentPath:  torrentPath,
 		statePath:    statePath,
+		saveSubPath:  info.SaveSubPath,
 	}, nil
 }

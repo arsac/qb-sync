@@ -2,9 +2,13 @@ package qbclient
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"time"
 
 	"github.com/autobrr/go-qbittorrent"
+	"github.com/failsafe-go/failsafe-go"
+	"github.com/failsafe-go/failsafe-go/circuitbreaker"
 
 	"github.com/arsac/qb-sync/internal/metrics"
 	"github.com/arsac/qb-sync/internal/utils"
@@ -39,20 +43,21 @@ type Config struct {
 
 // DefaultConfig returns sensible defaults.
 func DefaultConfig() Config {
-	cbConfig := utils.DefaultCircuitBreakerConfig()
-	retry := utils.DefaultRetryConfig()
 	return Config{
-		Retry:          retry,
-		CircuitBreaker: &cbConfig,
+		Retry: utils.DefaultRetryConfig(),
+		CircuitBreaker: &utils.CircuitBreakerConfig{
+			MaxFailures:  5,
+			ResetTimeout: 30 * time.Second,
+		},
 	}
 }
 
 // ResilientClient wraps a qBittorrent client with retry and circuit breaker logic.
 type ResilientClient struct {
-	client *qbittorrent.Client
-	config Config
-	logger *slog.Logger
-	cb     *utils.CircuitBreaker
+	client   *qbittorrent.Client
+	logger   *slog.Logger
+	executor failsafe.Executor[any]
+	cb       circuitbreaker.CircuitBreaker[any] // nil if CB disabled; for state inspection
 }
 
 // NewResilientClient creates a new resilient qBittorrent client.
@@ -61,16 +66,58 @@ func NewResilientClient(
 	config Config,
 	logger *slog.Logger,
 ) *ResilientClient {
-	var cb *utils.CircuitBreaker
+	// Wrap the retriable checker to explicitly reject circuitbreaker.ErrOpen,
+	// so retry aborts immediately when the circuit breaker is open.
+	retryConfig := config.Retry
+	originalChecker := retryConfig.RetriableChecker
+	if originalChecker == nil {
+		originalChecker = utils.IsRetriableError
+	}
+	retryConfig.RetriableChecker = func(err error) bool {
+		if errors.Is(err, circuitbreaker.ErrOpen) {
+			return false
+		}
+		return originalChecker(err)
+	}
+
+	retryPolicy := utils.NewRetryPolicy(retryConfig, logger, func() {
+		metrics.QBClientRetriesTotal.Inc()
+	})
+
+	var cb circuitbreaker.CircuitBreaker[any]
+	var policies []failsafe.Policy[any]
+
 	if config.CircuitBreaker != nil {
-		cb = utils.NewCircuitBreaker(*config.CircuitBreaker)
+		cb = circuitbreaker.NewBuilder[any]().
+			WithFailureThreshold(uint(config.CircuitBreaker.MaxFailures)).
+			WithSuccessThreshold(1).
+			WithDelay(config.CircuitBreaker.ResetTimeout).
+			HandleIf(func(_ any, err error) bool {
+				return utils.IsCircuitBreakerFailure(err)
+			}).
+			OnOpen(func(e circuitbreaker.StateChangedEvent) {
+				logger.Warn("circuit breaker opened")
+			}).
+			OnHalfOpen(func(e circuitbreaker.StateChangedEvent) {
+				logger.Info("circuit breaker half-open, probing")
+			}).
+			OnClose(func(e circuitbreaker.StateChangedEvent) {
+				logger.Info("circuit breaker closed")
+			}).
+			Build()
+		// Retry wraps CircuitBreaker: each retry attempt checks CB first.
+		// If CB is open, circuitbreaker.ErrOpen is returned, and the
+		// retry HandleIf rejects it immediately (no pointless retries).
+		policies = []failsafe.Policy[any]{retryPolicy, cb}
+	} else {
+		policies = []failsafe.Policy[any]{retryPolicy}
 	}
 
 	return &ResilientClient{
-		client: client,
-		config: config,
-		logger: logger,
-		cb:     cb,
+		client:   client,
+		logger:   logger,
+		executor: failsafe.With(policies...),
+		cb:       cb,
 	}
 }
 
@@ -81,14 +128,14 @@ func (r *ResilientClient) Client() *qbittorrent.Client {
 
 // LoginCtx logs in to qBittorrent with retry.
 func (r *ResilientClient) LoginCtx(ctx context.Context) error {
-	return r.doVoid(ctx, "Login", func(ctx context.Context) error {
+	return r.runVoid(ctx, "Login", func(ctx context.Context) error {
 		return r.client.LoginCtx(ctx)
 	})
 }
 
 // GetAppPreferencesCtx gets qBittorrent application preferences with retry.
 func (r *ResilientClient) GetAppPreferencesCtx(ctx context.Context) (qbittorrent.AppPreferences, error) {
-	return doWithRetry(ctx, r.cb, r.config.Retry, r.logger, "GetAppPreferences",
+	return runWithResult(ctx, r.executor, "GetAppPreferences",
 		func(ctx context.Context) (qbittorrent.AppPreferences, error) {
 			return r.client.GetAppPreferencesCtx(ctx)
 		})
@@ -99,7 +146,7 @@ func (r *ResilientClient) GetTorrentsCtx(
 	ctx context.Context,
 	opts qbittorrent.TorrentFilterOptions,
 ) ([]qbittorrent.Torrent, error) {
-	return doWithRetry(ctx, r.cb, r.config.Retry, r.logger, "GetTorrents",
+	return runWithResult(ctx, r.executor, "GetTorrents",
 		func(ctx context.Context) ([]qbittorrent.Torrent, error) {
 			return r.client.GetTorrentsCtx(ctx, opts)
 		})
@@ -110,7 +157,7 @@ func (r *ResilientClient) GetTorrentPieceStatesCtx(
 	ctx context.Context,
 	hash string,
 ) ([]qbittorrent.PieceState, error) {
-	return doWithRetry(ctx, r.cb, r.config.Retry, r.logger, "GetTorrentPieceStates",
+	return runWithResult(ctx, r.executor, "GetTorrentPieceStates",
 		func(ctx context.Context) ([]qbittorrent.PieceState, error) {
 			return r.client.GetTorrentPieceStatesCtx(ctx, hash)
 		})
@@ -121,7 +168,7 @@ func (r *ResilientClient) GetTorrentPieceHashesCtx(
 	ctx context.Context,
 	hash string,
 ) ([]string, error) {
-	return doWithRetry(ctx, r.cb, r.config.Retry, r.logger, "GetTorrentPieceHashes",
+	return runWithResult(ctx, r.executor, "GetTorrentPieceHashes",
 		func(ctx context.Context) ([]string, error) {
 			return r.client.GetTorrentPieceHashesCtx(ctx, hash)
 		})
@@ -132,7 +179,7 @@ func (r *ResilientClient) GetTorrentPropertiesCtx(
 	ctx context.Context,
 	hash string,
 ) (qbittorrent.TorrentProperties, error) {
-	return doWithRetry(ctx, r.cb, r.config.Retry, r.logger, "GetTorrentProperties",
+	return runWithResult(ctx, r.executor, "GetTorrentProperties",
 		func(ctx context.Context) (qbittorrent.TorrentProperties, error) {
 			return r.client.GetTorrentPropertiesCtx(ctx, hash)
 		})
@@ -143,7 +190,7 @@ func (r *ResilientClient) GetFilesInformationCtx(
 	ctx context.Context,
 	hash string,
 ) (*qbittorrent.TorrentFiles, error) {
-	return doWithRetry(ctx, r.cb, r.config.Retry, r.logger, "GetFilesInformation",
+	return runWithResult(ctx, r.executor, "GetFilesInformation",
 		func(ctx context.Context) (*qbittorrent.TorrentFiles, error) {
 			return r.client.GetFilesInformationCtx(ctx, hash)
 		})
@@ -154,7 +201,7 @@ func (r *ResilientClient) ExportTorrentCtx(
 	ctx context.Context,
 	hash string,
 ) ([]byte, error) {
-	return doWithRetry(ctx, r.cb, r.config.Retry, r.logger, "ExportTorrent",
+	return runWithResult(ctx, r.executor, "ExportTorrent",
 		func(ctx context.Context) ([]byte, error) {
 			return r.client.ExportTorrentCtx(ctx, hash)
 		})
@@ -166,7 +213,7 @@ func (r *ResilientClient) DeleteTorrentsCtx(
 	hashes []string,
 	deleteFiles bool,
 ) error {
-	return r.doVoid(ctx, "DeleteTorrents", func(ctx context.Context) error {
+	return r.runVoid(ctx, "DeleteTorrents", func(ctx context.Context) error {
 		return r.client.DeleteTorrentsCtx(ctx, hashes, deleteFiles)
 	})
 }
@@ -177,7 +224,7 @@ func (r *ResilientClient) AddTagsCtx(
 	hashes []string,
 	tags string,
 ) error {
-	return r.doVoid(ctx, "AddTags", func(ctx context.Context) error {
+	return r.runVoid(ctx, "AddTags", func(ctx context.Context) error {
 		return r.client.AddTagsCtx(ctx, hashes, tags)
 	})
 }
@@ -187,7 +234,7 @@ func (r *ResilientClient) StopCtx(
 	ctx context.Context,
 	hashes []string,
 ) error {
-	return r.doVoid(ctx, "Stop", func(ctx context.Context) error {
+	return r.runVoid(ctx, "Stop", func(ctx context.Context) error {
 		return r.client.StopCtx(ctx, hashes)
 	})
 }
@@ -197,7 +244,7 @@ func (r *ResilientClient) ResumeCtx(
 	ctx context.Context,
 	hashes []string,
 ) error {
-	return r.doVoid(ctx, "Resume", func(ctx context.Context) error {
+	return r.runVoid(ctx, "Resume", func(ctx context.Context) error {
 		return r.client.ResumeCtx(ctx, hashes)
 	})
 }
@@ -208,38 +255,44 @@ func (r *ResilientClient) AddTorrentFromMemoryCtx(
 	buf []byte,
 	options map[string]string,
 ) error {
-	return r.doVoid(ctx, "AddTorrentFromMemory", func(ctx context.Context) error {
+	return r.runVoid(ctx, "AddTorrentFromMemory", func(ctx context.Context) error {
 		return r.client.AddTorrentFromMemoryCtx(ctx, buf, options)
 	})
 }
 
-// doVoid executes a void operation with retry and optional circuit breaker.
-func (r *ResilientClient) doVoid(
+// runVoid executes a void operation through the executor.
+func (r *ResilientClient) runVoid(
 	ctx context.Context,
 	operation string,
 	fn func(ctx context.Context) error,
 ) error {
-	wrappedFn := func(ctx context.Context) (struct{}, error) {
-		return struct{}{}, fn(ctx)
-	}
-	_, err := doWithRetry(ctx, r.cb, r.config.Retry, r.logger, operation, wrappedFn)
+	metrics.QBAPICallsTotal.WithLabelValues(operation).Inc()
+	start := time.Now()
+	err := r.executor.WithContext(ctx).Run(func() error {
+		return fn(ctx)
+	})
+	metrics.QBAPICallDuration.WithLabelValues(operation).Observe(time.Since(start).Seconds())
 	return err
 }
 
-// doWithRetry is a package-level generic function for retry with optional circuit breaker.
-func doWithRetry[T any](
+// runWithResult executes a typed operation through the executor.
+func runWithResult[T any](
 	ctx context.Context,
-	cb *utils.CircuitBreaker,
-	config utils.RetryConfig,
-	logger *slog.Logger,
+	executor failsafe.Executor[any],
 	operation string,
 	fn func(ctx context.Context) (T, error),
 ) (T, error) {
 	metrics.QBAPICallsTotal.WithLabelValues(operation).Inc()
-	if cb != nil {
-		return utils.RetryWithCircuitBreaker(ctx, cb, config, logger, operation, fn)
+	start := time.Now()
+	result, err := executor.WithContext(ctx).Get(func() (any, error) {
+		return fn(ctx)
+	})
+	metrics.QBAPICallDuration.WithLabelValues(operation).Observe(time.Since(start).Seconds())
+	if err != nil {
+		var zero T
+		return zero, err
 	}
-	return utils.Retry(ctx, config, logger, operation, fn)
+	return result.(T), nil
 }
 
 // CircuitBreakerState returns the current circuit breaker state, or "disabled" if not configured.
@@ -247,5 +300,14 @@ func (r *ResilientClient) CircuitBreakerState() string {
 	if r.cb == nil {
 		return "disabled"
 	}
-	return r.cb.State()
+	switch {
+	case r.cb.IsClosed():
+		return "closed"
+	case r.cb.IsOpen():
+		return "open"
+	case r.cb.IsHalfOpen():
+		return "half-open"
+	default:
+		return "unknown"
+	}
 }

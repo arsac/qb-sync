@@ -92,6 +92,7 @@ message InitTorrentRequest {
   repeated FileInfo files = 6;
   bytes torrent_file = 7;           // Raw .torrent file for resume state and verification
   repeated string piece_hashes = 8; // SHA1 hashes per piece (hex-encoded)
+  string save_sub_path = 9;         // Relative sub-path prefix for file storage (e.g., "movies" from category)
 }
 
 message FileInfo {
@@ -193,6 +194,7 @@ message FinalizeTorrentRequest {
   string save_path = 2;    // Destination path for qBittorrent
   string category = 3;     // Optional category
   string tags = 4;         // Optional tags (comma-separated)
+  string save_sub_path = 5; // Relative sub-path prefix for file storage (e.g., "movies" from category)
 }
 
 message FinalizeTorrentResponse {

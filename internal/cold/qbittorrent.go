@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/autobrr/go-qbittorrent"
@@ -71,9 +72,9 @@ func (s *Server) addAndVerifyTorrent(
 		return "", fmt.Errorf("reading torrent file: %w", readErr)
 	}
 
-	// Use the cold-side save path (container mount point, e.g., "/downloads").
-	// The hot's save path from req is meaningless on the cold side.
-	savePath := s.config.GetSavePath()
+	// Use the cold-side save path (container mount point, e.g., "/downloads"),
+	// joined with the sub-path from init (e.g., "movies" from category).
+	savePath := filepath.Join(s.config.GetSavePath(), state.saveSubPath)
 
 	opts := map[string]string{
 		"savepath":           savePath,

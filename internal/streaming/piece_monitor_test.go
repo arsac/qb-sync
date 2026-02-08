@@ -1,6 +1,7 @@
 package streaming
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"os"
@@ -522,6 +523,159 @@ func TestPieceMonitor_IsDownloadingState(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPieceMonitor_RetryFailed(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	newMonitor := func(chanBuf int) *PieceMonitor {
+		return &PieceMonitor{
+			logger:    logger,
+			torrents:  make(map[string]*torrentState),
+			completed: make(chan *pb.Piece, chanBuf),
+			removed:   make(chan string, removedChannelBufSize),
+		}
+	}
+
+	newState := func(numPieces int, pieceSize int64) *torrentState {
+		return &torrentState{
+			meta: &TorrentMetadata{
+				InitTorrentRequest: &pb.InitTorrentRequest{
+					TorrentHash: "abc123",
+					NumPieces:   int32(numPieces),
+					PieceSize:   pieceSize,
+					TotalSize:   int64(numPieces) * pieceSize,
+				},
+			},
+			hashes:   make([]string, numPieces),
+			streamed: make([]bool, numPieces),
+			failed:   make([]bool, numPieces),
+		}
+	}
+
+	t.Run("re-queues failed pieces", func(t *testing.T) {
+		monitor := newMonitor(completedChannelBufSize)
+		state := newState(10, 1024)
+		state.failed[2] = true
+		state.failed[7] = true
+
+		hash := "abc123"
+		monitor.torrents[hash] = state
+
+		err := monitor.RetryFailed(t.Context(), hash)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// Both pieces should be queued
+		var received []int32
+		for range 2 {
+			select {
+			case p := <-monitor.completed:
+				received = append(received, p.GetIndex())
+			case <-time.After(time.Second):
+				t.Fatal("timeout waiting for piece")
+			}
+		}
+
+		if len(received) != 2 {
+			t.Fatalf("expected 2 pieces, got %d", len(received))
+		}
+		if received[0] != 2 || received[1] != 7 {
+			t.Errorf("expected pieces [2, 7], got %v", received)
+		}
+
+		// Failed flags should be cleared
+		state.mu.RLock()
+		if state.failed[2] || state.failed[7] {
+			t.Error("failed flags should be cleared after successful send")
+		}
+		state.mu.RUnlock()
+	})
+
+	t.Run("channel full leaves pieces marked failed", func(t *testing.T) {
+		// Buffer of 1 — second piece can't be sent
+		monitor := newMonitor(1)
+		state := newState(10, 1024)
+		state.failed[1] = true
+		state.failed[3] = true
+		state.failed[5] = true
+
+		hash := "abc123"
+		monitor.torrents[hash] = state
+
+		err := monitor.RetryFailed(t.Context(), hash)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// One piece should have been sent
+		select {
+		case <-monitor.completed:
+		case <-time.After(time.Second):
+			t.Fatal("expected at least one piece in channel")
+		}
+
+		// Remaining pieces should still be marked failed
+		state.mu.RLock()
+		failedCount := 0
+		for _, f := range state.failed {
+			if f {
+				failedCount++
+			}
+		}
+		state.mu.RUnlock()
+
+		if failedCount < 1 {
+			t.Error("pieces that couldn't be sent should remain marked failed")
+		}
+	})
+
+	t.Run("no failed pieces is a no-op", func(t *testing.T) {
+		monitor := newMonitor(completedChannelBufSize)
+		state := newState(5, 1024)
+
+		hash := "abc123"
+		monitor.torrents[hash] = state
+
+		err := monitor.RetryFailed(t.Context(), hash)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// Channel should be empty
+		select {
+		case p := <-monitor.completed:
+			t.Errorf("expected no pieces, got index %d", p.GetIndex())
+		default:
+		}
+	})
+
+	t.Run("returns error for untracked torrent", func(t *testing.T) {
+		monitor := newMonitor(completedChannelBufSize)
+
+		err := monitor.RetryFailed(t.Context(), "nonexistent")
+		if !errors.Is(err, ErrTorrentNotTracked) {
+			t.Errorf("expected ErrTorrentNotTracked, got %v", err)
+		}
+	})
+
+	t.Run("returns context error on cancellation", func(t *testing.T) {
+		monitor := newMonitor(0) // unbuffered — all sends will fail
+		state := newState(5, 1024)
+		state.failed[0] = true
+
+		hash := "abc123"
+		monitor.torrents[hash] = state
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // cancel immediately
+
+		err := monitor.RetryFailed(ctx, hash)
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("expected context.Canceled, got %v", err)
+		}
+	})
 }
 
 func TestPieceMonitor_RemovalNotification_Integration(t *testing.T) {

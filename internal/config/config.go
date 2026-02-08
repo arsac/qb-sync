@@ -41,6 +41,9 @@ type BaseConfig struct {
 	// Tag to apply to synced torrents (for visibility in qBittorrent UI)
 	SyncedTag string
 
+	// Logging
+	LogLevel string // Log level: debug, info, warn, error (default: info)
+
 	DryRun bool
 }
 
@@ -162,6 +165,7 @@ func SetupHotFlags(cmd *cobra.Command) {
 	flags.String("health-addr", defaultHealthAddr, "HTTP health endpoint address (empty to disable)")
 	flags.String("synced-tag", defaultSyncedTag, "Tag to apply to synced torrents (empty to disable)")
 	flags.Bool("dry-run", false, "Run without making changes")
+	flags.String("log-level", "info", "Log level: debug, info, warn, error")
 }
 
 // SetupColdFlags sets up flags for the cold command.
@@ -181,6 +185,7 @@ func SetupColdFlags(cmd *cobra.Command) {
 	flags.String("health-addr", defaultHealthAddr, "HTTP health endpoint address (empty to disable)")
 	flags.String("synced-tag", defaultSyncedTag, "Tag to apply to synced torrents (empty to disable)")
 	flags.Bool("dry-run", false, "Run without making changes")
+	flags.String("log-level", "info", "Log level: debug, info, warn, error")
 }
 
 // BindHotFlags binds hot command flags to viper.
@@ -194,6 +199,7 @@ func BindHotFlags(cmd *cobra.Command, v *viper.Viper) error {
 		"cold-addr", "min-space", "min-seeding-time",
 		"force", "sleep", "rate-limit", "piece-timeout",
 		"reconnect-max-delay", "health-addr", "synced-tag", "dry-run",
+		"log-level",
 	}
 
 	for _, flag := range flags {
@@ -214,7 +220,7 @@ func BindColdFlags(cmd *cobra.Command, v *viper.Viper) error {
 	flags := []string{
 		"listen", "data", "save-path", "qb-url", "qb-username", "qb-password",
 		"poll-interval", "poll-timeout", "stream-workers", "max-stream-buffer",
-		"health-addr", "synced-tag", "dry-run",
+		"health-addr", "synced-tag", "dry-run", "log-level",
 	}
 
 	for _, flag := range flags {
@@ -235,6 +241,7 @@ func loadBase(v *viper.Viper) BaseConfig {
 		DataPath:   v.GetString("data"),
 		HealthAddr: v.GetString("health-addr"),
 		SyncedTag:  v.GetString("synced-tag"),
+		LogLevel:   v.GetString("log-level"),
 		DryRun:     v.GetBool("dry-run"),
 	}
 }

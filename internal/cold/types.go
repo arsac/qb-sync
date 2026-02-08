@@ -48,6 +48,7 @@ type serverTorrentState struct {
 	files            []*serverFileInfo // Files in this torrent
 	torrentPath      string            // Path to stored .torrent file
 	statePath        string            // Path to written pieces state file
+	saveSubPath      string            // Relative sub-path prefix (e.g., "movies" from category)
 	dirty            bool              // Whether state needs to be flushed
 	piecesSinceFlush int               // Pieces written since last flush (for count-based trigger)
 	finalizing       bool              // True during FinalizeTorrent to prevent concurrent writes
@@ -86,7 +87,8 @@ type persistedTorrentInfo struct {
 	PieceLength int64               `json:"pieceLength"`
 	TotalSize   int64               `json:"totalSize"`
 	Files       []persistedFileInfo `json:"files"`
-	PieceHashes []string            `json:"pieceHashes"` // SHA1 hashes per piece for post-restart verification
+	PieceHashes []string            `json:"pieceHashes"`    // SHA1 hashes per piece for post-restart verification
+	SaveSubPath string              `json:"saveSubPath,omitempty"` // Relative sub-path prefix (e.g., "movies")
 }
 
 // torrentRef is a reference to a torrent state for safe iteration.

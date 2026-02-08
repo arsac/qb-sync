@@ -16,9 +16,11 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 
+	"github.com/arsac/qb-sync/internal/metrics"
 	pb "github.com/arsac/qb-sync/proto"
 )
 
@@ -31,14 +33,18 @@ const (
 	// Torrent pieces are commonly 1–16 MB; the default gRPC limit of 4 MB is too small.
 	maxGRPCMessageSize = 20 * 1024 * 1024 // 20 MB
 
-	// DefaultSendTimeout is the maximum time Send() can block before being
-	// considered stuck. Prevents permanent deadlock from HTTP/2 flow control
-	// blocking when the receiver stops consuming data.
-	DefaultSendTimeout = 60 * time.Second
-)
+	// ackWriteTimeout is how long receiveAcks waits to write an ack to the channel
+	// before treating the stream as stuck. If forwardAcks is slow draining the channel,
+	// this prevents receiveAcks from blocking forever and never calling Recv() again
+	// (which is the only way to detect stream death and trigger ps.cancel()).
+	ackWriteTimeout = 30 * time.Second
 
-// ErrSendTimeout is returned when Send() exceeds the configured timeout.
-var ErrSendTimeout = errors.New("send timeout: stream likely dead")
+	// sendTimeout is how long Send waits for the gRPC stream.Send to complete.
+	// gRPC Send() blocks on HTTP/2 flow control when the receiver stops consuming.
+	// Since Send doesn't accept a context, we use a goroutine+timer to impose a timeout
+	// and cancel the stream context if it fires.
+	sendTimeout = 30 * time.Second
+)
 
 // successResponse is implemented by gRPC response types that have Success/Error fields.
 type successResponse interface {
@@ -97,15 +103,11 @@ func NewGRPCDestination(addr string) (*GRPCDestination, error) {
 	}, nil
 }
 
-// ValidateConnection checks that the cold server is reachable.
-// This should be called before starting the main loop to fail fast.
+// ValidateConnection checks that the cold server is reachable using the
+// standard gRPC health check protocol (grpc.health.v1.Health).
 func (d *GRPCDestination) ValidateConnection(ctx context.Context) error {
-	// Use GetFileByInode with inode 0 as a health check.
-	// This validates the gRPC connection is working and the server is responsive.
-	// Inode 0 is invalid so it will always return not found, but that's fine for validation.
-	_, err := d.client.GetFileByInode(ctx, &pb.GetFileByInodeRequest{
-		Inode: 0,
-	})
+	healthClient := healthpb.NewHealthClient(d.conn)
+	_, err := healthClient.Check(ctx, &healthpb.HealthCheckRequest{})
 	if err != nil {
 		return fmt.Errorf("cold server not reachable: %w", err)
 	}
@@ -245,12 +247,11 @@ func (d *GRPCDestination) OpenStream(ctx context.Context, logger *slog.Logger) (
 	}
 
 	ps := &PieceStream{
-		ctx:         streamCtx,
-		cancel:      streamCancel,
-		stream:      stream,
-		logger:      logger,
-		sendTimeout: DefaultSendTimeout,
-		acks:        make(chan *pb.PieceAck, DefaultAckChannelSize),
+		ctx:      streamCtx,
+		cancel:   streamCancel,
+		stream:   stream,
+		logger:   logger,
+		acks:     make(chan *pb.PieceAck, DefaultAckChannelSize),
 		ackReady:    make(chan struct{}, 1), // Signal when acks are processed
 		done:        make(chan struct{}),
 		errors:      make(chan error, 1),
@@ -304,13 +305,14 @@ func (d *GRPCDestination) RegisterFile(ctx context.Context, inode uint64, path s
 // On success, clears the cached init result to prevent memory leaks.
 func (d *GRPCDestination) FinalizeTorrent(
 	ctx context.Context,
-	hash, savePath, category, tags string,
+	hash, savePath, category, tags, saveSubPath string,
 ) error {
 	resp, err := d.client.FinalizeTorrent(ctx, &pb.FinalizeTorrentRequest{
 		TorrentHash: hash,
 		SavePath:    savePath,
 		Category:    category,
 		Tags:        tags,
+		SaveSubPath: saveSubPath,
 	})
 	if err != nil {
 		return fmt.Errorf("finalize torrent RPC failed: %w", err)
@@ -439,22 +441,38 @@ func GRPCErrorCode(err error) codes.Code {
 //
 // Each PieceStream owns a cancellable context derived from the parent. When the
 // receive loop detects stream death, it cancels the context to unblock any Send()
-// stuck on HTTP/2 flow control. Send() also enforces a configurable timeout as
-// a safety net against indefinite blocking.
+// stuck on HTTP/2 flow control.
 type PieceStream struct {
 	ctx    context.Context
 	cancel context.CancelFunc // Cancels stream context; unblocks stuck Send()
 	stream pb.QBSyncService_StreamPiecesBidiClient
 	logger *slog.Logger
 
-	sendTimeout time.Duration // Maximum time Send() can block
-
 	acks     chan *pb.PieceAck // Incoming acknowledgments
 	ackReady chan struct{}     // Signals when acks have been processed (for backpressure)
 	done     chan struct{}     // Closed when receive goroutine exits
 	errors   chan error        // Stream errors
 
-	sendMu sync.Mutex // Protects concurrent Send calls (gRPC streams are not send-safe)
+	sendMu    sync.Mutex  // Protects concurrent Send calls (gRPC streams are not send-safe)
+	sendTimer *time.Timer // Reusable timer for Send timeout (protected by sendMu)
+
+	// Test-overridable timeouts. Zero means use the package-level const.
+	ackWriteTimeoutOverride time.Duration
+	sendTimeoutOverride     time.Duration
+}
+
+func (ps *PieceStream) effectiveAckWriteTimeout() time.Duration {
+	if ps.ackWriteTimeoutOverride > 0 {
+		return ps.ackWriteTimeoutOverride
+	}
+	return ackWriteTimeout
+}
+
+func (ps *PieceStream) effectiveSendTimeout() time.Duration {
+	if ps.sendTimeoutOverride > 0 {
+		return ps.sendTimeoutOverride
+	}
+	return sendTimeout
 }
 
 // pieceKey creates a unique key for tracking in-flight pieces.
@@ -467,7 +485,7 @@ func pieceKey(hash string, index int32) string {
 // On exit, cancels the stream context to unblock any Send() stuck on
 // HTTP/2 flow control — this is the primary mechanism that breaks the
 // deadlock when the receiver stops consuming data.
-func (ps *PieceStream) receiveAcks() { //nolint:gocognit // complexity from panic recovery
+func (ps *PieceStream) receiveAcks() { //nolint:gocognit // complexity from panic recovery + timeout
 	defer close(ps.done)
 	defer ps.cancel() // Unblock stuck Send() by cancelling the stream context
 	defer func() {
@@ -483,23 +501,33 @@ func (ps *PieceStream) receiveAcks() { //nolint:gocognit // complexity from pani
 		}
 	}()
 
+	// Reusable timer for ack channel write timeout.
+	// time.NewTimer + Reset avoids per-iteration allocation of time.After.
+	timeout := ps.effectiveAckWriteTimeout()
+	ackTimer := time.NewTimer(timeout)
+	defer ackTimer.Stop()
+
 	for {
 		// Check for context cancellation before blocking on Recv
 		select {
 		case <-ps.ctx.Done():
+			metrics.ReceiveAcksExitTotal.WithLabelValues(metrics.ReasonContextCancel).Inc()
 			return
 		default:
 		}
 
 		ack, err := ps.stream.Recv()
 		if errors.Is(err, io.EOF) {
+			metrics.ReceiveAcksExitTotal.WithLabelValues(metrics.ReasonEOF).Inc()
 			return
 		}
 		if err != nil {
 			// Check if this is due to context cancellation
 			if ps.ctx.Err() != nil {
+				metrics.ReceiveAcksExitTotal.WithLabelValues(metrics.ReasonContextCancel).Inc()
 				return
 			}
+			metrics.ReceiveAcksExitTotal.WithLabelValues(metrics.ReasonStreamError).Inc()
 			select {
 			case ps.errors <- err:
 			default:
@@ -513,50 +541,70 @@ func (ps *PieceStream) receiveAcks() { //nolint:gocognit // complexity from pani
 		default:
 		}
 
-		// Send ack to consumer - block if channel full to prevent dropped acks
+		// Send ack to consumer. If the channel is full for too long, the ack
+		// consumer is stuck — exit so defer ps.cancel() fires and unblocks
+		// any Send() blocked on HTTP/2 flow control.
+		ackTimer.Reset(timeout)
 		select {
 		case ps.acks <- ack:
+			// In Go 1.23+, Stop guarantees the channel is drained.
+			ackTimer.Stop()
 		case <-ps.ctx.Done():
+			metrics.ReceiveAcksExitTotal.WithLabelValues(metrics.ReasonContextCancel).Inc()
 			return
+		case <-ackTimer.C:
+			metrics.ReceiveAcksExitTotal.WithLabelValues(metrics.ReasonAckChannelBlocked).Inc()
+			metrics.AckChannelBlockedTotal.Inc()
+			ps.logger.Warn("ack channel blocked, closing stream",
+				"timeout", timeout,
+			)
+			return // defer ps.cancel() fires, unblocks stuck Send()
 		}
 	}
 }
 
-// Send sends a piece over the stream with a timeout safety net.
-// If the stream is dead (receiver not consuming), HTTP/2 flow control blocks
-// Send() indefinitely. The per-stream context cancel (from receiveAcks exit)
-// is the primary unblock mechanism; the timeout is a secondary safety net.
+// Send sends a piece over the stream with a timeout.
+// gRPC's Send() blocks on HTTP/2 flow control when the receiver stops consuming
+// and doesn't accept a context parameter. We use a goroutine to impose a timeout:
+// if Send doesn't return in time, we cancel the stream context to unblock it.
 // This method is safe for concurrent use.
 func (ps *PieceStream) Send(req *pb.WritePieceRequest) error {
 	ps.sendMu.Lock()
 	defer ps.sendMu.Unlock()
 
-	// Fast path: check if stream is already dead.
-	select {
-	case <-ps.ctx.Done():
-		return ps.ctx.Err()
-	default:
+	// Fast path: stream already cancelled.
+	if err := ps.ctx.Err(); err != nil {
+		return err
 	}
 
-	// Send in a background goroutine so we can enforce a timeout.
-	// This prevents permanent deadlock when HTTP/2 flow control blocks
-	// because the receiver stopped consuming.
-	errCh := make(chan error, 1)
+	done := make(chan error, 1)
 	go func() {
-		errCh <- ps.stream.Send(req)
+		done <- ps.stream.Send(req)
 	}()
 
-	timer := time.NewTimer(ps.sendTimeout)
-	defer timer.Stop()
+	// Lazy-init reusable timer. Avoids time.After which leaks a goroutine
+	// for the full timeout duration on every Send (the common fast-path case).
+	// Protected by sendMu so no concurrent access.
+	if ps.sendTimer == nil {
+		ps.sendTimer = time.NewTimer(ps.effectiveSendTimeout())
+	} else {
+		ps.sendTimer.Reset(ps.effectiveSendTimeout())
+	}
 
 	select {
-	case err := <-errCh:
+	case err := <-done:
+		ps.sendTimer.Stop()
 		return err
+	case <-ps.sendTimer.C:
+		metrics.SendTimeoutTotal.Inc()
+		ps.cancel() // Unblock the Send goroutine by cancelling the stream
+		return <-done
 	case <-ps.ctx.Done():
-		return ps.ctx.Err()
-	case <-timer.C:
-		ps.cancel() // Force-kill the stream to unblock the goroutine
-		return ErrSendTimeout
+		// Stream died (e.g., receiveAcks detected failure and cancelled).
+		// Wait for the Send goroutine — gRPC will unblock it promptly
+		// after context cancel via RST_STREAM.
+		ps.sendTimer.Stop()
+		return <-done
 	}
 }
 
