@@ -408,6 +408,7 @@ func (t *QBTask) runOnce(ctx context.Context) {
 		t.logger.ErrorContext(ctx, "failed to move torrents", "error", err)
 	}
 	t.updateSyncAgeGauge()
+	t.updateTorrentProgressGauges()
 
 	t.pruneCycleCount++
 	if t.pruneCycleCount >= pruneCycleInterval {
@@ -425,6 +426,27 @@ func (t *QBTask) updateSyncAgeGauge() {
 	for hash, tt := range t.trackedTorrents {
 		age := time.Since(tt.completionTime).Seconds()
 		metrics.OldestPendingSyncSeconds.WithLabelValues(hash, tt.name).Set(age)
+	}
+}
+
+// updateTorrentProgressGauges sets per-torrent progress gauges for Grafana dashboards.
+// Resets first to clear stale labels from previously finalized/removed torrents.
+func (t *QBTask) updateTorrentProgressGauges() {
+	t.trackedMu.RLock()
+	defer t.trackedMu.RUnlock()
+
+	metrics.TorrentPiecesTotal.Reset()
+	metrics.TorrentPiecesStreamed.Reset()
+	metrics.TorrentSizeBytesTotal.Reset()
+
+	for hash, tt := range t.trackedTorrents {
+		progress, err := t.tracker.GetProgress(hash)
+		if err != nil {
+			continue
+		}
+		metrics.TorrentPiecesTotal.WithLabelValues(hash, tt.name).Set(float64(progress.TotalPieces))
+		metrics.TorrentPiecesStreamed.WithLabelValues(hash, tt.name).Set(float64(progress.Streamed))
+		metrics.TorrentSizeBytesTotal.WithLabelValues(hash, tt.name).Set(float64(tt.size))
 	}
 }
 

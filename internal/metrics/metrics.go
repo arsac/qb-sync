@@ -489,6 +489,36 @@ var (
 		[]string{LabelHash, LabelName},
 	)
 
+	// TorrentPiecesTotal tracks the total number of pieces per tracked torrent.
+	TorrentPiecesTotal = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "torrent_pieces_total",
+			Help:      "Total number of pieces per tracked torrent",
+		},
+		[]string{LabelHash, LabelName},
+	)
+
+	// TorrentPiecesStreamed tracks the number of pieces synced to cold per tracked torrent.
+	TorrentPiecesStreamed = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "torrent_pieces_streamed",
+			Help:      "Number of pieces synced to cold per tracked torrent",
+		},
+		[]string{LabelHash, LabelName},
+	)
+
+	// TorrentSizeBytesTotal tracks the total size in bytes per tracked torrent.
+	TorrentSizeBytesTotal = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "torrent_size_bytes_total",
+			Help:      "Total size in bytes per tracked torrent",
+		},
+		[]string{LabelHash, LabelName},
+	)
+
 	// CompletedOnColdCacheSize tracks the size of the completed-on-cold cache on hot.
 	CompletedOnColdCacheSize = promauto.NewGauge(
 		prometheus.GaugeOpts{

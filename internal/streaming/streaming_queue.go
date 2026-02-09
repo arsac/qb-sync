@@ -645,7 +645,9 @@ func (q *BidiQueue) drainInFlightPool(ctx context.Context, pool *StreamPool) {
 
 	q.logger.InfoContext(ctx, "draining in-flight pieces", "count", totalInFlight)
 
-	drainCtx, cancel := context.WithTimeout(ctx, drainTimeout)
+	// Use Background so the drain isn't immediately cancelled when the parent
+	// context triggered the shutdown. The drainTimeout is the hard deadline.
+	drainCtx, cancel := context.WithTimeout(context.Background(), drainTimeout)
 	defer cancel()
 
 	for pool.TotalInFlight() > 0 {
