@@ -2,8 +2,10 @@ package qbclient
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -20,8 +22,9 @@ var _ streaming.PieceSource = (*Source)(nil)
 
 // cachedMeta holds per-torrent cached metadata for ReadPiece.
 type cachedMeta struct {
-	files      []*pb.FileInfo
-	contentDir string // resolved content directory for this torrent
+	files       []*pb.FileInfo
+	contentDir  string // primary read directory for this torrent
+	fallbackDir string // alternate directory to try on ENOENT (empty if none)
 }
 
 // Source implements streaming.PieceSource using qBittorrent API.
@@ -72,6 +75,26 @@ func (s *Source) ResolveContentDir(torrentSavePath string) string {
 		return filepath.Join(s.dataPath, sub)
 	}
 	return s.dataPath
+}
+
+// resolveReadDirs returns the primary and fallback directories for reading pieces.
+// The primary is the best guess based on torrent progress; the fallback covers
+// the transition window when files move between download and save paths.
+func (s *Source) resolveReadDirs(torrent qbittorrent.Torrent) (primary, fallback string) {
+	saveDir := s.ResolveContentDir(torrent.SavePath)
+	if torrent.DownloadPath == "" {
+		return saveDir, ""
+	}
+	dlDir := s.ResolveContentDir(torrent.DownloadPath)
+	// dlDir == s.dataPath means DownloadPath is outside the qB save root
+	// (ResolveContentDir couldn't compute a meaningful relative path).
+	if dlDir == s.dataPath || dlDir == saveDir {
+		return saveDir, ""
+	}
+	if torrent.Progress < 1.0 {
+		return dlDir, saveDir
+	}
+	return saveDir, dlDir
 }
 
 // GetPieceStates returns the current state of all pieces for a torrent.
@@ -125,7 +148,7 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 	}
 	torrent := torrents[0]
 
-	contentDir := s.ResolveContentDir(torrent.SavePath)
+	contentDir, fallbackDir := s.resolveReadDirs(torrent)
 
 	qbFiles, err := s.client.GetFilesInformationCtx(ctx, hash)
 	if err != nil {
@@ -192,11 +215,14 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 			PieceHashes: pieceHashes,
 			SaveSubPath: s.ResolveSubPath(torrent.SavePath),
 		},
-		ContentDir: contentDir,
+		ContentDir:  contentDir,
+		FallbackDir: fallbackDir,
 	}, nil
 }
 
 // ReadPiece reads a piece's data from disk.
+// On ENOENT, tries the fallback directory (covers download ↔ save path transitions),
+// then evicts cache and retries with fresh metadata (covers *arr recategorization).
 func (s *Source) ReadPiece(ctx context.Context, piece *pb.Piece) ([]byte, error) {
 	hash := piece.GetTorrentHash()
 
@@ -205,6 +231,31 @@ func (s *Source) ReadPiece(ctx context.Context, piece *pb.Piece) ([]byte, error)
 		return nil, err
 	}
 
+	data, readErr := s.readPieceMultiFile(cached.contentDir, cached.files, piece.GetOffset(), piece.GetSize())
+	if readErr == nil || !errors.Is(readErr, os.ErrNotExist) {
+		return data, readErr
+	}
+
+	// ENOENT: try the fallback directory (download ↔ save path transition).
+	if cached.fallbackDir != "" {
+		data, readErr = s.readPieceMultiFile(cached.fallbackDir, cached.files, piece.GetOffset(), piece.GetSize())
+		if readErr == nil {
+			// Fallback worked — promote it to primary in the cache.
+			s.fileCache.Store(hash, &cachedMeta{
+				files:      cached.files,
+				contentDir: cached.fallbackDir,
+			})
+			return data, nil
+		}
+	}
+
+	// Both dirs failed (or no fallback). Evict and retry with fresh metadata
+	// from qBittorrent — handles *arr recategorization where paths change entirely.
+	s.fileCache.Delete(hash)
+	cached, err = s.cachedTorrentMeta(ctx, hash)
+	if err != nil {
+		return nil, err
+	}
 	return s.readPieceMultiFile(cached.contentDir, cached.files, piece.GetOffset(), piece.GetSize())
 }
 
@@ -220,8 +271,9 @@ func (s *Source) cachedTorrentMeta(ctx context.Context, hash string) (*cachedMet
 	}
 
 	cm := &cachedMeta{
-		files:      meta.GetFiles(),
-		contentDir: meta.ContentDir,
+		files:       meta.GetFiles(),
+		contentDir:  meta.ContentDir,
+		fallbackDir: meta.FallbackDir,
 	}
 	s.fileCache.Store(hash, cm)
 	return cm, nil

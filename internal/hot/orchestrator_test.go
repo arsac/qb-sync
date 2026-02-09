@@ -1259,6 +1259,214 @@ func (m *mockPieceSource) ReadPiece(_ context.Context, _ *pb.Piece) ([]byte, err
 	return nil, nil
 }
 
+func TestIsSyncableState(t *testing.T) {
+	syncable := []qbittorrent.TorrentState{
+		qbittorrent.TorrentStateDownloading,
+		qbittorrent.TorrentStateStalledDl,
+		qbittorrent.TorrentStateQueuedDl,
+		qbittorrent.TorrentStateForcedDl,
+		qbittorrent.TorrentStateUploading,
+		qbittorrent.TorrentStateStalledUp,
+		qbittorrent.TorrentStateQueuedUp,
+		qbittorrent.TorrentStateForcedUp,
+	}
+	for _, state := range syncable {
+		if !isSyncableState(state) {
+			t.Errorf("expected %q to be syncable", state)
+		}
+	}
+
+	notSyncable := []qbittorrent.TorrentState{
+		qbittorrent.TorrentStatePausedDl,
+		qbittorrent.TorrentStatePausedUp,
+		qbittorrent.TorrentStateStoppedDl,
+		qbittorrent.TorrentStateStoppedUp,
+		qbittorrent.TorrentStateError,
+		qbittorrent.TorrentStateMissingFiles,
+		qbittorrent.TorrentStateMoving,
+		qbittorrent.TorrentStateCheckingDl,
+		qbittorrent.TorrentStateCheckingUp,
+		qbittorrent.TorrentStateCheckingResumeData,
+		qbittorrent.TorrentStateMetaDl,
+		qbittorrent.TorrentStateAllocating,
+		qbittorrent.TorrentStateUnknown,
+	}
+	for _, state := range notSyncable {
+		if isSyncableState(state) {
+			t.Errorf("expected %q to NOT be syncable", state)
+		}
+	}
+}
+
+func TestTrackNewTorrents_StateAndProgressFiltering(t *testing.T) {
+	logger := testLogger(t)
+	const numPieces = 10
+
+	makePiecesNeeded := func(haveCount int) []bool {
+		needed := make([]bool, numPieces)
+		for i := haveCount; i < numPieces; i++ {
+			needed[i] = true
+		}
+		return needed
+	}
+
+	t.Run("skips non-syncable states", func(t *testing.T) {
+		mockSource := &mockPieceSource{numPieces: numPieces}
+		tracker := streaming.NewPieceMonitor(nil, mockSource, logger, streaming.DefaultPieceMonitorConfig())
+
+		// Only hashB (downloading) should reach CheckTorrentStatus;
+		// hashA (paused) and hashC (error) are filtered by isSyncableState.
+		coldDest := &mockColdDest{
+			checkStatusResults: map[string]*streaming.InitTorrentResult{
+				"hashB": {Status: pb.TorrentSyncStatus_SYNC_STATUS_READY, PiecesNeeded: makePiecesNeeded(0)},
+			},
+		}
+
+		mockClient := &mockQBClient{
+			getTorrentsResult: []qbittorrent.Torrent{
+				{Hash: "hashA", Name: "paused", State: qbittorrent.TorrentStatePausedDl, Progress: 0.5},
+				{Hash: "hashB", Name: "downloading", State: qbittorrent.TorrentStateDownloading, Progress: 0.5},
+				{Hash: "hashC", Name: "error", State: qbittorrent.TorrentStateError, Progress: 0.5},
+			},
+		}
+
+		tmpDir := t.TempDir()
+		task := &QBTask{
+			cfg:                &config.HotConfig{},
+			logger:             logger,
+			srcClient:          mockClient,
+			grpcDest:           coldDest,
+			tracker:            tracker,
+			trackedTorrents:    make(map[string]trackedTorrent),
+			completedOnCold:    make(map[string]bool),
+			completedCachePath: filepath.Join(tmpDir, "cache.json"),
+			finalizeBackoffs:   make(map[string]*finalizeBackoff),
+		}
+
+		var trackOrder []string
+		task.trackingOrderHook = func(hash string) {
+			trackOrder = append(trackOrder, hash)
+		}
+
+		err := task.trackNewTorrents(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// Only hashB (downloading) should be tracked
+		if len(trackOrder) != 1 {
+			t.Fatalf("expected 1 tracked, got %d: %v", len(trackOrder), trackOrder)
+		}
+		if trackOrder[0] != "hashB" {
+			t.Errorf("expected hashB, got %s", trackOrder[0])
+		}
+	})
+
+	t.Run("skips torrents with zero progress", func(t *testing.T) {
+		mockSource := &mockPieceSource{numPieces: numPieces}
+		tracker := streaming.NewPieceMonitor(nil, mockSource, logger, streaming.DefaultPieceMonitorConfig())
+
+		// Only hashB (has progress) should reach CheckTorrentStatus;
+		// hashA (zero progress) is filtered before querying cold.
+		coldDest := &mockColdDest{
+			checkStatusResults: map[string]*streaming.InitTorrentResult{
+				"hashB": {Status: pb.TorrentSyncStatus_SYNC_STATUS_READY, PiecesNeeded: makePiecesNeeded(0)},
+			},
+		}
+
+		mockClient := &mockQBClient{
+			getTorrentsResult: []qbittorrent.Torrent{
+				{Hash: "hashA", Name: "no-progress", State: qbittorrent.TorrentStateDownloading, Progress: 0},
+				{Hash: "hashB", Name: "has-progress", State: qbittorrent.TorrentStateDownloading, Progress: 0.1},
+			},
+		}
+
+		tmpDir := t.TempDir()
+		task := &QBTask{
+			cfg:                &config.HotConfig{},
+			logger:             logger,
+			srcClient:          mockClient,
+			grpcDest:           coldDest,
+			tracker:            tracker,
+			trackedTorrents:    make(map[string]trackedTorrent),
+			completedOnCold:    make(map[string]bool),
+			completedCachePath: filepath.Join(tmpDir, "cache.json"),
+			finalizeBackoffs:   make(map[string]*finalizeBackoff),
+		}
+
+		var trackOrder []string
+		task.trackingOrderHook = func(hash string) {
+			trackOrder = append(trackOrder, hash)
+		}
+
+		err := task.trackNewTorrents(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// Only hashB (has progress) should be tracked
+		if len(trackOrder) != 1 {
+			t.Fatalf("expected 1 tracked, got %d: %v", len(trackOrder), trackOrder)
+		}
+		if trackOrder[0] != "hashB" {
+			t.Errorf("expected hashB, got %s", trackOrder[0])
+		}
+	})
+
+	t.Run("tracks downloading torrents alongside completed ones", func(t *testing.T) {
+		mockSource := &mockPieceSource{numPieces: numPieces}
+		tracker := streaming.NewPieceMonitor(nil, mockSource, logger, streaming.DefaultPieceMonitorConfig())
+
+		coldDest := &mockColdDest{
+			checkStatusResults: map[string]*streaming.InitTorrentResult{
+				"downloading": {Status: pb.TorrentSyncStatus_SYNC_STATUS_READY, PiecesNeeded: makePiecesNeeded(0)},
+				"completed":   {Status: pb.TorrentSyncStatus_SYNC_STATUS_READY, PiecesNeeded: makePiecesNeeded(5), PiecesHaveCount: 5},
+			},
+		}
+
+		mockClient := &mockQBClient{
+			getTorrentsResult: []qbittorrent.Torrent{
+				{Hash: "downloading", Name: "dl-torrent", State: qbittorrent.TorrentStateDownloading, Progress: 0.3},
+				{Hash: "completed", Name: "up-torrent", State: qbittorrent.TorrentStateStalledUp, Progress: 1.0},
+			},
+		}
+
+		tmpDir := t.TempDir()
+		task := &QBTask{
+			cfg:                &config.HotConfig{},
+			logger:             logger,
+			srcClient:          mockClient,
+			grpcDest:           coldDest,
+			tracker:            tracker,
+			trackedTorrents:    make(map[string]trackedTorrent),
+			completedOnCold:    make(map[string]bool),
+			completedCachePath: filepath.Join(tmpDir, "cache.json"),
+			finalizeBackoffs:   make(map[string]*finalizeBackoff),
+		}
+
+		var trackOrder []string
+		task.trackingOrderHook = func(hash string) {
+			trackOrder = append(trackOrder, hash)
+		}
+
+		err := task.trackNewTorrents(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if len(trackOrder) != 2 {
+			t.Fatalf("expected 2 tracked, got %d: %v", len(trackOrder), trackOrder)
+		}
+		// Sorted by progress on cold: completed (5) first, then downloading (0)
+		if trackOrder[0] != "completed" {
+			t.Errorf("expected completed first (more pieces on cold), got %s", trackOrder[0])
+		}
+		if trackOrder[1] != "downloading" {
+			t.Errorf("expected downloading second, got %s", trackOrder[1])
+		}
+	})
+}
+
 func TestTrackNewTorrents_PrioritizesByProgress(t *testing.T) {
 	logger := testLogger(t)
 	const numPieces = 1000
@@ -1298,9 +1506,9 @@ func TestTrackNewTorrents_PrioritizesByProgress(t *testing.T) {
 		// API returns A, B, C in arbitrary order
 		mockClient := &mockQBClient{
 			getTorrentsResult: []qbittorrent.Torrent{
-				{Hash: "hashA", Name: "torrentA", CompletionOn: 100},
-				{Hash: "hashB", Name: "torrentB", CompletionOn: 200},
-				{Hash: "hashC", Name: "torrentC", CompletionOn: 300},
+				{Hash: "hashA", Name: "torrentA", CompletionOn: 100, State: qbittorrent.TorrentStateStalledUp, Progress: 1.0},
+				{Hash: "hashB", Name: "torrentB", CompletionOn: 200, State: qbittorrent.TorrentStateStalledUp, Progress: 1.0},
+				{Hash: "hashC", Name: "torrentC", CompletionOn: 300, State: qbittorrent.TorrentStateStalledUp, Progress: 1.0},
 			},
 		}
 
@@ -1351,8 +1559,8 @@ func TestTrackNewTorrents_PrioritizesByProgress(t *testing.T) {
 
 		mockClient := &mockQBClient{
 			getTorrentsResult: []qbittorrent.Torrent{
-				{Hash: "hashX", Name: "torrentX"},
-				{Hash: "hashY", Name: "torrentY"},
+				{Hash: "hashX", Name: "torrentX", State: qbittorrent.TorrentStateStalledUp, Progress: 1.0},
+				{Hash: "hashY", Name: "torrentY", State: qbittorrent.TorrentStateStalledUp, Progress: 1.0},
 			},
 		}
 

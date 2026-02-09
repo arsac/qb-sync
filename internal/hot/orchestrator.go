@@ -92,10 +92,10 @@ type QBTask struct {
 	// Cycle counter for periodic pruning of completedOnCold
 	pruneCycleCount int
 
-	// Per-cycle cache of completed torrents to avoid redundant GetTorrentsCtx calls.
+	// Per-cycle cache of torrents to avoid redundant GetTorrentsCtx calls.
 	// Set by trackNewTorrents, consumed by fetchTorrentsCompletedOnCold, reset each cycle.
 	// nil means not yet fetched this cycle; non-nil (even empty) means cached.
-	cycleCompletedTorrents []qbittorrent.Torrent
+	cycleTorrents []qbittorrent.Torrent
 
 	// trackingOrderHook is called with each hash when tracking starts. Test-only.
 	trackingOrderHook func(hash string)
@@ -396,7 +396,7 @@ func (t *QBTask) Run(ctx context.Context) error {
 const pruneCycleInterval = 50
 
 func (t *QBTask) runOnce(ctx context.Context) {
-	t.cycleCompletedTorrents = nil
+	t.cycleTorrents = nil
 
 	if err := t.trackNewTorrents(ctx); err != nil {
 		t.logger.ErrorContext(ctx, "failed to track torrents", "error", err)
@@ -428,30 +428,55 @@ func (t *QBTask) updateSyncAgeGauge() {
 	}
 }
 
+// isSyncableState returns true for torrent states where pieces can be read and synced.
+func isSyncableState(state qbittorrent.TorrentState) bool {
+	switch state {
+	case qbittorrent.TorrentStateDownloading,
+		qbittorrent.TorrentStateStalledDl,
+		qbittorrent.TorrentStateQueuedDl,
+		qbittorrent.TorrentStateForcedDl,
+		qbittorrent.TorrentStateUploading,
+		qbittorrent.TorrentStateStalledUp,
+		qbittorrent.TorrentStateQueuedUp,
+		qbittorrent.TorrentStateForcedUp:
+		return true
+	default:
+		return false
+	}
+}
+
 // candidateTorrent pairs a torrent with its cold status for priority sorting.
 type candidateTorrent struct {
 	torrent    qbittorrent.Torrent
 	coldResult *streaming.InitTorrentResult
 }
 
-// trackNewTorrents starts tracking new completed torrents.
+// trackNewTorrents starts tracking new syncable torrents (downloading or completed).
 // Uses a two-pass approach: first queries cold for status, then sorts candidates
 // by progress (most pieces on cold first) before tracking. This ensures
 // partially-streamed torrents are prioritized after restart.
 func (t *QBTask) trackNewTorrents(ctx context.Context) error {
-	torrents, err := t.srcClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
-		Filter: qbittorrent.TorrentFilterCompleted,
-	})
+	torrents, err := t.srcClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{})
 	if err != nil {
-		return fmt.Errorf("fetching completed torrents: %w", err)
+		return fmt.Errorf("fetching torrents: %w", err)
 	}
 
 	// Cache for reuse by fetchTorrentsCompletedOnCold in the same cycle
-	t.cycleCompletedTorrents = torrents
+	t.cycleTorrents = torrents
 
 	// Pass 1: Query cold status for each untracked torrent, collect READY candidates.
 	var candidates []candidateTorrent
 	for _, torrent := range torrents {
+		// Skip torrents that aren't in a syncable state
+		if !isSyncableState(torrent.State) {
+			continue
+		}
+
+		// Skip torrents with no downloaded pieces yet
+		if torrent.Progress <= 0 {
+			continue
+		}
+
 		// Check local cache first (fast path)
 		t.completedMu.RLock()
 		knownComplete := t.completedOnCold[torrent.Hash]
@@ -827,15 +852,13 @@ func (t *QBTask) maybeMoveToCold(ctx context.Context) error {
 
 // fetchTorrentsCompletedOnCold returns hot torrents that are known to be complete on cold.
 func (t *QBTask) fetchTorrentsCompletedOnCold(ctx context.Context) ([]qbittorrent.Torrent, error) {
-	// Reuse the completed torrents list from trackNewTorrents if available
-	allCompleted := t.cycleCompletedTorrents
-	if allCompleted != nil {
+	// Reuse the torrents list from trackNewTorrents if available
+	allTorrents := t.cycleTorrents
+	if allTorrents != nil {
 		metrics.CycleCacheHitsTotal.Inc()
 	} else {
 		var err error
-		allCompleted, err = t.srcClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
-			Filter: qbittorrent.TorrentFilterCompleted,
-		})
+		allTorrents, err = t.srcClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{})
 		if err != nil {
 			return nil, err
 		}
@@ -846,7 +869,7 @@ func (t *QBTask) fetchTorrentsCompletedOnCold(ctx context.Context) ([]qbittorren
 	defer t.completedMu.RUnlock()
 
 	var result []qbittorrent.Torrent
-	for _, torrent := range allCompleted {
+	for _, torrent := range allTorrents {
 		if t.completedOnCold[torrent.Hash] {
 			result = append(result, torrent)
 		}
