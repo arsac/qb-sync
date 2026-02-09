@@ -5,6 +5,7 @@ go 1.25
 require (
 	github.com/autobrr/go-qbittorrent v1.14.0
 	github.com/failsafe-go/failsafe-go v0.9.5
+	github.com/jackpal/bencode-go v1.0.2
 	github.com/prometheus/client_golang v1.22.0
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0

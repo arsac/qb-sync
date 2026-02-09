@@ -59,7 +59,7 @@ func (s *Server) FinalizeTorrent(
 	failureResponse := func(errMsg string) *pb.FinalizeTorrentResponse {
 		clearFinalizing()
 		metrics.FinalizationDuration.WithLabelValues(metrics.ResultFailure).Observe(time.Since(startTime).Seconds())
-		metrics.FinalizationErrorsTotal.WithLabelValues(metrics.ModeCold, hash, "").Inc()
+		metrics.FinalizationErrorsTotal.WithLabelValues(metrics.ModeCold).Inc()
 		return &pb.FinalizeTorrentResponse{Success: false, Error: errMsg}
 	}
 
@@ -92,7 +92,10 @@ func (s *Server) FinalizeTorrent(
 		}
 
 		updateStateAfterRelocate(state, s.config.BasePath, oldSubPath, newSubPath)
-		s.updatePersistedInfoAfterRelocate(hash, s.config.BasePath, oldSubPath, newSubPath)
+		metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
+		if subPathErr := saveSubPathFile(metaDir, newSubPath); subPathErr != nil {
+			return failureResponse(fmt.Sprintf("persisting sub-path after relocation: %v", subPathErr)), nil
+		}
 	}
 
 	// Verify all pieces are written
@@ -118,7 +121,8 @@ func (s *Server) FinalizeTorrent(
 	// Helper to record success metrics and clean up
 	successResponse := func(stateStr string) *pb.FinalizeTorrentResponse {
 		metrics.FinalizationDuration.WithLabelValues(metrics.ResultSuccess).Observe(time.Since(startTime).Seconds())
-		metrics.TorrentsSyncedTotal.WithLabelValues(metrics.ModeCold, hash, "").Inc()
+		name := strings.TrimSuffix(filepath.Base(state.torrentPath), ".torrent")
+		metrics.TorrentsSyncedTotal.WithLabelValues(metrics.ModeCold, hash, name).Inc()
 		s.logger.InfoContext(ctx, "torrent finalized", "hash", hash, "state", stateStr)
 		s.cleanupFinalizedTorrent(hash)
 		return &pb.FinalizeTorrentResponse{Success: true, State: stateStr}
@@ -149,13 +153,23 @@ func (s *Server) FinalizeTorrent(
 	return successResponse("finalized"), nil
 }
 
-// cleanupFinalizedTorrent removes a successfully finalized torrent from tracking.
-// This prevents memory leaks from accumulating completed torrent state.
+// cleanupFinalizedTorrent removes a successfully finalized torrent from tracking
+// and cleans up its metadata directory.
 func (s *Server) cleanupFinalizedTorrent(hash string) {
 	s.mu.Lock()
 	delete(s.torrents, hash)
 	s.mu.Unlock()
 	metrics.ActiveTorrents.WithLabelValues(metrics.ModeCold).Dec()
+
+	// Remove metadata directory (.qbsync/{hash}/) — no longer needed after finalization.
+	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
+	if err := os.RemoveAll(metaDir); err != nil && !os.IsNotExist(err) {
+		s.logger.Warn("failed to clean up metadata directory after finalization",
+			"hash", hash,
+			"path", metaDir,
+			"error", err,
+		)
+	}
 }
 
 // getOrRecoverState gets the torrent state from memory, or recovers it from disk.
@@ -192,6 +206,7 @@ func (s *Server) getOrRecoverState(ctx context.Context, hash string) (*serverTor
 	}
 	s.torrents[hash] = recoveredState
 	s.mu.Unlock()
+	metrics.ActiveTorrents.WithLabelValues(metrics.ModeCold).Inc()
 
 	s.logger.InfoContext(ctx, "recovered torrent state from disk",
 		"hash", hash,

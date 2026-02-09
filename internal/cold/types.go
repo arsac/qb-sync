@@ -73,24 +73,6 @@ type serverFileInfo struct {
 	hardlinkDoneCh chan struct{} // Wait on this before hardlinking (used when hlState == hlStatePending)
 }
 
-// persistedFileInfo stores file information for recovery after restart.
-type persistedFileInfo struct {
-	Path   string `json:"path"`
-	Size   int64  `json:"size"`
-	Offset int64  `json:"offset"`
-}
-
-// persistedTorrentInfo stores torrent metadata for recovery after restart.
-type persistedTorrentInfo struct {
-	Name        string              `json:"name"`
-	NumPieces   int                 `json:"numPieces"`
-	PieceLength int64               `json:"pieceLength"`
-	TotalSize   int64               `json:"totalSize"`
-	Files       []persistedFileInfo `json:"files"`
-	PieceHashes []string            `json:"pieceHashes"`    // SHA1 hashes per piece for post-restart verification
-	SaveSubPath string              `json:"saveSubPath,omitempty"` // Relative sub-path prefix (e.g., "movies")
-}
-
 // torrentRef is a reference to a torrent state for safe iteration.
 // Used when collecting torrents under s.mu to process under individual state.mu.
 type torrentRef struct {

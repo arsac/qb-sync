@@ -15,8 +15,8 @@ const (
 	defaultStateFlushCount    = 100              // Count-based: flush after N pieces as safety net
 
 	// Metadata directory and file names for recovery after restart.
-	metaDirName       = ".qbsync"
-	filesInfoFileName = "files.json"
+	metaDirName     = ".qbsync"
+	subPathFileName = ".subpath"
 
 	// Concurrent streaming settings.
 	defaultStreamWorkers = 8   // Number of concurrent piece writers (tuned for NFS/ZFS)

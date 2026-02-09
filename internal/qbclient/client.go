@@ -58,13 +58,16 @@ type ResilientClient struct {
 	logger   *slog.Logger
 	executor failsafe.Executor[any]
 	cb       circuitbreaker.CircuitBreaker[any] // nil if CB disabled; for state inspection
+	mode     string                             // metrics label: "hot" or "cold"
 }
 
 // NewResilientClient creates a new resilient qBittorrent client.
+// mode is the metrics label identifying the caller ("hot" or "cold").
 func NewResilientClient(
 	client *qbittorrent.Client,
 	config Config,
 	logger *slog.Logger,
+	mode string,
 ) *ResilientClient {
 	// Wrap the retriable checker to explicitly reject circuitbreaker.ErrOpen,
 	// so retry aborts immediately when the circuit breaker is open.
@@ -118,6 +121,7 @@ func NewResilientClient(
 		logger:   logger,
 		executor: failsafe.With(policies...),
 		cb:       cb,
+		mode:     mode,
 	}
 }
 
@@ -135,7 +139,7 @@ func (r *ResilientClient) LoginCtx(ctx context.Context) error {
 
 // GetAppPreferencesCtx gets qBittorrent application preferences with retry.
 func (r *ResilientClient) GetAppPreferencesCtx(ctx context.Context) (qbittorrent.AppPreferences, error) {
-	return runWithResult(ctx, r.executor, "GetAppPreferences",
+	return runWithResult(ctx, r.executor, r.mode, "GetAppPreferences",
 		func(ctx context.Context) (qbittorrent.AppPreferences, error) {
 			return r.client.GetAppPreferencesCtx(ctx)
 		})
@@ -146,7 +150,7 @@ func (r *ResilientClient) GetTorrentsCtx(
 	ctx context.Context,
 	opts qbittorrent.TorrentFilterOptions,
 ) ([]qbittorrent.Torrent, error) {
-	return runWithResult(ctx, r.executor, "GetTorrents",
+	return runWithResult(ctx, r.executor, r.mode, "GetTorrents",
 		func(ctx context.Context) ([]qbittorrent.Torrent, error) {
 			return r.client.GetTorrentsCtx(ctx, opts)
 		})
@@ -157,7 +161,7 @@ func (r *ResilientClient) GetTorrentPieceStatesCtx(
 	ctx context.Context,
 	hash string,
 ) ([]qbittorrent.PieceState, error) {
-	return runWithResult(ctx, r.executor, "GetTorrentPieceStates",
+	return runWithResult(ctx, r.executor, r.mode, "GetTorrentPieceStates",
 		func(ctx context.Context) ([]qbittorrent.PieceState, error) {
 			return r.client.GetTorrentPieceStatesCtx(ctx, hash)
 		})
@@ -168,7 +172,7 @@ func (r *ResilientClient) GetTorrentPieceHashesCtx(
 	ctx context.Context,
 	hash string,
 ) ([]string, error) {
-	return runWithResult(ctx, r.executor, "GetTorrentPieceHashes",
+	return runWithResult(ctx, r.executor, r.mode, "GetTorrentPieceHashes",
 		func(ctx context.Context) ([]string, error) {
 			return r.client.GetTorrentPieceHashesCtx(ctx, hash)
 		})
@@ -179,7 +183,7 @@ func (r *ResilientClient) GetTorrentPropertiesCtx(
 	ctx context.Context,
 	hash string,
 ) (qbittorrent.TorrentProperties, error) {
-	return runWithResult(ctx, r.executor, "GetTorrentProperties",
+	return runWithResult(ctx, r.executor, r.mode, "GetTorrentProperties",
 		func(ctx context.Context) (qbittorrent.TorrentProperties, error) {
 			return r.client.GetTorrentPropertiesCtx(ctx, hash)
 		})
@@ -190,7 +194,7 @@ func (r *ResilientClient) GetFilesInformationCtx(
 	ctx context.Context,
 	hash string,
 ) (*qbittorrent.TorrentFiles, error) {
-	return runWithResult(ctx, r.executor, "GetFilesInformation",
+	return runWithResult(ctx, r.executor, r.mode, "GetFilesInformation",
 		func(ctx context.Context) (*qbittorrent.TorrentFiles, error) {
 			return r.client.GetFilesInformationCtx(ctx, hash)
 		})
@@ -201,7 +205,7 @@ func (r *ResilientClient) ExportTorrentCtx(
 	ctx context.Context,
 	hash string,
 ) ([]byte, error) {
-	return runWithResult(ctx, r.executor, "ExportTorrent",
+	return runWithResult(ctx, r.executor, r.mode, "ExportTorrent",
 		func(ctx context.Context) ([]byte, error) {
 			return r.client.ExportTorrentCtx(ctx, hash)
 		})
@@ -266,12 +270,12 @@ func (r *ResilientClient) runVoid(
 	operation string,
 	fn func(ctx context.Context) error,
 ) error {
-	metrics.QBAPICallsTotal.WithLabelValues(operation).Inc()
+	metrics.QBAPICallsTotal.WithLabelValues(r.mode, operation).Inc()
 	start := time.Now()
 	err := r.executor.WithContext(ctx).Run(func() error {
 		return fn(ctx)
 	})
-	metrics.QBAPICallDuration.WithLabelValues(operation).Observe(time.Since(start).Seconds())
+	metrics.QBAPICallDuration.WithLabelValues(r.mode, operation).Observe(time.Since(start).Seconds())
 	return err
 }
 
@@ -279,15 +283,16 @@ func (r *ResilientClient) runVoid(
 func runWithResult[T any](
 	ctx context.Context,
 	executor failsafe.Executor[any],
+	mode string,
 	operation string,
 	fn func(ctx context.Context) (T, error),
 ) (T, error) {
-	metrics.QBAPICallsTotal.WithLabelValues(operation).Inc()
+	metrics.QBAPICallsTotal.WithLabelValues(mode, operation).Inc()
 	start := time.Now()
 	result, err := executor.WithContext(ctx).Get(func() (any, error) {
 		return fn(ctx)
 	})
-	metrics.QBAPICallDuration.WithLabelValues(operation).Observe(time.Since(start).Seconds())
+	metrics.QBAPICallDuration.WithLabelValues(mode, operation).Observe(time.Since(start).Seconds())
 	if err != nil {
 		var zero T
 		return zero, err

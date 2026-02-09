@@ -15,6 +15,7 @@ import (
 	"golang.org/x/sync/semaphore"
 
 	"github.com/arsac/qb-sync/internal/health"
+	"github.com/arsac/qb-sync/internal/metrics"
 	"github.com/arsac/qb-sync/internal/qbclient"
 	pb "github.com/arsac/qb-sync/proto"
 
@@ -100,7 +101,7 @@ func NewServer(config ServerConfig, logger *slog.Logger) *Server {
 			Password: config.ColdQB.Password,
 		})
 		qbConfig := qbclient.DefaultConfig()
-		s.qbClient = qbclient.NewResilientClient(rawClient, qbConfig, logger.With("component", "cold-qb-client"))
+		s.qbClient = qbclient.NewResilientClient(rawClient, qbConfig, logger.With("component", "cold-qb-client"), metrics.ModeCold)
 	}
 
 	if loadErr := s.inodes.Load(); loadErr != nil {

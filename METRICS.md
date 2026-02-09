@@ -20,9 +20,9 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 |--------|--------|-------------|
 | `qbsync_torrents_synced_total` | `mode`, `hash`, `name` | Torrents successfully synced |
 | `qbsync_torrent_bytes_synced_total` | `hash`, `name` | Bytes synced per torrent (hot only, for completed-transfers table) |
-| `qbsync_finalization_errors_total` | `mode`, `hash`, `name` | Finalization failures |
-| `qbsync_torrent_stop_errors_total` | `mode`, `hash`, `name` | Failures stopping torrents before handoff |
-| `qbsync_torrent_resume_errors_total` | `mode`, `hash`, `name` | Failures resuming torrents after handoff rollback |
+| `qbsync_finalization_errors_total` | `mode` | Finalization failures |
+| `qbsync_torrent_stop_errors_total` | `mode` | Failures stopping torrents before handoff |
+| `qbsync_torrent_resume_errors_total` | `mode` | Failures resuming torrents after handoff rollback |
 | `qbsync_orphan_cleanups_total` | | Orphan torrents cleaned up on cold |
 | `qbsync_pieces_sent_total` | | Pieces sent from hot |
 | `qbsync_pieces_acked_total` | | Pieces acknowledged by cold |
@@ -31,7 +31,7 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_bytes_sent_total` | | Bytes sent from hot (aggregate) |
 | `qbsync_bytes_received_total` | | Bytes received on cold (aggregate) |
 | `qbsync_qb_client_retries_total` | | qBittorrent API retries |
-| `qbsync_qb_api_calls_total` | `operation` | qBittorrent API calls by operation |
+| `qbsync_qb_api_calls_total` | `mode`, `operation` | qBittorrent API calls by operation |
 | `qbsync_circuit_breaker_trips_total` | `mode`, `component` | Circuit breaker trips |
 | `qbsync_stream_reconnects_total` | | gRPC stream reconnections |
 | `qbsync_stale_pieces_total` | | Pieces that timed out in-flight |
@@ -83,9 +83,9 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_piece_write_duration_seconds` | | 1ms .. 5s | Time to verify and write a piece on cold |
 | `qbsync_piece_rtt_seconds` | | 10ms .. 5s | Round-trip time for piece acknowledgment |
 | `qbsync_finalization_duration_seconds` | `result` | 100ms .. 120s | Time to finalize a torrent on cold |
-| `qbsync_qb_api_call_duration_seconds` | `operation` | 10ms .. 10s | qBittorrent API call latency (including retries) |
+| `qbsync_qb_api_call_duration_seconds` | `mode`, `operation` | 10ms .. 10s | qBittorrent API call latency (including retries) |
 | `qbsync_state_flush_duration_seconds` | | 1ms .. 2.5s | Time to flush dirty torrent state to disk (cold) |
-| `qbsync_torrent_sync_latency_seconds` | `hash`, `name` | 10s .. 7200s | End-to-end sync duration from download completion to cold finalization |
+| `qbsync_torrent_sync_latency_seconds` | | 10s .. 7200s | End-to-end sync duration from download completion to cold finalization |
 
 ## Grafana Tips
 
@@ -95,8 +95,14 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 |--------|--------|
 | Name | `qbsync_torrent_bytes_synced_total` label `name` |
 | Bytes | `qbsync_torrent_bytes_synced_total` |
-| Sync latency | `qbsync_torrent_sync_latency_seconds_sum` |
 | Synced at | `timestamp(qbsync_torrents_synced_total{mode="hot"})` |
+
+**Sync latency distribution** (aggregated across all torrents):
+
+| Panel | PromQL |
+|-------|--------|
+| p50 | `histogram_quantile(0.50, sum(rate(qbsync_torrent_sync_latency_seconds_bucket[$__rate_interval])) by (le))` |
+| p99 | `histogram_quantile(0.99, sum(rate(qbsync_torrent_sync_latency_seconds_bucket[$__rate_interval])) by (le))` |
 
 **Key alert candidates:**
 

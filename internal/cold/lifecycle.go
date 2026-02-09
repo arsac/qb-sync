@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
-	"strings"
 	"time"
 
 	"github.com/arsac/qb-sync/internal/metrics"
@@ -171,18 +170,21 @@ func (s *Server) isOrphanedTorrent(ctx context.Context, hash string, timeout tim
 	}
 
 	// Check state file modification time
-	statePath := filepath.Join(s.config.BasePath, metaDirName, hash, ".state")
+	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
+	statePath := filepath.Join(metaDir, ".state")
 	info, statErr := os.Stat(statePath)
 	if statErr != nil {
 		if os.IsNotExist(statErr) {
-			// No state file - check files.json for creation time
-			filesPath := filepath.Join(s.config.BasePath, metaDirName, hash, filesInfoFileName)
-			filesInfo, filesStatErr := os.Stat(filesPath)
-			if filesStatErr != nil {
-				// No metadata at all - probably already cleaned up or corrupted
+			// No state file - check for .torrent file as fallback timestamp
+			torrentPath, findErr := findTorrentFile(metaDir)
+			if findErr != nil {
 				return false
 			}
-			info = filesInfo
+			torrentInfo, torrentStatErr := os.Stat(torrentPath)
+			if torrentStatErr != nil {
+				return false
+			}
+			info = torrentInfo
 		} else {
 			s.logger.DebugContext(ctx, "failed to stat state file",
 				"hash", hash,
@@ -192,20 +194,18 @@ func (s *Server) isOrphanedTorrent(ctx context.Context, hash string, timeout tim
 		}
 	}
 
-	lastModified := info.ModTime()
-	age := time.Since(lastModified)
-
-	if age > timeout {
-		s.logger.InfoContext(ctx, "found orphaned torrent",
-			"hash", hash,
-			"lastModified", lastModified,
-			"age", age.Round(time.Minute),
-			"timeout", timeout,
-		)
-		return true
+	age := time.Since(info.ModTime())
+	if age <= timeout {
+		return false
 	}
 
-	return false
+	s.logger.InfoContext(ctx, "found orphaned torrent",
+		"hash", hash,
+		"lastModified", info.ModTime(),
+		"age", age.Round(time.Minute),
+		"timeout", timeout,
+	)
+	return true
 }
 
 // cleanupOrphan removes all data associated with an orphaned torrent.
@@ -246,40 +246,7 @@ func (s *Server) cleanupOrphan(ctx context.Context, hash string) {
 
 	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
 
-	// Load file info to find partial files
-	var filesDeleted int
-	info, loadErr := s.loadFilesInfo(metaDir)
-	if loadErr != nil {
-		// Can't load file info - still clean up metadata directory to prevent unbounded growth.
-		// Any .partial files will remain on disk but are identifiable by suffix for manual cleanup.
-		s.logger.WarnContext(ctx, "orphan cleanup without file info, .partial files may remain on disk",
-			"hash", hash,
-			"metaDir", metaDir,
-			"error", loadErr,
-		)
-	} else {
-		// Delete partial files
-		for _, f := range info.Files {
-			// f.Path is the partial file path
-			if err := os.Remove(f.Path); err == nil {
-				filesDeleted++
-			} else if !os.IsNotExist(err) {
-				s.logger.DebugContext(ctx, "failed to remove orphan partial file",
-					"hash", hash,
-					"path", f.Path,
-					"error", err,
-				)
-			}
-
-			// Also try to remove the non-partial version (may have been partially finalized)
-			finalPath := strings.TrimSuffix(f.Path, partialSuffix)
-			if finalPath != f.Path {
-				if err := os.Remove(finalPath); err == nil {
-					filesDeleted++
-				}
-			}
-		}
-	}
+	filesDeleted := s.deleteOrphanFiles(ctx, hash, metaDir)
 
 	// Always remove meta directory to prevent unbounded growth
 	if err := os.RemoveAll(metaDir); err != nil && !os.IsNotExist(err) {
@@ -298,6 +265,53 @@ func (s *Server) cleanupOrphan(ctx context.Context, hash string) {
 	)
 }
 
+// deleteOrphanFiles parses the .torrent file in metaDir to locate and remove
+// data files (both .partial and finalized versions). Returns the number of files deleted.
+func (s *Server) deleteOrphanFiles(ctx context.Context, hash, metaDir string) int {
+	torrentPath, findErr := findTorrentFile(metaDir)
+	if findErr != nil {
+		s.logger.WarnContext(ctx, "orphan cleanup without torrent file, .partial files may remain on disk",
+			"hash", hash, "metaDir", metaDir, "error", findErr)
+		return 0
+	}
+
+	torrentData, readErr := os.ReadFile(torrentPath)
+	if readErr != nil {
+		s.logger.WarnContext(ctx, "orphan cleanup: failed to read torrent file",
+			"hash", hash, "error", readErr)
+		return 0
+	}
+
+	parsed, parseErr := parseTorrentFile(torrentData)
+	if parseErr != nil {
+		s.logger.WarnContext(ctx, "orphan cleanup: failed to parse torrent file",
+			"hash", hash, "error", parseErr)
+		return 0
+	}
+
+	var deleted int
+	subPath := loadSubPathFile(metaDir)
+	for _, f := range parsed.Files {
+		filePath := filepath.Join(s.config.BasePath, subPath, f.Path)
+
+		// Try to remove .partial version
+		partialPath := filePath + partialSuffix
+		if err := os.Remove(partialPath); err == nil {
+			deleted++
+		} else if !os.IsNotExist(err) {
+			s.logger.DebugContext(ctx, "failed to remove orphan partial file",
+				"hash", hash, "path", partialPath, "error", err)
+		}
+
+		// Also try to remove the finalized version (may have been partially finalized)
+		if err := os.Remove(filePath); err == nil {
+			deleted++
+		}
+	}
+
+	return deleted
+}
+
 // runInodeCleaner periodically removes stale entries from the inode-to-path map.
 // An entry is stale if the file no longer exists on disk (e.g., was deleted externally).
 // This prevents unbounded memory growth in long-running servers.
@@ -307,5 +321,10 @@ func (s *Server) runInodeCleaner(ctx context.Context) {
 		interval = defaultInodeCleanupInterval
 	}
 
-	runPeriodic(ctx, interval, s.logger, "inode-cleaner", s.inodes.CleanupStale)
+	runPeriodic(ctx, interval, s.logger, "inode-cleaner", func(ctx context.Context) {
+		s.inodes.CleanupStale(ctx)
+		if saveErr := s.inodes.Save(); saveErr != nil {
+			s.logger.WarnContext(ctx, "failed to persist inode map after cleanup", "error", saveErr)
+		}
+	})
 }
