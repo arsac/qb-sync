@@ -14,6 +14,7 @@ import (
 
 	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
@@ -31,7 +32,17 @@ const (
 
 	// maxGRPCMessageSize is the maximum gRPC message size for piece transfers.
 	// Torrent pieces are commonly 1–16 MB; the default gRPC limit of 4 MB is too small.
-	maxGRPCMessageSize = 20 * 1024 * 1024 // 20 MB
+	maxGRPCMessageSize = 32 * 1024 * 1024 // 32 MB
+
+	// finalizeConnTimeout is how long FinalizeTorrent waits for the gRPC
+	// connection to become READY before giving up. This prevents fail-fast
+	// behavior on unary RPCs when the cold server was recently restarted.
+	finalizeConnTimeout = 20 * time.Second
+
+	// maxReconnectBackoff caps gRPC's exponential reconnection backoff.
+	// The default (120s) causes long gaps between reconnect attempts, which
+	// can exceed finalizeConnTimeout and prevent recovery after a server restart.
+	maxReconnectBackoff = 5 * time.Second
 
 	// ackWriteTimeout is how long receiveAcks waits to write an ack to the channel
 	// before treating the stream as stuck. If forwardAcks is slow draining the channel,
@@ -87,6 +98,14 @@ func NewGRPCDestination(addr string) (*GRPCDestination, error) {
 		addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithKeepaliveParams(kaParams),
+		grpc.WithConnectParams(grpc.ConnectParams{
+			Backoff: backoff.Config{
+				BaseDelay:  1 * time.Second,
+				Multiplier: 1.6,
+				Jitter:     0.2,
+				MaxDelay:   maxReconnectBackoff,
+			},
+		}),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(maxGRPCMessageSize),
 			grpc.MaxCallSendMsgSize(maxGRPCMessageSize),
@@ -307,13 +326,19 @@ func (d *GRPCDestination) FinalizeTorrent(
 	ctx context.Context,
 	hash, savePath, category, tags, saveSubPath string,
 ) error {
-	resp, err := d.client.FinalizeTorrent(ctx, &pb.FinalizeTorrentRequest{
+	// Use WaitForReady so the RPC waits for the connection to recover
+	// after a cold server restart instead of failing fast with "connection refused".
+	// The per-call timeout prevents blocking the orchestrator loop indefinitely.
+	callCtx, cancel := context.WithTimeout(ctx, finalizeConnTimeout)
+	defer cancel()
+
+	resp, err := d.client.FinalizeTorrent(callCtx, &pb.FinalizeTorrentRequest{
 		TorrentHash: hash,
 		SavePath:    savePath,
 		Category:    category,
 		Tags:        tags,
 		SaveSubPath: saveSubPath,
-	})
+	}, grpc.WaitForReady(true))
 	if err != nil {
 		return fmt.Errorf("finalize torrent RPC failed: %w", err)
 	}

@@ -4,15 +4,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/autobrr/go-qbittorrent"
 
+	"github.com/arsac/qb-sync/internal/metrics"
 	"github.com/arsac/qb-sync/internal/streaming"
 	"github.com/arsac/qb-sync/internal/utils"
 	pb "github.com/arsac/qb-sync/proto"
@@ -20,11 +23,94 @@ import (
 
 var _ streaming.PieceSource = (*Source)(nil)
 
+// fileHandleCache caches open file handles per torrent to avoid repeated
+// open/close syscalls on the hot read path. os.File.ReadAt maps to pread(2)
+// which is safe for concurrent use on the same fd.
+type fileHandleCache struct {
+	mu     sync.Mutex
+	byHash map[string]map[string]*os.File // hash -> (abs path -> *os.File)
+}
+
+// get returns a cached handle or opens the file and caches it.
+// The lock is released before os.Open to avoid holding the mutex during the syscall.
+// On re-acquire, a double-check handles the race where another goroutine opened the
+// same file concurrently — the loser closes its duplicate fd.
+func (c *fileHandleCache) get(hash, path string) (*os.File, error) {
+	c.mu.Lock()
+	if c.byHash != nil {
+		if perHash, ok := c.byHash[hash]; ok {
+			if f, ok := perHash[path]; ok {
+				c.mu.Unlock()
+				metrics.FileHandleCacheTotal.WithLabelValues(metrics.ResultHit).Inc()
+				return f, nil
+			}
+		}
+	}
+	c.mu.Unlock()
+
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.byHash == nil {
+		c.byHash = make(map[string]map[string]*os.File)
+	}
+	perHash, ok := c.byHash[hash]
+	if !ok {
+		perHash = make(map[string]*os.File)
+		c.byHash[hash] = perHash
+	}
+
+	if existing, ok := perHash[path]; ok {
+		// Another goroutine won the race — use its handle, close ours.
+		f.Close()
+		metrics.FileHandleCacheTotal.WithLabelValues(metrics.ResultHit).Inc()
+		return existing, nil
+	}
+	perHash[path] = f
+	metrics.FileHandleCacheTotal.WithLabelValues(metrics.ResultMiss).Inc()
+	return f, nil
+}
+
+// evict removes and closes all cached handles for a torrent hash.
+func (c *fileHandleCache) evict(hash string) {
+	c.mu.Lock()
+	handles := c.byHash[hash]
+	delete(c.byHash, hash)
+	c.mu.Unlock()
+
+	if len(handles) > 0 {
+		metrics.FileHandleEvictionsTotal.Inc()
+	}
+	for _, f := range handles {
+		f.Close()
+	}
+}
+
+// evictPath removes and closes a single cached handle for a torrent+path.
+func (c *fileHandleCache) evictPath(hash, path string) {
+	c.mu.Lock()
+	var f *os.File
+	if perHash, ok := c.byHash[hash]; ok {
+		f = perHash[path]
+		delete(perHash, path)
+	}
+	c.mu.Unlock()
+
+	if f != nil {
+		metrics.FileHandleEvictionsTotal.Inc()
+		f.Close()
+	}
+}
+
 // cachedMeta holds per-torrent cached metadata for ReadPiece.
 type cachedMeta struct {
-	files       []*pb.FileInfo
-	contentDir  string // primary read directory for this torrent
-	fallbackDir string // alternate directory to try on ENOENT (empty if none)
+	files      []*pb.FileInfo
+	contentDir string // read directory for this torrent
 }
 
 // Source implements streaming.PieceSource using qBittorrent API.
@@ -32,7 +118,10 @@ type Source struct {
 	client            *ResilientClient
 	dataPath          string   // Local path where torrent content is accessible
 	qbDefaultSavePath string   // qBittorrent's default save path (queried at init)
+	qbTempPath        string   // qBittorrent's temp path for incomplete torrents (empty if disabled)
+	tempDataPath      string   // Local equivalent of qbTempPath (computed from dataPath + relative offset)
 	fileCache         sync.Map // hash -> *cachedMeta
+	handles           fileHandleCache
 }
 
 // NewSource creates a new qBittorrent piece source with resilient client.
@@ -51,6 +140,14 @@ func (s *Source) Init(ctx context.Context) error {
 		return fmt.Errorf("getting qBittorrent preferences: %w", err)
 	}
 	s.qbDefaultSavePath = filepath.Clean(prefs.SavePath)
+	if prefs.TempPathEnabled && prefs.TempPath != "" {
+		s.qbTempPath = filepath.Clean(prefs.TempPath)
+		tempRel, relErr := filepath.Rel(s.qbDefaultSavePath, s.qbTempPath)
+		if relErr != nil {
+			return fmt.Errorf("computing temp path relative offset: %w", relErr)
+		}
+		s.tempDataPath = filepath.Clean(filepath.Join(s.dataPath, tempRel))
+	}
 	return nil
 }
 
@@ -66,35 +163,37 @@ func (s *Source) ResolveSubPath(torrentSavePath string) string {
 	return rel
 }
 
+// resolveQBDir maps any qBittorrent path to the corresponding local path by
+// trying both the default save root and the temp root. This handles paths under
+// the temp directory (incomplete torrents) as well as the save directory.
+func (s *Source) resolveQBDir(qbDir string) string {
+	if rel, err := filepath.Rel(s.qbDefaultSavePath, qbDir); err == nil && !strings.HasPrefix(rel, "..") {
+		return filepath.Clean(filepath.Join(s.dataPath, rel))
+	}
+	if s.qbTempPath != "" && s.tempDataPath != "" {
+		if rel, err := filepath.Rel(s.qbTempPath, qbDir); err == nil && !strings.HasPrefix(rel, "..") {
+			return filepath.Clean(filepath.Join(s.tempDataPath, rel))
+		}
+	}
+	return s.dataPath
+}
+
 // ResolveContentDir maps a torrent's save_path to the local content directory.
 // When ATM + categories are enabled, save_path includes a category subdirectory
 // (e.g., /downloads/movies instead of /downloads). This method computes the
 // relative subdirectory and applies it to the local dataPath.
 func (s *Source) ResolveContentDir(torrentSavePath string) string {
-	if sub := s.ResolveSubPath(torrentSavePath); sub != "" {
-		return filepath.Join(s.dataPath, sub)
-	}
-	return s.dataPath
+	return s.resolveQBDir(torrentSavePath)
 }
 
-// resolveReadDirs returns the primary and fallback directories for reading pieces.
-// The primary is the best guess based on torrent progress; the fallback covers
-// the transition window when files move between download and save paths.
-func (s *Source) resolveReadDirs(torrent qbittorrent.Torrent) (primary, fallback string) {
-	saveDir := s.ResolveContentDir(torrent.SavePath)
-	if torrent.DownloadPath == "" {
-		return saveDir, ""
+// resolveReadDir returns the directory for reading pieces.
+// Uses ContentPath (the actual current location on disk) as the authoritative
+// source. On ENOENT (torrent moved mid-read), callers should re-query.
+func (s *Source) resolveReadDir(torrent qbittorrent.Torrent) string {
+	if torrent.ContentPath != "" {
+		return s.resolveQBDir(filepath.Dir(torrent.ContentPath))
 	}
-	dlDir := s.ResolveContentDir(torrent.DownloadPath)
-	// dlDir == s.dataPath means DownloadPath is outside the qB save root
-	// (ResolveContentDir couldn't compute a meaningful relative path).
-	if dlDir == s.dataPath || dlDir == saveDir {
-		return saveDir, ""
-	}
-	if torrent.Progress < 1.0 {
-		return dlDir, saveDir
-	}
-	return saveDir, dlDir
+	return s.resolveQBDir(torrent.SavePath)
 }
 
 // GetPieceStates returns the current state of all pieces for a torrent.
@@ -148,7 +247,7 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 	}
 	torrent := torrents[0]
 
-	contentDir, fallbackDir := s.resolveReadDirs(torrent)
+	contentDir := s.resolveReadDir(torrent)
 
 	qbFiles, err := s.client.GetFilesInformationCtx(ctx, hash)
 	if err != nil {
@@ -215,14 +314,14 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 			PieceHashes: pieceHashes,
 			SaveSubPath: s.ResolveSubPath(torrent.SavePath),
 		},
-		ContentDir:  contentDir,
-		FallbackDir: fallbackDir,
+		ContentDir: contentDir,
 	}, nil
 }
 
 // ReadPiece reads a piece's data from disk.
-// On ENOENT, tries the fallback directory (covers download ↔ save path transitions),
-// then evicts cache and retries with fresh metadata (covers *arr recategorization).
+// On ENOENT, evicts cache and retries with fresh metadata from qBittorrent.
+// Re-querying content_path reflects the torrent's new location after moves
+// (download→save transition or *arr recategorization).
 func (s *Source) ReadPiece(ctx context.Context, piece *pb.Piece) ([]byte, error) {
 	hash := piece.GetTorrentHash()
 
@@ -231,32 +330,26 @@ func (s *Source) ReadPiece(ctx context.Context, piece *pb.Piece) ([]byte, error)
 		return nil, err
 	}
 
-	data, readErr := s.readPieceMultiFile(cached.contentDir, cached.files, piece.GetOffset(), piece.GetSize())
+	readStart := time.Now()
+	defer func() { metrics.PieceReadDuration.Observe(time.Since(readStart).Seconds()) }()
+
+	data, readErr := s.readPieceMultiFile(hash, cached.contentDir, cached.files, piece.GetOffset(), piece.GetSize())
 	if readErr == nil || !errors.Is(readErr, os.ErrNotExist) {
 		return data, readErr
 	}
 
-	// ENOENT: try the fallback directory (download ↔ save path transition).
-	if cached.fallbackDir != "" {
-		data, readErr = s.readPieceMultiFile(cached.fallbackDir, cached.files, piece.GetOffset(), piece.GetSize())
-		if readErr == nil {
-			// Fallback worked — promote it to primary in the cache.
-			s.fileCache.Store(hash, &cachedMeta{
-				files:      cached.files,
-				contentDir: cached.fallbackDir,
-			})
-			return data, nil
-		}
+	// ENOENT: torrent moved (download→save or *arr recategorization).
+	// Re-query content_path which reflects the new location.
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-
-	// Both dirs failed (or no fallback). Evict and retry with fresh metadata
-	// from qBittorrent — handles *arr recategorization where paths change entirely.
+	s.handles.evict(hash)
 	s.fileCache.Delete(hash)
 	cached, err = s.cachedTorrentMeta(ctx, hash)
 	if err != nil {
 		return nil, err
 	}
-	return s.readPieceMultiFile(cached.contentDir, cached.files, piece.GetOffset(), piece.GetSize())
+	return s.readPieceMultiFile(hash, cached.contentDir, cached.files, piece.GetOffset(), piece.GetSize())
 }
 
 // cachedTorrentMeta returns the cached metadata for a torrent, fetching on first access.
@@ -271,20 +364,80 @@ func (s *Source) cachedTorrentMeta(ctx context.Context, hash string) (*cachedMet
 	}
 
 	cm := &cachedMeta{
-		files:       meta.GetFiles(),
-		contentDir:  meta.ContentDir,
-		fallbackDir: meta.FallbackDir,
+		files:      meta.GetFiles(),
+		contentDir: meta.ContentDir,
 	}
 	s.fileCache.Store(hash, cm)
 	return cm, nil
 }
 
-// EvictCache removes cached file metadata for a torrent after finalization.
+// EvictCache removes cached file metadata and open file handles for a torrent.
 func (s *Source) EvictCache(hash string) {
 	s.fileCache.Delete(hash)
+	s.handles.evict(hash)
+}
+
+// readChunkCached reads a chunk using a cached file handle. On ReadAt error
+// (not io.EOF), it evicts the stale handle and retries once with a fresh open.
+func (s *Source) readChunkCached(hash, path string, offset, size int64) ([]byte, error) {
+	f, err := s.handles.get(hash, path)
+	if err != nil {
+		return nil, err
+	}
+
+	data := make([]byte, size)
+	n, err := f.ReadAt(data, offset)
+	if err != nil && !errors.Is(err, io.EOF) {
+		// Stale handle (e.g., file replaced in-place) — evict and retry once.
+		s.handles.evictPath(hash, path)
+		f, err = s.handles.get(hash, path)
+		if err != nil {
+			return nil, err
+		}
+		n, err = f.ReadAt(data, offset)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, err
+		}
+	}
+
+	return data[:n], nil
+}
+
+// readPieceFromRegions reads piece data spanning multiple files using cached handles.
+func (s *Source) readPieceFromRegions(hash string, regions []utils.FileRegion, pieceOffset, pieceSize int64) ([]byte, error) {
+	data := make([]byte, 0, pieceSize)
+	remaining := pieceSize
+	currentOffset := pieceOffset
+
+	for _, region := range regions {
+		if remaining <= 0 {
+			break
+		}
+
+		fileEnd := region.Offset + region.Size
+		if fileEnd <= currentOffset {
+			continue
+		}
+
+		fileReadOffset := max(currentOffset-region.Offset, 0)
+		availableInFile := region.Size - fileReadOffset
+		toRead := min(remaining, availableInFile)
+
+		chunk, err := s.readChunkCached(hash, region.Path, fileReadOffset, toRead)
+		if err != nil {
+			return nil, fmt.Errorf("reading from %s at offset %d: %w", region.Path, fileReadOffset, err)
+		}
+
+		data = append(data, chunk...)
+		remaining -= int64(len(chunk))
+		currentOffset += int64(len(chunk))
+	}
+
+	return data, nil
 }
 
 func (s *Source) readPieceMultiFile(
+	hash string,
 	basePath string,
 	files []*pb.FileInfo,
 	offset, size int64,
@@ -297,5 +450,5 @@ func (s *Source) readPieceMultiFile(
 			Size:   f.GetSize(),
 		}
 	}
-	return utils.ReadPieceFromFiles(regions, offset, size)
+	return s.readPieceFromRegions(hash, regions, offset, size)
 }

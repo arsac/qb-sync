@@ -23,7 +23,7 @@ var (
 
 const (
 	defaultPollInterval     = 2 * time.Second
-	completedChannelBufSize = 1000
+	completedChannelBufSize = 5000
 	removedChannelBufSize   = 100
 	completeProgress        = 1.0
 

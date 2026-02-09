@@ -307,7 +307,7 @@ func (q *BidiQueue) runSenderPool(ctx context.Context, pool *StreamPool, stopSen
 					return
 				case <-pool.AckReady():
 					// Fast path: woken by ack arrival.
-				case <-time.After(1 * time.Second):
+				case <-time.After(50 * time.Millisecond):
 					// Safety net: recheck capacity periodically.
 					// Handles missed AckReady signals and stale-cleanup capacity changes.
 				}

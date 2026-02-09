@@ -31,8 +31,7 @@ const (
 type TorrentMetadata struct {
 	*pb.InitTorrentRequest
 
-	ContentDir  string // Primary read directory (source-side only)
-	FallbackDir string // Alternate read directory for path transitions (source-side only)
+	ContentDir string // Read directory (source-side only)
 }
 
 // PieceSource provides piece metadata and content from the source.

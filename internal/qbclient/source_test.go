@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/autobrr/go-qbittorrent"
@@ -18,6 +19,8 @@ func TestResolveContentDir(t *testing.T) {
 		name              string
 		dataPath          string
 		qbDefaultSavePath string
+		qbTempPath        string
+		tempDataPath      string
 		torrentSavePath   string
 		want              string
 	}{
@@ -63,6 +66,24 @@ func TestResolveContentDir(t *testing.T) {
 			torrentSavePath:   "/data/torrents",
 			want:              "/data/torrents",
 		},
+		{
+			name:              "temp path resolves via qbTempPath (sibling dirs)",
+			dataPath:          "/mnt/data/torrents",
+			qbDefaultSavePath: "/data/torrents",
+			qbTempPath:        "/data/incomplete",
+			tempDataPath:      "/mnt/data/incomplete",
+			torrentSavePath:   "/data/incomplete/movies",
+			want:              "/mnt/data/incomplete/movies",
+		},
+		{
+			name:              "temp path exact match",
+			dataPath:          "/mnt/data/torrents",
+			qbDefaultSavePath: "/data/torrents",
+			qbTempPath:        "/data/incomplete",
+			tempDataPath:      "/mnt/data/incomplete",
+			torrentSavePath:   "/data/incomplete",
+			want:              "/mnt/data/incomplete",
+		},
 	}
 
 	for _, tt := range tests {
@@ -70,6 +91,8 @@ func TestResolveContentDir(t *testing.T) {
 			s := &Source{
 				dataPath:          tt.dataPath,
 				qbDefaultSavePath: tt.qbDefaultSavePath,
+				qbTempPath:        tt.qbTempPath,
+				tempDataPath:      tt.tempDataPath,
 			}
 			got := s.ResolveContentDir(tt.torrentSavePath)
 			if got != tt.want {
@@ -79,85 +102,108 @@ func TestResolveContentDir(t *testing.T) {
 	}
 }
 
-func TestResolveReadDirs(t *testing.T) {
+func TestResolveReadDir(t *testing.T) {
 	tests := []struct {
 		name              string
 		dataPath          string
 		qbDefaultSavePath string
+		qbTempPath        string
+		tempDataPath      string
 		torrent           qbittorrent.Torrent
-		wantPrimary       string
-		wantFallback      string
+		want              string
 	}{
 		{
-			name:              "completed torrent: primary=save, fallback=download",
+			name:              "completed torrent: ContentPath in save dir",
 			dataPath:          "/data",
 			qbDefaultSavePath: "/downloads",
 			torrent: qbittorrent.Torrent{
-				SavePath:     "/downloads/movies",
-				DownloadPath: "/downloads/incomplete",
-				Progress:     1.0,
+				SavePath:    "/downloads/movies",
+				ContentPath: "/downloads/movies/MyMovie",
+				Progress:    1.0,
 			},
-			wantPrimary:  "/data/movies",
-			wantFallback: "/data/incomplete",
+			want: "/data/movies",
 		},
 		{
-			name:              "downloading: primary=download, fallback=save",
+			name:              "downloading: ContentPath in download dir",
 			dataPath:          "/data",
 			qbDefaultSavePath: "/downloads",
 			torrent: qbittorrent.Torrent{
-				SavePath:     "/downloads/movies",
-				DownloadPath: "/downloads/incomplete",
-				Progress:     0.5,
+				SavePath:    "/downloads/movies",
+				ContentPath: "/downloads/incomplete/MyMovie",
+				Progress:    0.5,
 			},
-			wantPrimary:  "/data/incomplete",
-			wantFallback: "/data/movies",
+			want: "/data/incomplete",
 		},
 		{
-			name:              "no DownloadPath: primary=save, no fallback",
+			name:              "no DownloadPath: resolves via ContentPath",
+			dataPath:          "/data",
+			qbDefaultSavePath: "/downloads",
+			torrent: qbittorrent.Torrent{
+				SavePath:    "/downloads/movies",
+				ContentPath: "/downloads/movies/MyMovie",
+				Progress:    0.3,
+			},
+			want: "/data/movies",
+		},
+		{
+			name:              "zero progress: ContentPath in download dir",
+			dataPath:          "/data",
+			qbDefaultSavePath: "/downloads",
+			torrent: qbittorrent.Torrent{
+				SavePath:    "/downloads/movies",
+				ContentPath: "/downloads/incomplete/MyMovie",
+				Progress:    0,
+			},
+			want: "/data/incomplete",
+		},
+		{
+			name:              "temp path: ContentPath resolves via qbTempPath",
+			dataPath:          "/mnt/data/torrents",
+			qbDefaultSavePath: "/data/torrents",
+			qbTempPath:        "/data/incomplete",
+			tempDataPath:      "/mnt/data/incomplete",
+			torrent: qbittorrent.Torrent{
+				SavePath:    "/data/torrents/movies",
+				ContentPath: "/data/incomplete/MyMovie",
+				Progress:    0.5,
+			},
+			want: "/mnt/data/incomplete",
+		},
+		{
+			name:              "ContentPath reflects temp dir with category subdir",
+			dataPath:          "/mnt/data/torrents",
+			qbDefaultSavePath: "/data/torrents",
+			qbTempPath:        "/data/incomplete",
+			tempDataPath:      "/mnt/data/incomplete",
+			torrent: qbittorrent.Torrent{
+				SavePath:    "/data/torrents/movies",
+				ContentPath: "/data/incomplete/movies/MyMovie",
+				Progress:    0.3,
+			},
+			want: "/mnt/data/incomplete/movies",
+		},
+		{
+			name:              "ContentPath matches SavePath after completion",
+			dataPath:          "/data",
+			qbDefaultSavePath: "/downloads",
+			qbTempPath:        "/temp/incomplete",
+			tempDataPath:      "/data/../temp/incomplete",
+			torrent: qbittorrent.Torrent{
+				SavePath:    "/downloads/movies",
+				ContentPath: "/downloads/movies/MyMovie",
+				Progress:    1.0,
+			},
+			want: "/data/movies",
+		},
+		{
+			name:              "empty ContentPath falls back to save dir",
 			dataPath:          "/data",
 			qbDefaultSavePath: "/downloads",
 			torrent: qbittorrent.Torrent{
 				SavePath: "/downloads/movies",
-				Progress: 0.3,
+				Progress: 0.5,
 			},
-			wantPrimary:  "/data/movies",
-			wantFallback: "",
-		},
-		{
-			name:              "DownloadPath outside save root: primary=save, no fallback",
-			dataPath:          "/data",
-			qbDefaultSavePath: "/downloads",
-			torrent: qbittorrent.Torrent{
-				SavePath:     "/downloads/movies",
-				DownloadPath: "/other-mount/incomplete",
-				Progress:     0.5,
-			},
-			wantPrimary:  "/data/movies",
-			wantFallback: "",
-		},
-		{
-			name:              "zero progress with DownloadPath: primary=download, fallback=save",
-			dataPath:          "/data",
-			qbDefaultSavePath: "/downloads",
-			torrent: qbittorrent.Torrent{
-				SavePath:     "/downloads/movies",
-				DownloadPath: "/downloads/incomplete",
-				Progress:     0,
-			},
-			wantPrimary:  "/data/incomplete",
-			wantFallback: "/data/movies",
-		},
-		{
-			name:              "DownloadPath same as SavePath: primary=save, no fallback",
-			dataPath:          "/data",
-			qbDefaultSavePath: "/downloads",
-			torrent: qbittorrent.Torrent{
-				SavePath:     "/downloads/movies",
-				DownloadPath: "/downloads/movies",
-				Progress:     0.5,
-			},
-			wantPrimary:  "/data/movies",
-			wantFallback: "",
+			want: "/data/movies",
 		},
 	}
 
@@ -166,19 +212,18 @@ func TestResolveReadDirs(t *testing.T) {
 			s := &Source{
 				dataPath:          tt.dataPath,
 				qbDefaultSavePath: tt.qbDefaultSavePath,
+				qbTempPath:        tt.qbTempPath,
+				tempDataPath:      tt.tempDataPath,
 			}
-			primary, fallback := s.resolveReadDirs(tt.torrent)
-			if primary != tt.wantPrimary {
-				t.Errorf("primary = %q, want %q", primary, tt.wantPrimary)
-			}
-			if fallback != tt.wantFallback {
-				t.Errorf("fallback = %q, want %q", fallback, tt.wantFallback)
+			got := s.resolveReadDir(tt.torrent)
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
 			}
 		})
 	}
 }
 
-func TestReadPiece_ENOENTFallback(t *testing.T) {
+func TestReadPiece_ENOENTRetry(t *testing.T) {
 	content := []byte("piece data here!")
 	files := []*pb.FileInfo{
 		{Path: "file.bin", Size: int64(len(content)), Offset: 0},
@@ -187,7 +232,7 @@ func TestReadPiece_ENOENTFallback(t *testing.T) {
 		return &pb.Piece{TorrentHash: hash, Offset: 0, Size: int64(len(content))}
 	}
 
-	t.Run("succeeds on first try from primary dir", func(t *testing.T) {
+	t.Run("succeeds on first try", func(t *testing.T) {
 		dir := t.TempDir()
 		if err := os.WriteFile(filepath.Join(dir, "file.bin"), content, 0o644); err != nil {
 			t.Fatal(err)
@@ -205,42 +250,6 @@ func TestReadPiece_ENOENTFallback(t *testing.T) {
 		}
 	})
 
-	t.Run("ENOENT on primary falls back to fallbackDir", func(t *testing.T) {
-		staleDir := t.TempDir() // empty — file no longer here
-		correctDir := t.TempDir()
-		if err := os.WriteFile(filepath.Join(correctDir, "file.bin"), content, 0o644); err != nil {
-			t.Fatal(err)
-		}
-
-		s := &Source{}
-		s.fileCache.Store("h2", &cachedMeta{
-			files:       files,
-			contentDir:  staleDir,
-			fallbackDir: correctDir,
-		})
-
-		data, err := s.ReadPiece(context.Background(), makePiece("h2"))
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if string(data) != string(content) {
-			t.Errorf("got %q, want %q", string(data), string(content))
-		}
-
-		// Cache should be updated: primary promoted to correctDir, no fallback
-		raw, ok := s.fileCache.Load("h2")
-		if !ok {
-			t.Fatal("cache entry should still exist")
-		}
-		cached := raw.(*cachedMeta)
-		if cached.contentDir != correctDir {
-			t.Errorf("cache contentDir = %q, want %q", cached.contentDir, correctDir)
-		}
-		if cached.fallbackDir != "" {
-			t.Errorf("cache fallbackDir = %q, want empty", cached.fallbackDir)
-		}
-	})
-
 	t.Run("readPieceMultiFile returns ENOENT for missing file", func(t *testing.T) {
 		// Verifies the ENOENT detection that ReadPiece relies on for its
 		// evict-and-retry path. Full ReadPiece integration (evict + refetch)
@@ -248,7 +257,7 @@ func TestReadPiece_ENOENTFallback(t *testing.T) {
 		emptyDir := t.TempDir()
 
 		s := &Source{}
-		_, err := s.readPieceMultiFile(emptyDir, files, 0, int64(len(content)))
+		_, err := s.readPieceMultiFile("h3", emptyDir, files, 0, int64(len(content)))
 		if !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("expected ENOENT, got %v", err)
 		}
@@ -256,12 +265,11 @@ func TestReadPiece_ENOENTFallback(t *testing.T) {
 
 	t.Run("cache eviction removes entry", func(t *testing.T) {
 		// Verifies the cache eviction mechanics that ReadPiece uses when
-		// both primary and fallback dirs fail with ENOENT.
+		// ENOENT triggers a re-query.
 		s := &Source{}
 		s.fileCache.Store("h4", &cachedMeta{
-			files:       files,
-			contentDir:  "/nonexistent/primary",
-			fallbackDir: "/nonexistent/fallback",
+			files:      files,
+			contentDir: "/nonexistent/primary",
 		})
 
 		s.fileCache.Delete("h4")
@@ -325,7 +333,7 @@ func TestReadPieceMultiFile_SingleFile(t *testing.T) {
 	}
 
 	// Read a "piece" from the middle
-	data, err := s.readPieceMultiFile(dir, files, 4, 8)
+	data, err := s.readPieceMultiFile("testhash", dir, files, 4, 8)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -355,7 +363,7 @@ func TestReadPieceMultiFile_MultipleFiles(t *testing.T) {
 	}
 
 	// Read entirely from second file (offset 12, size 4)
-	data, err := s.readPieceMultiFile(dir, files, 12, 4)
+	data, err := s.readPieceMultiFile("testhash", dir, files, 12, 4)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -384,11 +392,220 @@ func TestReadPieceMultiFile_PieceSpansFiles(t *testing.T) {
 	}
 
 	// Read a piece that spans both files: last 2 bytes of a.bin + first 2 bytes of b.bin
-	data, err := s.readPieceMultiFile(dir, files, 2, 4)
+	data, err := s.readPieceMultiFile("testhash", dir, files, 2, 4)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if string(data) != "AABB" {
 		t.Errorf("got %q, want %q", string(data), "AABB")
+	}
+}
+
+func TestFileHandleCache_Get(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.bin")
+	if err := os.WriteFile(path, []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var c fileHandleCache
+
+	t.Run("opens and caches a handle", func(t *testing.T) {
+		f, err := c.get("h1", path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		buf := make([]byte, 5)
+		n, _ := f.ReadAt(buf, 0)
+		if string(buf[:n]) != "hello" {
+			t.Errorf("got %q, want %q", string(buf[:n]), "hello")
+		}
+	})
+
+	t.Run("returns cached handle on second call", func(t *testing.T) {
+		f1, _ := c.get("h1", path)
+		f2, _ := c.get("h1", path)
+		// Same fd should be returned (pointer equality).
+		if f1 != f2 {
+			t.Error("expected same *os.File pointer for cached handle")
+		}
+	})
+
+	t.Run("concurrent get deduplicates handles", func(t *testing.T) {
+		path2 := filepath.Join(dir, "data2.bin")
+		if err := os.WriteFile(path2, []byte("world"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		var c2 fileHandleCache
+		var wg sync.WaitGroup
+		results := make([]*os.File, 10)
+
+		for i := range results {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				f, err := c2.get("h2", path2)
+				if err != nil {
+					t.Errorf("goroutine %d: unexpected error: %v", idx, err)
+					return
+				}
+				results[idx] = f
+			}(i)
+		}
+		wg.Wait()
+
+		// All goroutines should get the same handle.
+		for i := 1; i < len(results); i++ {
+			if results[i] != results[0] {
+				t.Errorf("goroutine %d got different handle than goroutine 0", i)
+			}
+		}
+	})
+
+	t.Run("returns error for nonexistent file", func(t *testing.T) {
+		var c2 fileHandleCache
+		_, err := c2.get("h3", filepath.Join(dir, "nonexistent"))
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("expected ENOENT, got %v", err)
+		}
+	})
+}
+
+func TestFileHandleCache_Evict(t *testing.T) {
+	dir := t.TempDir()
+	path1 := filepath.Join(dir, "a.bin")
+	path2 := filepath.Join(dir, "b.bin")
+	if err := os.WriteFile(path1, []byte("aaa"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path2, []byte("bbb"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var c fileHandleCache
+	f1, _ := c.get("h1", path1)
+	f2, _ := c.get("h1", path2)
+
+	c.evict("h1")
+
+	// Handles should be closed — ReadAt on closed file returns an error.
+	buf := make([]byte, 1)
+	if _, err := f1.ReadAt(buf, 0); err == nil {
+		t.Error("expected error reading from closed handle f1")
+	}
+	if _, err := f2.ReadAt(buf, 0); err == nil {
+		t.Error("expected error reading from closed handle f2")
+	}
+
+	// Fresh get should return a new (working) handle.
+	f3, err := c.get("h1", path1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	n, _ := f3.ReadAt(buf, 0)
+	if string(buf[:n]) != "a" {
+		t.Errorf("got %q, want %q", string(buf[:n]), "a")
+	}
+}
+
+func TestFileHandleCache_EvictPath(t *testing.T) {
+	dir := t.TempDir()
+	path1 := filepath.Join(dir, "a.bin")
+	path2 := filepath.Join(dir, "b.bin")
+	if err := os.WriteFile(path1, []byte("aaa"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path2, []byte("bbb"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var c fileHandleCache
+	f1, _ := c.get("h1", path1)
+	f2, _ := c.get("h1", path2)
+
+	c.evictPath("h1", path1)
+
+	// path1 handle should be closed.
+	buf := make([]byte, 1)
+	if _, err := f1.ReadAt(buf, 0); err == nil {
+		t.Error("expected error reading from evicted handle")
+	}
+
+	// path2 handle should still work.
+	n, err := f2.ReadAt(buf, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(buf[:n]) != "b" {
+		t.Errorf("got %q, want %q", string(buf[:n]), "b")
+	}
+}
+
+func TestReadChunkCached_StaleHandleRetry(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.bin")
+	if err := os.WriteFile(path, []byte("original"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Source{}
+
+	// Prime the cache with a handle to "original".
+	data, err := s.readChunkCached("h1", path, 0, 8)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(data) != "original" {
+		t.Fatalf("got %q, want %q", string(data), "original")
+	}
+
+	// Replace the file (simulates torrent client rewriting).
+	// On Linux, deleting and recreating the file makes the old fd stale for new data,
+	// but ReadAt on the old fd still works (reads old content via inode).
+	// Instead, we test the cache evictPath codepath directly by evicting and verifying
+	// the new handle sees fresh content.
+	if err := os.WriteFile(path, []byte("replaced"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Evict and re-read to prove the retry path works.
+	s.handles.evictPath("h1", path)
+	data, err = s.readChunkCached("h1", path, 0, 8)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(data) != "replaced" {
+		t.Errorf("got %q, want %q", string(data), "replaced")
+	}
+}
+
+func TestEvictCache_ClosesHandles(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.bin")
+	if err := os.WriteFile(path, []byte("test"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Source{}
+	s.fileCache.Store("h1", &cachedMeta{
+		files:      []*pb.FileInfo{{Path: "data.bin", Size: 4, Offset: 0}},
+		contentDir: dir,
+	})
+
+	// Open a handle through the cache.
+	f, _ := s.handles.get("h1", path)
+
+	s.EvictCache("h1")
+
+	// fileCache should be empty.
+	if _, ok := s.fileCache.Load("h1"); ok {
+		t.Error("fileCache should have been evicted")
+	}
+
+	// Handle should be closed.
+	buf := make([]byte, 1)
+	if _, err := f.ReadAt(buf, 0); err == nil {
+		t.Error("expected error reading from closed handle")
 	}
 }

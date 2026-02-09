@@ -33,7 +33,12 @@ const (
 
 	// maxGRPCMessageSize is the maximum gRPC message size for piece transfers.
 	// Torrent pieces are commonly 1-16 MB; the default gRPC limit of 4 MB is too small.
-	maxGRPCMessageSize = 20 * 1024 * 1024 // 20 MB
+	maxGRPCMessageSize = 32 * 1024 * 1024 // 32 MB
+
+	// gracefulShutdownTimeout is how long GracefulStop waits for active streams
+	// to finish before force-stopping. Long-lived bidirectional streams (piece
+	// streaming) can block shutdown indefinitely without this timeout.
+	gracefulShutdownTimeout = 10 * time.Second
 )
 
 // Server receives pieces over gRPC and writes them to disk.
@@ -182,7 +187,23 @@ func (s *Server) Run(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		s.logger.InfoContext(ctx, "shutting down gRPC server")
-		s.server.GracefulStop()
+
+		// Try graceful shutdown first, then force-stop after timeout.
+		// GracefulStop blocks until all active RPCs finish — long-lived
+		// bidirectional streams (piece streaming) can block indefinitely.
+		stopped := make(chan struct{})
+		go func() {
+			s.server.GracefulStop()
+			close(stopped)
+		}()
+		select {
+		case <-stopped:
+		case <-time.After(gracefulShutdownTimeout):
+			s.logger.WarnContext(ctx, "graceful shutdown timed out, forcing stop")
+			s.server.Stop()
+			<-stopped // Wait for GracefulStop to return after Stop
+		}
+
 		s.cleanup()
 		return ctx.Err()
 	case serveErr := <-errCh:

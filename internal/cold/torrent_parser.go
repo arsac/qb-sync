@@ -77,12 +77,14 @@ func parseTorrentFile(data []byte) (*parsedTorrent, error) {
 			Offset: 0,
 		}}
 	} else {
-		// Multi-file torrent
+		// Multi-file torrent — paths include the torrent name as root directory.
+		// In bencode, info.Files[].Path contains components relative to info.Name,
+		// e.g. ["Big Buck Bunny.en.srt"]. The full disk path is Name/component.
 		var offset int64
 		files = make([]parsedFile, len(info.Files))
 		for i, f := range info.Files {
 			files[i] = parsedFile{
-				Path:   filepath.Join(f.Path...),
+				Path:   filepath.Join(append([]string{info.Name}, f.Path...)...),
 				Size:   f.Length,
 				Offset: offset,
 			}

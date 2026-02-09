@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -255,6 +256,20 @@ func TestE2E_FullSyncFlow(t *testing.T) {
 	t.Log("Waiting for torrent to be synced to cold...")
 	env.WaitForTorrentCompleteOnCold(ctx, bigBuckBunnyHash, 3*time.Minute, "torrent should be complete on cold")
 
+	// Wait for the orchestrator to finish post-finalization work (tag application)
+	// before canceling. WaitForTorrentCompleteOnCold returns as soon as the torrent
+	// appears on cold qBittorrent, but the FinalizeTorrent RPC may still be in-flight
+	// on the hot side — canceling now would kill it before tags are applied.
+	require.Eventually(t, func() bool {
+		torrents, tagErr := env.HotClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+			Hashes: []string{bigBuckBunnyHash},
+		})
+		if tagErr != nil || len(torrents) == 0 {
+			return false
+		}
+		return strings.Contains(torrents[0].Tags, "synced")
+	}, 30*time.Second, time.Second, "hot torrent should have 'synced' tag before shutdown")
+
 	cancelOrchestrator()
 	<-orchestratorDone
 
@@ -283,6 +298,85 @@ func TestE2E_FullSyncFlow(t *testing.T) {
 		"hot torrent should have 'synced' tag")
 
 	t.Log("Full sync flow completed successfully!")
+
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
+}
+
+// TestE2E_TempPathSync tests the full sync flow when temp_path_enabled is set
+// on the hot qBittorrent instance. When temp_path is enabled, qBittorrent
+// downloads files into the temp directory first, then moves them to save_path
+// on completion. The orchestrator must resolve ContentPath (which points at
+// the temp dir during download) to find pieces on disk.
+// Starting the orchestrator before the download completes maximizes the chance
+// of exercising the temp path reading code.
+func TestE2E_TempPathSync(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+
+	env := SetupTestEnv(t, WithHotTempPath())
+	ctx := context.Background()
+
+	// Verify temp path is enabled on hot qBittorrent.
+	prefs, err := env.HotClient().GetAppPreferencesCtx(ctx)
+	require.NoError(t, err)
+	require.True(t, prefs.TempPathEnabled, "temp_path_enabled should be true")
+	require.Equal(t, "/incomplete", prefs.TempPath, "temp_path should be /incomplete")
+	t.Logf("Hot qBittorrent prefs: temp_path_enabled=%v, temp_path=%s", prefs.TempPathEnabled, prefs.TempPath)
+
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
+
+	// Add torrent to hot.
+	t.Log("Adding Big Buck Bunny torrent to hot (with temp_path enabled)...")
+	err = env.AddTorrentToHot(ctx, bigBuckBunnyURL, nil)
+	require.NoError(t, err)
+
+	torrent := env.WaitForTorrent(env.HotClient(), bigBuckBunnyHash, torrentAppearTimeout)
+	require.NotNil(t, torrent)
+
+	// Log torrent paths — DownloadPath and ContentPath should reference /incomplete
+	// while the torrent is downloading.
+	t.Logf("Torrent SavePath:     %s", torrent.SavePath)
+	t.Logf("Torrent DownloadPath: %s", torrent.DownloadPath)
+	t.Logf("Torrent ContentPath:  %s", torrent.ContentPath)
+
+	// Start orchestrator immediately (before download finishes) so it may observe
+	// files in the temp directory and exercise the temp path resolution.
+	cfg := env.CreateHotConfig()
+	task, dest, err := env.CreateHotTask(cfg)
+	require.NoError(t, err)
+	defer dest.Close()
+
+	orchestratorCtx, cancelOrchestrator := context.WithTimeout(ctx, orchestratorTimeout)
+	defer cancelOrchestrator()
+
+	orchestratorDone := make(chan error, 1)
+	go func() {
+		orchestratorDone <- task.Run(orchestratorCtx)
+	}()
+
+	// Wait for sync to complete on cold.
+	t.Log("Waiting for torrent to sync to cold...")
+	env.WaitForTorrentCompleteOnCold(ctx, bigBuckBunnyHash, syncCompleteTimeout,
+		"torrent with temp_path should sync to cold")
+
+	// Wait for "synced" tag on hot before cancelling the orchestrator.
+	require.Eventually(t, func() bool {
+		torrents, tagErr := env.HotClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+			Hashes: []string{bigBuckBunnyHash},
+		})
+		if tagErr != nil || len(torrents) == 0 {
+			return false
+		}
+		return strings.Contains(torrents[0].Tags, "synced")
+	}, 30*time.Second, time.Second, "hot torrent should have 'synced' tag")
+
+	cancelOrchestrator()
+	<-orchestratorDone
+
+	env.AssertTorrentCompleteOnCold(ctx, bigBuckBunnyHash)
+
+	t.Log("Temp path sync flow completed successfully!")
 
 	env.CleanupBothSides(ctx, bigBuckBunnyHash)
 }

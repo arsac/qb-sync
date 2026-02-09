@@ -288,10 +288,13 @@ func TestCleanupOrphan(t *testing.T) {
 
 		hash := "abc123"
 		metaDir := filepath.Join(tmpDir, metaDirName, hash)
-		partialFile := filepath.Join(tmpDir, "test.txt.partial")
+		partialFile := filepath.Join(tmpDir, "test", "test.txt.partial")
 
 		// Create metadata and partial file
 		createTestTorrentFileWithPaths(t, tmpDir, hash, []string{"test.txt"}, "")
+		if err := os.MkdirAll(filepath.Dir(partialFile), 0o755); err != nil {
+			t.Fatal(err)
+		}
 		if err := os.WriteFile(partialFile, []byte("test"), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -320,7 +323,7 @@ func TestCleanupOrphan(t *testing.T) {
 		}
 
 		hash := "abc123"
-		partialFile := filepath.Join(tmpDir, "data", "test.txt.partial")
+		partialFile := filepath.Join(tmpDir, "test", "data", "test.txt.partial")
 
 		// Create directory structure
 		if err := os.MkdirAll(filepath.Dir(partialFile), 0o755); err != nil {
@@ -356,8 +359,8 @@ func TestCleanupOrphan(t *testing.T) {
 		}
 
 		hash := "abc123"
-		partialFile := filepath.Join(tmpDir, "data", "test.txt.partial")
-		finalFile := filepath.Join(tmpDir, "data", "test.txt")
+		partialFile := filepath.Join(tmpDir, "test", "data", "test.txt.partial")
+		finalFile := filepath.Join(tmpDir, "test", "data", "test.txt")
 
 		// Create both partial and final versions
 		if err := os.MkdirAll(filepath.Dir(partialFile), 0o755); err != nil {
@@ -432,7 +435,7 @@ func TestCleanupOrphanedTorrents(t *testing.T) {
 
 		// Create an orphaned torrent (old metadata)
 		orphanHash := "orphan123"
-		orphanPartial := filepath.Join(tmpDir, "orphan.partial")
+		orphanPartial := filepath.Join(tmpDir, "test", "orphan.partial")
 		if err := os.MkdirAll(filepath.Dir(orphanPartial), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -447,7 +450,7 @@ func TestCleanupOrphanedTorrents(t *testing.T) {
 
 		// Create a fresh torrent (recent metadata)
 		freshHash := "fresh456"
-		freshPartial := filepath.Join(tmpDir, "fresh.partial")
+		freshPartial := filepath.Join(tmpDir, "test", "fresh.partial")
 		if err := os.WriteFile(freshPartial, []byte("fresh data"), 0o644); err != nil {
 			t.Fatal(err)
 		}

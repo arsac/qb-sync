@@ -127,17 +127,18 @@ func TestParseTorrentFile_MultiFile(t *testing.T) {
 		t.Fatalf("len(Files) = %d, want 3", len(parsed.Files))
 	}
 
-	// Check file paths (joined with filepath.Join)
-	wantPath0 := filepath.Join("dir1", "file1.txt")
+	// Check file paths (joined with filepath.Join, including torrent name as root dir)
+	wantPath0 := filepath.Join("MyTorrent", "dir1", "file1.txt")
 	if parsed.Files[0].Path != wantPath0 {
 		t.Errorf("Files[0].Path = %q, want %q", parsed.Files[0].Path, wantPath0)
 	}
-	wantPath1 := filepath.Join("dir2", "file2.txt")
+	wantPath1 := filepath.Join("MyTorrent", "dir2", "file2.txt")
 	if parsed.Files[1].Path != wantPath1 {
 		t.Errorf("Files[1].Path = %q, want %q", parsed.Files[1].Path, wantPath1)
 	}
-	if parsed.Files[2].Path != "readme.txt" {
-		t.Errorf("Files[2].Path = %q, want %q", parsed.Files[2].Path, "readme.txt")
+	wantPath2 := filepath.Join("MyTorrent", "readme.txt")
+	if parsed.Files[2].Path != wantPath2 {
+		t.Errorf("Files[2].Path = %q, want %q", parsed.Files[2].Path, wantPath2)
 	}
 
 	// Check offsets
@@ -318,9 +319,9 @@ func TestParseTorrentFile_RealMultiFile(t *testing.T) {
 		size   int64
 		offset int64
 	}{
-		{"Big Buck Bunny.en.srt", 140, 0},
-		{"Big Buck Bunny.mp4", 276134947, 140},
-		{"poster.jpg", 310380, 140 + 276134947},
+		{"Big Buck Bunny/Big Buck Bunny.en.srt", 140, 0},
+		{"Big Buck Bunny/Big Buck Bunny.mp4", 276134947, 140},
+		{"Big Buck Bunny/poster.jpg", 310380, 140 + 276134947},
 	}
 	for i, want := range wantFiles {
 		if parsed.Files[i].Path != want.path {

@@ -8,16 +8,16 @@ import (
 )
 
 const (
-	DefaultMinWindow     = 4
-	DefaultMaxWindow     = 500
-	DefaultInitialWindow = 16
+	DefaultMinWindow     = 8
+	DefaultMaxWindow     = 2000
+	DefaultInitialWindow = 64
 
 	// RTT thresholds for window adjustment (optimized for stable WireGuard links).
 	rttIncreaseThreshold = 1.25 // RTT can be 25% above min before we hold steady.
 	rttDecreaseThreshold = 1.5  // RTT 1.5x min triggers window reduction (react earlier to queuing).
 
 	// Window adjustment factors.
-	windowIncreaseStep   = 1    // Additive increase.
+	windowIncreaseStep   = 4    // Additive increase.
 	windowDecreaseFactor = 0.75 // Multiplicative decrease (75% of current).
 	windowFailFactor     = 0.5  // Aggressive decrease on failure (50% of current).
 

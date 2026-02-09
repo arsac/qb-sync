@@ -50,6 +50,8 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_idle_poll_skips_total` | | Piece poll skips due to idle torrent detection |
 | `qbsync_cycle_cache_hits_total` | | Per-cycle completed-torrents cache reuses |
 | `qbsync_health_check_cache_total` | `result` | Health check cache hits/misses |
+| `qbsync_file_handle_cache_total` | `result` | File handle cache lookups (hit/miss) on hot |
+| `qbsync_file_handle_evictions_total` | | File handle evictions (stale retry, fallback, or full evict) |
 | `qbsync_window_full_total` | | Sender blocked waiting for congestion window capacity |
 | `qbsync_send_timeout_total` | | Send() timed out on HTTP/2 flow control backpressure |
 | `qbsync_receive_acks_exit_total` | `reason` | receiveAcks goroutine exits by reason |
@@ -82,6 +84,7 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 
 | Metric | Labels | Buckets | Description |
 |--------|--------|---------|-------------|
+| `qbsync_piece_read_duration_seconds` | | 1ms .. 5s | Time to read a piece from disk on hot |
 | `qbsync_piece_send_duration_seconds` | | 10ms .. 10s | Time to send a piece from hot |
 | `qbsync_piece_write_duration_seconds` | | 1ms .. 5s | Time to verify and write a piece on cold |
 | `qbsync_piece_rtt_seconds` | | 10ms .. 5s | Round-trip time for piece acknowledgment |

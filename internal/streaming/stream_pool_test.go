@@ -333,12 +333,12 @@ func TestScalingDecisionThresholds(t *testing.T) {
 	}{
 		{
 			name:          "large increase triggers scale up",
-			changeRatio:   0.15, // 15% > 10% threshold
+			changeRatio:   0.10, // 10% > 5% threshold
 			shouldScaleUp: true,
 		},
 		{
 			name:          "small increase does not trigger scale up",
-			changeRatio:   0.05, // 5% < 10% threshold
+			changeRatio:   0.03, // 3% < 5% threshold
 			shouldScaleUp: false,
 		},
 		{
@@ -353,12 +353,12 @@ func TestScalingDecisionThresholds(t *testing.T) {
 		},
 		{
 			name:          "very small change is plateau",
-			changeRatio:   0.02, // 2% < 5% threshold
+			changeRatio:   0.02, // 2% < 3% threshold
 			shouldPlateau: true,
 		},
 		{
 			name:          "moderate change is not plateau",
-			changeRatio:   0.08, // 8% > 5% threshold
+			changeRatio:   0.04, // 4% > 3% threshold
 			shouldPlateau: false,
 		},
 	}

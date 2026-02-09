@@ -383,6 +383,25 @@ var (
 			Help:      "Total times receiveAcks exited because the ack channel was blocked too long",
 		},
 	)
+
+	// FileHandleCacheTotal counts file handle cache lookups by result (hit/miss).
+	FileHandleCacheTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "file_handle_cache_total",
+			Help:      "Total file handle cache lookups by result (hit/miss)",
+		},
+		[]string{LabelResult},
+	)
+
+	// FileHandleEvictionsTotal counts file handle evictions from the cache.
+	FileHandleEvictionsTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "file_handle_evictions_total",
+			Help:      "Total file handle evictions (stale handle retry, fallback promotion, or full evict)",
+		},
+	)
 )
 
 // Gauges track values that can go up or down.
@@ -565,6 +584,16 @@ var (
 			Name:      "piece_send_duration_seconds",
 			Help:      "Time to send a piece",
 			Buckets:   []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
+		},
+	)
+
+	// PieceReadDuration tracks the time to read a piece from disk on hot.
+	PieceReadDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: namespace,
+			Name:      "piece_read_duration_seconds",
+			Help:      "Time to read a piece from disk on hot server",
+			Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5},
 		},
 	)
 

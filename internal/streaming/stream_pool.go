@@ -18,22 +18,22 @@ import (
 
 const (
 	// DefaultPoolSize is the default number of parallel streams.
-	DefaultPoolSize = 4
+	DefaultPoolSize = 8
 
 	// MinPoolSize is the minimum allowed pool size.
-	MinPoolSize = 2
+	MinPoolSize = 4
 
 	// MaxPoolSize is the maximum allowed pool size.
-	MaxPoolSize = 16
+	MaxPoolSize = 32
 
 	// DefaultAckChannelSize is the default buffer size for ack aggregation per stream.
 	DefaultAckChannelSize = 1000
 
 	// Adaptive scaling constants.
-	defaultScaleInterval      = 10 * time.Second // How often to check for scaling
-	defaultScaleUpThreshold   = 0.10             // 10% throughput increase to scale up
+	defaultScaleInterval      = 5 * time.Second  // How often to check for scaling
+	defaultScaleUpThreshold   = 0.05             // 5% throughput increase to scale up
 	defaultScaleDownThreshold = 0.15             // 15% throughput decrease to scale down
-	defaultPlateauThreshold   = 0.05             // <5% change considered plateau
+	defaultPlateauThreshold   = 0.03             // <3% change considered plateau
 	defaultPlateauCount       = 3                // Consecutive plateaus before stopping
 	scalingCooldownPeriod     = 2 * time.Minute  // Cooldown before resuming scaling after pause
 

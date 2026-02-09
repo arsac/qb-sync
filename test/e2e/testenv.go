@@ -62,21 +62,47 @@ type TestEnv struct {
 	coldServerConfig cold.ServerConfig
 }
 
+// SetupOption configures the test environment.
+type SetupOption func(*setupConfig)
+
+type setupConfig struct {
+	hotTempPath bool
+}
+
+// WithHotTempPath enables temp_path on the hot qBittorrent instance.
+// This mounts the same host directory at an additional container path (/incomplete)
+// and configures qBittorrent to use it as the temp/incomplete download directory.
+func WithHotTempPath() SetupOption {
+	return func(cfg *setupConfig) {
+		cfg.hotTempPath = true
+	}
+}
+
 // SetupTestEnv creates and starts the test environment using docker-compose.
-func SetupTestEnv(t *testing.T) *TestEnv {
+func SetupTestEnv(t *testing.T, opts ...SetupOption) *TestEnv {
 	t.Helper()
 	ctx := context.Background()
 
+	var sc setupConfig
+	for _, opt := range opts {
+		opt(&sc)
+	}
+
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	// Create temp directories for test data
+	// Create temp directories for test data.
+	// Hot directory names match the container mount points (/downloads, /incomplete)
+	// so the orchestrator's relative-path computation (Rel(save_path, temp_path)
+	// applied to dataPath) resolves to the correct host directory.
 	tmpDir := t.TempDir()
-	hotPath := filepath.Join(tmpDir, "hot")
+	hotPath := filepath.Join(tmpDir, "downloads")
+	hotIncompletePath := filepath.Join(tmpDir, "incomplete")
 	coldPath := filepath.Join(tmpDir, "cold")
 	hotConfig := filepath.Join(tmpDir, "qb-hot")
 	coldConfig := filepath.Join(tmpDir, "qb-cold")
 
 	require.NoError(t, os.MkdirAll(hotPath, 0o755))
+	require.NoError(t, os.MkdirAll(hotIncompletePath, 0o755))
 	require.NoError(t, os.MkdirAll(coldPath, 0o755))
 	require.NoError(t, os.MkdirAll(hotConfig, 0o755))
 	require.NoError(t, os.MkdirAll(coldConfig, 0o755))
@@ -88,13 +114,22 @@ func SetupTestEnv(t *testing.T) *TestEnv {
 	// Docker compose content for e2e tests
 	// Use fixed host port binding so URLs remain stable across container restarts.
 	// This is important for testing orchestrator recovery after qBittorrent restarts.
+	hotExtraVolumes := ""
+	if sc.hotTempPath {
+		// Mount a separate host dir at /incomplete inside the container.
+		// The orchestrator's resolveQBDir computes a local tempDataPath from
+		// the relative offset between save_path and temp_path, so host paths
+		// must mirror the container layout (separate directories).
+		hotExtraVolumes = fmt.Sprintf("\n      - %s:/incomplete", hotIncompletePath)
+	}
+
 	composeContent := fmt.Sprintf(`
 services:
   qb-hot:
     image: ghcr.io/home-operations/qbittorrent:5.1.4
     volumes:
       - %s:/downloads
-      - %s:/config
+      - %s:/config%s
     ports:
       - "%d:8080"
     healthcheck:
@@ -117,7 +152,7 @@ services:
       timeout: 5s
       retries: 30
       start_period: 10s
-`, hotPath, hotConfig, hotPortNum, coldPath, coldConfig, coldPortNum)
+`, hotPath, hotConfig, hotExtraVolumes, hotPortNum, coldPath, coldConfig, coldPortNum)
 
 	// Create compose stack
 	identifier := fmt.Sprintf("qbsync-e2e-%d", time.Now().UnixNano())
@@ -169,9 +204,14 @@ services:
 
 	// Configure qBittorrent save paths to match volume mounts.
 	// The home-operations image defaults to /config/Downloads, but we mount data at /downloads.
-	require.NoError(t, hotClient.SetPreferencesCtx(ctx, map[string]interface{}{
+	hotPrefs := map[string]interface{}{
 		"save_path": "/downloads",
-	}))
+	}
+	if sc.hotTempPath {
+		hotPrefs["temp_path_enabled"] = true
+		hotPrefs["temp_path"] = "/incomplete"
+	}
+	require.NoError(t, hotClient.SetPreferencesCtx(ctx, hotPrefs))
 	require.NoError(t, coldClient.SetPreferencesCtx(ctx, map[string]interface{}{
 		"save_path": "/cold-data",
 	}))
