@@ -75,28 +75,3 @@ func updateStateAfterRelocate(state *serverTorrentState, basePath, oldSubPath, n
 
 	state.saveSubPath = newSubPath
 }
-
-// updatePersistedInfoAfterRelocate loads, updates, and re-saves the persisted
-// torrent info with new sub-path and file paths.
-func (s *Server) updatePersistedInfoAfterRelocate(
-	hash, basePath, oldSubPath, newSubPath string,
-) {
-	metaDir := filepath.Join(basePath, metaDirName, hash)
-	info, loadErr := s.loadFilesInfo(metaDir)
-	if loadErr != nil {
-		return
-	}
-
-	oldBase := filepath.Join(basePath, oldSubPath)
-	newBase := filepath.Join(basePath, newSubPath)
-
-	info.SaveSubPath = newSubPath
-	for i := range info.Files {
-		rel, relErr := filepath.Rel(oldBase, info.Files[i].Path)
-		if relErr == nil {
-			info.Files[i].Path = filepath.Join(newBase, rel)
-		}
-	}
-
-	_ = s.saveFilesInfo(metaDir, info)
-}

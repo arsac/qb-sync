@@ -127,7 +127,7 @@ func (r *InodeRegistry) AbortInProgress(ctx context.Context, inode Inode, torren
 
 // mapPath returns the path to the inode map persistence file.
 func (r *InodeRegistry) mapPath() string {
-	return filepath.Join(r.basePath, ".inode_map.json")
+	return filepath.Join(r.basePath, metaDirName, ".inode_map.json")
 }
 
 // Load loads the persisted inode-to-path mapping from disk.
@@ -135,9 +135,20 @@ func (r *InodeRegistry) Load() error {
 	data, err := os.ReadFile(r.mapPath())
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil // No persisted state yet
+			// Migrate from legacy location (basePath/.inode_map.json)
+			legacyPath := filepath.Join(r.basePath, ".inode_map.json")
+			data, err = os.ReadFile(legacyPath)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return nil // No persisted state yet
+				}
+				return err
+			}
+			// Clean up legacy file after successful read
+			defer os.Remove(legacyPath)
+		} else {
+			return err
 		}
-		return err
 	}
 
 	var loaded map[Inode]string
@@ -163,11 +174,12 @@ func (r *InodeRegistry) Save() error {
 		return err
 	}
 
-	if mkdirErr := os.MkdirAll(r.basePath, serverDirPermissions); mkdirErr != nil {
+	mapFile := r.mapPath()
+	if mkdirErr := os.MkdirAll(filepath.Dir(mapFile), serverDirPermissions); mkdirErr != nil {
 		return mkdirErr
 	}
 
-	return atomicWriteFile(r.mapPath(), data, serverFilePermissions)
+	return atomicWriteFile(mapFile, data, serverFilePermissions)
 }
 
 // CleanupStale removes entries where the file no longer exists on disk.

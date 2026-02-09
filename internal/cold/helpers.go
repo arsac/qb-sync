@@ -46,34 +46,6 @@ func calculatePiecesCovered(files []*serverFileInfo, numPieces int32, pieceSize,
 	return piecesCovered
 }
 
-// buildPersistedInfo creates a persistedTorrentInfo from file info.
-func buildPersistedInfo(
-	name string,
-	numPieces int32,
-	pieceSize, totalSize int64,
-	files []*serverFileInfo,
-	pieceHashes []string,
-	saveSubPath string,
-) *persistedTorrentInfo {
-	persistedFiles := make([]persistedFileInfo, len(files))
-	for i, f := range files {
-		persistedFiles[i] = persistedFileInfo{
-			Path:   f.path,
-			Size:   f.size,
-			Offset: f.offset,
-		}
-	}
-	return &persistedTorrentInfo{
-		Name:        name,
-		NumPieces:   int(numPieces),
-		PieceLength: pieceSize,
-		TotalSize:   totalSize,
-		Files:       persistedFiles,
-		PieceHashes: pieceHashes,
-		SaveSubPath: saveSubPath,
-	}
-}
-
 // countHardlinkResults counts hardlinked, pending, and pre-existing files from results.
 func countHardlinkResults(results []*pb.HardlinkResult) (int, int, int) {
 	hardlinked, pending, preExisting := 0, 0, 0

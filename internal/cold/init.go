@@ -159,16 +159,14 @@ func (s *Server) initNewTorrent(
 	// This handles cold restart: persisted state may have files at the old path
 	// (e.g., no category prefix), while hot now sends the correct sub-path.
 	saveSubPath := req.GetSaveSubPath()
-	if persistedInfo, loadInfoErr := s.loadFilesInfo(metaDir); loadInfoErr == nil {
-		if persistedInfo.SaveSubPath != saveSubPath {
-			relPaths := make([]string, len(req.GetFiles()))
-			for i, f := range req.GetFiles() {
-				relPaths[i] = f.GetPath()
-			}
-			if _, relocErr := s.relocateFiles(ctx, hash, relPaths, persistedInfo.SaveSubPath, saveSubPath); relocErr != nil {
-				s.logger.WarnContext(ctx, "failed to relocate files, continuing with fresh setup",
-					"hash", hash, "error", relocErr)
-			}
+	if oldSubPath := loadSubPathFile(metaDir); oldSubPath != saveSubPath {
+		relPaths := make([]string, len(req.GetFiles()))
+		for i, f := range req.GetFiles() {
+			relPaths[i] = f.GetPath()
+		}
+		if _, relocErr := s.relocateFiles(ctx, hash, relPaths, oldSubPath, saveSubPath); relocErr != nil {
+			s.logger.WarnContext(ctx, "failed to relocate files, continuing with fresh setup",
+				"hash", hash, "error", relocErr)
 		}
 	}
 
@@ -203,12 +201,10 @@ func (s *Server) initNewTorrent(
 		}
 	}
 
-	// Persist file info for recovery after restart.
-	// If this fails, the torrent would be unrecoverable after a server restart,
-	// so we return an error (caller will clean up the sentinel).
-	persistedInfo := buildPersistedInfo(name, numPieces, pieceSize, totalSize, files, req.GetPieceHashes(), saveSubPath)
-	if saveErr := s.saveFilesInfo(metaDir, persistedInfo); saveErr != nil {
-		return initErrorResponse("failed to save files info for recovery: %v", saveErr)
+	// Persist save sub-path for recovery after restart.
+	// The .torrent file (already written above) provides all other metadata.
+	if saveErr := saveSubPathFile(metaDir, saveSubPath); saveErr != nil {
+		return initErrorResponse("failed to save sub-path for recovery: %v", saveErr)
 	}
 
 	// Swap sentinel for real state under s.mu

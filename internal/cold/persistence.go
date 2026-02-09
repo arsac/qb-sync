@@ -2,7 +2,6 @@ package cold
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -87,71 +86,83 @@ func (s *Server) doSaveState(path string, written []bool) error {
 	return s.saveState(path, written)
 }
 
-// saveFilesInfo saves file metadata for recovery after restart.
-func (s *Server) saveFilesInfo(metaDir string, info *persistedTorrentInfo) error {
-	path := filepath.Join(metaDir, filesInfoFileName)
-	data, err := json.Marshal(info)
-	if err != nil {
-		return fmt.Errorf("marshaling files info: %w", err)
+// saveSubPathFile persists the save sub-path to a .subpath file in the metadata directory.
+func saveSubPathFile(metaDir, subPath string) error {
+	if subPath == "" {
+		return nil
 	}
-	return atomicWriteFile(path, data, serverFilePermissions)
+	path := filepath.Join(metaDir, subPathFileName)
+	return atomicWriteFile(path, []byte(subPath), serverFilePermissions)
 }
 
-// loadFilesInfo loads file metadata for recovery after restart.
-func (s *Server) loadFilesInfo(metaDir string) (*persistedTorrentInfo, error) {
-	path := filepath.Join(metaDir, filesInfoFileName)
+// loadSubPathFile reads the save sub-path from the .subpath file.
+// Returns "" if the file is missing or unreadable.
+func loadSubPathFile(metaDir string) string {
+	path := filepath.Join(metaDir, subPathFileName)
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return ""
 	}
-	var info persistedTorrentInfo
-	if unmarshalErr := json.Unmarshal(data, &info); unmarshalErr != nil {
-		return nil, fmt.Errorf("unmarshaling files info: %w", unmarshalErr)
+	return strings.TrimSpace(string(data))
+}
+
+// findTorrentFile locates the .torrent file in metaDir.
+func findTorrentFile(metaDir string) (string, error) {
+	entries, readErr := os.ReadDir(metaDir)
+	if readErr != nil {
+		return "", fmt.Errorf("reading meta dir: %w", readErr)
 	}
-	return &info, nil
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".torrent") {
+			return filepath.Join(metaDir, entry.Name()), nil
+		}
+	}
+	return "", errors.New("torrent file not found")
 }
 
 // recoverTorrentState attempts to recover torrent state from disk after a server restart.
 // This enables FinalizeTorrent to work even if the torrent was initialized in a previous
-// server instance.
+// server instance. Parses the .torrent file directly for metadata.
 func (s *Server) recoverTorrentState(ctx context.Context, hash string) (*serverTorrentState, error) {
 	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
 
-	// Load persisted file info
-	info, loadErr := s.loadFilesInfo(metaDir)
-	if loadErr != nil {
-		return nil, fmt.Errorf("loading files info: %w", loadErr)
+	// Find and parse the .torrent file
+	torrentPath, findErr := findTorrentFile(metaDir)
+	if findErr != nil {
+		return nil, findErr
 	}
 
-	statePath := filepath.Join(metaDir, ".state")
+	torrentData, readErr := os.ReadFile(torrentPath)
+	if readErr != nil {
+		return nil, fmt.Errorf("reading torrent file: %w", readErr)
+	}
+
+	parsed, parseErr := parseTorrentFile(torrentData)
+	if parseErr != nil {
+		return nil, fmt.Errorf("parsing torrent file: %w", parseErr)
+	}
 
 	// Load written pieces state
-	written, stateErr := s.loadState(statePath, info.NumPieces)
+	statePath := filepath.Join(metaDir, ".state")
+	written, stateErr := s.loadState(statePath, parsed.NumPieces)
 	if stateErr != nil {
 		return nil, fmt.Errorf("loading state: %w", stateErr)
 	}
 
-	// Find the .torrent file
-	torrentPath := ""
-	entries, readErr := os.ReadDir(metaDir)
-	if readErr != nil {
-		return nil, fmt.Errorf("reading meta dir: %w", readErr)
-	}
-	for _, entry := range entries {
-		if strings.HasSuffix(entry.Name(), ".torrent") {
-			torrentPath = filepath.Join(metaDir, entry.Name())
-			break
-		}
-	}
-	if torrentPath == "" {
-		return nil, errors.New("torrent file not found")
-	}
+	// Load save sub-path
+	saveSubPath := loadSubPathFile(metaDir)
 
-	// Reconstruct file info
-	files := make([]*serverFileInfo, len(info.Files))
-	for i, f := range info.Files {
+	// Reconstruct file paths from torrent metadata + saveSubPath.
+	// Use the finalized path if it exists, otherwise assume partial.
+	files := make([]*serverFileInfo, len(parsed.Files))
+	for i, f := range parsed.Files {
+		finalPath := filepath.Join(s.config.BasePath, saveSubPath, f.Path)
+		diskPath := finalPath + partialSuffix
+		if _, err := os.Stat(finalPath); err == nil {
+			diskPath = finalPath
+		}
 		files[i] = &serverFileInfo{
-			path:   f.Path,
+			path:   diskPath,
 			size:   f.Size,
 			offset: f.Offset,
 		}
@@ -162,7 +173,7 @@ func (s *Server) recoverTorrentState(ctx context.Context, hash string) (*serverT
 	s.logger.InfoContext(ctx, "recovering torrent state",
 		"hash", hash,
 		"written", writtenCount,
-		"total", info.NumPieces,
+		"total", parsed.NumPieces,
 		"files", len(files),
 	)
 
@@ -170,12 +181,12 @@ func (s *Server) recoverTorrentState(ctx context.Context, hash string) (*serverT
 		info:         nil, // Not needed for finalization
 		written:      written,
 		writtenCount: writtenCount,
-		pieceHashes:  info.PieceHashes,
-		pieceLength:  info.PieceLength,
-		totalSize:    info.TotalSize,
+		pieceHashes:  parsed.PieceHashes,
+		pieceLength:  parsed.PieceLength,
+		totalSize:    parsed.TotalSize,
 		files:        files,
 		torrentPath:  torrentPath,
 		statePath:    statePath,
-		saveSubPath:  info.SaveSubPath,
+		saveSubPath:  saveSubPath,
 	}, nil
 }

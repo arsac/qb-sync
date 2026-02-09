@@ -648,7 +648,7 @@ func (t *QBTask) finalizeCompletedStreams(ctx context.Context) error {
 
 		// All pieces streamed - finalize on cold server
 		if finalizeErr := t.finalizeTorrent(ctx, hash); finalizeErr != nil {
-			metrics.FinalizationErrorsTotal.WithLabelValues(metrics.ModeHot, hash, tracked[hash].name).Inc()
+			metrics.FinalizationErrorsTotal.WithLabelValues(metrics.ModeHot).Inc()
 			t.logger.ErrorContext(ctx, "finalize failed",
 				"hash", hash,
 				"error", finalizeErr,
@@ -667,7 +667,7 @@ func (t *QBTask) finalizeCompletedStreams(ctx context.Context) error {
 		t.clearFinalizeBackoff(hash)
 
 		// Record sync latency (time from download completion to finalization)
-		metrics.TorrentSyncLatencySeconds.WithLabelValues(hash, tracked[hash].name).Observe(time.Since(tracked[hash].completionTime).Seconds())
+		metrics.TorrentSyncLatencySeconds.Observe(time.Since(tracked[hash].completionTime).Seconds())
 
 		// Mark as complete on cold (persisted cache)
 		t.markCompletedOnCold(hash)
@@ -1013,7 +1013,7 @@ func (t *QBTask) deleteGroupFromHot(ctx context.Context, group torrentGroup) (in
 
 		// Step 1: Stop seeding on hot
 		if stopErr := t.srcClient.StopCtx(ctx, []string{torrent.Hash}); stopErr != nil {
-			metrics.TorrentStopErrorsTotal.WithLabelValues(metrics.ModeHot, torrent.Hash, torrent.Name).Inc()
+			metrics.TorrentStopErrorsTotal.WithLabelValues(metrics.ModeHot).Inc()
 			t.logger.WarnContext(ctx, "failed to stop torrent on hot, skipping handoff",
 				"hash", torrent.Hash, "error", stopErr)
 			failed++
@@ -1026,7 +1026,7 @@ func (t *QBTask) deleteGroupFromHot(ctx context.Context, group torrentGroup) (in
 				"hash", torrent.Hash, "error", startErr)
 			// Rollback: resume on hot so somebody is seeding
 			if resumeErr := t.srcClient.ResumeCtx(ctx, []string{torrent.Hash}); resumeErr != nil {
-				metrics.TorrentResumeErrorsTotal.WithLabelValues(metrics.ModeHot, torrent.Hash, torrent.Name).Inc()
+				metrics.TorrentResumeErrorsTotal.WithLabelValues(metrics.ModeHot).Inc()
 				t.logger.WarnContext(ctx, "failed to resume torrent on hot after cold start failure",
 					"hash", torrent.Hash, "error", resumeErr)
 			}

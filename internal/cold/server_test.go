@@ -1,8 +1,9 @@
 package cold
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
+	"crypto/sha1"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -236,7 +237,7 @@ func TestIsOrphanedTorrent(t *testing.T) {
 		}
 	})
 
-	t.Run("falls back to files.json when state file missing", func(t *testing.T) {
+	t.Run("falls back to torrent file when state file missing", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		s := &Server{
 			config:         ServerConfig{BasePath: tmpDir},
@@ -246,11 +247,11 @@ func TestIsOrphanedTorrent(t *testing.T) {
 		}
 
 		hash := "abc123"
-		// Create only files.json (no .state file)
-		createTestFilesInfo(t, tmpDir, hash, time.Now().Add(-48*time.Hour))
+		// Create only .torrent file (no .state file)
+		createTestTorrentFile(t, tmpDir, hash, time.Now().Add(-48*time.Hour))
 
 		if !s.isOrphanedTorrent(ctx, hash, 24*time.Hour) {
-			t.Error("torrent with old files.json should be orphaned")
+			t.Error("torrent with old .torrent file should be orphaned")
 		}
 	})
 
@@ -290,7 +291,7 @@ func TestCleanupOrphan(t *testing.T) {
 		partialFile := filepath.Join(tmpDir, "test.txt.partial")
 
 		// Create metadata and partial file
-		createTestFilesInfoWithPaths(t, tmpDir, hash, []string{partialFile})
+		createTestTorrentFileWithPaths(t, tmpDir, hash, []string{"test.txt"}, "")
 		if err := os.WriteFile(partialFile, []byte("test"), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -329,7 +330,7 @@ func TestCleanupOrphan(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		createTestFilesInfoWithPaths(t, tmpDir, hash, []string{partialFile})
+		createTestTorrentFileWithPaths(t, tmpDir, hash, []string{"data/test.txt"}, "")
 
 		s.cleanupOrphan(ctx, hash)
 
@@ -369,7 +370,7 @@ func TestCleanupOrphan(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		createTestFilesInfoWithPaths(t, tmpDir, hash, []string{partialFile})
+		createTestTorrentFileWithPaths(t, tmpDir, hash, []string{"data/test.txt"}, "")
 
 		s.cleanupOrphan(ctx, hash)
 
@@ -382,7 +383,7 @@ func TestCleanupOrphan(t *testing.T) {
 		}
 	})
 
-	t.Run("cleans up metadata directory even when files.json is unreadable", func(t *testing.T) {
+	t.Run("cleans up metadata directory even when torrent file is missing", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		s := &Server{
 			config:         ServerConfig{BasePath: tmpDir},
@@ -394,21 +395,21 @@ func TestCleanupOrphan(t *testing.T) {
 		hash := "abc123"
 		metaDir := filepath.Join(tmpDir, metaDirName, hash)
 
-		// Create meta dir with invalid files.json
+		// Create meta dir without a .torrent file
 		if err := os.MkdirAll(metaDir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(metaDir, filesInfoFileName), []byte("invalid json"), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(metaDir, ".state"), []byte{1, 0}, 0o644); err != nil {
 			t.Fatal(err)
 		}
 
 		s.cleanupOrphan(ctx, hash)
 
 		// Meta directory should be deleted to prevent unbounded growth.
-		// Partial files can't be located without valid files.json but are
+		// Partial files can't be located without a valid .torrent file but are
 		// identifiable by .partial suffix for manual cleanup.
 		if _, err := os.Stat(metaDir); !os.IsNotExist(err) {
-			t.Error("meta directory should be deleted even when files.json is unreadable")
+			t.Error("meta directory should be deleted even when torrent file is missing")
 		}
 	})
 }
@@ -438,10 +439,11 @@ func TestCleanupOrphanedTorrents(t *testing.T) {
 		if err := os.WriteFile(orphanPartial, []byte("orphan data"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		createTestFilesInfoWithPaths(t, tmpDir, orphanHash, []string{orphanPartial})
-		// Backdate the metadata
+		createTestTorrentFileWithPaths(t, tmpDir, orphanHash, []string{"orphan"}, "")
+		// Backdate the torrent file to make it appear orphaned
 		metaDir := filepath.Join(tmpDir, metaDirName, orphanHash)
-		setModTime(t, filepath.Join(metaDir, filesInfoFileName), time.Now().Add(-2*time.Hour))
+		torrentPath, _ := findTorrentFile(metaDir)
+		setModTime(t, torrentPath, time.Now().Add(-2*time.Hour))
 
 		// Create a fresh torrent (recent metadata)
 		freshHash := "fresh456"
@@ -449,7 +451,7 @@ func TestCleanupOrphanedTorrents(t *testing.T) {
 		if err := os.WriteFile(freshPartial, []byte("fresh data"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		createTestFilesInfoWithPaths(t, tmpDir, freshHash, []string{freshPartial})
+		createTestTorrentFileWithPaths(t, tmpDir, freshHash, []string{"fresh"}, "")
 
 		s.cleanupOrphanedTorrents(ctx)
 
@@ -1184,7 +1186,7 @@ func TestCountHardlinkResults_PreExisting(t *testing.T) {
 func createTestMetadata(t *testing.T, basePath, hash string, modTime time.Time) {
 	t.Helper()
 	createTestStateFile(t, basePath, hash, modTime)
-	createTestFilesInfo(t, basePath, hash, modTime)
+	createTestTorrentFile(t, basePath, hash, modTime)
 }
 
 func createTestStateFile(t *testing.T, basePath, hash string, modTime time.Time) {
@@ -1200,45 +1202,65 @@ func createTestStateFile(t *testing.T, basePath, hash string, modTime time.Time)
 	setModTime(t, statePath, modTime)
 }
 
-func createTestFilesInfo(t *testing.T, basePath, hash string, modTime time.Time) {
+// createTestTorrentFile creates a .torrent file in the metaDir with the given modTime.
+// If no file paths are provided, uses a single dummy file.
+func createTestTorrentFile(t *testing.T, basePath, hash string, modTime time.Time) {
 	t.Helper()
-	createTestFilesInfoWithPaths(t, basePath, hash, []string{})
-	filesPath := filepath.Join(basePath, metaDirName, hash, filesInfoFileName)
-	setModTime(t, filesPath, modTime)
+	createTestTorrentFileWithPaths(t, basePath, hash, nil, "")
+	torrentPath, err := findTorrentFile(filepath.Join(basePath, metaDirName, hash))
+	if err != nil {
+		t.Fatal(err)
+	}
+	setModTime(t, torrentPath, modTime)
 }
 
-func createTestFilesInfoWithPaths(t *testing.T, basePath, hash string, filePaths []string) {
+// createTestTorrentFileWithPaths creates a .torrent file + optional .subpath in the metaDir.
+// relPaths are torrent-relative paths (e.g., "data/test.txt"). If empty, uses a dummy file.
+func createTestTorrentFileWithPaths(t *testing.T, basePath, hash string, relPaths []string, subPath string) {
 	t.Helper()
 	metaDir := filepath.Join(basePath, metaDirName, hash)
 	if err := os.MkdirAll(metaDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
-	files := make([]persistedFileInfo, len(filePaths))
-	for i, path := range filePaths {
-		files[i] = persistedFileInfo{
-			Path:   path,
-			Size:   1024,
-			Offset: int64(i) * 1024,
+	// Build pieces (10 fake piece hashes)
+	numPieces := 10
+	var piecesBuf bytes.Buffer
+	for range numPieces {
+		h := sha1.Sum([]byte("fake-piece"))
+		piecesBuf.Write(h[:])
+	}
+
+	bt := bencodeTorrent{
+		Info: bencodeInfo{
+			Name:        "test",
+			PieceLength: 1024,
+			Pieces:      piecesBuf.String(),
+		},
+	}
+	if len(relPaths) == 0 {
+		bt.Info.Length = int64(numPieces) * 1024
+	} else {
+		files := make([]bencodeFile, len(relPaths))
+		for i, p := range relPaths {
+			files[i] = bencodeFile{
+				Length: 1024,
+				Path:   strings.Split(p, "/"),
+			}
 		}
+		bt.Info.Files = files
 	}
 
-	info := persistedTorrentInfo{
-		Name:        "test",
-		NumPieces:   10,
-		PieceLength: 1024,
-		TotalSize:   10240,
-		Files:       files,
+	torrentPath := filepath.Join(metaDir, "test.torrent")
+	if err := os.WriteFile(torrentPath, encodeTorrent(t, bt), 0o644); err != nil {
+		t.Fatal(err)
 	}
 
-	data, marshalErr := json.Marshal(info)
-	if marshalErr != nil {
-		t.Fatal(marshalErr)
-	}
-
-	filesPath := filepath.Join(metaDir, filesInfoFileName)
-	if writeErr := os.WriteFile(filesPath, data, 0o644); writeErr != nil {
-		t.Fatal(writeErr)
+	if subPath != "" {
+		subPathFile := filepath.Join(metaDir, subPathFileName)
+		if err := os.WriteFile(subPathFile, []byte(subPath), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -1497,14 +1519,11 @@ func TestInitTorrent_RelocatesOnSubPathChange(t *testing.T) {
 		assertFileExists(t, newPartialPath, "partial file should exist at new sub-path after re-init")
 		assertFileNotExists(t, oldPartialPath, "partial file should not exist at old path after relocation")
 
-		// Verify persisted info was updated with new sub-path
+		// Verify persisted sub-path was updated
 		metaDir := filepath.Join(tmpDir, metaDirName, hash)
-		info, loadErr := s.loadFilesInfo(metaDir)
-		if loadErr != nil {
-			t.Fatalf("failed to load persisted info: %v", loadErr)
-		}
-		if info.SaveSubPath != "movies" {
-			t.Errorf("persisted SaveSubPath = %q, want %q", info.SaveSubPath, "movies")
+		subPath := loadSubPathFile(metaDir)
+		if subPath != "movies" {
+			t.Errorf("persisted subPath = %q, want %q", subPath, "movies")
 		}
 	})
 

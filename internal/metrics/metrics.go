@@ -57,7 +57,7 @@ var (
 			Name:      "finalization_errors_total",
 			Help:      "Total finalization failures",
 		},
-		[]string{LabelMode, LabelHash, LabelName},
+		[]string{LabelMode},
 	)
 
 	// TorrentStopErrorsTotal counts failures when stopping torrents before finalization.
@@ -67,7 +67,7 @@ var (
 			Name:      "torrent_stop_errors_total",
 			Help:      "Total failures stopping torrents before finalization",
 		},
-		[]string{LabelMode, LabelHash, LabelName},
+		[]string{LabelMode},
 	)
 
 	// TorrentResumeErrorsTotal counts failures when resuming torrents after finalization failure.
@@ -77,7 +77,7 @@ var (
 			Name:      "torrent_resume_errors_total",
 			Help:      "Total failures resuming torrents after finalization failure",
 		},
-		[]string{LabelMode, LabelHash, LabelName},
+		[]string{LabelMode},
 	)
 
 	// OrphanCleanupsTotal counts orphaned torrents cleaned up on cold.
@@ -591,14 +591,13 @@ var (
 	)
 
 	// TorrentSyncLatencySeconds tracks end-to-end sync duration from download completion to cold finalization.
-	TorrentSyncLatencySeconds = promauto.NewHistogramVec(
+	TorrentSyncLatencySeconds = promauto.NewHistogram(
 		prometheus.HistogramOpts{
 			Namespace: namespace,
 			Name:      "torrent_sync_latency_seconds",
 			Help:      "End-to-end sync duration from download completion on hot to finalization on cold",
 			Buckets:   []float64{10, 30, 60, 120, 300, 600, 1800, 3600, 7200},
 		},
-		[]string{LabelHash, LabelName},
 	)
 )
 
