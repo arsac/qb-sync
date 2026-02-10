@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math"
 	"runtime/debug"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -52,9 +53,10 @@ var ErrPoolClosed = errors.New("stream pool is closed")
 // fields are accessed via the parent pool's mutex. The atomic stat fields
 // (bytesSent, piecesOK, piecesFail) may be read without holding the lock.
 type PooledStream struct {
-	stream *PieceStream
-	window *congestion.AdaptiveWindow
-	id     int
+	stream    *PieceStream
+	window    *congestion.AdaptiveWindow
+	id        int
+	connLabel string // Pre-computed gRPC connection index label for metrics
 
 	// Stats - atomic for lock-free reads
 	bytesSent  atomic.Int64
@@ -322,9 +324,10 @@ func (p *StreamPool) addStreamLocked() error {
 	}
 
 	ps := &PooledStream{
-		stream: stream,
-		window: congestion.NewAdaptiveWindow(p.windowConfig),
-		id:     p.nextID,
+		stream:    stream,
+		window:    congestion.NewAdaptiveWindow(p.windowConfig),
+		id:        p.nextID,
+		connLabel: strconv.Itoa(stream.connIdx),
 	}
 	p.nextID++
 	p.streams = append(p.streams, ps)

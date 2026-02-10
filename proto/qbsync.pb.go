@@ -1285,6 +1285,7 @@ func (x *AbortTorrentResponse) GetFilesDeleted() int32 {
 type StartTorrentRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	TorrentHash   string                 `protobuf:"bytes,1,opt,name=torrent_hash,json=torrentHash,proto3" json:"torrent_hash,omitempty"`
+	Tag           string                 `protobuf:"bytes,2,opt,name=tag,proto3" json:"tag,omitempty"` // Optional tag to apply after starting (e.g., "source-removed")
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1322,6 +1323,13 @@ func (*StartTorrentRequest) Descriptor() ([]byte, []int) {
 func (x *StartTorrentRequest) GetTorrentHash() string {
 	if x != nil {
 		return x.TorrentHash
+	}
+	return ""
+}
+
+func (x *StartTorrentRequest) GetTag() string {
+	if x != nil {
+		return x.Tag
 	}
 	return ""
 }
@@ -1556,9 +1564,10 @@ const file_qbsync_proto_rawDesc = "" +
 	"\x14AbortTorrentResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\x12#\n" +
-	"\rfiles_deleted\x18\x03 \x01(\x05R\ffilesDeleted\"8\n" +
+	"\rfiles_deleted\x18\x03 \x01(\x05R\ffilesDeleted\"J\n" +
 	"\x13StartTorrentRequest\x12!\n" +
-	"\ftorrent_hash\x18\x01 \x01(\tR\vtorrentHash\"F\n" +
+	"\ftorrent_hash\x18\x01 \x01(\tR\vtorrentHash\x12\x10\n" +
+	"\x03tag\x18\x02 \x01(\tR\x03tag\"F\n" +
 	"\x14StartTorrentResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\"\x80\x01\n" +

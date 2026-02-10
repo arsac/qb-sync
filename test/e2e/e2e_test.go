@@ -128,8 +128,8 @@ func TestE2E_DryRunDoesNotDelete(t *testing.T) {
 	torrent := env.WaitForTorrent(env.HotClient(), wiredCDHash, 30*time.Second)
 	require.NotNil(t, torrent)
 
-	// Create task in dry run mode with Force to bypass space check
-	cfg := env.CreateHotConfig(WithDryRun(true), WithForce(true))
+	// Create task in dry run mode and drain to bypass space check
+	cfg := env.CreateHotConfig(WithDryRun(true), WithMinSeedingTime(0))
 	task, dest, err := env.CreateHotTask(cfg)
 	require.NoError(t, err)
 	defer dest.Close()
@@ -141,8 +141,8 @@ func TestE2E_DryRunDoesNotDelete(t *testing.T) {
 	// Mark torrent as complete on cold (simulates sync without actually syncing)
 	task.MarkCompletedOnCold(wiredCDHash)
 
-	// Run maybeMoveToCold in dry run mode
-	err = task.MaybeMoveToCold(ctx)
+	// Drain in dry run mode
+	err = task.Drain(ctx)
 	require.NoError(t, err)
 
 	// Torrent should still exist on hot (dry run)
@@ -494,34 +494,114 @@ func TestE2E_StopBeforeDeleteOnDiskPressure(t *testing.T) {
 	}, 15*time.Second, time.Second,
 		"cold torrent should be stopped before disk pressure handoff")
 
-	// Now: simulate disk pressure with Force + no min seeding time
-	t.Log("Running disk pressure cleanup (Force mode)...")
-	forceCfg := env.CreateHotConfig(WithForce(true), WithMinSeedingTime(0))
-	forceTask, forceDest, err := env.CreateHotTask(forceCfg)
+	// Now: drain to evacuate all synced torrents
+	t.Log("Running drain...")
+	drainCfg := env.CreateHotConfig(WithMinSeedingTime(0))
+	drainTask, drainDest, err := env.CreateHotTask(drainCfg)
 	require.NoError(t, err)
-	defer forceDest.Close()
+	defer drainDest.Close()
 
-	err = forceTask.Login(ctx)
+	err = drainTask.Login(ctx)
 	require.NoError(t, err)
 
-	// Mark as completed on cold so maybeMoveToCold picks it up
-	forceTask.MarkCompletedOnCold(wiredCDHash)
+	// Mark as completed on cold so drain picks it up
+	drainTask.MarkCompletedOnCold(wiredCDHash)
 
-	err = forceTask.MaybeMoveToCold(ctx)
+	err = drainTask.Drain(ctx)
 	require.NoError(t, err)
 
 	// Torrent should now be deleted from hot (stop → start cold → delete)
 	env.WaitForTorrentDeleted(ctx, env.HotClient(), wiredCDHash, 10*time.Second,
-		"torrent should be deleted from hot after disk pressure cleanup")
+		"torrent should be deleted from hot after drain")
 
 	// Cold torrent should now be SEEDING (started during handoff).
 	// qBittorrent may take a moment to transition from stoppedUP to an active state.
 	require.Eventually(t, func() bool {
 		return !env.IsTorrentStopped(ctx, env.ColdClient(), wiredCDHash)
 	}, 15*time.Second, time.Second,
-		"torrent on cold should be seeding after disk pressure handoff")
+		"torrent on cold should be seeding after drain handoff")
 
 	t.Log("Torrent handed off: hot deleted, cold now seeding!")
+
+	env.CleanupBothSides(ctx, wiredCDHash)
+}
+
+// TestE2E_SourceRemovedTagOnDiskPressure verifies that the source-removed tag is applied
+// on the cold torrent when a torrent is removed from hot during disk pressure cleanup.
+// Flow: sync to cold → force cleanup → verify cold has source-removed AND synced tags.
+func TestE2E_SourceRemovedTagOnDiskPressure(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+
+	env := SetupTestEnv(t)
+	ctx := context.Background()
+
+	env.CleanupBothSides(ctx, wiredCDHash)
+
+	t.Log("Adding Wired CD torrent to hot...")
+	env.DownloadTorrentOnHot(ctx, testTorrentURL, wiredCDHash, torrentDownloadTimeout)
+
+	// First: sync to cold without Force (torrent stays on hot)
+	cfg := env.CreateHotConfig()
+	task, dest, err := env.CreateHotTask(cfg)
+	require.NoError(t, err)
+	defer dest.Close()
+
+	orchestratorCtx, cancelOrchestrator := context.WithTimeout(ctx, syncCompleteTimeout)
+	defer cancelOrchestrator()
+
+	orchestratorDone := make(chan error, 1)
+	go func() {
+		orchestratorDone <- task.Run(orchestratorCtx)
+	}()
+
+	t.Log("Waiting for torrent to be synced to cold...")
+	env.WaitForTorrentCompleteOnCold(ctx, wiredCDHash, syncCompleteTimeout, "torrent should be complete on cold")
+
+	cancelOrchestrator()
+	<-orchestratorDone
+
+	env.AssertTorrentCompleteOnCold(ctx, wiredCDHash)
+
+	// Now: drain to evacuate all synced torrents
+	t.Log("Running drain...")
+	drainCfg := env.CreateHotConfig(WithMinSeedingTime(0))
+	drainTask, drainDest, err := env.CreateHotTask(drainCfg)
+	require.NoError(t, err)
+	defer drainDest.Close()
+
+	err = drainTask.Login(ctx)
+	require.NoError(t, err)
+
+	// Mark as completed on cold so drain picks it up
+	drainTask.MarkCompletedOnCold(wiredCDHash)
+
+	err = drainTask.Drain(ctx)
+	require.NoError(t, err)
+
+	// Torrent should now be deleted from hot
+	env.WaitForTorrentDeleted(ctx, env.HotClient(), wiredCDHash, 10*time.Second,
+		"torrent should be deleted from hot after drain")
+
+	// Cold torrent should now be seeding
+	require.Eventually(t, func() bool {
+		return !env.IsTorrentStopped(ctx, env.ColdClient(), wiredCDHash)
+	}, 15*time.Second, time.Second,
+		"torrent on cold should be seeding after drain handoff")
+
+	// Verify cold torrent has the source-removed tag
+	coldTorrents, err := env.ColdClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+		Hashes: []string{wiredCDHash},
+	})
+	require.NoError(t, err)
+	require.Len(t, coldTorrents, 1)
+	assert.Contains(t, coldTorrents[0].Tags, "source-removed",
+		"cold torrent should have 'source-removed' tag after drain handoff")
+	assert.Contains(t, coldTorrents[0].Tags, "synced",
+		"cold torrent should retain 'synced' tag after handoff")
+
+	t.Log("Source-removed tag correctly applied on cold after drain handoff!")
 
 	env.CleanupBothSides(ctx, wiredCDHash)
 }
@@ -891,9 +971,9 @@ func TestE2E_HardlinkGroupDeletion(t *testing.T) {
 	require.True(t, linked, "files should now be hardlinked")
 	t.Log("Successfully created hardlink between torrent files")
 
-	// Create hot task with Force mode (to bypass space check) and no min seeding time
-	forceCfg := env.CreateHotConfig(WithForce(true), WithMinSeedingTime(0))
-	task, dest, err := env.CreateHotTask(forceCfg)
+	// Create hot task and drain (bypasses space check and seeding time)
+	drainCfg := env.CreateHotConfig(WithMinSeedingTime(0))
+	task, dest, err := env.CreateHotTask(drainCfg)
 	require.NoError(t, err)
 	defer dest.Close()
 
@@ -906,9 +986,9 @@ func TestE2E_HardlinkGroupDeletion(t *testing.T) {
 	task.MarkCompletedOnCold(wiredCDHash)
 	t.Log("Both torrents marked as complete on cold")
 
-	// Run maybeMoveToCold - this should detect the hardlink group and delete both
-	t.Log("Running maybeMoveToCold...")
-	err = task.MaybeMoveToCold(ctx)
+	// Drain - this should detect the hardlink group and delete both
+	t.Log("Running Drain...")
+	err = task.Drain(ctx)
 	require.NoError(t, err)
 
 	// Verify BOTH torrents were deleted (because they're in the same hardlink group)
@@ -1156,9 +1236,9 @@ func TestE2E_NonHardlinkedDeletedIndependently(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, torrents, 2)
 
-	// Create task with Force mode
-	forceCfg := env.CreateHotConfig(WithForce(true), WithMinSeedingTime(0))
-	task, dest, err := env.CreateHotTask(forceCfg)
+	// Create task and drain
+	drainCfg := env.CreateHotConfig(WithMinSeedingTime(0))
+	task, dest, err := env.CreateHotTask(drainCfg)
 	require.NoError(t, err)
 	defer dest.Close()
 
@@ -1169,9 +1249,9 @@ func TestE2E_NonHardlinkedDeletedIndependently(t *testing.T) {
 	err = task.Login(ctx)
 	require.NoError(t, err)
 
-	// Run maybeMoveToCold
-	t.Log("Running maybeMoveToCold...")
-	err = task.MaybeMoveToCold(ctx)
+	// Drain
+	t.Log("Running Drain...")
+	err = task.Drain(ctx)
 	require.NoError(t, err)
 
 	// Both should be deleted (independently, not as a group)

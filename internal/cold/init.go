@@ -224,7 +224,6 @@ func (s *Server) initNewTorrent(
 	s.mu.Lock()
 	s.torrents[hash] = state
 	s.mu.Unlock()
-	metrics.ActiveTorrents.WithLabelValues(metrics.ModeCold).Inc()
 
 	// Log summary
 	hardlinkedCount, pendingCount, preExistingCount := countHardlinkResults(hardlinkResults)

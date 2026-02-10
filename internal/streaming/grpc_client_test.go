@@ -758,9 +758,9 @@ type stubClient struct {
 	id int
 }
 
-// TestStreamClient_RoundRobin verifies that streamClient distributes calls
-// evenly across all clients using atomic round-robin.
-func TestStreamClient_RoundRobin(t *testing.T) {
+// TestStreamConnIdx_RoundRobin verifies that streamConnIdx distributes calls
+// evenly across all connections using atomic round-robin.
+func TestStreamConnIdx_RoundRobin(t *testing.T) {
 	t.Parallel()
 
 	clients := []pb.QBSyncServiceClient{
@@ -775,32 +775,30 @@ func TestStreamClient_RoundRobin(t *testing.T) {
 
 	counts := make([]int, 3)
 	for range 9 {
-		c := d.streamClient()
-		sc := c.(*stubClient)
-		counts[sc.id]++
+		idx := d.streamConnIdx()
+		counts[idx]++
 	}
 
 	for i, count := range counts {
 		if count != 3 {
-			t.Errorf("client %d called %d times, want 3", i, count)
+			t.Errorf("connection %d selected %d times, want 3", i, count)
 		}
 	}
 }
 
-// TestStreamClient_SingleConn verifies the fast-path: with 1 client,
-// streamClient always returns the same client without touching the atomic.
-func TestStreamClient_SingleConn(t *testing.T) {
+// TestStreamConnIdx_SingleConn verifies the fast-path: with 1 connection,
+// streamConnIdx always returns 0 without touching the atomic.
+func TestStreamConnIdx_SingleConn(t *testing.T) {
 	t.Parallel()
 
-	client := &stubClient{id: 0}
 	d := &GRPCDestination{
-		clients: []pb.QBSyncServiceClient{client},
+		clients: []pb.QBSyncServiceClient{&stubClient{id: 0}},
 	}
 
 	for range 10 {
-		c := d.streamClient()
-		if c != client {
-			t.Fatal("expected same client for single-conn fast path")
+		idx := d.streamConnIdx()
+		if idx != 0 {
+			t.Fatalf("expected index 0 for single-conn fast path, got %d", idx)
 		}
 	}
 }
@@ -829,9 +827,9 @@ func TestClient_AlwaysReturnsFirst(t *testing.T) {
 	}
 }
 
-// TestStreamClient_RoundRobin_Concurrent verifies that round-robin is safe
+// TestStreamConnIdx_RoundRobin_Concurrent verifies that round-robin is safe
 // under concurrent access (no races, even distribution).
-func TestStreamClient_RoundRobin_Concurrent(t *testing.T) {
+func TestStreamConnIdx_RoundRobin_Concurrent(t *testing.T) {
 	t.Parallel()
 
 	const numClients = 3
@@ -853,9 +851,8 @@ func TestStreamClient_RoundRobin_Concurrent(t *testing.T) {
 	for range numGoroutines {
 		go func() {
 			for range callsPerGoroutine {
-				c := d.streamClient()
-				sc := c.(*stubClient)
-				counts[sc.id].Add(1)
+				idx := d.streamConnIdx()
+				counts[idx].Add(1)
 			}
 			done <- struct{}{}
 		}()
@@ -870,7 +867,7 @@ func TestStreamClient_RoundRobin_Concurrent(t *testing.T) {
 	for i := range numClients {
 		got := int(counts[i].Load())
 		if got != expected {
-			t.Errorf("client %d: got %d calls, want %d", i, got, expected)
+			t.Errorf("connection %d: got %d calls, want %d", i, got, expected)
 		}
 	}
 }

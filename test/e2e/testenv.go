@@ -566,9 +566,9 @@ func (env *TestEnv) CreateHotConfig(opts ...HotConfigOption) *config.HotConfig {
 		MinSpaceGB:      1,
 		MinSeedingTime:  0,
 		SleepInterval:   time.Second,
-		Force:           false,
 		GRPCConnections: 2,
-		NumSenders:      4,
+		NumSenders:       4,
+		SourceRemovedTag: "source-removed",
 	}
 	for _, opt := range opts {
 		opt(cfg)
@@ -583,13 +583,6 @@ type HotConfigOption func(*config.HotConfig)
 func WithDryRun(dryRun bool) HotConfigOption {
 	return func(cfg *config.HotConfig) {
 		cfg.DryRun = dryRun
-	}
-}
-
-// WithForce sets force mode.
-func WithForce(force bool) HotConfigOption {
-	return func(cfg *config.HotConfig) {
-		cfg.Force = force
 	}
 }
 
@@ -611,6 +604,13 @@ func WithGRPCConnections(n int) HotConfigOption {
 func WithNumSenders(n int) HotConfigOption {
 	return func(cfg *config.HotConfig) {
 		cfg.NumSenders = n
+	}
+}
+
+// WithSourceRemovedTag sets the tag applied on cold when torrent is removed from hot.
+func WithSourceRemovedTag(tag string) HotConfigOption {
+	return func(cfg *config.HotConfig) {
+		cfg.SourceRemovedTag = tag
 	}
 }
 

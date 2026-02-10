@@ -7,12 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"os"
 	"path/filepath"
 	"slices"
 	"sync"
-	"syscall"
+	"sync/atomic"
 	"time"
 
 	"github.com/autobrr/go-qbittorrent"
@@ -27,6 +26,9 @@ import (
 	pb "github.com/arsac/qb-sync/proto"
 )
 
+// ErrDrainInProgress is returned when Drain is called while another drain is running.
+var ErrDrainInProgress = errors.New("drain already in progress")
+
 const (
 	bytesPerGB = int64(1024 * 1024 * 1024)
 
@@ -37,8 +39,8 @@ const (
 	minFinalizeBackoff = 2 * time.Second
 	maxFinalizeBackoff = 30 * time.Second
 
-	// Abort torrent settings.
-	abortTorrentTimeout = 30 * time.Second
+	// Timeout for unary RPCs to cold server during removal/handoff.
+	coldRPCTimeout = 30 * time.Second
 )
 
 // finalizeBackoff tracks exponential backoff state for finalization retries.
@@ -100,6 +102,9 @@ type QBTask struct {
 
 	// trackingOrderHook is called with each hash when tracking starts. Test-only.
 	trackingOrderHook func(hash string)
+
+	// draining is set by Drain() to bypass space/seeding checks in maybeMoveToCold.
+	draining atomic.Bool
 }
 
 // NewQBTask creates a new QBTask with streaming integration.
@@ -185,6 +190,33 @@ func (t *QBTask) RunOnce(ctx context.Context) {
 // MaybeMoveToCold is the exported version of maybeMoveToCold for testing.
 func (t *QBTask) MaybeMoveToCold(ctx context.Context) error {
 	return t.maybeMoveToCold(ctx)
+}
+
+// Drain triggers a one-shot evacuation: hands off ALL synced torrents to cold,
+// ignoring MinSpaceGB and MinSeedingTime. Blocks until the cycle completes.
+// Returns ErrDrainInProgress if a drain is already running.
+func (t *QBTask) Drain(ctx context.Context) error {
+	if !t.draining.CompareAndSwap(false, true) {
+		return ErrDrainInProgress
+	}
+	defer func() {
+		t.draining.Store(false)
+		metrics.Draining.Set(0)
+	}()
+	metrics.Draining.Set(1)
+	t.logger.InfoContext(ctx, "drain started")
+	err := t.maybeMoveToCold(ctx)
+	if err != nil {
+		t.logger.ErrorContext(ctx, "drain failed", "error", err)
+	} else {
+		t.logger.InfoContext(ctx, "drain complete")
+	}
+	return err
+}
+
+// Draining reports whether a drain is in progress.
+func (t *QBTask) Draining() bool {
+	return t.draining.Load()
 }
 
 // Progress returns the streaming progress for a torrent.
@@ -408,9 +440,14 @@ func (t *QBTask) runOnce(ctx context.Context) {
 	if err := t.finalizeCompletedStreams(ctx); err != nil {
 		t.logger.ErrorContext(ctx, "failed to finalize streams", "error", err)
 	}
-	if err := t.maybeMoveToCold(ctx); err != nil {
-		t.logger.ErrorContext(ctx, "failed to move torrents", "error", err)
+	if !t.Draining() {
+		if err := t.maybeMoveToCold(ctx); err != nil {
+			t.logger.ErrorContext(ctx, "failed to move torrents", "error", err)
+		}
 	}
+	t.trackedMu.RLock()
+	metrics.ActiveTorrents.WithLabelValues(metrics.ModeHot).Set(float64(len(t.trackedTorrents)))
+	t.trackedMu.RUnlock()
 	t.updateSyncAgeGauge()
 	t.updateTorrentProgressGauges()
 
@@ -538,8 +575,6 @@ func (t *QBTask) trackNewTorrents(ctx context.Context) error {
 
 	for _, c := range candidates {
 		if t.startTrackingReady(ctx, c.torrent, c.coldResult) {
-			metrics.ActiveTorrents.WithLabelValues(metrics.ModeHot).Inc()
-
 			t.logger.InfoContext(ctx, "started tracking torrent",
 				"name", c.torrent.Name,
 				"hash", c.torrent.Hash,
@@ -738,7 +773,6 @@ func (t *QBTask) finalizeCompletedStreams(ctx context.Context) error {
 		delete(t.trackedTorrents, hash)
 		t.trackedMu.Unlock()
 
-		metrics.ActiveTorrents.WithLabelValues(metrics.ModeHot).Dec()
 		metrics.TorrentsSyncedTotal.WithLabelValues(metrics.ModeHot, hash, name).Inc()
 		metrics.TorrentBytesSyncedTotal.WithLabelValues(hash, name).Add(float64(tracked[hash].size))
 		metrics.OldestPendingSyncSeconds.DeleteLabelValues(hash, name)
@@ -793,9 +827,13 @@ func (t *QBTask) finalizeTorrent(ctx context.Context, hash string) error {
 }
 
 // maybeMoveToCold deletes torrents known to be complete on cold when space is low.
+// During a drain (t.draining is true), bypasses space and seeding checks to
+// evacuate all synced torrents.
 func (t *QBTask) maybeMoveToCold(ctx context.Context) error {
-	if !t.cfg.Force {
-		freeSpaceGB, err := t.getFreeSpaceGB(t.cfg.DataPath)
+	isDraining := t.draining.Load()
+
+	if !isDraining {
+		freeSpaceGB, err := t.getFreeSpaceGB(ctx)
 		if err != nil {
 			return fmt.Errorf("getting free space: %w", err)
 		}
@@ -822,16 +860,20 @@ func (t *QBTask) maybeMoveToCold(ctx context.Context) error {
 	groups := t.groupHardlinkedTorrents(ctx, torrents)
 	sortedGroups := t.sortGroupsByPriority(groups)
 
-	freeSpaceBefore, err := t.getFreeSpaceGB(t.cfg.DataPath)
-	if err != nil {
-		return fmt.Errorf("getting free space before cleanup: %w", err)
+	var freeSpaceBefore int64
+	if !isDraining {
+		var err error
+		freeSpaceBefore, err = t.getFreeSpaceGB(ctx)
+		if err != nil {
+			return fmt.Errorf("getting free space before cleanup: %w", err)
+		}
 	}
 
 	var groupsDeleted, groupsSkippedSeeding, groupsFailed, torrentsHandedOff int
 	minSeedingSeconds := int64(t.cfg.MinSeedingTime.Seconds())
 
 	for _, group := range sortedGroups {
-		if group.minSeeding < minSeedingSeconds {
+		if !isDraining && group.minSeeding < minSeedingSeconds {
 			t.logger.InfoContext(ctx, "group has not seeded long enough",
 				"minSeeding", group.minSeeding,
 				"required", minSeedingSeconds,
@@ -849,8 +891,8 @@ func (t *QBTask) maybeMoveToCold(ctx context.Context) error {
 			groupsDeleted++
 		}
 
-		if !t.cfg.Force {
-			currentSpaceGB, spaceErr := t.getFreeSpaceGB(t.cfg.DataPath)
+		if !isDraining {
+			currentSpaceGB, spaceErr := t.getFreeSpaceGB(ctx)
 			if spaceErr != nil {
 				return fmt.Errorf("getting free space: %w", spaceErr)
 			}
@@ -861,24 +903,25 @@ func (t *QBTask) maybeMoveToCold(ctx context.Context) error {
 		}
 	}
 
-	freeSpaceAfter, err := t.getFreeSpaceGB(t.cfg.DataPath)
-	if err != nil {
-		return fmt.Errorf("getting free space after cleanup: %w", err)
-	}
-
 	metrics.HotCleanupGroupsTotal.WithLabelValues(metrics.ResultSuccess).Add(float64(groupsDeleted))
 	metrics.HotCleanupGroupsTotal.WithLabelValues(metrics.ResultSkippedSeeding).Add(float64(groupsSkippedSeeding))
 	metrics.HotCleanupGroupsTotal.WithLabelValues(metrics.ResultFailure).Add(float64(groupsFailed))
 	metrics.HotCleanupTorrentsHandedOffTotal.Add(float64(torrentsHandedOff))
 
-	t.logger.InfoContext(ctx, "hot cleanup cycle complete",
+	logAttrs := []any{
 		"groupsEvaluated", len(sortedGroups),
 		"groupsDeleted", groupsDeleted,
 		"groupsSkippedSeeding", groupsSkippedSeeding,
 		"groupsFailed", groupsFailed,
 		"torrentsHandedOff", torrentsHandedOff,
-		"spaceFreedGB", freeSpaceAfter-freeSpaceBefore,
-	)
+	}
+	if !isDraining {
+		freeSpaceAfter, spaceErr := t.getFreeSpaceGB(ctx)
+		if spaceErr == nil {
+			logAttrs = append(logAttrs, "spaceFreedGB", freeSpaceAfter-freeSpaceBefore)
+		}
+	}
+	t.logger.InfoContext(ctx, "hot cleanup cycle complete", logAttrs...)
 
 	return nil
 }
@@ -1043,7 +1086,11 @@ func (t *QBTask) sortGroupsByPriority(groups []torrentGroup) []torrentGroup {
 		if a.popularity != b.popularity {
 			return cmp.Compare(a.popularity, b.popularity)
 		}
-		// Reverse order for size (larger first)
+		// Longest seeded first (already contributed most to the swarm)
+		if a.minSeeding != b.minSeeding {
+			return cmp.Compare(b.minSeeding, a.minSeeding)
+		}
+		// Largest first (reclaim more space)
 		return cmp.Compare(b.maxSize, a.maxSize)
 	})
 	return groups
@@ -1077,7 +1124,7 @@ func (t *QBTask) deleteGroupFromHot(ctx context.Context, group torrentGroup) (in
 		}
 
 		// Step 2: Start on cold (cold has the torrent stopped from finalization)
-		if startErr := t.grpcDest.StartTorrent(ctx, torrent.Hash); startErr != nil {
+		if startErr := t.grpcDest.StartTorrent(ctx, torrent.Hash, t.cfg.SourceRemovedTag); startErr != nil {
 			t.logger.ErrorContext(ctx, "failed to start torrent on cold, resuming on hot",
 				"hash", torrent.Hash, "error", startErr)
 			// Rollback: resume on hot so somebody is seeding
@@ -1106,14 +1153,12 @@ func (t *QBTask) deleteGroupFromHot(ctx context.Context, group torrentGroup) (in
 	return handed, nil
 }
 
-func (t *QBTask) getFreeSpaceGB(path string) (int64, error) {
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(path, &stat); err != nil {
+func (t *QBTask) getFreeSpaceGB(ctx context.Context) (int64, error) {
+	freeBytes, err := t.srcClient.GetFreeSpaceOnDiskCtx(ctx)
+	if err != nil {
 		return 0, err
 	}
-	freeBytes := stat.Bavail * uint64(stat.Bsize)
-	freeGB := freeBytes / uint64(bytesPerGB)
-	return int64(min(freeGB, uint64(math.MaxInt64))), nil
+	return freeBytes / bytesPerGB, nil
 }
 
 // shouldAttemptFinalize checks if enough time has passed since the last failed
@@ -1187,19 +1232,17 @@ func (t *QBTask) handleTorrentRemoval(ctx context.Context, hash string) {
 	delete(t.trackedTorrents, hash)
 	t.trackedMu.Unlock()
 
-	// Also remove from completed cache (if user deleted a synced torrent)
-	t.completedMu.Lock()
-	delete(t.completedOnCold, hash)
-	metrics.CompletedOnColdCacheSize.Set(float64(len(t.completedOnCold)))
-	t.completedMu.Unlock()
-
-	t.saveCompletedCache()
+	// Check completedOnCold (determines StartTorrent vs AbortTorrent).
+	// Don't delete yet — only remove after StartTorrent succeeds so
+	// pruneCompletedOnCold can clean up if the RPC fails.
+	t.completedMu.RLock()
+	wasCompletedOnCold := t.completedOnCold[hash]
+	t.completedMu.RUnlock()
 
 	// Clear any finalize backoff state
 	t.clearFinalizeBackoff(hash)
 
 	if wasTracked {
-		metrics.ActiveTorrents.WithLabelValues(metrics.ModeHot).Dec()
 		metrics.OldestPendingSyncSeconds.DeleteLabelValues(hash, tt.name)
 	} else {
 		t.logger.DebugContext(ctx, "removed torrent was not in tracked list",
@@ -1207,21 +1250,49 @@ func (t *QBTask) handleTorrentRemoval(ctx context.Context, hash string) {
 		)
 	}
 
-	// Notify cold server to abort and clean up partial files
 	if t.cfg.DryRun {
-		t.logger.InfoContext(ctx, "[dry-run] would abort torrent on cold",
-			"hash", hash,
+		if wasCompletedOnCold {
+			t.logger.InfoContext(ctx, "[dry-run] would start/tag torrent on cold",
+				"hash", hash, "tag", t.cfg.SourceRemovedTag,
+			)
+		} else {
+			t.logger.InfoContext(ctx, "[dry-run] would abort torrent on cold",
+				"hash", hash,
+			)
+		}
+		return
+	}
+
+	// Torrent was complete on cold: start seeding and apply tag
+	if wasCompletedOnCold {
+		startCtx, cancel := context.WithTimeout(ctx, coldRPCTimeout)
+		defer cancel()
+		if startErr := t.grpcDest.StartTorrent(startCtx, hash, t.cfg.SourceRemovedTag); startErr != nil {
+			t.logger.WarnContext(ctx, "failed to start/tag torrent on cold after removal (will retry via prune)",
+				"hash", hash, "error", startErr,
+			)
+			return // Keep in completedOnCold — pruneCompletedOnCold will clean up
+		}
+
+		// StartTorrent succeeded — remove from completedOnCold cache
+		t.completedMu.Lock()
+		delete(t.completedOnCold, hash)
+		metrics.CompletedOnColdCacheSize.Set(float64(len(t.completedOnCold)))
+		t.completedMu.Unlock()
+		t.saveCompletedCache()
+
+		t.logger.InfoContext(ctx, "started and tagged torrent on cold after hot removal",
+			"hash", hash, "tag", t.cfg.SourceRemovedTag,
 		)
 		return
 	}
 
-	// Use timeout to prevent blocking indefinitely if cold server is unresponsive
-	abortCtx, cancel := context.WithTimeout(ctx, abortTorrentTimeout)
+	// Torrent was not complete on cold: abort and clean up partial files
+	abortCtx, cancel := context.WithTimeout(ctx, coldRPCTimeout)
 	defer cancel()
 
 	filesDeleted, err := t.grpcDest.AbortTorrent(abortCtx, hash, true)
 	if err != nil {
-		// Log but don't fail - periodic orphan cleanup on cold will handle it
 		t.logger.WarnContext(ctx, "failed to abort torrent on cold (periodic cleanup will handle)",
 			"hash", hash,
 			"error", err,

@@ -9,6 +9,7 @@ import (
 
 	"github.com/autobrr/go-qbittorrent"
 
+	"github.com/arsac/qb-sync/internal/metrics"
 	"github.com/arsac/qb-sync/internal/utils"
 	pb "github.com/arsac/qb-sync/proto"
 )
@@ -220,6 +221,15 @@ func (s *Server) StartTorrent(ctx context.Context, req *pb.StartTorrentRequest) 
 			Success: false,
 			Error:   fmt.Sprintf("resume failed: %v", resumeErr),
 		}, nil
+	}
+
+	if tag := req.GetTag(); tag != "" {
+		if tagErr := s.qbClient.AddTagsCtx(ctx, []string{hash}, tag); tagErr != nil {
+			metrics.TagApplicationErrorsTotal.WithLabelValues(metrics.ModeCold).Inc()
+			s.logger.WarnContext(ctx, "failed to apply tag to started torrent",
+				"hash", hash, "tag", tag, "error", tagErr,
+			)
+		}
 	}
 
 	s.logger.InfoContext(ctx, "started torrent on cold qBittorrent", "hash", hash)

@@ -24,11 +24,11 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_torrent_stop_errors_total` | `mode` | Failures stopping torrents before handoff |
 | `qbsync_torrent_resume_errors_total` | `mode` | Failures resuming torrents after handoff rollback |
 | `qbsync_orphan_cleanups_total` | | Orphan torrents cleaned up on cold |
-| `qbsync_pieces_sent_total` | | Pieces sent from hot |
+| `qbsync_pieces_sent_total` | `connection` | Pieces sent from hot |
 | `qbsync_pieces_acked_total` | | Pieces acknowledged by cold |
 | `qbsync_pieces_failed_total` | | Piece transfer failures |
 | `qbsync_pieces_received_total` | | Pieces received on cold |
-| `qbsync_bytes_sent_total` | | Bytes sent from hot (aggregate) |
+| `qbsync_bytes_sent_total` | `connection` | Bytes sent from hot |
 | `qbsync_bytes_received_total` | | Bytes received on cold (aggregate) |
 | `qbsync_qb_client_retries_total` | | qBittorrent API retries |
 | `qbsync_qb_api_calls_total` | `mode`, `operation` | qBittorrent API calls by operation |
@@ -79,13 +79,16 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_inode_registry_size` | | Registered inodes for hardlink deduplication (cold) |
 | `qbsync_cold_worker_queue_depth` | | Pieces queued waiting for a cold write worker |
 | `qbsync_cold_workers_busy` | | Cold write workers currently processing |
+| `qbsync_grpc_connections_configured` | | TCP connections configured for gRPC streaming (hot) |
+| `qbsync_sender_workers_configured` | | Concurrent sender workers configured (hot) |
+| `qbsync_draining` | | Shutdown drain in progress: 1=draining, 0=normal (hot) |
 
 ## Histograms
 
 | Metric | Labels | Buckets | Description |
 |--------|--------|---------|-------------|
 | `qbsync_piece_read_duration_seconds` | | 1ms .. 5s | Time to read a piece from disk on hot |
-| `qbsync_piece_send_duration_seconds` | | 10ms .. 10s | Time to send a piece from hot |
+| `qbsync_piece_send_duration_seconds` | `connection` | 10ms .. 10s | Time to send a piece from hot |
 | `qbsync_piece_write_duration_seconds` | | 1ms .. 5s | Time to verify and write a piece on cold |
 | `qbsync_piece_rtt_seconds` | | 10ms .. 5s | Round-trip time for piece acknowledgment |
 | `qbsync_finalization_duration_seconds` | `result` | 100ms .. 120s | Time to finalize a torrent on cold |
@@ -128,3 +131,4 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 - `qbsync_circuit_breaker_state == 1` -- circuit breaker open
 - `rate(qbsync_piece_hash_mismatch_total[5m]) > 0.1` -- data integrity issues
 - `qbsync_oldest_pending_sync_seconds > 3600` -- torrent stuck syncing for over an hour
+- `qbsync_draining == 1` for > 5m -- shutdown drain taking too long

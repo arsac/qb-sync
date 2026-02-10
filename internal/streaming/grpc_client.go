@@ -167,13 +167,13 @@ func (d *GRPCDestination) client() pb.QBSyncServiceClient {
 	return d.clients[0]
 }
 
-// streamClient returns the next client for streaming RPCs (round-robin across all connections).
-func (d *GRPCDestination) streamClient() pb.QBSyncServiceClient {
+// streamConnIdx returns the next connection index for streaming RPCs (round-robin across all connections).
+func (d *GRPCDestination) streamConnIdx() int {
 	if len(d.clients) == 1 {
-		return d.clients[0]
+		return 0
 	}
 	idx := d.streamIdx.Add(1) - 1
-	return d.clients[idx%uint32(len(d.clients))]
+	return int(idx % uint32(len(d.clients)))
 }
 
 // ValidateConnection checks that the cold server is reachable on all
@@ -313,15 +313,18 @@ func (d *GRPCDestination) WritePiece(ctx context.Context, req *pb.WritePieceRequ
 // Each stream gets its own cancellable context so a stuck Send() can be
 // unblocked without tearing down the entire pool.
 func (d *GRPCDestination) OpenStream(ctx context.Context, logger *slog.Logger) (*PieceStream, error) {
+	connIdx := d.streamConnIdx()
+	client := d.clients[connIdx]
 	streamCtx, streamCancel := context.WithCancel(ctx)
 
-	stream, err := d.streamClient().StreamPiecesBidi(streamCtx)
+	stream, err := client.StreamPiecesBidi(streamCtx)
 	if err != nil {
 		streamCancel()
 		return nil, fmt.Errorf("failed to open stream: %w", err)
 	}
 
 	ps := &PieceStream{
+		connIdx: connIdx,
 		ctx:      streamCtx,
 		cancel:   streamCancel,
 		stream:   stream,
@@ -444,9 +447,10 @@ func (d *GRPCDestination) AbortTorrent(ctx context.Context, hash string, deleteF
 // StartTorrent resumes a stopped torrent on the cold server.
 // Called during disk pressure cleanup after hot stops seeding,
 // to ensure cold takes over before hot deletes.
-func (d *GRPCDestination) StartTorrent(ctx context.Context, hash string) error {
+func (d *GRPCDestination) StartTorrent(ctx context.Context, hash string, tag string) error {
 	resp, err := d.client().StartTorrent(ctx, &pb.StartTorrentRequest{
 		TorrentHash: hash,
+		Tag:         tag,
 	})
 	if err != nil {
 		return fmt.Errorf("start torrent RPC failed: %w", err)
@@ -554,6 +558,8 @@ type sendRequest struct {
 // A dedicated sendLoop goroutine serializes all stream.Send() calls via a channel,
 // following the gRPC best practice of a single sender per stream.
 type PieceStream struct {
+	connIdx int // Index of the gRPC connection this stream uses
+
 	ctx    context.Context
 	cancel context.CancelFunc // Cancels stream context; unblocks stuck Send()
 	stream pb.QBSyncService_StreamPiecesBidiClient

@@ -60,6 +60,7 @@ func (s *Server) runStateFlusher(ctx context.Context) {
 func (s *Server) flushDirtyStates(ctx context.Context) {
 	// Collect all torrent references while holding s.mu (no state locks here)
 	s.mu.RLock()
+	metrics.ActiveTorrents.WithLabelValues(metrics.ModeCold).Set(float64(len(s.torrents)))
 	torrents := s.collectTorrents()
 	s.mu.RUnlock()
 

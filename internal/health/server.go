@@ -33,6 +33,7 @@ type Server struct {
 	addr   string
 	logger *slog.Logger
 	server *http.Server
+	mux    *http.ServeMux
 
 	ready   atomic.Bool
 	checks  map[string]CheckFunc
@@ -52,15 +53,15 @@ func NewServer(cfg Config, logger *slog.Logger) *Server {
 		checks: make(map[string]CheckFunc),
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", s.handleHealthz)
-	mux.HandleFunc("/livez", s.handleLivez)
-	mux.HandleFunc("/readyz", s.handleReadyz)
-	mux.Handle("/metrics", promhttp.Handler())
+	s.mux = http.NewServeMux()
+	s.mux.HandleFunc("/healthz", s.handleHealthz)
+	s.mux.HandleFunc("/livez", s.handleLivez)
+	s.mux.HandleFunc("/readyz", s.handleReadyz)
+	s.mux.Handle("/metrics", promhttp.Handler())
 
 	s.server = &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           mux,
+		Handler:           s.mux,
 		ReadHeaderTimeout: readHeaderTimeout,
 	}
 

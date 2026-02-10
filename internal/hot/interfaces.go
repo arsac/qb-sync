@@ -13,5 +13,5 @@ type ColdDestination interface {
 	CheckTorrentStatus(ctx context.Context, hash string) (*streaming.InitTorrentResult, error)
 	FinalizeTorrent(ctx context.Context, hash, savePath, category, tags, saveSubPath string) error
 	AbortTorrent(ctx context.Context, hash string, deleteFiles bool) (int32, error)
-	StartTorrent(ctx context.Context, hash string) error
+	StartTorrent(ctx context.Context, hash string, tag string) error
 }

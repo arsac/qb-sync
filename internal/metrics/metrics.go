@@ -10,13 +10,14 @@ const namespace = "qbsync"
 
 // Label constants for consistent labeling across metrics.
 const (
-	LabelMode      = "mode"      // hot, cold
-	LabelResult    = "result"    // success, failure
-	LabelOperation = "operation" // GetTorrents, Login, etc.
-	LabelComponent = "component" // qb_client, stream_queue
-	LabelReason    = "reason"    // exit reason for goroutines
-	LabelHash      = "hash"      // torrent info hash
-	LabelName      = "name"      // torrent name
+	LabelMode       = "mode"       // hot, cold
+	LabelResult     = "result"     // success, failure
+	LabelOperation  = "operation"  // GetTorrents, Login, etc.
+	LabelComponent  = "component"  // qb_client, stream_queue
+	LabelReason     = "reason"     // exit reason for goroutines
+	LabelHash       = "hash"       // torrent info hash
+	LabelName       = "name"       // torrent name
+	LabelConnection = "connection" // gRPC connection index
 )
 
 // Label value constants for consistent usage across the codebase.
@@ -89,13 +90,14 @@ var (
 		},
 	)
 
-	// PiecesSentTotal counts pieces sent from hot server.
-	PiecesSentTotal = promauto.NewCounter(
+	// PiecesSentTotal counts pieces sent from hot server, per gRPC connection.
+	PiecesSentTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "pieces_sent_total",
 			Help:      "Total pieces sent from hot server",
 		},
+		[]string{LabelConnection},
 	)
 
 	// PiecesAckedTotal counts pieces successfully acknowledged.
@@ -125,13 +127,14 @@ var (
 		},
 	)
 
-	// BytesSentTotal counts bytes sent from hot server.
-	BytesSentTotal = promauto.NewCounter(
+	// BytesSentTotal counts bytes sent from hot server, per gRPC connection.
+	BytesSentTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "bytes_sent_total",
 			Help:      "Total bytes sent from hot server",
 		},
+		[]string{LabelConnection},
 	)
 
 	// BytesReceivedTotal counts bytes received on cold server.
@@ -573,18 +576,46 @@ var (
 			Help:      "Number of cold server write workers currently processing a piece",
 		},
 	)
+
+	// Draining tracks whether the hot server is currently draining (1=draining, 0=normal).
+	Draining = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "draining",
+			Help:      "Whether the hot server is draining synced torrents on shutdown (1=draining, 0=normal)",
+		},
+	)
+
+	// GRPCConnectionsConfigured tracks the number of TCP connections to the cold server.
+	GRPCConnectionsConfigured = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "grpc_connections_configured",
+			Help:      "Number of TCP connections configured for gRPC streaming to cold server",
+		},
+	)
+
+	// SenderWorkersConfigured tracks the number of concurrent sender goroutines.
+	SenderWorkersConfigured = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "sender_workers_configured",
+			Help:      "Number of concurrent sender workers configured for streaming",
+		},
+	)
 )
 
 // Histograms track distributions of values.
 var (
-	// PieceSendDuration tracks the time to send a piece.
-	PieceSendDuration = promauto.NewHistogram(
+	// PieceSendDuration tracks the time to send a piece, per gRPC connection.
+	PieceSendDuration = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: namespace,
 			Name:      "piece_send_duration_seconds",
 			Help:      "Time to send a piece",
 			Buckets:   []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
 		},
+		[]string{LabelConnection},
 	)
 
 	// PieceReadDuration tracks the time to read a piece from disk on hot.

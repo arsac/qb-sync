@@ -147,13 +147,15 @@ func TestLoadHot(t *testing.T) {
 		v.Set("cold-addr", "cold:50051")
 		v.Set("min-space", 100)
 		v.Set("min-seeding-time", 7200)
-		v.Set("force", true)
 		v.Set("dry-run", true)
 		v.Set("sleep", 60)
 		v.Set("rate-limit", int64(1000000))
 		v.Set("synced-tag", "my-synced")
 		v.Set("grpc-connections", 3)
 		v.Set("num-senders", 8)
+		v.Set("source-removed-tag", "custom-removed")
+		v.Set("drain-annotation", "my/drain")
+		v.Set("drain-timeout", 480)
 
 		cfg, err := LoadHot(v)
 		require.NoError(t, err)
@@ -165,13 +167,42 @@ func TestLoadHot(t *testing.T) {
 		assert.Equal(t, "cold:50051", cfg.ColdAddr)
 		assert.Equal(t, int64(100), cfg.MinSpaceGB)
 		assert.Equal(t, 7200, int(cfg.MinSeedingTime.Seconds()))
-		assert.True(t, cfg.Force)
 		assert.True(t, cfg.DryRun)
 		assert.Equal(t, 60, int(cfg.SleepInterval.Seconds()))
 		assert.Equal(t, int64(1000000), cfg.MaxBytesPerSec)
 		assert.Equal(t, "my-synced", cfg.SyncedTag)
 		assert.Equal(t, 3, cfg.GRPCConnections)
 		assert.Equal(t, 8, cfg.NumSenders)
+		assert.Equal(t, "custom-removed", cfg.SourceRemovedTag)
+		assert.Equal(t, "my/drain", cfg.DrainAnnotation)
+		assert.Equal(t, 480, int(cfg.DrainTimeout.Seconds()))
+	})
+
+	t.Run("source-removed-tag is empty when not set in viper", func(t *testing.T) {
+		t.Parallel()
+		v := viper.New()
+		v.Set("data", "/data/path")
+		v.Set("qb-url", "http://qb:8080")
+		v.Set("cold-addr", "cold:50051")
+		// Default "source-removed" is applied at flag level, not viper level.
+		// LoadHot without the flag binding sees empty string.
+
+		cfg, err := LoadHot(v)
+		require.NoError(t, err)
+		assert.Empty(t, cfg.SourceRemovedTag)
+	})
+
+	t.Run("source-removed-tag can be empty to disable", func(t *testing.T) {
+		t.Parallel()
+		v := viper.New()
+		v.Set("data", "/data/path")
+		v.Set("qb-url", "http://qb:8080")
+		v.Set("cold-addr", "cold:50051")
+		v.Set("source-removed-tag", "")
+
+		cfg, err := LoadHot(v)
+		require.NoError(t, err)
+		assert.Empty(t, cfg.SourceRemovedTag)
 	})
 
 	t.Run("synced-tag can be empty to disable tagging", func(t *testing.T) {
@@ -255,8 +286,9 @@ func TestSetupHotFlags(t *testing.T) {
 	flags := []string{
 		"data", "qb-url", "qb-username", "qb-password",
 		"cold-addr", "min-space", "min-seeding-time",
-		"force", "dry-run", "sleep", "rate-limit", "synced-tag",
-		"grpc-connections", "num-senders",
+		"dry-run", "sleep", "rate-limit", "synced-tag",
+		"grpc-connections", "num-senders", "source-removed-tag",
+		"drain-annotation", "drain-timeout",
 	}
 
 	for _, flag := range flags {
@@ -274,6 +306,10 @@ func TestSetupHotFlags(t *testing.T) {
 	// Verify num-senders default value
 	numSendersFlag := cmd.Flags().Lookup("num-senders")
 	assert.Equal(t, "4", numSendersFlag.DefValue)
+
+	// Verify source-removed-tag default value
+	sourceRemovedTagFlag := cmd.Flags().Lookup("source-removed-tag")
+	assert.Equal(t, "source-removed", sourceRemovedTagFlag.DefValue)
 }
 
 func TestSetupColdFlags(t *testing.T) {

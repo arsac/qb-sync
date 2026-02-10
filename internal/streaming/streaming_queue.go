@@ -122,6 +122,10 @@ func NewBidiQueue(
 	if config.NumStreams <= 0 {
 		config.NumStreams = DefaultPoolSize
 	}
+	if config.NumSenders <= 0 {
+		config.NumSenders = defaultNumSenders
+	}
+	metrics.SenderWorkersConfigured.Set(float64(config.NumSenders))
 
 	q := &BidiQueue{
 		source:       source,
@@ -287,6 +291,13 @@ func (q *BidiQueue) runStream(ctx context.Context) error {
 	wg.Wait()
 	q.drainInFlightPool(ctx, pool)
 
+	// Reset streaming gauges so they don't retain stale values while idle.
+	metrics.InflightPieces.Set(0)
+	metrics.StreamPoolSize.Set(0)
+	metrics.AdaptiveWindowSize.Set(0)
+	metrics.TransferThroughputBytesPerSecond.Set(0)
+	metrics.StreamPoolScalingPaused.Set(0)
+
 	select {
 	case streamError := <-streamErr:
 		return streamError
@@ -299,10 +310,6 @@ func (q *BidiQueue) runStream(ctx context.Context) error {
 // plus a dedicated stats reporter goroutine.
 func (q *BidiQueue) runSenderPool(ctx context.Context, pool *StreamPool, stopSender <-chan struct{}) {
 	numSenders := q.config.NumSenders
-	if numSenders <= 0 {
-		numSenders = defaultNumSenders
-	}
-
 	q.logger.InfoContext(ctx, "starting sender workers", "count", numSenders)
 
 	var wg sync.WaitGroup
@@ -489,9 +496,9 @@ func (q *BidiQueue) sendPiecePool(ctx context.Context, pool *StreamPool, piece *
 		return fmt.Errorf("sending: %w", sendErr)
 	}
 
-	metrics.PiecesSentTotal.Inc()
-	metrics.BytesSentTotal.Add(float64(len(data)))
-	metrics.PieceSendDuration.Observe(time.Since(sendStart).Seconds())
+	metrics.PiecesSentTotal.WithLabelValues(ps.connLabel).Inc()
+	metrics.BytesSentTotal.WithLabelValues(ps.connLabel).Add(float64(len(data)))
+	metrics.PieceSendDuration.WithLabelValues(ps.connLabel).Observe(time.Since(sendStart).Seconds())
 
 	q.bytesSent.Add(int64(len(data)))
 	ps.bytesSent.Add(int64(len(data)))

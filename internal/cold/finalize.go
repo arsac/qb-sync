@@ -240,7 +240,6 @@ func (s *Server) cleanupFinalizedTorrent(hash string) {
 	s.mu.Lock()
 	delete(s.torrents, hash)
 	s.mu.Unlock()
-	metrics.ActiveTorrents.WithLabelValues(metrics.ModeCold).Dec()
 
 	// Remove metadata directory (.qbsync/{hash}/) — no longer needed after finalization.
 	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
@@ -287,7 +286,6 @@ func (s *Server) getOrRecoverState(ctx context.Context, hash string) (*serverTor
 	}
 	s.torrents[hash] = recoveredState
 	s.mu.Unlock()
-	metrics.ActiveTorrents.WithLabelValues(metrics.ModeCold).Inc()
 
 	s.logger.InfoContext(ctx, "recovered torrent state from disk",
 		"hash", hash,

@@ -216,6 +216,7 @@ message AbortTorrentResponse {
 
 message StartTorrentRequest {
   string torrent_hash = 1;
+  string tag = 2;  // Optional tag to apply after starting (e.g., "source-removed")
 }
 
 message StartTorrentResponse {

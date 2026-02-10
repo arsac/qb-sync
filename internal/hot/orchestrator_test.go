@@ -45,6 +45,9 @@ type mockQBClient struct {
 
 	getTorrentsResult []qbittorrent.Torrent
 	getTorrentsErr    error
+
+	freeSpaceOnDisk int64
+	freeSpaceErr    error
 }
 
 var _ qbclient.Client = (*mockQBClient)(nil)
@@ -122,6 +125,10 @@ func (m *mockQBClient) ResumeCtx(_ context.Context, hashes []string) error {
 
 func (m *mockQBClient) AddTorrentFromMemoryCtx(_ context.Context, _ []byte, _ map[string]string) error {
 	return nil
+}
+
+func (m *mockQBClient) GetFreeSpaceOnDiskCtx(_ context.Context) (int64, error) {
+	return m.freeSpaceOnDisk, m.freeSpaceErr
 }
 
 // Tests for finalization backoff logic. These can be unit tested without mocking gRPC.
@@ -344,12 +351,12 @@ func TestConcurrentBackoffAccess(t *testing.T) {
 }
 
 func TestConstants(t *testing.T) {
-	t.Run("abortTorrentTimeout is reasonable", func(t *testing.T) {
-		if abortTorrentTimeout < 5*time.Second {
-			t.Errorf("abortTorrentTimeout too short: %v", abortTorrentTimeout)
+	t.Run("coldRPCTimeout is reasonable", func(t *testing.T) {
+		if coldRPCTimeout < 5*time.Second {
+			t.Errorf("coldRPCTimeout too short: %v", coldRPCTimeout)
 		}
-		if abortTorrentTimeout > 2*time.Minute {
-			t.Errorf("abortTorrentTimeout too long: %v", abortTorrentTimeout)
+		if coldRPCTimeout > 2*time.Minute {
+			t.Errorf("coldRPCTimeout too long: %v", coldRPCTimeout)
 		}
 	})
 
@@ -384,6 +391,7 @@ type mockColdDest struct {
 
 	startCalled bool
 	startHash   string
+	startTag    string
 	startErr    error
 }
 
@@ -416,19 +424,22 @@ func (m *mockColdDest) AbortTorrent(_ context.Context, hash string, deleteFiles 
 	return m.abortResult, m.abortErr
 }
 
-func (m *mockColdDest) StartTorrent(_ context.Context, hash string) error {
+func (m *mockColdDest) StartTorrent(_ context.Context, hash string, tag string) error {
 	m.startCalled = true
 	m.startHash = hash
+	m.startTag = tag
 	return m.startErr
 }
 
 func TestHandleTorrentRemoval(t *testing.T) {
 	logger := testLogger(t)
 
-	t.Run("removes from local tracking and calls AbortTorrent", func(t *testing.T) {
-		coldDest := &mockColdDest{abortResult: 3}
+	t.Run("calls StartTorrent when completedOnCold", func(t *testing.T) {
+		coldDest := &mockColdDest{}
 		task := &QBTask{
-			cfg:              &config.HotConfig{},
+			cfg: &config.HotConfig{
+				SourceRemovedTag: "source-removed",
+			},
 			logger:           logger,
 			grpcDest:         coldDest,
 			trackedTorrents:  map[string]trackedTorrent{"abc123": {completionTime: time.Now()}},
@@ -450,14 +461,17 @@ func TestHandleTorrentRemoval(t *testing.T) {
 		}
 		task.completedMu.RUnlock()
 
-		if !coldDest.abortCalled {
-			t.Error("AbortTorrent should have been called")
+		if !coldDest.startCalled {
+			t.Error("StartTorrent should have been called")
 		}
-		if coldDest.abortHash != "abc123" {
-			t.Errorf("expected abort hash 'abc123', got '%s'", coldDest.abortHash)
+		if coldDest.startHash != "abc123" {
+			t.Errorf("expected start hash 'abc123', got '%s'", coldDest.startHash)
 		}
-		if !coldDest.abortDeleteFiles {
-			t.Error("AbortTorrent should have been called with deleteFiles=true")
+		if coldDest.startTag != "source-removed" {
+			t.Errorf("expected start tag 'source-removed', got '%s'", coldDest.startTag)
+		}
+		if coldDest.abortCalled {
+			t.Error("AbortTorrent should NOT have been called when completedOnCold")
 		}
 	})
 
@@ -500,22 +514,105 @@ func TestHandleTorrentRemoval(t *testing.T) {
 
 		task.handleTorrentRemoval(context.Background(), "abc123")
 
-		// Local state should still be cleaned up even in dry run
+		// trackedTorrents should be cleaned up even in dry run
 		task.trackedMu.RLock()
 		if _, ok := task.trackedTorrents["abc123"]; ok {
 			t.Error("torrent should have been removed from trackedTorrents in dry run")
 		}
 		task.trackedMu.RUnlock()
 
+		// completedOnCold should be preserved in dry run (no action taken)
 		task.completedMu.RLock()
-		if task.completedOnCold["abc123"] {
-			t.Error("torrent should have been removed from completedOnCold in dry run")
+		if !task.completedOnCold["abc123"] {
+			t.Error("completedOnCold should be preserved in dry run mode")
 		}
 		task.completedMu.RUnlock()
 
-		// But AbortTorrent should NOT be called
+		// Neither StartTorrent nor AbortTorrent should be called in dry run
+		if coldDest.startCalled {
+			t.Error("StartTorrent should NOT have been called in dry run mode")
+		}
 		if coldDest.abortCalled {
 			t.Error("AbortTorrent should NOT have been called in dry run mode")
+		}
+	})
+
+	t.Run("calls AbortTorrent when not completedOnCold", func(t *testing.T) {
+		coldDest := &mockColdDest{abortResult: 3}
+		task := &QBTask{
+			cfg:              &config.HotConfig{},
+			logger:           logger,
+			grpcDest:         coldDest,
+			trackedTorrents:  map[string]trackedTorrent{"abc123": {completionTime: time.Now()}},
+			completedOnCold:  make(map[string]bool),
+			finalizeBackoffs: make(map[string]*finalizeBackoff),
+		}
+
+		task.handleTorrentRemoval(context.Background(), "abc123")
+
+		if !coldDest.abortCalled {
+			t.Error("AbortTorrent should have been called when not completedOnCold")
+		}
+		if coldDest.abortHash != "abc123" {
+			t.Errorf("expected abort hash 'abc123', got '%s'", coldDest.abortHash)
+		}
+		if coldDest.startCalled {
+			t.Error("StartTorrent should NOT have been called when not completedOnCold")
+		}
+	})
+
+	t.Run("passes empty tag when SourceRemovedTag is empty", func(t *testing.T) {
+		coldDest := &mockColdDest{}
+		task := &QBTask{
+			cfg: &config.HotConfig{
+				SourceRemovedTag: "",
+			},
+			logger:           logger,
+			grpcDest:         coldDest,
+			trackedTorrents:  map[string]trackedTorrent{"abc123": {completionTime: time.Now()}},
+			completedOnCold:  map[string]bool{"abc123": true},
+			finalizeBackoffs: make(map[string]*finalizeBackoff),
+		}
+
+		task.handleTorrentRemoval(context.Background(), "abc123")
+
+		if !coldDest.startCalled {
+			t.Error("StartTorrent should have been called")
+		}
+		if coldDest.startTag != "" {
+			t.Errorf("expected empty tag, got '%s'", coldDest.startTag)
+		}
+	})
+
+	t.Run("keeps completedOnCold when StartTorrent fails", func(t *testing.T) {
+		coldDest := &mockColdDest{startErr: errors.New("cold unreachable")}
+		task := &QBTask{
+			cfg: &config.HotConfig{
+				SourceRemovedTag: "source-removed",
+			},
+			logger:           logger,
+			grpcDest:         coldDest,
+			trackedTorrents:  map[string]trackedTorrent{"abc123": {completionTime: time.Now()}},
+			completedOnCold:  map[string]bool{"abc123": true},
+			finalizeBackoffs: make(map[string]*finalizeBackoff),
+		}
+
+		task.handleTorrentRemoval(context.Background(), "abc123")
+
+		if !coldDest.startCalled {
+			t.Error("StartTorrent should have been called")
+		}
+
+		// completedOnCold should be preserved when StartTorrent fails
+		task.completedMu.RLock()
+		if !task.completedOnCold["abc123"] {
+			t.Error("completedOnCold should be preserved when StartTorrent fails")
+		}
+		task.completedMu.RUnlock()
+
+		// AbortTorrent should NOT be called
+		if coldDest.abortCalled {
+			t.Error("AbortTorrent should NOT have been called when completedOnCold")
 		}
 	})
 
@@ -797,6 +894,56 @@ func TestDeleteGroupFromHot(t *testing.T) {
 		}
 		if mockClient.resumeCalled {
 			t.Error("ResumeCtx should NOT have been called — cold is seeding, delete retry next cycle")
+		}
+	})
+
+	t.Run("passes SourceRemovedTag to StartTorrent", func(t *testing.T) {
+		mockClient := &mockQBClient{}
+		coldDest := &mockColdDest{}
+		task := &QBTask{
+			cfg: &config.HotConfig{
+				SourceRemovedTag: "source-removed",
+			},
+			logger:    logger,
+			srcClient: mockClient,
+			grpcDest:  coldDest,
+		}
+
+		group := makeGroup("abc123")
+		_, err := task.deleteGroupFromHot(context.Background(), group)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if !coldDest.startCalled {
+			t.Error("StartTorrent should have been called")
+		}
+		if coldDest.startTag != "source-removed" {
+			t.Errorf("expected tag 'source-removed', got '%s'", coldDest.startTag)
+		}
+	})
+
+	t.Run("passes empty tag when SourceRemovedTag is empty", func(t *testing.T) {
+		mockClient := &mockQBClient{}
+		coldDest := &mockColdDest{}
+		task := &QBTask{
+			cfg:       &config.HotConfig{},
+			logger:    logger,
+			srcClient: mockClient,
+			grpcDest:  coldDest,
+		}
+
+		group := makeGroup("abc123")
+		_, err := task.deleteGroupFromHot(context.Background(), group)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if !coldDest.startCalled {
+			t.Error("StartTorrent should have been called")
+		}
+		if coldDest.startTag != "" {
+			t.Errorf("expected empty tag, got '%s'", coldDest.startTag)
 		}
 	})
 }
@@ -1663,3 +1810,199 @@ func TestTrackNewTorrents_PrioritizesByProgress(t *testing.T) {
 		task.completedMu.RUnlock()
 	})
 }
+
+func TestSortGroupsByPriority(t *testing.T) {
+	logger := testLogger(t)
+	task := &QBTask{cfg: &config.HotConfig{}, logger: logger}
+
+	t.Run("sorts by popularity ascending", func(t *testing.T) {
+		groups := []torrentGroup{
+			{popularity: 100, minSeeding: 500, maxSize: 1000},
+			{popularity: 10, minSeeding: 500, maxSize: 1000},
+			{popularity: 50, minSeeding: 500, maxSize: 1000},
+		}
+		sorted := task.sortGroupsByPriority(groups)
+		if sorted[0].popularity != 10 || sorted[1].popularity != 50 || sorted[2].popularity != 100 {
+			t.Errorf("expected popularity order [10, 50, 100], got [%d, %d, %d]",
+				sorted[0].popularity, sorted[1].popularity, sorted[2].popularity)
+		}
+	})
+
+	t.Run("tiebreaks by seeding time descending", func(t *testing.T) {
+		groups := []torrentGroup{
+			{popularity: 50, minSeeding: 100, maxSize: 1000},
+			{popularity: 50, minSeeding: 300, maxSize: 1000},
+			{popularity: 50, minSeeding: 200, maxSize: 1000},
+		}
+		sorted := task.sortGroupsByPriority(groups)
+		if sorted[0].minSeeding != 300 || sorted[1].minSeeding != 200 || sorted[2].minSeeding != 100 {
+			t.Errorf("expected seeding order [300, 200, 100], got [%d, %d, %d]",
+				sorted[0].minSeeding, sorted[1].minSeeding, sorted[2].minSeeding)
+		}
+	})
+
+	t.Run("tiebreaks by size descending", func(t *testing.T) {
+		groups := []torrentGroup{
+			{popularity: 50, minSeeding: 200, maxSize: 500},
+			{popularity: 50, minSeeding: 200, maxSize: 2000},
+			{popularity: 50, minSeeding: 200, maxSize: 1000},
+		}
+		sorted := task.sortGroupsByPriority(groups)
+		if sorted[0].maxSize != 2000 || sorted[1].maxSize != 1000 || sorted[2].maxSize != 500 {
+			t.Errorf("expected size order [2000, 1000, 500], got [%d, %d, %d]",
+				sorted[0].maxSize, sorted[1].maxSize, sorted[2].maxSize)
+		}
+	})
+
+	t.Run("full priority chain: popularity > seeding > size", func(t *testing.T) {
+		groups := []torrentGroup{
+			{popularity: 50, minSeeding: 300, maxSize: 500},  // second (pop=50, seeding=300)
+			{popularity: 10, minSeeding: 100, maxSize: 2000}, // first (lowest pop)
+			{popularity: 50, minSeeding: 100, maxSize: 2000}, // third (pop=50, seeding=100)
+		}
+		sorted := task.sortGroupsByPriority(groups)
+		if sorted[0].popularity != 10 {
+			t.Error("lowest popularity should be first")
+		}
+		if sorted[1].minSeeding != 300 {
+			t.Error("among equal popularity, longest seeded should come first")
+		}
+		if sorted[2].minSeeding != 100 {
+			t.Error("shortest seeded should be last")
+		}
+	})
+}
+
+func TestGetFreeSpaceGB(t *testing.T) {
+	logger := testLogger(t)
+
+	t.Run("converts bytes to GB", func(t *testing.T) {
+		mockClient := &mockQBClient{freeSpaceOnDisk: 107_374_182_400} // 100 GB
+		task := &QBTask{
+			cfg:       &config.HotConfig{},
+			logger:    logger,
+			srcClient: mockClient,
+		}
+
+		gb, err := task.getFreeSpaceGB(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if gb != 100 {
+			t.Errorf("expected 100 GB, got %d", gb)
+		}
+	})
+
+	t.Run("truncates partial GB", func(t *testing.T) {
+		mockClient := &mockQBClient{freeSpaceOnDisk: 53_687_091_200} // 50 GB exactly
+		task := &QBTask{
+			cfg:       &config.HotConfig{},
+			logger:    logger,
+			srcClient: mockClient,
+		}
+
+		gb, err := task.getFreeSpaceGB(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if gb != 50 {
+			t.Errorf("expected 50 GB, got %d", gb)
+		}
+	})
+
+	t.Run("propagates API error", func(t *testing.T) {
+		mockClient := &mockQBClient{freeSpaceErr: errors.New("qb unreachable")}
+		task := &QBTask{
+			cfg:       &config.HotConfig{},
+			logger:    logger,
+			srcClient: mockClient,
+		}
+
+		_, err := task.getFreeSpaceGB(context.Background())
+		if err == nil {
+			t.Error("expected error when API fails")
+		}
+	})
+}
+
+func TestDrain(t *testing.T) {
+	logger := testLogger(t)
+
+	t.Run("sets and clears draining flag", func(t *testing.T) {
+		mockClient := &mockQBClient{
+			freeSpaceOnDisk: 1_000_000_000_000, // plenty of space
+		}
+		task := &QBTask{
+			cfg:             &config.HotConfig{MinSpaceGB: 10},
+			logger:          logger,
+			srcClient:       mockClient,
+			completedOnCold: make(map[string]bool),
+			trackedTorrents: make(map[string]trackedTorrent),
+		}
+
+		if task.Draining() {
+			t.Error("should not be draining initially")
+		}
+
+		// Drain with no completed-on-cold torrents — should succeed immediately
+		err := task.Drain(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if task.Draining() {
+			t.Error("should not be draining after Drain() returns")
+		}
+	})
+
+	t.Run("drain bypasses space check", func(t *testing.T) {
+		mockClient := &mockQBClient{
+			freeSpaceOnDisk: 1_000_000_000_000, // 1TB free — well above min
+			getTorrentsResult: []qbittorrent.Torrent{
+				{Hash: "abc123", SeedingTime: 9999, Size: 1000},
+			},
+		}
+		coldDest := &mockColdDest{}
+		task := &QBTask{
+			cfg:             &config.HotConfig{MinSpaceGB: 10},
+			logger:          logger,
+			srcClient:       mockClient,
+			grpcDest:        coldDest,
+			source:          qbclient.NewSource(nil, ""),
+			completedOnCold: map[string]bool{"abc123": true},
+			trackedTorrents: make(map[string]trackedTorrent),
+		}
+
+		// Normal maybeMoveToCold would skip (plenty of space).
+		// Drain should still process.
+		err := task.Drain(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// deleteGroupFromHot should have been called
+		if !mockClient.stopCalled {
+			t.Error("drain should have attempted to hand off torrents despite sufficient space")
+		}
+	})
+
+	t.Run("concurrent drain returns ErrDrainInProgress", func(t *testing.T) {
+		task := &QBTask{
+			cfg:             &config.HotConfig{MinSpaceGB: 10},
+			logger:          logger,
+			completedOnCold: make(map[string]bool),
+			trackedTorrents: make(map[string]trackedTorrent),
+		}
+
+		// Manually set draining to simulate an in-progress drain
+		task.draining.Store(true)
+
+		err := task.Drain(context.Background())
+		if !errors.Is(err, ErrDrainInProgress) {
+			t.Errorf("expected ErrDrainInProgress, got %v", err)
+		}
+
+		task.draining.Store(false)
+	})
+}
+

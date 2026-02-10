@@ -30,6 +30,7 @@ type Client interface {
 	StopCtx(ctx context.Context, hashes []string) error
 	ResumeCtx(ctx context.Context, hashes []string) error
 	AddTorrentFromMemoryCtx(ctx context.Context, buf []byte, options map[string]string) error
+	GetFreeSpaceOnDiskCtx(ctx context.Context) (int64, error)
 }
 
 // Ensure ResilientClient implements Client interface.
@@ -262,6 +263,14 @@ func (r *ResilientClient) AddTorrentFromMemoryCtx(
 	return r.runVoid(ctx, "AddTorrentFromMemory", func(ctx context.Context) error {
 		return r.client.AddTorrentFromMemoryCtx(ctx, buf, options)
 	})
+}
+
+// GetFreeSpaceOnDiskCtx returns free space on qBittorrent's default save path in bytes.
+func (r *ResilientClient) GetFreeSpaceOnDiskCtx(ctx context.Context) (int64, error) {
+	return runWithResult(ctx, r.executor, r.mode, "GetFreeSpaceOnDisk",
+		func(ctx context.Context) (int64, error) {
+			return r.client.GetFreeSpaceOnDiskCtx(ctx)
+		})
 }
 
 // runVoid executes a void operation through the executor.
