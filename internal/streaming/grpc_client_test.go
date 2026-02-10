@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -748,4 +749,149 @@ func TestSenderLoop_SignalRaceWithoutNotify(t *testing.T) {
 	}
 
 	_ = fmt.Sprintf("test uses fmt") // Ensure fmt import is used.
+}
+
+// stubClient is a minimal QBSyncServiceClient for testing round-robin distribution.
+// Each instance has a unique id for identity checks.
+type stubClient struct {
+	pb.QBSyncServiceClient
+	id int
+}
+
+// TestStreamClient_RoundRobin verifies that streamClient distributes calls
+// evenly across all clients using atomic round-robin.
+func TestStreamClient_RoundRobin(t *testing.T) {
+	t.Parallel()
+
+	clients := []pb.QBSyncServiceClient{
+		&stubClient{id: 0},
+		&stubClient{id: 1},
+		&stubClient{id: 2},
+	}
+
+	d := &GRPCDestination{
+		clients: clients,
+	}
+
+	counts := make([]int, 3)
+	for range 9 {
+		c := d.streamClient()
+		sc := c.(*stubClient)
+		counts[sc.id]++
+	}
+
+	for i, count := range counts {
+		if count != 3 {
+			t.Errorf("client %d called %d times, want 3", i, count)
+		}
+	}
+}
+
+// TestStreamClient_SingleConn verifies the fast-path: with 1 client,
+// streamClient always returns the same client without touching the atomic.
+func TestStreamClient_SingleConn(t *testing.T) {
+	t.Parallel()
+
+	client := &stubClient{id: 0}
+	d := &GRPCDestination{
+		clients: []pb.QBSyncServiceClient{client},
+	}
+
+	for range 10 {
+		c := d.streamClient()
+		if c != client {
+			t.Fatal("expected same client for single-conn fast path")
+		}
+	}
+}
+
+// TestClient_AlwaysReturnsFirst verifies that client() always returns
+// the first connection (for unary RPCs).
+func TestClient_AlwaysReturnsFirst(t *testing.T) {
+	t.Parallel()
+
+	clients := []pb.QBSyncServiceClient{
+		&stubClient{id: 0},
+		&stubClient{id: 1},
+		&stubClient{id: 2},
+	}
+
+	d := &GRPCDestination{
+		clients: clients,
+	}
+
+	for range 10 {
+		c := d.client()
+		sc := c.(*stubClient)
+		if sc.id != 0 {
+			t.Fatalf("client() returned client %d, want 0", sc.id)
+		}
+	}
+}
+
+// TestStreamClient_RoundRobin_Concurrent verifies that round-robin is safe
+// under concurrent access (no races, even distribution).
+func TestStreamClient_RoundRobin_Concurrent(t *testing.T) {
+	t.Parallel()
+
+	const numClients = 3
+	const numGoroutines = 6
+	const callsPerGoroutine = 100
+
+	clients := make([]pb.QBSyncServiceClient, numClients)
+	for i := range numClients {
+		clients[i] = &stubClient{id: i}
+	}
+
+	d := &GRPCDestination{
+		clients: clients,
+	}
+
+	var counts [numClients]atomic.Int64
+	done := make(chan struct{})
+
+	for range numGoroutines {
+		go func() {
+			for range callsPerGoroutine {
+				c := d.streamClient()
+				sc := c.(*stubClient)
+				counts[sc.id].Add(1)
+			}
+			done <- struct{}{}
+		}()
+	}
+
+	for range numGoroutines {
+		<-done
+	}
+
+	total := numGoroutines * callsPerGoroutine
+	expected := total / numClients
+	for i := range numClients {
+		got := int(counts[i].Load())
+		if got != expected {
+			t.Errorf("client %d: got %d calls, want %d", i, got, expected)
+		}
+	}
+}
+
+// TestClose_Idempotent verifies that Close() can be called multiple times
+// safely and returns the same error each time via sync.Once.
+func TestClose_Idempotent(t *testing.T) {
+	t.Parallel()
+
+	d, err := NewGRPCDestination("localhost:0", 2)
+	if err != nil {
+		t.Fatalf("NewGRPCDestination: %v", err)
+	}
+
+	err1 := d.Close()
+	err2 := d.Close()
+
+	if err1 != nil {
+		t.Fatalf("first Close: %v", err1)
+	}
+	if err1 != err2 {
+		t.Fatalf("Close not idempotent: first=%v, second=%v", err1, err2)
+	}
 }

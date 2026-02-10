@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -89,25 +90,38 @@ var _ HardlinkDestination = (*GRPCDestination)(nil)
 // GRPCDestination sends pieces to a remote gRPC server.
 // It provides PieceDestination-like functionality plus additional features
 // for hardlink deduplication, streaming, and torrent lifecycle management.
+//
+// Multiple TCP connections can be opened to the same server to avoid the
+// single-TCP-flow bandwidth ceiling imposed by HTTP/2 multiplexing.
+// Streaming RPCs are distributed across connections via round-robin;
+// unary RPCs always use the first connection.
 type GRPCDestination struct {
-	conn        *grpc.ClientConn
-	client      pb.QBSyncServiceClient
+	conns       []*grpc.ClientConn
+	clients     []pb.QBSyncServiceClient
+	streamIdx   atomic.Uint32                 // Lock-free round-robin for OpenStream
 	initResults map[string]*InitTorrentResult // Cached init results
 	initGroup   singleflight.Group            // Deduplicates concurrent InitTorrent calls
 	mu          sync.RWMutex
+	closeOnce   sync.Once
+	closeErr    error
 }
 
-// NewGRPCDestination creates a new gRPC destination client.
-func NewGRPCDestination(addr string) (*GRPCDestination, error) {
-	// Configure keepalive for better connection management
+// NewGRPCDestination creates a new gRPC destination client with numConns
+// independent TCP connections. Each connection gets its own kernel CUBIC
+// window, avoiding the single-TCP-flow bandwidth ceiling. Streaming RPCs
+// are distributed across connections via round-robin.
+func NewGRPCDestination(addr string, numConns int) (*GRPCDestination, error) {
+	if numConns <= 0 {
+		numConns = 1
+	}
+
 	kaParams := keepalive.ClientParameters{
 		Time:                keepaliveTime,
 		Timeout:             keepaliveTimeout,
-		PermitWithoutStream: true, // Send pings even without active streams
+		PermitWithoutStream: true,
 	}
 
-	conn, err := grpc.NewClient(
-		addr,
+	opts := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithKeepaliveParams(kaParams),
 		grpc.WithConnectParams(grpc.ConnectParams{
@@ -124,25 +138,53 @@ func NewGRPCDestination(addr string) (*GRPCDestination, error) {
 			grpc.MaxCallRecvMsgSize(maxGRPCMessageSize),
 			grpc.MaxCallSendMsgSize(maxGRPCMessageSize),
 		),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect: %w", err)
 	}
 
-	return &GRPCDestination{
-		conn:        conn,
-		client:      pb.NewQBSyncServiceClient(conn),
+	d := &GRPCDestination{
+		conns:       make([]*grpc.ClientConn, 0, numConns),
+		clients:     make([]pb.QBSyncServiceClient, 0, numConns),
 		initResults: make(map[string]*InitTorrentResult),
-	}, nil
+	}
+
+	for i := range numConns {
+		conn, err := grpc.NewClient(addr, opts...)
+		if err != nil {
+			// Clean up already-opened connections
+			for _, c := range d.conns {
+				_ = c.Close()
+			}
+			return nil, fmt.Errorf("failed to connect (conn %d): %w", i, err)
+		}
+		d.conns = append(d.conns, conn)
+		d.clients = append(d.clients, pb.NewQBSyncServiceClient(conn))
+	}
+
+	return d, nil
 }
 
-// ValidateConnection checks that the cold server is reachable using the
-// standard gRPC health check protocol (grpc.health.v1.Health).
+// client returns the primary client for unary RPCs (always the first connection).
+func (d *GRPCDestination) client() pb.QBSyncServiceClient {
+	return d.clients[0]
+}
+
+// streamClient returns the next client for streaming RPCs (round-robin across all connections).
+func (d *GRPCDestination) streamClient() pb.QBSyncServiceClient {
+	if len(d.clients) == 1 {
+		return d.clients[0]
+	}
+	idx := d.streamIdx.Add(1) - 1
+	return d.clients[idx%uint32(len(d.clients))]
+}
+
+// ValidateConnection checks that the cold server is reachable on all
+// connections using the standard gRPC health check protocol (grpc.health.v1.Health).
 func (d *GRPCDestination) ValidateConnection(ctx context.Context) error {
-	healthClient := healthpb.NewHealthClient(d.conn)
-	_, err := healthClient.Check(ctx, &healthpb.HealthCheckRequest{})
-	if err != nil {
-		return fmt.Errorf("cold server not reachable: %w", err)
+	for i, conn := range d.conns {
+		healthClient := healthpb.NewHealthClient(conn)
+		_, err := healthClient.Check(ctx, &healthpb.HealthCheckRequest{})
+		if err != nil {
+			return fmt.Errorf("cold server not reachable (conn %d): %w", i, err)
+		}
 	}
 	return nil
 }
@@ -193,7 +235,7 @@ func (d *GRPCDestination) InitTorrent(ctx context.Context, req *pb.InitTorrentRe
 		}
 		d.mu.RUnlock()
 
-		resp, rpcErr := d.client.InitTorrent(ctx, req)
+		resp, rpcErr := d.client().InitTorrent(ctx, req)
 		if rpcErr != nil {
 			return nil, fmt.Errorf("init torrent RPC failed: %w", rpcErr)
 		}
@@ -245,7 +287,7 @@ func (d *GRPCDestination) CheckTorrentStatus(ctx context.Context, hash string) (
 		TorrentHash: hash,
 	}
 
-	resp, err := d.client.InitTorrent(ctx, req)
+	resp, err := d.client().InitTorrent(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("check status RPC failed: %w", err)
 	}
@@ -260,7 +302,7 @@ func (d *GRPCDestination) CheckTorrentStatus(ctx context.Context, hash string) (
 
 // WritePiece sends a piece to the remote server (unary, for simple cases).
 func (d *GRPCDestination) WritePiece(ctx context.Context, req *pb.WritePieceRequest) error {
-	resp, err := d.client.WritePiece(ctx, req)
+	resp, err := d.client().WritePiece(ctx, req)
 	if err != nil {
 		return fmt.Errorf("write piece RPC failed: %w", err)
 	}
@@ -273,7 +315,7 @@ func (d *GRPCDestination) WritePiece(ctx context.Context, req *pb.WritePieceRequ
 func (d *GRPCDestination) OpenStream(ctx context.Context, logger *slog.Logger) (*PieceStream, error) {
 	streamCtx, streamCancel := context.WithCancel(ctx)
 
-	stream, err := d.client.StreamPiecesBidi(streamCtx)
+	stream, err := d.streamClient().StreamPiecesBidi(streamCtx)
 	if err != nil {
 		streamCancel()
 		return nil, fmt.Errorf("failed to open stream: %w", err)
@@ -301,7 +343,7 @@ func (d *GRPCDestination) OpenStream(ctx context.Context, logger *slog.Logger) (
 
 // GetFileByInode checks if a file with the given inode exists on the receiver.
 func (d *GRPCDestination) GetFileByInode(ctx context.Context, inode uint64) (string, bool, error) {
-	resp, err := d.client.GetFileByInode(ctx, &pb.GetFileByInodeRequest{
+	resp, err := d.client().GetFileByInode(ctx, &pb.GetFileByInodeRequest{
 		Inode: inode,
 	})
 	if err != nil {
@@ -313,7 +355,7 @@ func (d *GRPCDestination) GetFileByInode(ctx context.Context, inode uint64) (str
 
 // CreateHardlink creates a hardlink on the receiver from source to target path.
 func (d *GRPCDestination) CreateHardlink(ctx context.Context, sourcePath, targetPath string) error {
-	resp, err := d.client.CreateHardlink(ctx, &pb.CreateHardlinkRequest{
+	resp, err := d.client().CreateHardlink(ctx, &pb.CreateHardlinkRequest{
 		SourcePath: sourcePath,
 		TargetPath: targetPath,
 	})
@@ -325,7 +367,7 @@ func (d *GRPCDestination) CreateHardlink(ctx context.Context, sourcePath, target
 
 // RegisterFile registers a completed file for hardlink tracking on the receiver.
 func (d *GRPCDestination) RegisterFile(ctx context.Context, inode uint64, path string, size int64) error {
-	resp, err := d.client.RegisterFile(ctx, &pb.RegisterFileRequest{
+	resp, err := d.client().RegisterFile(ctx, &pb.RegisterFileRequest{
 		Inode: inode,
 		Path:  path,
 		Size:  size,
@@ -352,7 +394,7 @@ func (d *GRPCDestination) FinalizeTorrent(
 	callCtx, cancel := context.WithTimeout(ctx, finalizeConnTimeout)
 	defer cancel()
 
-	resp, err := d.client.FinalizeTorrent(callCtx, &pb.FinalizeTorrentRequest{
+	resp, err := d.client().FinalizeTorrent(callCtx, &pb.FinalizeTorrentRequest{
 		TorrentHash: hash,
 		SavePath:    savePath,
 		Category:    category,
@@ -385,7 +427,7 @@ func (d *GRPCDestination) AbortTorrent(ctx context.Context, hash string, deleteF
 	// and if RPC fails the torrent needs re-initialization anyway
 	defer d.ClearInitResult(hash)
 
-	resp, err := d.client.AbortTorrent(ctx, &pb.AbortTorrentRequest{
+	resp, err := d.client().AbortTorrent(ctx, &pb.AbortTorrentRequest{
 		TorrentHash: hash,
 		DeleteFiles: deleteFiles,
 	})
@@ -403,7 +445,7 @@ func (d *GRPCDestination) AbortTorrent(ctx context.Context, hash string, deleteF
 // Called during disk pressure cleanup after hot stops seeding,
 // to ensure cold takes over before hot deletes.
 func (d *GRPCDestination) StartTorrent(ctx context.Context, hash string) error {
-	resp, err := d.client.StartTorrent(ctx, &pb.StartTorrentRequest{
+	resp, err := d.client().StartTorrent(ctx, &pb.StartTorrentRequest{
 		TorrentHash: hash,
 	})
 	if err != nil {
@@ -421,9 +463,18 @@ func (d *GRPCDestination) ClearInitResult(hash string) {
 	d.mu.Unlock()
 }
 
-// Close closes the gRPC connection.
+// Close closes all gRPC connections. Safe for repeated calls.
 func (d *GRPCDestination) Close() error {
-	return d.conn.Close()
+	d.closeOnce.Do(func() {
+		var errs []error
+		for _, conn := range d.conns {
+			if err := conn.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		d.closeErr = errors.Join(errs...)
+	})
+	return d.closeErr
 }
 
 // CleanupStaleEntries removes cached init results for torrents that are no longer active.

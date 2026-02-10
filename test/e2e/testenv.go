@@ -30,9 +30,13 @@ const (
 	testUsername = ""
 	testPassword = ""
 
-	// Test torrent - Sintel (small, legal test torrent).
-	testTorrentURL = "https://webtorrent.io/torrents/sintel.torrent"
-	sintelHash     = "08ada5a7a6183aae1e09d831df6748d566095a10"
+	// Test torrent - Wired CD (small, legal, multi-file test torrent: 53 MB, 18 files).
+	testTorrentURL = "https://webtorrent.io/torrents/wired-cd.torrent"
+	wiredCDHash    = "a88fda5954e89178c372716a6a78b8180ed4dad3"
+
+	// Sintel torrent - larger, used only by perf tests.
+	sintelTorrentURL = "https://webtorrent.io/torrents/sintel.torrent"
+	sintelHash       = "08ada5a7a6183aae1e09d831df6748d566095a10"
 
 	// Shared test constants used by both testenv.go and test files.
 	torrentAppearTimeout = 30 * time.Second
@@ -543,9 +547,10 @@ func (env *TestEnv) IsTorrentStopped(ctx context.Context, client *qbittorrent.Cl
 	}
 }
 
-// CreateGRPCDestination creates a gRPC destination for testing.
+// CreateGRPCDestination creates a gRPC destination for testing with 2 connections
+// (matching the default GRPCConnections value used in production).
 func (env *TestEnv) CreateGRPCDestination() (*streaming.GRPCDestination, error) {
-	return streaming.NewGRPCDestination(env.grpcAddr)
+	return streaming.NewGRPCDestination(env.grpcAddr, 2)
 }
 
 // CreateHotConfig creates a hot config for testing.
@@ -558,10 +563,12 @@ func (env *TestEnv) CreateHotConfig(opts ...HotConfigOption) *config.HotConfig {
 			DataPath:   env.hotPath,
 			SyncedTag:  "synced",
 		},
-		MinSpaceGB:     1,
-		MinSeedingTime: 0,
-		SleepInterval:  time.Second,
-		Force:          false,
+		MinSpaceGB:      1,
+		MinSeedingTime:  0,
+		SleepInterval:   time.Second,
+		Force:           false,
+		GRPCConnections: 2,
+		NumSenders:      4,
 	}
 	for _, opt := range opts {
 		opt(cfg)
@@ -590,6 +597,20 @@ func WithForce(force bool) HotConfigOption {
 func WithMinSeedingTime(d time.Duration) HotConfigOption {
 	return func(cfg *config.HotConfig) {
 		cfg.MinSeedingTime = d
+	}
+}
+
+// WithGRPCConnections sets the number of gRPC connections.
+func WithGRPCConnections(n int) HotConfigOption {
+	return func(cfg *config.HotConfig) {
+		cfg.GRPCConnections = n
+	}
+}
+
+// WithNumSenders sets the number of sender goroutines.
+func WithNumSenders(n int) HotConfigOption {
+	return func(cfg *config.HotConfig) {
+		cfg.NumSenders = n
 	}
 }
 

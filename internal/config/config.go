@@ -23,6 +23,8 @@ const (
 	defaultHealthAddr           = ":8080"
 	defaultSyncedTag            = "synced"
 	defaultReconnectMaxDelaySec = 30
+	defaultNumSenders           = 4
+	defaultGRPCConnections      = 2
 )
 
 // BaseConfig contains configuration shared between hot and cold servers.
@@ -65,6 +67,7 @@ type HotConfig struct {
 	MaxBytesPerSec    int64
 	ReconnectMaxDelay time.Duration // Max reconnect backoff delay (default: 30s)
 	NumSenders        int           // Concurrent sender workers for streaming (default: 4)
+	GRPCConnections   int           // Number of TCP connections to cold server (default: 2)
 }
 
 // Validate validates the base configuration shared by hot and cold.
@@ -163,6 +166,8 @@ func SetupHotFlags(cmd *cobra.Command) {
 	flags.Int64("rate-limit", 0, "Max bytes/sec for streaming (0 = unlimited)")
 	flags.Int("piece-timeout", defaultPieceTimeoutSec, "Timeout in seconds for stale in-flight pieces (increase for high-latency links)")
 	flags.Int("reconnect-max-delay", defaultReconnectMaxDelaySec, "Max reconnect backoff delay in seconds (decrease for unstable links)")
+	flags.Int("num-senders", defaultNumSenders, "Concurrent sender workers for streaming (increase for high-throughput links)")
+	flags.Int("grpc-connections", defaultGRPCConnections, "Number of TCP connections for gRPC streaming (increase for high-throughput links)")
 	flags.String("health-addr", defaultHealthAddr, "HTTP health endpoint address (empty to disable)")
 	flags.String("synced-tag", defaultSyncedTag, "Tag to apply to synced torrents (empty to disable)")
 	flags.Bool("dry-run", false, "Run without making changes")
@@ -199,7 +204,7 @@ func BindHotFlags(cmd *cobra.Command, v *viper.Viper) error {
 		"data", "qb-url", "qb-username", "qb-password",
 		"cold-addr", "min-space", "min-seeding-time",
 		"force", "sleep", "rate-limit", "piece-timeout",
-		"reconnect-max-delay", "health-addr", "synced-tag", "dry-run",
+		"reconnect-max-delay", "num-senders", "grpc-connections", "health-addr", "synced-tag", "dry-run",
 		"log-level",
 	}
 
@@ -259,6 +264,8 @@ func LoadHot(v *viper.Viper) (*HotConfig, error) {
 		PieceTimeout:      time.Duration(v.GetInt("piece-timeout")) * time.Second,
 		MaxBytesPerSec:    v.GetInt64("rate-limit"),
 		ReconnectMaxDelay: time.Duration(v.GetInt("reconnect-max-delay")) * time.Second,
+		NumSenders:        v.GetInt("num-senders"),
+		GRPCConnections:   v.GetInt("grpc-connections"),
 	}
 
 	// Support conventional env vars as fallbacks

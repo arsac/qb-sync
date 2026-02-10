@@ -59,7 +59,7 @@ func TestE2E_PerfActiveTorrent(t *testing.T) {
 	ctx := context.Background()
 
 	// Use Sintel torrent - larger than Big Buck Bunny for better measurements
-	torrentURL := testTorrentURL
+	torrentURL := sintelTorrentURL
 	torrentHash := sintelHash
 
 	// Cleanup any existing
@@ -195,7 +195,7 @@ func TestE2E_PerfPreDownloaded(t *testing.T) {
 
 	// Add torrent and wait for complete download
 	t.Log("Adding torrent and waiting for download to complete...")
-	err := env.AddTorrentToHot(ctx, testTorrentURL, nil)
+	err := env.AddTorrentToHot(ctx, sintelTorrentURL, nil)
 	require.NoError(t, err)
 
 	torrent := env.WaitForTorrent(env.HotClient(), torrentHash, 30*time.Second)

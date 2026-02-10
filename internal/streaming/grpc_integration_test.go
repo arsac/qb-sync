@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -477,5 +478,188 @@ func TestIntegration_SendTimeoutErrorReachesPool(t *testing.T) {
 		t.Logf("pool received error: %v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for error on pool.errs — forwardAcks silent-death fix not working")
+	}
+}
+
+// startTestGRPCServerAddr starts a gRPC server on localhost with a controllable
+// StreamPiecesBidi handler and returns the listener address string.
+// This allows callers to connect via NewGRPCDestination with numConns.
+func startTestGRPCServerAddr(t *testing.T, handler func(pb.QBSyncService_StreamPiecesBidiServer) error) string {
+	t.Helper()
+
+	lis, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+
+	srv := grpc.NewServer()
+	pb.RegisterQBSyncServiceServer(srv, &testGRPCServer{handler: handler})
+
+	go srv.Serve(lis) //nolint:errcheck // test server
+	t.Cleanup(func() { srv.Stop() })
+
+	return lis.Addr().String()
+}
+
+// TestIntegration_NewGRPCDestination_MultiConn verifies that NewGRPCDestination
+// creates the requested number of independent connections and clients.
+func TestIntegration_NewGRPCDestination_MultiConn(t *testing.T) {
+	t.Parallel()
+
+	addr := startTestGRPCServerAddr(t, func(stream pb.QBSyncService_StreamPiecesBidiServer) error {
+		<-stream.Context().Done()
+		return stream.Context().Err()
+	})
+
+	d, err := NewGRPCDestination(addr, 3)
+	if err != nil {
+		t.Fatalf("NewGRPCDestination: %v", err)
+	}
+	defer d.Close()
+
+	if len(d.conns) != 3 {
+		t.Errorf("len(conns) = %d, want 3", len(d.conns))
+	}
+	if len(d.clients) != 3 {
+		t.Errorf("len(clients) = %d, want 3", len(d.clients))
+	}
+
+	// Verify all connections are distinct
+	for i := 0; i < len(d.conns); i++ {
+		for j := i + 1; j < len(d.conns); j++ {
+			if d.conns[i] == d.conns[j] {
+				t.Errorf("conns[%d] == conns[%d], want distinct", i, j)
+			}
+		}
+	}
+
+	if err := d.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// TestIntegration_NewGRPCDestination_ZeroDefaultsToOne verifies that numConns=0
+// defaults to 1 connection.
+func TestIntegration_NewGRPCDestination_ZeroDefaultsToOne(t *testing.T) {
+	t.Parallel()
+
+	addr := startTestGRPCServerAddr(t, func(stream pb.QBSyncService_StreamPiecesBidiServer) error {
+		<-stream.Context().Done()
+		return stream.Context().Err()
+	})
+
+	d, err := NewGRPCDestination(addr, 0)
+	if err != nil {
+		t.Fatalf("NewGRPCDestination: %v", err)
+	}
+	defer d.Close()
+
+	if len(d.conns) != 1 {
+		t.Errorf("len(conns) = %d, want 1", len(d.conns))
+	}
+	if len(d.clients) != 1 {
+		t.Errorf("len(clients) = %d, want 1", len(d.clients))
+	}
+}
+
+// TestIntegration_NewGRPCDestination_NegativeDefaultsToOne verifies that
+// negative numConns defaults to 1 connection.
+func TestIntegration_NewGRPCDestination_NegativeDefaultsToOne(t *testing.T) {
+	t.Parallel()
+
+	addr := startTestGRPCServerAddr(t, func(stream pb.QBSyncService_StreamPiecesBidiServer) error {
+		<-stream.Context().Done()
+		return stream.Context().Err()
+	})
+
+	d, err := NewGRPCDestination(addr, -1)
+	if err != nil {
+		t.Fatalf("NewGRPCDestination: %v", err)
+	}
+	defer d.Close()
+
+	if len(d.conns) != 1 {
+		t.Errorf("len(conns) = %d, want 1", len(d.conns))
+	}
+}
+
+// TestIntegration_OpenStream_DistributesAcrossConns verifies that OpenStream
+// distributes streams across all connections via round-robin, and that each
+// stream can send and receive independently.
+func TestIntegration_OpenStream_DistributesAcrossConns(t *testing.T) {
+	t.Parallel()
+
+	addr := startTestGRPCServerAddr(t, func(stream pb.QBSyncService_StreamPiecesBidiServer) error {
+		for {
+			req, err := stream.Recv()
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if sendErr := stream.Send(&pb.PieceAck{
+				TorrentHash: req.GetTorrentHash(),
+				PieceIndex:  req.GetPieceIndex(),
+				Success:     true,
+			}); sendErr != nil {
+				return sendErr
+			}
+		}
+	})
+
+	d, err := NewGRPCDestination(addr, 2)
+	if err != nil {
+		t.Fatalf("NewGRPCDestination: %v", err)
+	}
+	defer d.Close()
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	const numStreams = 4
+	streams := make([]*PieceStream, numStreams)
+	for i := range numStreams {
+		s, openErr := d.OpenStream(context.Background(), logger)
+		if openErr != nil {
+			t.Fatalf("OpenStream(%d): %v", i, openErr)
+		}
+		streams[i] = s
+	}
+
+	// Send a piece on each stream and verify we get an ack back.
+	var wg sync.WaitGroup
+	for i, s := range streams {
+		wg.Add(1)
+		go func(idx int, ps *PieceStream) {
+			defer wg.Done()
+
+			sendErr := ps.Send(&pb.WritePieceRequest{
+				TorrentHash: "test",
+				PieceIndex:  int32(idx),
+				Data:        []byte("piece-data"),
+			})
+			if sendErr != nil {
+				t.Errorf("stream %d Send: %v", idx, sendErr)
+				return
+			}
+
+			select {
+			case ack := <-ps.Acks():
+				if !ack.GetSuccess() {
+					t.Errorf("stream %d ack: not success", idx)
+				}
+				if ack.GetPieceIndex() != int32(idx) {
+					t.Errorf("stream %d ack index = %d, want %d", idx, ack.GetPieceIndex(), idx)
+				}
+			case <-time.After(5 * time.Second):
+				t.Errorf("stream %d: timed out waiting for ack", idx)
+			}
+		}(i, s)
+	}
+
+	wg.Wait()
+
+	for _, s := range streams {
+		s.Close()
 	}
 }

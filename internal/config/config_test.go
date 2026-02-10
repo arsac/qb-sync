@@ -152,6 +152,8 @@ func TestLoadHot(t *testing.T) {
 		v.Set("sleep", 60)
 		v.Set("rate-limit", int64(1000000))
 		v.Set("synced-tag", "my-synced")
+		v.Set("grpc-connections", 3)
+		v.Set("num-senders", 8)
 
 		cfg, err := LoadHot(v)
 		require.NoError(t, err)
@@ -168,6 +170,8 @@ func TestLoadHot(t *testing.T) {
 		assert.Equal(t, 60, int(cfg.SleepInterval.Seconds()))
 		assert.Equal(t, int64(1000000), cfg.MaxBytesPerSec)
 		assert.Equal(t, "my-synced", cfg.SyncedTag)
+		assert.Equal(t, 3, cfg.GRPCConnections)
+		assert.Equal(t, 8, cfg.NumSenders)
 	})
 
 	t.Run("synced-tag can be empty to disable tagging", func(t *testing.T) {
@@ -252,6 +256,7 @@ func TestSetupHotFlags(t *testing.T) {
 		"data", "qb-url", "qb-username", "qb-password",
 		"cold-addr", "min-space", "min-seeding-time",
 		"force", "dry-run", "sleep", "rate-limit", "synced-tag",
+		"grpc-connections", "num-senders",
 	}
 
 	for _, flag := range flags {
@@ -261,6 +266,14 @@ func TestSetupHotFlags(t *testing.T) {
 	// Verify synced-tag default value
 	syncedTagFlag := cmd.Flags().Lookup("synced-tag")
 	assert.Equal(t, "synced", syncedTagFlag.DefValue)
+
+	// Verify grpc-connections default value
+	grpcConnsFlag := cmd.Flags().Lookup("grpc-connections")
+	assert.Equal(t, "2", grpcConnsFlag.DefValue)
+
+	// Verify num-senders default value
+	numSendersFlag := cmd.Flags().Lookup("num-senders")
+	assert.Equal(t, "4", numSendersFlag.DefValue)
 }
 
 func TestSetupColdFlags(t *testing.T) {
