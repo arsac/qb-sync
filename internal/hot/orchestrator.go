@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -695,6 +696,13 @@ func (t *QBTask) finalizeCompletedStreams(ctx context.Context) error {
 
 		// All pieces streamed - finalize on cold server
 		if finalizeErr := t.finalizeTorrent(ctx, hash); finalizeErr != nil {
+			// Cold server is still verifying — not an error, just poll again next cycle.
+			if errors.Is(finalizeErr, streaming.ErrFinalizeVerifying) {
+				t.logger.InfoContext(ctx, "cold server still verifying, will poll again",
+					"hash", hash,
+				)
+				continue
+			}
 			metrics.FinalizationErrorsTotal.WithLabelValues(metrics.ModeHot).Inc()
 			t.logger.ErrorContext(ctx, "finalize failed",
 				"hash", hash,

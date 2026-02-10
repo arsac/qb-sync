@@ -43,6 +43,16 @@ const (
 	// Memory management.
 	defaultMaxStreamBufferMB = 512 // Default global memory budget for buffered piece data
 	maxVerifyConcurrency     = 4   // Limit concurrent piece reads during finalization to cap transient memory
+
+	// verifyIdleTimeout is how long verification can go without verifying a piece
+	// before it is considered stalled. Resets on each successfully verified piece.
+	verifyIdleTimeout = 60 * time.Second
+
+	// backgroundFinalizeTimeout is the upper-bound timeout for the entire
+	// background finalization (verification + inode registration + qBittorrent).
+	// Defense-in-depth: the idle watchdog covers verification stalls, but this
+	// caps the total wall-clock time including qBittorrent operations.
+	backgroundFinalizeTimeout = 30 * time.Minute
 )
 
 // QBConfig holds qBittorrent configuration for the cold server.

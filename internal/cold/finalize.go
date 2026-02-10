@@ -18,9 +18,12 @@ import (
 )
 
 // FinalizeTorrent completes the torrent transfer by renaming partial files,
-// adding to qBittorrent, and verifying via recheck.
-// This operation is idempotent: file renaming checks for existing files,
-// and qB operations handle already-added torrents.
+// verifying piece integrity, adding to qBittorrent, and confirming.
+//
+// Verification runs in the background with a progress-based idle timeout
+// (not tied to the RPC context) so it survives client-side deadline cancellation.
+// If the hot side calls FinalizeTorrent while verification is already running,
+// the response indicates "in progress" without error so the hot side can poll.
 func (s *Server) FinalizeTorrent(
 	ctx context.Context,
 	req *pb.FinalizeTorrentRequest,
@@ -34,30 +37,57 @@ func (s *Server) FinalizeTorrent(
 		return &pb.FinalizeTorrentResponse{Success: false, Error: stateErr.Error()}, nil
 	}
 
-	// Set finalizing flag to prevent concurrent writes
+	// Check if finalization is already in progress or completed.
 	state.mu.Lock()
 	if state.finalizing {
+		result, done := state.finalizeResult, state.finalizeDone
 		state.mu.Unlock()
+
+		// If we have a cached result from a completed background finalization, return it.
+		if result != nil {
+			if result.success {
+				// Clean up now that hot has received the success response.
+				s.cleanupFinalizedTorrent(hash)
+				return &pb.FinalizeTorrentResponse{Success: true, State: result.state}, nil
+			}
+			// Background finalization failed — wait for the goroutine to fully exit
+			// before clearing state, preventing concurrent background goroutines.
+			if done != nil {
+				<-done
+			}
+			state.mu.Lock()
+			state.finalizing = false
+			state.finalizeResult = nil
+			state.finalizeDone = nil
+			state.mu.Unlock()
+			return &pb.FinalizeTorrentResponse{Success: false, Error: result.err}, nil
+		}
+
+		// Background work is still running — tell hot it's in progress
+		// so it polls again without counting this as a failure.
 		return &pb.FinalizeTorrentResponse{
-			Success: false,
-			Error:   "finalization already in progress",
+			Success: true,
+			State:   "verifying",
 		}, nil
 	}
+	// Create finalizeDone immediately so concurrent polls always see it.
+	done := make(chan struct{})
 	state.finalizing = true
+	state.finalizeDone = done
 	writtenCount := state.writtenCount
 	totalPieces := len(state.written)
 	state.mu.Unlock()
 
-	// Helper to clear finalizing flag - must be called on all exit paths except success
-	clearFinalizing := func() {
+	// Helper to clear finalizing state, close the done channel, record failure
+	// metrics, and return error response. Used on all early exit paths before
+	// the background goroutine is launched.
+	failureResponse := func(errMsg string) *pb.FinalizeTorrentResponse {
+		close(done)
 		state.mu.Lock()
 		state.finalizing = false
+		state.finalizeResult = nil
+		state.finalizeDone = nil
 		state.mu.Unlock()
-	}
-
-	// Helper to record failure metrics and return error response
-	failureResponse := func(errMsg string) *pb.FinalizeTorrentResponse {
-		clearFinalizing()
 		metrics.FinalizationDuration.WithLabelValues(metrics.ResultFailure).Observe(time.Since(startTime).Seconds())
 		metrics.FinalizationErrorsTotal.WithLabelValues(metrics.ModeCold).Inc()
 		return &pb.FinalizeTorrentResponse{Success: false, Error: errMsg}
@@ -74,21 +104,13 @@ func (s *Server) FinalizeTorrent(
 		for i, fi := range state.files {
 			rel, relErr := filepath.Rel(oldBase, strings.TrimSuffix(fi.path, partialSuffix))
 			if relErr != nil {
-				clearFinalizing()
-				return &pb.FinalizeTorrentResponse{
-					Success: false,
-					Error:   fmt.Sprintf("computing relative path: %v", relErr),
-				}, nil
+				return failureResponse(fmt.Sprintf("computing relative path: %v", relErr)), nil
 			}
 			relPaths[i] = rel
 		}
 
 		if _, relocErr := s.relocateFiles(ctx, hash, relPaths, oldSubPath, newSubPath); relocErr != nil {
-			clearFinalizing()
-			return &pb.FinalizeTorrentResponse{
-				Success: false,
-				Error:   fmt.Sprintf("relocating files: %v", relocErr),
-			}, nil
+			return failureResponse(fmt.Sprintf("relocating files: %v", relocErr)), nil
 		}
 
 		updateStateAfterRelocate(state, s.config.BasePath, oldSubPath, newSubPath)
@@ -98,45 +120,85 @@ func (s *Server) FinalizeTorrent(
 		}
 	}
 
-	// Verify all pieces are written
+	// Verify all pieces are written.
 	if writtenCount < totalPieces {
 		return failureResponse(fmt.Sprintf("incomplete: %d/%d pieces", writtenCount, totalPieces)), nil
 	}
 
-	// Finalize files (sync, close, rename .partial -> final)
-	// This is idempotent - already renamed files are detected and skipped
+	// Finalize files (sync, close, rename .partial -> final).
+	// This is idempotent — already renamed files are detected and skipped.
 	if finalizeErr := s.finalizeFiles(ctx, hash, state); finalizeErr != nil {
 		return failureResponse(fmt.Sprintf("finalizing files: %v", finalizeErr)), nil
 	}
 
-	// Verify all pieces by reading back from finalized files
-	// This ensures data integrity before we tell hot it's safe to delete
-	if verifyErr := s.verifyFinalizedPieces(ctx, hash, state); verifyErr != nil {
-		return failureResponse(fmt.Sprintf("verification failed: %v", verifyErr)), nil
+	// Launch verification and post-verification steps in the background.
+	// This decouples from the RPC context so verification survives hot-side
+	// deadline cancellation. The finalizing flag and finalizeDone channel were
+	// set upfront (under lock) so concurrent polls see "verifying" immediately.
+	go s.runBackgroundFinalization(hash, state, req, startTime, done)
+
+	// Return "verifying" to the hot side. Hot should poll via subsequent
+	// FinalizeTorrent calls until it gets the final result.
+	return &pb.FinalizeTorrentResponse{
+		Success: true,
+		State:   "verifying",
+	}, nil
+}
+
+// runBackgroundFinalization runs piece verification and post-verification steps
+// (inode registration, qBittorrent integration) independently of the RPC context.
+// On completion, it stores the result in state.finalizeResult and closes done.
+func (s *Server) runBackgroundFinalization(
+	hash string,
+	state *serverTorrentState,
+	req *pb.FinalizeTorrentRequest,
+	startTime time.Time,
+	done chan struct{},
+) {
+	defer close(done)
+
+	// Use a background context with an upper-bound timeout — this work must not be
+	// cancelled by the RPC deadline, but we cap the total wall-clock time to prevent
+	// indefinite background work (e.g., qBittorrent operations hanging).
+	ctx, cancel := context.WithTimeout(context.Background(), backgroundFinalizeTimeout)
+	defer cancel()
+
+	// storeFailure records failure metrics and stores the error for the next poll.
+	storeFailure := func(errMsg string) {
+		metrics.FinalizationDuration.WithLabelValues(metrics.ResultFailure).Observe(time.Since(startTime).Seconds())
+		metrics.FinalizationErrorsTotal.WithLabelValues(metrics.ModeCold).Inc()
+		state.mu.Lock()
+		state.finalizeResult = &finalizeResult{err: errMsg}
+		state.mu.Unlock()
 	}
 
-	// Register inodes for files we wrote (not hardlinked) and signal waiters
+	// Verify all pieces by reading back from finalized files.
+	if verifyErr := s.verifyFinalizedPieces(ctx, hash, state); verifyErr != nil {
+		s.logger.ErrorContext(ctx, "background verification failed",
+			"hash", hash,
+			"error", verifyErr,
+		)
+		storeFailure(fmt.Sprintf("verification failed: %v", verifyErr))
+		return
+	}
+
+	// Register inodes for files we wrote (not hardlinked) and signal waiters.
 	s.registerFinalizedInodes(ctx, hash, state)
 
-	// Helper to record success metrics and clean up
-	successResponse := func(stateStr string) *pb.FinalizeTorrentResponse {
-		metrics.FinalizationDuration.WithLabelValues(metrics.ResultSuccess).Observe(time.Since(startTime).Seconds())
-		name := strings.TrimSuffix(filepath.Base(state.torrentPath), ".torrent")
-		metrics.TorrentsSyncedTotal.WithLabelValues(metrics.ModeCold, hash, name).Inc()
-		s.logger.InfoContext(ctx, "torrent finalized", "hash", hash, "state", stateStr)
-		s.cleanupFinalizedTorrent(hash)
-		return &pb.FinalizeTorrentResponse{Success: true, State: stateStr}
-	}
-
-	// Add to qBittorrent if configured and not in dry-run mode
+	// Add to qBittorrent if configured and not in dry-run mode.
 	if s.qbClient != nil && !s.config.DryRun {
 		finalState, qbErr := s.addAndVerifyTorrent(ctx, hash, state, req)
 		if qbErr != nil {
-			return failureResponse(fmt.Sprintf("qBittorrent: %v", qbErr)), nil
+			s.logger.ErrorContext(ctx, "background qBittorrent integration failed",
+				"hash", hash,
+				"error", qbErr,
+			)
+			storeFailure(fmt.Sprintf("qBittorrent: %v", qbErr))
+			return
 		}
 
-		// Apply synced tag for visibility (not used as source of truth)
-		if s.config.SyncedTag != "" && !s.config.DryRun {
+		// Apply synced tag for visibility (not used as source of truth).
+		if s.config.SyncedTag != "" {
 			if tagErr := s.qbClient.AddTagsCtx(ctx, []string{hash}, s.config.SyncedTag); tagErr != nil {
 				metrics.TagApplicationErrorsTotal.WithLabelValues(metrics.ModeCold).Inc()
 				s.logger.ErrorContext(ctx, "failed to add synced tag",
@@ -147,10 +209,29 @@ func (s *Server) FinalizeTorrent(
 			}
 		}
 
-		return successResponse(string(finalState)), nil
+		s.storeSuccessResult(ctx, hash, state, string(finalState), startTime)
+		return
 	}
 
-	return successResponse("finalized"), nil
+	s.storeSuccessResult(ctx, hash, state, "finalized", startTime)
+}
+
+// storeSuccessResult records success metrics and stores the result for the next poll.
+func (s *Server) storeSuccessResult(
+	ctx context.Context,
+	hash string,
+	state *serverTorrentState,
+	stateStr string,
+	startTime time.Time,
+) {
+	metrics.FinalizationDuration.WithLabelValues(metrics.ResultSuccess).Observe(time.Since(startTime).Seconds())
+	name := strings.TrimSuffix(filepath.Base(state.torrentPath), ".torrent")
+	metrics.TorrentsSyncedTotal.WithLabelValues(metrics.ModeCold, hash, name).Inc()
+	s.logger.InfoContext(ctx, "torrent finalized (background)", "hash", hash, "state", stateStr)
+
+	state.mu.Lock()
+	state.finalizeResult = &finalizeResult{success: true, state: stateStr}
+	state.mu.Unlock()
 }
 
 // cleanupFinalizedTorrent removes a successfully finalized torrent from tracking
@@ -428,7 +509,8 @@ func (s *Server) registerFinalizedInodes(ctx context.Context, hash string, state
 }
 
 // verifyFinalizedPieces reads back all pieces from finalized files and verifies their hashes.
-// This ensures data integrity before telling hot it's safe to delete.
+// Uses a progress-based idle timeout: as long as pieces keep being verified, it continues.
+// Only aborts if no piece is verified within verifyIdleTimeout.
 func (s *Server) verifyFinalizedPieces(ctx context.Context, hash string, state *serverTorrentState) error {
 	if len(state.pieceHashes) == 0 {
 		return fmt.Errorf("no piece hashes available for verification — refusing to finalize without integrity check")
@@ -447,12 +529,43 @@ func (s *Server) verifyFinalizedPieces(ctx context.Context, hash string, state *
 		"pieceSize", pieceSize,
 	)
 
+	// Create a context with progress-based idle timeout.
+	// The cancel func is called by the idle watchdog if no progress is made.
+	idleCtx, idleCancel := context.WithCancel(ctx)
+	defer idleCancel()
+
 	// Verify pieces in parallel — all accessed state fields (pieceHashes,
 	// pieceLength, totalSize, files) are immutable at this point (finalizing=true).
-	g, gCtx := errgroup.WithContext(ctx)
+	g, gCtx := errgroup.WithContext(idleCtx)
 	g.SetLimit(maxVerifyConcurrency)
 
 	var verified atomic.Int64
+	var lastProgress atomic.Value // stores time.Time of last verified piece
+	lastProgress.Store(time.Now())
+
+	// Idle watchdog: cancel verification if no progress within verifyIdleTimeout.
+	go func() {
+		ticker := time.NewTicker(verifyIdleTimeout / 2) // Check at half the timeout interval.
+		defer ticker.Stop()
+		for {
+			select {
+			case <-gCtx.Done():
+				return
+			case <-ticker.C:
+				last := lastProgress.Load().(time.Time)
+				if time.Since(last) > verifyIdleTimeout {
+					s.logger.ErrorContext(ctx, "verification stalled, aborting",
+						"hash", hash,
+						"verified", verified.Load(),
+						"total", numPieces,
+						"idleTimeout", verifyIdleTimeout,
+					)
+					idleCancel()
+					return
+				}
+			}
+		}
+	}()
 
 	for i, expectedHash := range state.pieceHashes {
 		if expectedHash == "" {
@@ -483,6 +596,9 @@ func (s *Server) verifyFinalizedPieces(ctx context.Context, hash string, state *
 				metrics.VerificationErrorsTotal.WithLabelValues(metrics.ModeCold).Inc()
 				return fmt.Errorf("piece %d: %w", i, err)
 			}
+
+			// Record progress for idle watchdog.
+			lastProgress.Store(time.Now())
 
 			if count := verified.Add(1); count%50 == 0 || count == int64(numPieces) {
 				s.logger.InfoContext(ctx, "verification progress",

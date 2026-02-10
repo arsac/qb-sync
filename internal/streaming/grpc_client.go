@@ -57,6 +57,11 @@ const (
 	sendTimeout = 30 * time.Second
 )
 
+// ErrFinalizeVerifying is returned by FinalizeTorrent when the cold server is
+// still verifying pieces in the background. The caller should retry later
+// without counting this as a failure.
+var ErrFinalizeVerifying = errors.New("finalization in progress: cold server is verifying pieces")
+
 // successResponse is implemented by gRPC response types that have Success/Error fields.
 type successResponse interface {
 	GetSuccess() bool
@@ -322,6 +327,9 @@ func (d *GRPCDestination) RegisterFile(ctx context.Context, inode uint64, path s
 // FinalizeTorrent requests the cold server to finalize a torrent:
 // rename .partial files, add to qBittorrent, verify, and confirm.
 // On success, clears the cached init result to prevent memory leaks.
+//
+// Returns ErrFinalizeVerifying if the cold server is still verifying pieces
+// in the background. The caller should retry later without penalty.
 func (d *GRPCDestination) FinalizeTorrent(
 	ctx context.Context,
 	hash, savePath, category, tags, saveSubPath string,
@@ -344,6 +352,12 @@ func (d *GRPCDestination) FinalizeTorrent(
 	}
 	if respErr := checkRPCResponse(resp, "finalize"); respErr != nil {
 		return respErr
+	}
+
+	// Cold returns state="verifying" when background verification is still running.
+	// Return a sentinel error so the orchestrator can retry without penalty.
+	if resp.GetState() == "verifying" {
+		return ErrFinalizeVerifying
 	}
 
 	// Clean up cached init result to prevent memory leak

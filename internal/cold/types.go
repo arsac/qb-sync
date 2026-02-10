@@ -52,6 +52,8 @@ type serverTorrentState struct {
 	dirty            bool              // Whether state needs to be flushed
 	piecesSinceFlush int               // Pieces written since last flush (for count-based trigger)
 	finalizing       bool              // True during FinalizeTorrent to prevent concurrent writes
+	finalizeDone     chan struct{}     // Closed when background finalization completes
+	finalizeResult   *finalizeResult   // Result of background finalization (nil = not started)
 	initializing     bool              // True while disk I/O is in progress during InitTorrent
 	mu               sync.Mutex
 
@@ -71,6 +73,13 @@ type serverFileInfo struct {
 	sourceInode    Inode         // Source inode for registration
 	hardlinkSource string        // Relative path to hardlink from (when ready)
 	hardlinkDoneCh chan struct{} // Wait on this before hardlinking (used when hlState == hlStatePending)
+}
+
+// finalizeResult stores the outcome of a background finalization.
+type finalizeResult struct {
+	success bool
+	state   string // qBittorrent state on success
+	err     string // Error message on failure
 }
 
 // torrentRef is a reference to a torrent state for safe iteration.

@@ -932,6 +932,70 @@ func TestFinalizeTorrent(t *testing.T) {
 	})
 }
 
+func TestFinalizeTorrent_ErrFinalizeVerifyingPropagates(t *testing.T) {
+	logger := testLogger(t)
+
+	t.Run("ErrFinalizeVerifying is returned by finalizeTorrent", func(t *testing.T) {
+		mockClient := &mockQBClient{
+			getTorrentsResult: []qbittorrent.Torrent{
+				{Hash: "abc123", SavePath: "/data", Category: "movies"},
+			},
+		}
+		coldDest := &mockColdDest{finalizeErr: streaming.ErrFinalizeVerifying}
+		task := &QBTask{
+			cfg:       &config.HotConfig{},
+			logger:    logger,
+			srcClient: mockClient,
+			grpcDest:  coldDest,
+			source:    qbclient.NewSource(nil, ""),
+		}
+
+		err := task.finalizeTorrent(context.Background(), "abc123")
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !errors.Is(err, streaming.ErrFinalizeVerifying) {
+			t.Errorf("expected ErrFinalizeVerifying, got: %v", err)
+		}
+	})
+
+	t.Run("ErrFinalizeVerifying does not increment backoff", func(t *testing.T) {
+		mockClient := &mockQBClient{
+			getTorrentsResult: []qbittorrent.Torrent{
+				{Hash: "abc123", SavePath: "/data"},
+			},
+		}
+		coldDest := &mockColdDest{finalizeErr: streaming.ErrFinalizeVerifying}
+		task := &QBTask{
+			cfg:              &config.HotConfig{},
+			logger:           logger,
+			srcClient:        mockClient,
+			grpcDest:         coldDest,
+			source:           qbclient.NewSource(nil, ""),
+			finalizeBackoffs: make(map[string]*finalizeBackoff),
+		}
+
+		// Call finalizeTorrent — returns ErrFinalizeVerifying
+		_ = task.finalizeTorrent(context.Background(), "abc123")
+
+		// Simulate orchestrator logic: ErrFinalizeVerifying should NOT call recordFinalizeFailure
+		// (the orchestrator checks errors.Is before recording failure).
+		// Verify no backoff was recorded.
+		task.backoffMu.Lock()
+		_, hasBackoff := task.finalizeBackoffs["abc123"]
+		task.backoffMu.Unlock()
+
+		if hasBackoff {
+			t.Error("ErrFinalizeVerifying should not create a backoff entry")
+		}
+
+		// Next attempt should be allowed immediately
+		if !task.shouldAttemptFinalize("abc123") {
+			t.Error("should allow immediate retry after ErrFinalizeVerifying")
+		}
+	})
+}
+
 // TestSyncedTagApplication tests that the synced tag is applied correctly.
 func TestSyncedTagApplication(t *testing.T) {
 	logger := testLogger(t)
