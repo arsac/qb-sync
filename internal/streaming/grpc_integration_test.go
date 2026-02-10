@@ -93,10 +93,14 @@ func openStreamWithTimeouts(
 		ackReady:                make(chan struct{}, 1),
 		done:                    make(chan struct{}),
 		errors:                  make(chan error, 1),
+		sendCh:                  make(chan *sendRequest),
+		stopSend:                make(chan struct{}),
+		sendDone:                make(chan struct{}),
 		ackWriteTimeoutOverride: ackTimeout,
 		sendTimeoutOverride:     sndTimeout,
 	}
 	go ps.receiveAcks()
+	go ps.sendLoop()
 	return ps
 }
 

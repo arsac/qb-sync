@@ -137,6 +137,9 @@ func NewQBTask(
 	if cfg.ReconnectMaxDelay > 0 {
 		queueConfig.ReconnectMaxDelay = cfg.ReconnectMaxDelay
 	}
+	if cfg.NumSenders > 0 {
+		queueConfig.NumSenders = cfg.NumSenders
+	}
 	queue := streaming.NewBidiQueue(source, dest, tracker, logger, queueConfig)
 
 	t := &QBTask{

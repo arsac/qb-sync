@@ -153,6 +153,10 @@ func TestBidiQueueConfig_Defaults(t *testing.T) {
 		t.Errorf("expected CircuitBreakerPause %v, got %v",
 			defaultCircuitBreakerPause, config.CircuitBreakerPause)
 	}
+
+	if config.NumSenders != 4 {
+		t.Errorf("NumSenders = %d, want 4", config.NumSenders)
+	}
 }
 
 func TestBidiQueueStats_ZeroValue(t *testing.T) {

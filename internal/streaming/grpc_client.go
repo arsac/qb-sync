@@ -34,6 +34,13 @@ const (
 	// Torrent pieces are commonly 1–16 MB; the default gRPC limit of 4 MB is too small.
 	maxGRPCMessageSize = 32 * 1024 * 1024 // 32 MB
 
+	// HTTP/2 flow control window sizes. The default 64 KB initial window requires
+	// 262 RTTs to transfer a 16 MB piece, capping first-piece throughput at ~61 MB/s
+	// on a 1 ms LAN. Larger windows allow the sender to push data without waiting
+	// for WINDOW_UPDATE frames, closing the gap with rsync on fast links.
+	initialStreamWindowSize = 16 * 1024 * 1024 // 16 MB per-stream flow control window
+	initialConnWindowSize   = 64 * 1024 * 1024 // 64 MB connection-level flow control window
+
 	// finalizeConnTimeout is how long FinalizeTorrent waits for the gRPC
 	// connection to become READY before giving up. This prevents fail-fast
 	// behavior on unary RPCs when the cold server was recently restarted.
@@ -52,8 +59,8 @@ const (
 
 	// sendTimeout is how long Send waits for the gRPC stream.Send to complete.
 	// gRPC Send() blocks on HTTP/2 flow control when the receiver stops consuming.
-	// Since Send doesn't accept a context, we use a goroutine+timer to impose a timeout
-	// and cancel the stream context if it fires.
+	// Since Send doesn't accept a context, the caller-side timer cancels the stream
+	// context if the sendLoop's stream.Send doesn't return in time.
 	sendTimeout = 30 * time.Second
 )
 
@@ -111,6 +118,8 @@ func NewGRPCDestination(addr string) (*GRPCDestination, error) {
 				MaxDelay:   maxReconnectBackoff,
 			},
 		}),
+		grpc.WithInitialWindowSize(initialStreamWindowSize),
+		grpc.WithInitialConnWindowSize(initialConnWindowSize),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(maxGRPCMessageSize),
 			grpc.MaxCallSendMsgSize(maxGRPCMessageSize),
@@ -276,13 +285,16 @@ func (d *GRPCDestination) OpenStream(ctx context.Context, logger *slog.Logger) (
 		stream:   stream,
 		logger:   logger,
 		acks:     make(chan *pb.PieceAck, DefaultAckChannelSize),
-		ackReady:    make(chan struct{}, 1), // Signal when acks are processed
-		done:        make(chan struct{}),
-		errors:      make(chan error, 1),
+		ackReady: make(chan struct{}, 1), // Signal when acks are processed
+		done:     make(chan struct{}),
+		errors:   make(chan error, 1),
+		sendCh:   make(chan *sendRequest), // unbuffered: natural backpressure
+		stopSend: make(chan struct{}),
+		sendDone: make(chan struct{}),
 	}
 
-	// Start goroutine to receive acks
 	go ps.receiveAcks()
+	go ps.sendLoop()
 
 	return ps, nil
 }
@@ -474,6 +486,12 @@ func GRPCErrorCode(err error) codes.Code {
 	return codes.Unknown
 }
 
+// sendRequest is a message passed to the sendLoop goroutine.
+type sendRequest struct {
+	msg   *pb.WritePieceRequest
+	errCh chan<- error // Caller waits on this for the result
+}
+
 // PieceStream manages a bidirectional streaming connection for piece transfer.
 // This is a thin wrapper around the gRPC stream - in-flight tracking is handled
 // by AdaptiveWindow in BidiQueue for congestion control.
@@ -481,6 +499,9 @@ func GRPCErrorCode(err error) codes.Code {
 // Each PieceStream owns a cancellable context derived from the parent. When the
 // receive loop detects stream death, it cancels the context to unblock any Send()
 // stuck on HTTP/2 flow control.
+//
+// A dedicated sendLoop goroutine serializes all stream.Send() calls via a channel,
+// following the gRPC best practice of a single sender per stream.
 type PieceStream struct {
 	ctx    context.Context
 	cancel context.CancelFunc // Cancels stream context; unblocks stuck Send()
@@ -492,8 +513,12 @@ type PieceStream struct {
 	done     chan struct{}     // Closed when receive goroutine exits
 	errors   chan error        // Stream errors
 
-	sendMu    sync.Mutex  // Protects concurrent Send calls (gRPC streams are not send-safe)
-	sendTimer *time.Timer // Reusable timer for Send timeout (protected by sendMu)
+	sendCh   chan *sendRequest // Fan-in channel for Send requests → sendLoop
+	stopSend chan struct{}     // Closed by CloseSend to signal sendLoop to exit
+	sendDone chan struct{}     // Closed when sendLoop exits
+
+	closeSendOnce sync.Once // Protects CloseSend from multiple calls
+	closeSendErr  error     // Result of the first CloseSend call
 
 	// Test-overridable timeouts. Zero means use the package-level const.
 	ackWriteTimeoutOverride time.Duration
@@ -602,48 +627,82 @@ func (ps *PieceStream) receiveAcks() { //nolint:gocognit // complexity from pani
 	}
 }
 
+// sendLoop is the sole goroutine that calls stream.Send(). All Send() callers
+// submit requests via sendCh; sendLoop serializes them and responds on errCh.
+// Exits when ctx is cancelled or stopSend is closed.
+//
+// On exit, drains any pending requests from sendCh and responds with a context
+// error so callers waiting on errCh don't leak.
+func (ps *PieceStream) sendLoop() {
+	defer close(ps.sendDone)
+	defer func() {
+		// Drain pending requests so callers blocked on errCh don't leak.
+		// Use ctx.Err() when available (context cancel path), otherwise
+		// fall back to a concrete error for the CloseSend path where
+		// the context may still be active.
+		drainErr := ps.ctx.Err()
+		if drainErr == nil {
+			drainErr = errors.New("stream send closed")
+		}
+		for {
+			select {
+			case req := <-ps.sendCh:
+				req.errCh <- drainErr
+			default:
+				return
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-ps.ctx.Done():
+			return
+		case <-ps.stopSend:
+			return
+		case req := <-ps.sendCh:
+			err := ps.stream.Send(req.msg)
+			req.errCh <- err
+		}
+	}
+}
+
 // Send sends a piece over the stream with a timeout.
-// gRPC's Send() blocks on HTTP/2 flow control when the receiver stops consuming
-// and doesn't accept a context parameter. We use a goroutine to impose a timeout:
-// if Send doesn't return in time, we cancel the stream context to unblock it.
+// Submits the request to the sendLoop goroutine via a channel and waits for the
+// result. If the send doesn't complete within the timeout, the stream context is
+// cancelled to unblock sendLoop's stream.Send() call.
 // This method is safe for concurrent use.
 func (ps *PieceStream) Send(req *pb.WritePieceRequest) error {
-	ps.sendMu.Lock()
-	defer ps.sendMu.Unlock()
-
 	// Fast path: stream already cancelled.
 	if err := ps.ctx.Err(); err != nil {
 		return err
 	}
 
-	done := make(chan error, 1)
-	go func() {
-		done <- ps.stream.Send(req)
-	}()
+	errCh := make(chan error, 1)
+	sr := &sendRequest{msg: req, errCh: errCh}
 
-	// Lazy-init reusable timer. Avoids time.After which leaks a goroutine
-	// for the full timeout duration on every Send (the common fast-path case).
-	// Protected by sendMu so no concurrent access.
-	if ps.sendTimer == nil {
-		ps.sendTimer = time.NewTimer(ps.effectiveSendTimeout())
-	} else {
-		ps.sendTimer.Reset(ps.effectiveSendTimeout())
+	// Submit to sendLoop. Unblocks if ctx is cancelled or CloseSend was called.
+	select {
+	case ps.sendCh <- sr:
+	case <-ps.ctx.Done():
+		return ps.ctx.Err()
+	case <-ps.stopSend:
+		return errors.New("stream send closed")
 	}
 
+	// Wait for result with timeout.
+	timer := time.NewTimer(ps.effectiveSendTimeout())
+	defer timer.Stop()
+
 	select {
-	case err := <-done:
-		ps.sendTimer.Stop()
+	case err := <-errCh:
 		return err
-	case <-ps.sendTimer.C:
+	case <-timer.C:
 		metrics.SendTimeoutTotal.Inc()
-		ps.cancel() // Unblock the Send goroutine by cancelling the stream
-		return <-done
+		ps.cancel() // Unblock sendLoop's stream.Send via context cancel
+		return <-errCh
 	case <-ps.ctx.Done():
-		// Stream died (e.g., receiveAcks detected failure and cancelled).
-		// Wait for the Send goroutine — gRPC will unblock it promptly
-		// after context cancel via RST_STREAM.
-		ps.sendTimer.Stop()
-		return <-done
+		return <-errCh
 	}
 }
 
@@ -669,20 +728,28 @@ func (ps *PieceStream) Done() <-chan struct{} {
 }
 
 // CloseSend signals that no more pieces will be sent.
-// The stream remains open for receiving acks.
+// It signals sendLoop to stop via stopSend, waits for it to finish any
+// in-progress send, then calls stream.CloseSend(). Safe for concurrent
+// and repeated calls via sync.Once. Does not cancel the stream context,
+// so receiveAcks continues to drain acks after the send side closes.
 func (ps *PieceStream) CloseSend() error {
-	return ps.stream.CloseSend()
+	ps.closeSendOnce.Do(func() {
+		close(ps.stopSend)
+		<-ps.sendDone
+		ps.closeSendErr = ps.stream.CloseSend()
+	})
+	return ps.closeSendErr
 }
 
-// Close closes the stream and waits for the receiver goroutine to exit.
+// Close closes the stream and waits for all goroutines to exit.
 // This should be called when the stream is no longer needed to ensure clean shutdown.
 func (ps *PieceStream) Close() {
-	// CloseSend signals the server we're done sending
-	_ = ps.stream.CloseSend()
-
-	// Cancel stream context to unblock any stuck Send() and ensure
-	// receiveAcks exits promptly. Safe to call multiple times.
+	// Cancel stream context first to unblock sendLoop if it's stuck in
+	// stream.Send() due to HTTP/2 flow control. This ensures CloseSend's
+	// <-ps.sendDone doesn't block indefinitely.
 	ps.cancel()
+
+	_ = ps.CloseSend()
 
 	// Wait for receiver goroutine to exit (it will exit when stream ends or errors)
 	<-ps.done

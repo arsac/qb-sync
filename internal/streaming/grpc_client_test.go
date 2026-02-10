@@ -74,11 +74,15 @@ func newTestPieceStreamWithOptions(
 		ackReady:                make(chan struct{}, 1),
 		done:                    make(chan struct{}),
 		errors:                  make(chan error, 1),
+		sendCh:                  make(chan *sendRequest),
+		stopSend:                make(chan struct{}),
+		sendDone:                make(chan struct{}),
 		ackWriteTimeoutOverride: ackTimeout,
 		sendTimeoutOverride:     sndTimeout,
 	}
 
 	go ps.receiveAcks()
+	go ps.sendLoop()
 	return ps
 }
 
@@ -116,6 +120,33 @@ func TestSend_StreamErrorPropagates(t *testing.T) {
 	if !errors.Is(err, expectedErr) {
 		t.Fatalf("expected %v, got %v", expectedErr, err)
 	}
+}
+
+// TestSend_AfterCloseSendReturnsError verifies that calling Send after CloseSend
+// returns an error instead of panicking. Before the stopSend fix, this would
+// panic with "send on closed channel" because CloseSend closed sendCh directly.
+func TestSend_AfterCloseSendReturnsError(t *testing.T) {
+	t.Parallel()
+
+	mock := &mockBidiStream{
+		sendFunc: func(*pb.WritePieceRequest) error { return nil },
+	}
+
+	ps := newTestPieceStream(context.Background(), mock)
+	defer ps.Close()
+
+	// Close the send side first.
+	if err := ps.CloseSend(); err != nil {
+		t.Fatalf("CloseSend failed: %v", err)
+	}
+
+	// Send after CloseSend must return an error, not panic.
+	err := ps.Send(&pb.WritePieceRequest{TorrentHash: "test"})
+	if err == nil {
+		t.Fatal("expected error from Send after CloseSend, got nil")
+	}
+
+	t.Logf("Send after CloseSend returned: %v", err)
 }
 
 // TestSend_ReceiveExitUnblocksSend verifies that when receiveAcks detects a

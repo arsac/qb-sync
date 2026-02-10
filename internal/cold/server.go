@@ -35,6 +35,14 @@ const (
 	// Torrent pieces are commonly 1-16 MB; the default gRPC limit of 4 MB is too small.
 	maxGRPCMessageSize = 32 * 1024 * 1024 // 32 MB
 
+	// HTTP/2 flow control window sizes. Must match the client (hot) side.
+	// The default 64 KB window throttles bulk piece transfers — the receiver
+	// can only buffer 64 KB before sending WINDOW_UPDATE, forcing the sender
+	// to stall on every round trip. Larger windows let the sender push data
+	// continuously without waiting for per-RTT acknowledgments.
+	initialStreamWindowSize = 16 * 1024 * 1024 // 16 MB per-stream flow control window
+	initialConnWindowSize   = 64 * 1024 * 1024 // 64 MB connection-level flow control window
+
 	// gracefulShutdownTimeout is how long GracefulStop waits for active streams
 	// to finish before force-stopping. Long-lived bidirectional streams (piece
 	// streaming) can block shutdown indefinitely without this timeout.
@@ -143,6 +151,8 @@ func (s *Server) Run(ctx context.Context) error {
 	s.server = grpc.NewServer(
 		grpc.MaxRecvMsgSize(maxGRPCMessageSize),
 		grpc.MaxSendMsgSize(maxGRPCMessageSize),
+		grpc.InitialWindowSize(initialStreamWindowSize),
+		grpc.InitialConnWindowSize(initialConnWindowSize),
 		grpc.KeepaliveParams(keepalive.ServerParameters{
 			Time:    30 * time.Second, // Send pings every 30s if no activity
 			Timeout: 10 * time.Second, // Wait 10s for ping ack

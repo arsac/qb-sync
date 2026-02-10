@@ -5,12 +5,50 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/arsac/qb-sync/internal/congestion"
 	pb "github.com/arsac/qb-sync/proto"
 )
+
+// concurrencyTrackingSource is a mock PieceSource that tracks max concurrent
+// ReadPiece calls and returns an error after a controlled delay.
+type concurrencyTrackingSource struct {
+	maxConcurrent atomic.Int32
+	concurrent    atomic.Int32
+	calls         atomic.Int64
+	delay         time.Duration
+}
+
+func (s *concurrencyTrackingSource) ReadPiece(_ context.Context, _ *pb.Piece) ([]byte, error) {
+	c := s.concurrent.Add(1)
+	defer s.concurrent.Add(-1)
+	s.calls.Add(1)
+
+	for {
+		old := s.maxConcurrent.Load()
+		if c <= old || s.maxConcurrent.CompareAndSwap(old, c) {
+			break
+		}
+	}
+
+	time.Sleep(s.delay)
+	return nil, errors.New("mock read error")
+}
+
+func (s *concurrencyTrackingSource) GetPieceStates(context.Context, string) ([]PieceState, error) {
+	return nil, nil
+}
+
+func (s *concurrencyTrackingSource) GetPieceHashes(context.Context, string) ([]string, error) {
+	return nil, nil
+}
+
+func (s *concurrencyTrackingSource) GetTorrentMetadata(context.Context, string) (*TorrentMetadata, error) {
+	return nil, nil
+}
 
 func testQueueLogger(t *testing.T) *slog.Logger {
 	t.Helper()
@@ -159,5 +197,98 @@ func TestDrainInFlightPool_MarksFailedOnPoolError(t *testing.T) {
 
 	if pool.TotalInFlight() != 0 {
 		t.Errorf("expected 0 in-flight after error drain, got %d", pool.TotalInFlight())
+	}
+}
+
+func TestSenderWorkersConcurrency(t *testing.T) {
+	const numSenders = 4
+	const numPieces = numSenders * 2
+
+	logger := testQueueLogger(t)
+
+	// Mock source: tracks concurrent ReadPiece calls with a delay to make
+	// concurrency observable, then returns an error (avoids needing a real
+	// gRPC stream for Send).
+	source := &concurrencyTrackingSource{delay: 100 * time.Millisecond}
+
+	// Pre-populate initResults so ensureTorrentInitialized succeeds.
+	dest := &GRPCDestination{
+		initResults: map[string]*InitTorrentResult{
+			"testhash": {},
+		},
+	}
+
+	// Tracker with no torrent state: IsPieceStreamed returns false,
+	// MarkFailed safely no-ops.
+	tracker := NewPieceMonitor(nil, nil, logger, DefaultPieceMonitorConfig())
+
+	config := DefaultBidiQueueConfig()
+	config.NumSenders = numSenders
+	q := &BidiQueue{
+		source:       source,
+		dest:         dest,
+		tracker:      tracker,
+		logger:       logger,
+		config:       config,
+		pieceStreams: make(map[string]*PooledStream),
+	}
+
+	// Pool with one stream whose window has capacity (CanSend = true).
+	// ReadPiece returns error before reaching SelectStream/Send, so the
+	// stream's nil PieceStream is never touched.
+	pool := makeTestPoolWithInflight(t, nil)
+
+	// Push all pieces into the buffered completed channel, then close it
+	// so workers drain the pieces and exit.
+	for i := range numPieces {
+		tracker.completed <- &pb.Piece{
+			TorrentHash: "testhash",
+			Index:       int32(i),
+		}
+	}
+	close(tracker.completed)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stopSender := make(chan struct{})
+
+	// Close stopSender after all pieces are fully processed so the stats
+	// reporter goroutine exits promptly (it only listens for ctx.Done or
+	// stopSender). We wait on piecesFail because it's the last thing
+	// incremented per piece in senderWorker.
+	go func() {
+		for q.piecesFail.Load() < numPieces {
+			time.Sleep(10 * time.Millisecond)
+		}
+		close(stopSender)
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		q.runSenderPool(ctx, pool, stopSender)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("runSenderPool did not complete in time")
+	}
+
+	// With 4 concurrent senders and 100ms delay per ReadPiece, multiple
+	// workers should overlap. Require at least 2 concurrent calls.
+	maxC := source.maxConcurrent.Load()
+	if maxC < 2 {
+		t.Errorf("expected concurrent ReadPiece calls, got max concurrency %d", maxC)
+	}
+
+	// All pieces should have been processed (each fails at ReadPiece).
+	if got := source.calls.Load(); got != numPieces {
+		t.Errorf("expected %d ReadPiece calls, got %d", numPieces, got)
+	}
+
+	// Each failed piece increments piecesFail.
+	if got := q.piecesFail.Load(); got != numPieces {
+		t.Errorf("expected %d piecesFail, got %d", numPieces, got)
 	}
 }

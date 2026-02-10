@@ -64,6 +64,7 @@ type HotConfig struct {
 	PieceTimeout      time.Duration // Timeout for stale in-flight pieces (default: 60s)
 	MaxBytesPerSec    int64
 	ReconnectMaxDelay time.Duration // Max reconnect backoff delay (default: 30s)
+	NumSenders        int           // Concurrent sender workers for streaming (default: 4)
 }
 
 // Validate validates the base configuration shared by hot and cold.

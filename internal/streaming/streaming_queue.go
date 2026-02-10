@@ -30,6 +30,7 @@ const (
 	defaultCircuitBreakerPause    = 5 * time.Minute  // Longer pause after max failures
 	windowStatsInterval           = 5 * time.Second  // How often to log window stats
 	staleCheckInterval            = 10 * time.Second // How often to check for stale in-flight pieces
+	defaultNumSenders             = 4                // Concurrent sender workers (parallelizes ReadPiece + Send)
 )
 
 // BidiQueueConfig configures the bidirectional streaming work queue.
@@ -50,6 +51,9 @@ type BidiQueueConfig struct {
 	ReconnectBaseDelay time.Duration // Initial reconnect delay (default: 1s)
 	ReconnectMaxDelay  time.Duration // Maximum reconnect delay cap (default: 30s)
 
+	// Sender parallelism
+	NumSenders int // Concurrent sender workers (default: 4)
+
 	// Adaptive window configuration (applied to each stream's congestion control)
 	AdaptiveWindow congestion.Config
 }
@@ -62,6 +66,7 @@ func DefaultBidiQueueConfig() BidiQueueConfig {
 		NumStreams:             MinPoolSize, // Start small with adaptive
 		MaxNumStreams:          MaxPoolSize,
 		AdaptivePool:           true, // Enable adaptive scaling
+		NumSenders:             defaultNumSenders,
 		MaxConsecutiveFailures: defaultMaxConsecutiveFailures,
 		CircuitBreakerPause:    defaultCircuitBreakerPause,
 		ReconnectBaseDelay:     reconnectBaseDelay,
@@ -290,11 +295,54 @@ func (q *BidiQueue) runStream(ctx context.Context) error {
 	}
 }
 
-// runSenderPool reads pieces from the tracker and distributes them across the stream pool.
+// runSenderPool spawns N sender workers that pull from tracker.Completed() concurrently,
+// plus a dedicated stats reporter goroutine.
 func (q *BidiQueue) runSenderPool(ctx context.Context, pool *StreamPool, stopSender <-chan struct{}) {
-	statsTicker := time.NewTicker(windowStatsInterval)
-	defer statsTicker.Stop()
+	numSenders := q.config.NumSenders
+	if numSenders <= 0 {
+		numSenders = defaultNumSenders
+	}
 
+	q.logger.InfoContext(ctx, "starting sender workers", "count", numSenders)
+
+	var wg sync.WaitGroup
+
+	// Periodic stats reporter.
+	wg.Go(func() {
+		statsTicker := time.NewTicker(windowStatsInterval)
+		defer statsTicker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-stopSender:
+				return
+			case <-statsTicker.C:
+				stats := pool.Stats()
+				q.logger.InfoContext(ctx, "stream pool stats",
+					"streams", stats.StreamCount,
+					"maxStreams", stats.MaxStreams,
+					"totalInFlight", stats.TotalInFlight,
+					"throughputMBps", stats.ThroughputMBps,
+					"adaptiveEnabled", stats.AdaptiveEnabled,
+					"scalingPaused", stats.ScalingPaused,
+				)
+			}
+		}
+	})
+
+	// Sender workers -- all pull from the same tracker.Completed() channel.
+	for i := range numSenders {
+		wg.Go(func() {
+			q.senderWorker(ctx, pool, stopSender, i)
+		})
+	}
+
+	wg.Wait()
+}
+
+// senderWorker is the per-piece send loop run by each sender goroutine.
+func (q *BidiQueue) senderWorker(ctx context.Context, pool *StreamPool, stopSender <-chan struct{}, id int) {
 	for {
 		// Wait for any stream to have capacity.
 		if !pool.CanSend() {
@@ -317,30 +365,17 @@ func (q *BidiQueue) runSenderPool(ctx context.Context, pool *StreamPool, stopSen
 		select {
 		case <-ctx.Done():
 			return
-
 		case <-stopSender:
 			return
-
-		case <-statsTicker.C:
-			stats := pool.Stats()
-			q.logger.InfoContext(ctx, "stream pool stats",
-				"streams", stats.StreamCount,
-				"maxStreams", stats.MaxStreams,
-				"totalInFlight", stats.TotalInFlight,
-				"throughputMBps", stats.ThroughputMBps,
-				"adaptiveEnabled", stats.AdaptiveEnabled,
-				"scalingPaused", stats.ScalingPaused,
-			)
-
 		case piece, ok := <-q.tracker.Completed():
 			if !ok {
 				return
 			}
-
 			if err := q.sendPiecePool(ctx, pool, piece); err != nil {
 				q.logger.ErrorContext(ctx, "failed to send piece",
 					"hash", piece.GetTorrentHash(),
 					"piece", piece.GetIndex(),
+					"sender", id,
 					"error", err,
 				)
 				q.tracker.MarkFailed(piece.GetTorrentHash(), int(piece.GetIndex()))
