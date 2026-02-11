@@ -3,8 +3,6 @@ package streaming
 import (
 	"context"
 	"errors"
-	"log/slog"
-	"os"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -50,17 +48,12 @@ func (s *concurrencyTrackingSource) GetTorrentMetadata(context.Context, string) 
 	return nil, nil
 }
 
-func testQueueLogger(t *testing.T) *slog.Logger {
-	t.Helper()
-	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-}
-
 // makeTestPoolWithInflight creates a StreamPool with one PooledStream that has
 // in-flight pieces registered in its congestion window.
 func makeTestPoolWithInflight(t *testing.T, keys []string) *StreamPool {
 	t.Helper()
 
-	logger := testQueueLogger(t)
+	logger := testLogger
 	pool := NewStreamPool(nil, logger, StreamPoolConfig{
 		MaxNumStreams:  1,
 		AckChannelSize: 100,
@@ -87,7 +80,7 @@ func makeTestPoolWithInflight(t *testing.T, keys []string) *StreamPool {
 // The tracker has no torrents — MarkStreamed/MarkFailed safely no-op.
 func makeDrainTestQueue(t *testing.T) *BidiQueue {
 	t.Helper()
-	logger := testQueueLogger(t)
+	logger := testLogger
 	return &BidiQueue{
 		tracker:      NewPieceMonitor(nil, nil, logger, DefaultPieceMonitorConfig()),
 		logger:       logger,
@@ -149,7 +142,7 @@ func TestDrainInFlightPool_ProcessesAcksWithCancelledContext(t *testing.T) {
 func TestDrainInFlightPool_SkipsWhenNoInflight(t *testing.T) {
 	q := makeDrainTestQueue(t)
 
-	pool := NewStreamPool(nil, testQueueLogger(t), StreamPoolConfig{
+	pool := NewStreamPool(nil, testLogger, StreamPoolConfig{
 		MaxNumStreams:  1,
 		AckChannelSize: 10,
 	})
@@ -204,7 +197,7 @@ func TestSenderWorkersConcurrency(t *testing.T) {
 	const numSenders = 4
 	const numPieces = numSenders * 2
 
-	logger := testQueueLogger(t)
+	logger := testLogger
 
 	// Mock source: tracks concurrent ReadPiece calls with a delay to make
 	// concurrency observable, then returns an error (avoids needing a real
@@ -298,7 +291,7 @@ func TestSenderWorkersConcurrency(t *testing.T) {
 func makeTestPoolWithStaleKeys(t *testing.T, streamKeys [][]string) (*StreamPool, []*PooledStream) {
 	t.Helper()
 
-	logger := testQueueLogger(t)
+	logger := testLogger
 	pool := NewStreamPool(nil, logger, StreamPoolConfig{
 		MaxNumStreams:  len(streamKeys),
 		AckChannelSize: 100,

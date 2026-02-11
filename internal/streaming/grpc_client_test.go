@@ -483,7 +483,7 @@ func TestForwardAcks_DrainsErrorOnStreamClose(t *testing.T) {
 				errs:     make(chan error, 10),
 				acks:     make(chan *pb.PieceAck, 10),
 				ackReady: make(chan struct{}, 10),
-				logger:   slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})),
+				logger:   testLogger,
 			}
 
 			pool.wg.Add(1)

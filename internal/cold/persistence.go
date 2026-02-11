@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/arsac/qb-sync/internal/utils"
 )
 
 // loadState loads the written pieces state from disk.
@@ -26,45 +28,9 @@ func (s *Server) loadState(path string, numPieces int) ([]bool, error) {
 	return written, nil
 }
 
-// atomicWriteFile writes data to a file atomically using write-to-temp + fsync + rename.
-// This prevents corruption from crashes or NFS connection drops mid-write.
-//
-//nolint:unparam // perm kept as parameter for API correctness even though callers currently use the same value
-func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".tmp-*")
-	if err != nil {
-		return fmt.Errorf("creating temp file: %w", err)
-	}
-	tmpPath := tmp.Name()
-
-	// Clean up temp file on any failure path
-	success := false
-	defer func() {
-		if !success {
-			_ = tmp.Close()
-			_ = os.Remove(tmpPath)
-		}
-	}()
-
-	if _, writeErr := tmp.Write(data); writeErr != nil {
-		return fmt.Errorf("writing temp file: %w", writeErr)
-	}
-	if syncErr := tmp.Sync(); syncErr != nil {
-		return fmt.Errorf("syncing temp file: %w", syncErr)
-	}
-	if closeErr := tmp.Close(); closeErr != nil {
-		return fmt.Errorf("closing temp file: %w", closeErr)
-	}
-	if chmodErr := os.Chmod(tmpPath, perm); chmodErr != nil {
-		return fmt.Errorf("setting permissions: %w", chmodErr)
-	}
-	if renameErr := os.Rename(tmpPath, path); renameErr != nil {
-		return fmt.Errorf("renaming temp file: %w", renameErr)
-	}
-
-	success = true
-	return nil
+// atomicWriteFile delegates to utils.AtomicWriteFile with standard server permissions.
+func atomicWriteFile(path string, data []byte) error {
+	return utils.AtomicWriteFile(path, data, serverFilePermissions)
 }
 
 // saveState persists the written pieces state to disk.
@@ -75,7 +41,7 @@ func (s *Server) saveState(path string, written []bool) error {
 			data[i] = 1
 		}
 	}
-	return atomicWriteFile(path, data, serverFilePermissions)
+	return atomicWriteFile(path, data)
 }
 
 // doSaveState calls saveStateFunc if set (testing), otherwise saveState.
@@ -92,7 +58,7 @@ func saveSubPathFile(metaDir, subPath string) error {
 		return nil
 	}
 	path := filepath.Join(metaDir, subPathFileName)
-	return atomicWriteFile(path, []byte(subPath), serverFilePermissions)
+	return atomicWriteFile(path, []byte(subPath))
 }
 
 // loadSubPathFile reads the save sub-path from the .subpath file.

@@ -111,13 +111,6 @@ func SetupTestEnv(t *testing.T, opts ...SetupOption) *TestEnv {
 	require.NoError(t, os.MkdirAll(hotConfig, 0o755))
 	require.NoError(t, os.MkdirAll(coldConfig, 0o755))
 
-	// Find free ports for fixed binding - ports stay stable across container restarts
-	hotPortNum := findFreePortNum(t)
-	coldPortNum := findFreePortNum(t)
-
-	// Docker compose content for e2e tests
-	// Use fixed host port binding so URLs remain stable across container restarts.
-	// This is important for testing orchestrator recovery after qBittorrent restarts.
 	hotExtraVolumes := ""
 	if sc.hotTempPath {
 		// Mount a separate host dir at /incomplete inside the container.
@@ -127,6 +120,8 @@ func SetupTestEnv(t *testing.T, opts ...SetupOption) *TestEnv {
 		hotExtraVolumes = fmt.Sprintf("\n      - %s:/incomplete", hotIncompletePath)
 	}
 
+	// Let Docker assign host ports dynamically to avoid TOCTOU port conflicts.
+	// Ports stay stable across container stop/start (same container instance).
 	composeContent := fmt.Sprintf(`
 services:
   qb-hot:
@@ -135,7 +130,7 @@ services:
       - %s:/downloads
       - %s:/config%s
     ports:
-      - "%d:8080"
+      - "8080"
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8080/api/v2/app/version"]
       interval: 2s
@@ -149,14 +144,14 @@ services:
       - %s:/cold-data
       - %s:/config
     ports:
-      - "%d:8080"
+      - "8080"
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8080/api/v2/app/version"]
       interval: 2s
       timeout: 5s
       retries: 30
       start_period: 10s
-`, hotPath, hotConfig, hotExtraVolumes, hotPortNum, coldPath, coldConfig, coldPortNum)
+`, hotPath, hotConfig, hotExtraVolumes, coldPath, coldConfig)
 
 	// Create compose stack
 	identifier := fmt.Sprintf("qbsync-e2e-%d", time.Now().UnixNano())
@@ -177,9 +172,9 @@ services:
 		Up(ctx, compose.Wait(true))
 	require.NoError(t, err)
 
-	// Use the fixed ports we allocated (stable across container restarts)
-	hotURL := fmt.Sprintf("http://localhost:%d", hotPortNum)
-	coldURL := fmt.Sprintf("http://localhost:%d", coldPortNum)
+	// Query the actual mapped ports from the running containers.
+	hotURL := serviceURL(t, ctx, stack, "qb-hot")
+	coldURL := serviceURL(t, ctx, stack, "qb-cold")
 
 	t.Logf("Hot qBittorrent: %s", hotURL)
 	t.Logf("Cold qBittorrent: %s", coldURL)
@@ -297,14 +292,14 @@ func findFreePort(t *testing.T) string {
 	return addr
 }
 
-// findFreePortNum finds an available TCP port and returns the port number.
-func findFreePortNum(t *testing.T) int {
+// serviceURL returns the HTTP URL for a compose service by querying its mapped port.
+func serviceURL(t *testing.T, ctx context.Context, stack compose.ComposeStack, service string) string {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	port := listener.Addr().(*net.TCPAddr).Port
-	require.NoError(t, listener.Close())
-	return port
+	container, err := stack.ServiceContainer(ctx, service)
+	require.NoError(t, err, "getting %s container", service)
+	mappedPort, err := container.MappedPort(ctx, "8080/tcp")
+	require.NoError(t, err, "getting mapped port for %s", service)
+	return fmt.Sprintf("http://localhost:%s", mappedPort.Port())
 }
 
 // HotURL returns the hot qBittorrent URL.
@@ -697,9 +692,19 @@ func (env *TestEnv) StopHotQBittorrent(ctx context.Context) error {
 // StartHotQBittorrent starts the hot qBittorrent container.
 func (env *TestEnv) StartHotQBittorrent(ctx context.Context) error {
 	env.t.Helper()
-	if err := env.startContainer(ctx, "qb-hot", "Hot", env.hotClient); err != nil {
+	newURL, err := env.startContainer(ctx, "qb-hot", "Hot")
+	if err != nil {
 		return err
 	}
+
+	env.hotURL = newURL
+	env.hotClient = qbittorrent.NewClient(qbittorrent.Config{
+		Host:     newURL,
+		Username: testUsername,
+		Password: testPassword,
+	})
+	env.waitForClientReady(ctx, env.hotClient, "hot")
+
 	env.t.Log("Hot qBittorrent container started and healthy")
 	return nil
 }
@@ -713,11 +718,21 @@ func (env *TestEnv) StopColdQBittorrent(ctx context.Context) error {
 // StartColdQBittorrent starts the cold qBittorrent container.
 func (env *TestEnv) StartColdQBittorrent(ctx context.Context) error {
 	env.t.Helper()
-	if err := env.startContainer(ctx, "qb-cold", "Cold", env.coldClient); err != nil {
+	newURL, err := env.startContainer(ctx, "qb-cold", "Cold")
+	if err != nil {
 		return err
 	}
 
-	env.t.Log("Restarting cold gRPC server...")
+	env.coldURL = newURL
+	env.coldClient = qbittorrent.NewClient(qbittorrent.Config{
+		Host:     newURL,
+		Username: testUsername,
+		Password: testPassword,
+	})
+	env.waitForClientReady(ctx, env.coldClient, "cold")
+
+	// Update the cold server config with the new URL and restart.
+	env.coldServerConfig.ColdQB.URL = newURL
 	env.StopColdServer()
 	env.StartColdServer()
 
@@ -741,27 +756,42 @@ func (env *TestEnv) stopContainer(ctx context.Context, service, name string) err
 func (env *TestEnv) startContainer(
 	ctx context.Context,
 	service, name string,
-	client *qbittorrent.Client,
-) error {
+) (string, error) {
 	container, err := env.compose.ServiceContainer(ctx, service)
 	if err != nil {
-		return fmt.Errorf("getting %s container: %w", name, err)
+		return "", fmt.Errorf("getting %s container: %w", name, err)
 	}
 	if startErr := container.Start(ctx); startErr != nil {
-		return fmt.Errorf("starting %s container: %w", name, startErr)
+		return "", fmt.Errorf("starting %s container: %w", name, startErr)
 	}
 
 	env.t.Logf("Waiting for %s qBittorrent to be healthy...", name)
 	waitStrategy := wait.ForHealthCheck().WithStartupTimeout(120 * time.Second)
 	if waitErr := waitStrategy.WaitUntilReady(ctx, container); waitErr != nil {
-		return fmt.Errorf("waiting for %s container health: %w", name, waitErr)
+		return "", fmt.Errorf("waiting for %s container health: %w", name, waitErr)
 	}
 
+	// Re-query mapped port after restart (testcontainers best practice).
+	mappedPort, portErr := container.MappedPort(ctx, "8080/tcp")
+	if portErr != nil {
+		return "", fmt.Errorf("getting mapped port for %s after restart: %w", name, portErr)
+	}
+
+	return fmt.Sprintf("http://localhost:%s", mappedPort.Port()), nil
+}
+
+// waitForClientReady waits for a qBittorrent client to login and be fully
+// operational (BT_backup loaded). Use after creating a fresh client.
+func (env *TestEnv) waitForClientReady(ctx context.Context, client *qbittorrent.Client, name string) {
+	env.t.Helper()
 	require.Eventually(env.t, func() bool {
 		return client.LoginCtx(ctx) == nil
 	}, 30*time.Second, time.Second, "%s qBittorrent should accept login after restart", name)
 
-	return nil
+	require.Eventually(env.t, func() bool {
+		_, listErr := client.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{})
+		return listErr == nil
+	}, 30*time.Second, time.Second, "%s qBittorrent API should be ready after restart", name)
 }
 
 // RestartHotQBittorrent restarts the hot qBittorrent container.

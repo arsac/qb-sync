@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,7 +16,7 @@ import (
 
 func TestNewServer_MemBudget(t *testing.T) {
 	t.Parallel()
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger(t)
 
 	t.Run("uses default when MaxStreamBufferBytes is zero", func(t *testing.T) {
 		t.Parallel()
@@ -181,7 +180,7 @@ func TestServerConfig_Validate(t *testing.T) {
 
 func TestIsOrphanedTorrent(t *testing.T) {
 	ctx := context.Background()
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger(t)
 
 	t.Run("tracked torrent is not orphaned", func(t *testing.T) {
 		tmpDir := t.TempDir()
@@ -274,7 +273,7 @@ func TestIsOrphanedTorrent(t *testing.T) {
 
 func TestCleanupOrphan(t *testing.T) {
 	ctx := context.Background()
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger(t)
 
 	t.Run("skips cleanup if torrent becomes tracked", func(t *testing.T) {
 		tmpDir := t.TempDir()
@@ -418,7 +417,7 @@ func TestCleanupOrphan(t *testing.T) {
 
 func TestCleanupOrphanedTorrents(t *testing.T) {
 	ctx := context.Background()
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger(t)
 
 	t.Run("scans meta directory and cleans orphans", func(t *testing.T) {
 		tmpDir := t.TempDir()
@@ -518,7 +517,7 @@ func TestCleanupOrphanedTorrents(t *testing.T) {
 
 func newAbortTestServer(t *testing.T) *Server {
 	t.Helper()
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger(t)
 	return &Server{
 		config:         ServerConfig{BasePath: t.TempDir()},
 		logger:         logger,
@@ -818,7 +817,7 @@ func TestAbortTorrent_InitWaitsForAbort(t *testing.T) {
 
 func TestSetupFile_PreExisting(t *testing.T) {
 	ctx := context.Background()
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger(t)
 
 	t.Run("detects pre-existing file with correct size", func(t *testing.T) {
 		tmpDir := t.TempDir()
@@ -932,7 +931,7 @@ func TestSetupFile_PreExisting(t *testing.T) {
 
 func TestInitTorrent_PreExistingFiles(t *testing.T) {
 	ctx := context.Background()
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger(t)
 
 	t.Run("all files pre-existing yields zero pieces needed", func(t *testing.T) {
 		tmpDir := t.TempDir()
@@ -1235,7 +1234,7 @@ func newRelocateInitRequest(hash, subPath string) *pb.InitTorrentRequest {
 
 func TestRelocateFiles(t *testing.T) {
 	t.Parallel()
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger(t)
 	ctx := context.Background()
 
 	newServer := func(t *testing.T) (*Server, string) {
@@ -1389,7 +1388,7 @@ func TestUpdateStateAfterRelocate(t *testing.T) {
 
 func TestInitTorrent_RelocatesOnSubPathChange(t *testing.T) {
 	ctx := context.Background()
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger(t)
 
 	// initAndRestart calls InitTorrent, then removes in-memory state to simulate a cold restart.
 	initAndRestart := func(t *testing.T, s *Server, req *pb.InitTorrentRequest) {
@@ -1480,7 +1479,7 @@ func TestInitTorrent_RelocatesOnSubPathChange(t *testing.T) {
 
 func TestFinalizeTorrent_RelocatesOnSubPathChange(t *testing.T) {
 	ctx := context.Background()
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger(t)
 
 	// newIncompleteState builds a serverTorrentState with incomplete pieces so that
 	// FinalizeTorrent aborts after the relocation check without triggering full finalization.

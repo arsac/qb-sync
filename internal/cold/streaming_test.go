@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"log/slog"
-	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -60,7 +58,7 @@ func (m *mockBidiStream) RecvMsg(any) error            { return nil }
 func newTestServer(t *testing.T, budgetBytes int64) *Server {
 	t.Helper()
 	tmpDir := t.TempDir()
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger(t)
 	return &Server{
 		config: ServerConfig{
 			BasePath:      tmpDir,

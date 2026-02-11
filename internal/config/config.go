@@ -255,20 +255,11 @@ func SetupColdFlags(cmd *cobra.Command) {
 	flags.String("log-level", "info", "Log level: debug, info, warn, error")
 }
 
-// BindHotFlags binds hot command flags to viper.
-func BindHotFlags(cmd *cobra.Command, v *viper.Viper) error {
-	v.SetEnvPrefix("QBSYNC_HOT")
+// bindFlags configures viper with an env prefix and binds the given flag names.
+func bindFlags(cmd *cobra.Command, v *viper.Viper, envPrefix string, flags []string) error {
+	v.SetEnvPrefix(envPrefix)
 	v.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
 	v.AutomaticEnv()
-
-	flags := []string{
-		"data", "qb-url", "qb-username", "qb-password",
-		"cold-addr", "min-space", "min-seeding-time", "sleep",
-		"rate-limit", "piece-timeout", "reconnect-max-delay",
-		"num-senders", "min-connections", "max-connections",
-		"source-removed-tag", "exclude-cleanup-tag", "health-addr", "synced-tag",
-		"dry-run", "log-level", "drain-annotation", "drain-timeout",
-	}
 
 	for _, flag := range flags {
 		if err := v.BindPFlag(flag, cmd.Flags().Lookup(flag)); err != nil {
@@ -279,25 +270,30 @@ func BindHotFlags(cmd *cobra.Command, v *viper.Viper) error {
 	return nil
 }
 
+// BindHotFlags binds hot command flags to viper.
+func BindHotFlags(cmd *cobra.Command, v *viper.Viper) error {
+	return bindFlags(cmd, v, "QBSYNC_HOT", []string{
+		"data", "qb-url", "qb-username", "qb-password",
+		"cold-addr", "min-space", "min-seeding-time", "sleep",
+		"rate-limit", "piece-timeout", "reconnect-max-delay",
+		"num-senders", "min-connections", "max-connections",
+		"source-removed-tag", "exclude-cleanup-tag", "health-addr", "synced-tag",
+		"dry-run", "log-level", "drain-annotation", "drain-timeout",
+	})
+}
+
 // BindColdFlags binds cold command flags to viper.
 func BindColdFlags(cmd *cobra.Command, v *viper.Viper) error {
-	v.SetEnvPrefix("QBSYNC_COLD")
-	v.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
-	v.AutomaticEnv()
-
-	flags := []string{
+	return bindFlags(cmd, v, "QBSYNC_COLD", []string{
 		"listen", "data", "save-path", "qb-url", "qb-username", "qb-password",
 		"poll-interval", "poll-timeout", "stream-workers", "max-stream-buffer",
 		"health-addr", "synced-tag", "dry-run", "log-level",
-	}
+	})
+}
 
-	for _, flag := range flags {
-		if err := v.BindPFlag(flag, cmd.Flags().Lookup(flag)); err != nil {
-			return fmt.Errorf("binding flag %s: %w", flag, err)
-		}
-	}
-
-	return nil
+// seconds returns a viper int key as a time.Duration in seconds.
+func seconds(v *viper.Viper, key string) time.Duration {
+	return time.Duration(v.GetInt(key)) * time.Second
 }
 
 // loadBase loads the base configuration shared by hot and cold.
@@ -320,13 +316,13 @@ func LoadHot(v *viper.Viper) (*HotConfig, error) {
 		BaseConfig:         loadBase(v),
 		ColdAddr:           v.GetString("cold-addr"),
 		MinSpaceGB:         v.GetInt64("min-space"),
-		MinSeedingTime:     time.Duration(v.GetInt("min-seeding-time")) * time.Second,
-		SleepInterval:      time.Duration(v.GetInt("sleep")) * time.Second,
+		MinSeedingTime:     seconds(v, "min-seeding-time"),
+		SleepInterval:      seconds(v, "sleep"),
 		DrainAnnotation:    v.GetString("drain-annotation"),
-		DrainTimeout:       time.Duration(v.GetInt("drain-timeout")) * time.Second,
-		PieceTimeout:       time.Duration(v.GetInt("piece-timeout")) * time.Second,
+		DrainTimeout:       seconds(v, "drain-timeout"),
+		PieceTimeout:       seconds(v, "piece-timeout"),
 		MaxBytesPerSec:     v.GetInt64("rate-limit"),
-		ReconnectMaxDelay:  time.Duration(v.GetInt("reconnect-max-delay")) * time.Second,
+		ReconnectMaxDelay:  seconds(v, "reconnect-max-delay"),
 		NumSenders:         v.GetInt("num-senders"),
 		MinGRPCConnections: v.GetInt("min-connections"),
 		MaxGRPCConnections: v.GetInt("max-connections"),
@@ -352,8 +348,8 @@ func LoadCold(v *viper.Viper) (*ColdConfig, error) {
 		BaseConfig:        loadBase(v),
 		ListenAddr:        v.GetString("listen"),
 		SavePath:          v.GetString("save-path"),
-		PollInterval:      time.Duration(v.GetInt("poll-interval")) * time.Second,
-		PollTimeout:       time.Duration(v.GetInt("poll-timeout")) * time.Second,
+		PollInterval:      seconds(v, "poll-interval"),
+		PollTimeout:       seconds(v, "poll-timeout"),
 		StreamWorkers:     v.GetInt("stream-workers"),
 		MaxStreamBufferMB: v.GetInt("max-stream-buffer"),
 	}

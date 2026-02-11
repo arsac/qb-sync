@@ -854,7 +854,7 @@ func TestIntegration_OpenStream_DistributesAcrossConns(t *testing.T) {
 	}
 	defer d.Close()
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger
 
 	const numStreams = 4
 	streams := make([]*PieceStream, numStreams)

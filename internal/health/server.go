@@ -33,7 +33,6 @@ type Server struct {
 	addr   string
 	logger *slog.Logger
 	server *http.Server
-	mux    *http.ServeMux
 
 	ready   atomic.Bool
 	checks  map[string]CheckFunc
@@ -53,15 +52,15 @@ func NewServer(cfg Config, logger *slog.Logger) *Server {
 		checks: make(map[string]CheckFunc),
 	}
 
-	s.mux = http.NewServeMux()
-	s.mux.HandleFunc("/healthz", s.handleHealthz)
-	s.mux.HandleFunc("/livez", s.handleLivez)
-	s.mux.HandleFunc("/readyz", s.handleReadyz)
-	s.mux.Handle("/metrics", promhttp.Handler())
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", s.handleHealthz)
+	mux.HandleFunc("/livez", s.handleLivez)
+	mux.HandleFunc("/readyz", s.handleReadyz)
+	mux.Handle("/metrics", promhttp.Handler())
 
 	s.server = &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           s.mux,
+		Handler:           mux,
 		ReadHeaderTimeout: readHeaderTimeout,
 	}
 
@@ -118,23 +117,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 // handleLivez checks if the process is alive and not deadlocked.
 // Runs all registered health checks.
 func (s *Server) handleLivez(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), checkTimeout)
-	defer cancel()
-
-	checkResults, allHealthy := s.runChecks(ctx)
-
-	resp := Response{
-		Status: "ok",
-		Checks: checkResults,
-	}
-
-	if !allHealthy {
-		resp.Status = "unhealthy"
-		s.writeJSON(w, http.StatusServiceUnavailable, resp)
-		return
-	}
-
-	s.writeJSON(w, http.StatusOK, resp)
+	s.respondWithChecks(w, r, "unhealthy")
 }
 
 // handleReadyz checks if the server is ready to receive traffic.
@@ -143,24 +126,23 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		s.writeJSON(w, http.StatusServiceUnavailable, Response{Status: "not ready"})
 		return
 	}
+	s.respondWithChecks(w, r, "not ready")
+}
 
-	// Also run liveness checks for readiness
+// respondWithChecks runs all health checks and writes the JSON response.
+// failStatus is used when any check fails (e.g., "unhealthy" or "not ready").
+func (s *Server) respondWithChecks(w http.ResponseWriter, r *http.Request, failStatus string) {
 	ctx, cancel := context.WithTimeout(r.Context(), checkTimeout)
 	defer cancel()
 
 	checkResults, allHealthy := s.runChecks(ctx)
-
-	resp := Response{
-		Status: "ok",
-		Checks: checkResults,
-	}
+	resp := Response{Status: "ok", Checks: checkResults}
 
 	if !allHealthy {
-		resp.Status = "not ready"
+		resp.Status = failStatus
 		s.writeJSON(w, http.StatusServiceUnavailable, resp)
 		return
 	}
-
 	s.writeJSON(w, http.StatusOK, resp)
 }
 

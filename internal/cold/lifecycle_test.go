@@ -2,8 +2,6 @@ package cold
 
 import (
 	"context"
-	"log/slog"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -22,7 +20,7 @@ func TestFlushDirtyStates_ReleasesLockDuringIO(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger(t)
 
 	state := &serverTorrentState{
 		written:          make([]bool, 100),
@@ -101,7 +99,7 @@ func TestFlushDirtyStates_ConcurrentWritesDuringIO(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger(t)
 
 	state := &serverTorrentState{
 		written:          make([]bool, 100),

@@ -3,7 +3,6 @@ package qbclient
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"time"
 
@@ -147,7 +146,7 @@ func (r *ResilientClient) LoginCtx(ctx context.Context) error {
 
 // GetAppPreferencesCtx gets qBittorrent application preferences with retry.
 func (r *ResilientClient) GetAppPreferencesCtx(ctx context.Context) (qbittorrent.AppPreferences, error) {
-	return runWithResult(ctx, r.executor, r.mode, "GetAppPreferences",
+	return run(ctx, r, "GetAppPreferences",
 		func(ctx context.Context) (qbittorrent.AppPreferences, error) {
 			return r.client.GetAppPreferencesCtx(ctx)
 		})
@@ -158,7 +157,7 @@ func (r *ResilientClient) GetTorrentsCtx(
 	ctx context.Context,
 	opts qbittorrent.TorrentFilterOptions,
 ) ([]qbittorrent.Torrent, error) {
-	return runWithResult(ctx, r.executor, r.mode, "GetTorrents",
+	return run(ctx, r, "GetTorrents",
 		func(ctx context.Context) ([]qbittorrent.Torrent, error) {
 			return r.client.GetTorrentsCtx(ctx, opts)
 		})
@@ -169,7 +168,7 @@ func (r *ResilientClient) GetTorrentPieceStatesCtx(
 	ctx context.Context,
 	hash string,
 ) ([]qbittorrent.PieceState, error) {
-	return runWithResult(ctx, r.executor, r.mode, "GetTorrentPieceStates",
+	return run(ctx, r, "GetTorrentPieceStates",
 		func(ctx context.Context) ([]qbittorrent.PieceState, error) {
 			return r.client.GetTorrentPieceStatesCtx(ctx, hash)
 		})
@@ -180,7 +179,7 @@ func (r *ResilientClient) GetTorrentPieceHashesCtx(
 	ctx context.Context,
 	hash string,
 ) ([]string, error) {
-	return runWithResult(ctx, r.executor, r.mode, "GetTorrentPieceHashes",
+	return run(ctx, r, "GetTorrentPieceHashes",
 		func(ctx context.Context) ([]string, error) {
 			return r.client.GetTorrentPieceHashesCtx(ctx, hash)
 		})
@@ -191,7 +190,7 @@ func (r *ResilientClient) GetTorrentPropertiesCtx(
 	ctx context.Context,
 	hash string,
 ) (qbittorrent.TorrentProperties, error) {
-	return runWithResult(ctx, r.executor, r.mode, "GetTorrentProperties",
+	return run(ctx, r, "GetTorrentProperties",
 		func(ctx context.Context) (qbittorrent.TorrentProperties, error) {
 			return r.client.GetTorrentPropertiesCtx(ctx, hash)
 		})
@@ -202,7 +201,7 @@ func (r *ResilientClient) GetFilesInformationCtx(
 	ctx context.Context,
 	hash string,
 ) (*qbittorrent.TorrentFiles, error) {
-	return runWithResult(ctx, r.executor, r.mode, "GetFilesInformation",
+	return run(ctx, r, "GetFilesInformation",
 		func(ctx context.Context) (*qbittorrent.TorrentFiles, error) {
 			return r.client.GetFilesInformationCtx(ctx, hash)
 		})
@@ -213,7 +212,7 @@ func (r *ResilientClient) ExportTorrentCtx(
 	ctx context.Context,
 	hash string,
 ) ([]byte, error) {
-	return runWithResult(ctx, r.executor, r.mode, "ExportTorrent",
+	return run(ctx, r, "ExportTorrent",
 		func(ctx context.Context) ([]byte, error) {
 			return r.client.ExportTorrentCtx(ctx, hash)
 		})
@@ -274,51 +273,39 @@ func (r *ResilientClient) AddTorrentFromMemoryCtx(
 
 // GetFreeSpaceOnDiskCtx returns free space on qBittorrent's default save path in bytes.
 func (r *ResilientClient) GetFreeSpaceOnDiskCtx(ctx context.Context) (int64, error) {
-	return runWithResult(ctx, r.executor, r.mode, "GetFreeSpaceOnDisk",
+	return run(ctx, r, "GetFreeSpaceOnDisk",
 		func(ctx context.Context) (int64, error) {
 			return r.client.GetFreeSpaceOnDiskCtx(ctx)
 		})
 }
 
-// runVoid executes a void operation through the executor.
-func (r *ResilientClient) runVoid(
-	ctx context.Context,
-	operation string,
-	fn func(ctx context.Context) error,
-) error {
-	metrics.QBAPICallsTotal.WithLabelValues(r.mode, operation).Inc()
-	start := time.Now()
-	err := r.executor.WithContext(ctx).Run(func() error {
-		return fn(ctx)
+// runVoid executes a void operation through the executor with retry and metrics.
+func (r *ResilientClient) runVoid(ctx context.Context, operation string, fn func(ctx context.Context) error) error {
+	_, err := run(ctx, r, operation, func(ctx context.Context) (struct{}, error) {
+		return struct{}{}, fn(ctx)
 	})
-	metrics.QBAPICallDuration.WithLabelValues(r.mode, operation).Observe(time.Since(start).Seconds())
 	return err
 }
 
-// runWithResult executes a typed operation through the executor.
-func runWithResult[T any](
+// run executes a typed operation through the executor with retry, circuit breaker, and metrics.
+func run[T any](
 	ctx context.Context,
-	executor failsafe.Executor[any],
-	mode string,
+	r *ResilientClient,
 	operation string,
 	fn func(ctx context.Context) (T, error),
 ) (T, error) {
-	metrics.QBAPICallsTotal.WithLabelValues(mode, operation).Inc()
+	metrics.QBAPICallsTotal.WithLabelValues(r.mode, operation).Inc()
 	start := time.Now()
-	result, err := executor.WithContext(ctx).Get(func() (any, error) {
+	result, err := r.executor.WithContext(ctx).Get(func() (any, error) {
 		return fn(ctx)
 	})
-	metrics.QBAPICallDuration.WithLabelValues(mode, operation).Observe(time.Since(start).Seconds())
+	metrics.QBAPICallDuration.WithLabelValues(r.mode, operation).Observe(time.Since(start).Seconds())
 	if err != nil {
 		var zero T
 		return zero, err
 	}
-	typed, ok := result.(T)
-	if !ok {
-		var zero T
-		return zero, fmt.Errorf("type assertion failed: expected %T, got %T", zero, result)
-	}
-	return typed, nil
+	//nolint:errcheck // Type assertion is guaranteed: fn returns T, boxed to any, unboxed back to T.
+	return result.(T), nil
 }
 
 // CircuitBreakerState returns the current circuit breaker state, or "disabled" if not configured.

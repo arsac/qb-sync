@@ -72,6 +72,54 @@ func NewRetryPolicy(config RetryConfig, logger *slog.Logger, onRetry ...func()) 
 		Build()
 }
 
+// errorClass categorizes errors for retry and circuit breaker decisions.
+type errorClass int
+
+const (
+	// errorBenign: not retriable, does not trip the circuit breaker.
+	// Examples: nil, context cancelled, 404 not found, qBittorrent unmarshal quirk.
+	errorBenign errorClass = iota
+	// errorTransient: retriable and counts as a circuit breaker failure.
+	// Examples: connection refused, HTTP 502/503/504/429.
+	errorTransient
+	// errorPermanent: not retriable but counts as a circuit breaker failure.
+	// Examples: auth errors (401/403), unknown errors.
+	errorPermanent
+)
+
+// classifyError is the single decision tree used by IsRetriableError and
+// IsCircuitBreakerFailure. Centralizing the logic ensures both functions
+// agree on which errors are benign vs transient vs permanent.
+func classifyError(err error) errorClass {
+	if err == nil {
+		return errorBenign
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return errorBenign
+	}
+
+	errStr := strings.ToLower(err.Error())
+
+	// 404/not-found: resource doesn't exist, not a service issue.
+	if strings.Contains(errStr, "404") || strings.Contains(errStr, "not found") {
+		return errorBenign
+	}
+
+	// qBittorrent returns "Not Found" as plain text for missing torrents.
+	// The go-qbittorrent library tries to unmarshal this as JSON, resulting in:
+	// "could not unmarshal body: invalid character 'n' looking for beginning of value"
+	// (Note: lowercase 'n' after strings.ToLower normalization)
+	if strings.Contains(errStr, "could not unmarshal body: invalid character 'n'") {
+		return errorBenign
+	}
+
+	if isRetriableNetworkError(errStr) || isRetriableHTTPError(errStr) {
+		return errorTransient
+	}
+
+	return errorPermanent
+}
+
 // isRetriableNetworkError checks if the error string indicates a network issue worth retrying.
 func isRetriableNetworkError(errStr string) bool {
 	networkPatterns := []string{
@@ -107,70 +155,12 @@ func isRetriableHTTPError(errStr string) bool {
 // IsRetriableError determines if an error is transient and worth retrying.
 // This is the default checker - callers can provide custom checkers.
 func IsRetriableError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	// Context errors are NOT retriable (caller cancelled)
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
-	}
-
-	errStr := strings.ToLower(err.Error())
-
-	// Network/connection errors - always retry
-	if isRetriableNetworkError(errStr) {
-		return true
-	}
-
-	// HTTP errors that are retriable
-	if isRetriableHTTPError(errStr) {
-		return true
-	}
-
-	// 404 errors are NOT retriable (resource doesn't exist)
-	if strings.Contains(errStr, "404") || strings.Contains(errStr, "not found") {
-		return false
-	}
-
-	// 401/403 errors are NOT retriable (auth issues)
-	if strings.Contains(errStr, "401") || strings.Contains(errStr, "403") ||
-		strings.Contains(errStr, "unauthorized") || strings.Contains(errStr, "forbidden") {
-		return false
-	}
-
-	return false
+	return classifyError(err) == errorTransient
 }
 
 // IsCircuitBreakerFailure determines if an error should count against the circuit breaker.
-// Some errors (like 404 Not Found) indicate the resource doesn't exist, not that the
-// service is unavailable. These should NOT trip the circuit breaker.
+// Benign errors (404, context cancellation, qBittorrent unmarshal quirks) do NOT trip
+// the breaker. All other errors — transient or permanent — do.
 func IsCircuitBreakerFailure(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	// Context errors indicate caller cancellation, not service failure
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
-	}
-
-	errStr := strings.ToLower(err.Error())
-
-	// 404 errors indicate resource not found (e.g., deleted torrent).
-	// This is expected behavior, not a service availability issue.
-	if strings.Contains(errStr, "404") || strings.Contains(errStr, "not found") {
-		return false
-	}
-
-	// qBittorrent returns "Not Found" as plain text for missing torrents.
-	// The go-qbittorrent library tries to unmarshal this as JSON, resulting in:
-	// "could not unmarshal body: invalid character 'n' looking for beginning of value"
-	// (Note: lowercase 'n' after strings.ToLower normalization)
-	if strings.Contains(errStr, "could not unmarshal body: invalid character 'n'") {
-		return false
-	}
-
-	// All other errors are considered circuit breaker failures
-	return true
+	return classifyError(err) != errorBenign
 }

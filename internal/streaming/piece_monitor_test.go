@@ -3,8 +3,6 @@ package streaming
 import (
 	"context"
 	"errors"
-	"log/slog"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -15,7 +13,7 @@ import (
 )
 
 func TestPieceMonitor_Removed_Channel(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger
 
 	t.Run("channel is created with correct buffer size", func(t *testing.T) {
 		monitor := &PieceMonitor{
@@ -92,7 +90,7 @@ func TestPieceMonitor_Removed_Channel(t *testing.T) {
 }
 
 func TestPieceMonitor_CloseChannels(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger
 
 	t.Run("closes channels exactly once", func(t *testing.T) {
 		monitor := &PieceMonitor{
@@ -169,7 +167,7 @@ func TestPieceMonitor_CloseChannels(t *testing.T) {
 }
 
 func TestPieceMonitor_Untrack(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger
 
 	t.Run("removes torrent from tracking", func(t *testing.T) {
 		monitor := &PieceMonitor{
@@ -216,7 +214,7 @@ func TestPieceMonitor_Untrack(t *testing.T) {
 }
 
 func TestPieceMonitor_MarkStreamed(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger
 
 	t.Run("marks piece as streamed", func(t *testing.T) {
 		monitor := &PieceMonitor{
@@ -294,7 +292,7 @@ func TestPieceMonitor_MarkStreamed(t *testing.T) {
 }
 
 func TestPieceMonitor_MarkStreamedBatch(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger
 
 	t.Run("marks multiple pieces as streamed", func(t *testing.T) {
 		monitor := &PieceMonitor{
@@ -382,7 +380,7 @@ func TestPieceMonitor_MarkStreamedBatch(t *testing.T) {
 }
 
 func TestPieceMonitor_GetProgress(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger
 
 	t.Run("returns progress for tracked torrent", func(t *testing.T) {
 		monitor := &PieceMonitor{
@@ -484,7 +482,7 @@ func TestPieceMonitor_GetProgress(t *testing.T) {
 }
 
 func TestPieceMonitor_IsDownloadingState(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger
 
 	monitor := &PieceMonitor{
 		logger:    logger,
@@ -526,7 +524,7 @@ func TestPieceMonitor_IsDownloadingState(t *testing.T) {
 }
 
 func TestPieceMonitor_RetryFailed(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger
 
 	newMonitor := func(chanBuf int) *PieceMonitor {
 		return &PieceMonitor{
@@ -679,7 +677,7 @@ func TestPieceMonitor_RetryFailed(t *testing.T) {
 }
 
 func TestPieceMonitor_ResyncStreamed(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger
 
 	newMonitor := func() *PieceMonitor {
 		return &PieceMonitor{
@@ -811,7 +809,7 @@ func TestPieceMonitor_ResyncStreamed(t *testing.T) {
 }
 
 func TestPieceMonitor_RemovalNotification_Integration(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger
 
 	t.Run("removal notification blocks until received", func(t *testing.T) {
 		monitor := &PieceMonitor{

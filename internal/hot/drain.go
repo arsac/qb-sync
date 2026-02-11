@@ -9,6 +9,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+
+	"github.com/arsac/qb-sync/internal/metrics"
 )
 
 // checkDrainAnnotation queries the K8s API for the current pod's annotation.
@@ -35,4 +37,36 @@ func checkDrainAnnotation(ctx context.Context, annotationKey string) (bool, erro
 	}
 
 	return pod.Annotations[annotationKey] == "true", nil
+}
+
+// Drain triggers a one-shot evacuation: hands off ALL synced torrents to cold,
+// ignoring MinSpaceGB and MinSeedingTime. Blocks until the cycle completes.
+// Returns ErrDrainInProgress if a drain is already running.
+func (t *QBTask) Drain(ctx context.Context) error {
+	if !t.draining.CompareAndSwap(false, true) {
+		return ErrDrainInProgress
+	}
+	defer func() {
+		t.draining.Store(false)
+		metrics.Draining.Set(0)
+	}()
+	metrics.Draining.Set(1)
+	t.logger.InfoContext(ctx, "drain started")
+	err := t.maybeMoveToCold(ctx)
+	if err != nil {
+		t.logger.ErrorContext(ctx, "drain failed", "error", err)
+	} else {
+		t.logger.InfoContext(ctx, "drain complete")
+	}
+	return err
+}
+
+// Draining reports whether a drain is in progress.
+func (t *QBTask) Draining() bool {
+	return t.draining.Load()
+}
+
+// MaybeMoveToCold is the exported version of maybeMoveToCold for testing.
+func (t *QBTask) MaybeMoveToCold(ctx context.Context) error {
+	return t.maybeMoveToCold(ctx)
 }

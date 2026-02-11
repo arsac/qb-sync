@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -51,13 +52,39 @@ Run as cold server to receive pieces and manage destination qBittorrent.`,
 		RunE:  runCold,
 	}
 
-	// Setup flags for each subcommand
 	config.SetupHotFlags(hotCmd)
 	config.SetupColdFlags(coldCmd)
 
 	rootCmd.AddCommand(hotCmd, coldCmd)
 
 	return rootCmd.Execute()
+}
+
+// signalContext returns a context that is cancelled on SIGINT or SIGTERM.
+func signalContext(log *slog.Logger) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		log.Info("received signal, shutting down", "signal", sig)
+		cancel()
+	}()
+	return ctx, cancel
+}
+
+// startHealthServer starts the health server in the errgroup if addr is non-empty.
+func startHealthServer(
+	ctx context.Context, g *errgroup.Group, addr string, log *slog.Logger,
+) *health.Server {
+	if addr == "" {
+		return nil
+	}
+	hs := health.NewServer(health.Config{Addr: addr}, log.With("component", "health"))
+	g.Go(func() error {
+		return hs.Run(ctx)
+	})
+	return hs
 }
 
 func runHot(cmd *cobra.Command, _ []string) error {
@@ -80,30 +107,12 @@ func runHot(cmd *cobra.Command, _ []string) error {
 		"dryRun", cfg.DryRun,
 	)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := signalContext(log)
 	defer cancel()
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		sig := <-sigCh
-		log.Info("received signal, shutting down", "signal", sig)
-		cancel()
-	}()
-
 	g, ctx := errgroup.WithContext(ctx)
+	healthServer := startHealthServer(ctx, g, cfg.HealthAddr, log)
 
-	// Start health server if configured
-	var healthServer *health.Server
-	if cfg.HealthAddr != "" {
-		healthServer = health.NewServer(health.Config{Addr: cfg.HealthAddr}, log.With("component", "health"))
-		g.Go(func() error {
-			return healthServer.Run(ctx)
-		})
-	}
-
-	// Start the hot runner
 	g.Go(func() error {
 		runner := hot.NewRunner(cfg, log)
 		if healthServer != nil {
@@ -138,19 +147,9 @@ func runCold(cmd *cobra.Command, _ []string) error {
 		"dryRun", cfg.DryRun,
 	)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := signalContext(log)
 	defer cancel()
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		sig := <-sigCh
-		log.Info("received signal, shutting down", "signal", sig)
-		cancel()
-	}()
-
-	// Build server config
 	serverCfg := cold.ServerConfig{
 		ListenAddr:           cfg.ListenAddr,
 		BasePath:             cfg.DataPath,
@@ -161,7 +160,6 @@ func runCold(cmd *cobra.Command, _ []string) error {
 		DryRun:               cfg.DryRun,
 	}
 
-	// Add qBittorrent config if provided
 	if cfg.QBURL != "" {
 		serverCfg.ColdQB = &cold.QBConfig{
 			URL:          cfg.QBURL,
@@ -173,17 +171,8 @@ func runCold(cmd *cobra.Command, _ []string) error {
 	}
 
 	g, ctx := errgroup.WithContext(ctx)
+	healthServer := startHealthServer(ctx, g, cfg.HealthAddr, log)
 
-	// Start health server if configured
-	var healthServer *health.Server
-	if cfg.HealthAddr != "" {
-		healthServer = health.NewServer(health.Config{Addr: cfg.HealthAddr}, log.With("component", "health"))
-		g.Go(func() error {
-			return healthServer.Run(ctx)
-		})
-	}
-
-	// Start the cold server
 	g.Go(func() error {
 		server := cold.NewServer(serverCfg, log)
 		if healthServer != nil {

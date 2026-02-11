@@ -1974,16 +1974,13 @@ func TestTrackNewTorrents_PrioritizesByProgress(t *testing.T) {
 }
 
 func TestSortGroupsByPriority(t *testing.T) {
-	logger := testLogger(t)
-	task := &QBTask{cfg: &config.HotConfig{}, logger: logger}
-
 	t.Run("sorts by popularity ascending", func(t *testing.T) {
 		groups := []torrentGroup{
 			{popularity: 100, minSeeding: 500, maxSize: 1000},
 			{popularity: 10, minSeeding: 500, maxSize: 1000},
 			{popularity: 50, minSeeding: 500, maxSize: 1000},
 		}
-		sorted := task.sortGroupsByPriority(groups)
+		sorted := sortGroupsByPriority(groups)
 		if sorted[0].popularity != 10 || sorted[1].popularity != 50 || sorted[2].popularity != 100 {
 			t.Errorf("expected popularity order [10, 50, 100], got [%d, %d, %d]",
 				sorted[0].popularity, sorted[1].popularity, sorted[2].popularity)
@@ -1996,7 +1993,7 @@ func TestSortGroupsByPriority(t *testing.T) {
 			{popularity: 50, minSeeding: 300, maxSize: 1000},
 			{popularity: 50, minSeeding: 200, maxSize: 1000},
 		}
-		sorted := task.sortGroupsByPriority(groups)
+		sorted := sortGroupsByPriority(groups)
 		if sorted[0].minSeeding != 300 || sorted[1].minSeeding != 200 || sorted[2].minSeeding != 100 {
 			t.Errorf("expected seeding order [300, 200, 100], got [%d, %d, %d]",
 				sorted[0].minSeeding, sorted[1].minSeeding, sorted[2].minSeeding)
@@ -2009,7 +2006,7 @@ func TestSortGroupsByPriority(t *testing.T) {
 			{popularity: 50, minSeeding: 200, maxSize: 2000},
 			{popularity: 50, minSeeding: 200, maxSize: 1000},
 		}
-		sorted := task.sortGroupsByPriority(groups)
+		sorted := sortGroupsByPriority(groups)
 		if sorted[0].maxSize != 2000 || sorted[1].maxSize != 1000 || sorted[2].maxSize != 500 {
 			t.Errorf("expected size order [2000, 1000, 500], got [%d, %d, %d]",
 				sorted[0].maxSize, sorted[1].maxSize, sorted[2].maxSize)
@@ -2022,7 +2019,7 @@ func TestSortGroupsByPriority(t *testing.T) {
 			{popularity: 10, minSeeding: 100, maxSize: 2000}, // first (lowest pop)
 			{popularity: 50, minSeeding: 100, maxSize: 2000}, // third (pop=50, seeding=100)
 		}
-		sorted := task.sortGroupsByPriority(groups)
+		sorted := sortGroupsByPriority(groups)
 		if sorted[0].popularity != 10 {
 			t.Error("lowest popularity should be first")
 		}

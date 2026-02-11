@@ -272,6 +272,13 @@ func (q *BidiQueue) Run(ctx context.Context) error {
 
 // runStream runs a single streaming session using multiple parallel streams.
 func (q *BidiQueue) runStream(ctx context.Context) error {
+	// Clear stale init cache before opening new streams. After a cold server
+	// restart the old init state is invalid — without this, ensureTorrentInitialized
+	// returns the cached result and skips InitTorrent, causing WritePiece to fail
+	// with "not initialized". Clearing here (before pool.Open) is race-free because
+	// no sender workers are running yet.
+	q.dest.ClearInitCache()
+
 	poolConfig := StreamPoolConfig{
 		NumStreams:     q.config.NumStreams,
 		MaxNumStreams:  q.config.MaxNumStreams,

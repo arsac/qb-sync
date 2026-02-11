@@ -3,8 +3,6 @@ package cold
 import (
 	"context"
 	"errors"
-	"log/slog"
-	"os"
 	"testing"
 
 	"github.com/autobrr/go-qbittorrent"
@@ -71,11 +69,11 @@ func (m *mockQBClient) AddTorrentFromMemoryCtx(context.Context, []byte, map[stri
 }
 func (m *mockQBClient) GetFreeSpaceOnDiskCtx(context.Context) (int64, error) { return 0, nil }
 
-func newTestServerWithQB(mock *mockQBClient) *Server {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+func newTestServerWithQB(t *testing.T, mock *mockQBClient) *Server {
+	t.Helper()
 	return &Server{
-		config:         ServerConfig{BasePath: "/tmp"},
-		logger:         logger,
+		config:         ServerConfig{BasePath: t.TempDir()},
+		logger:         testLogger(t),
 		torrents:       make(map[string]*serverTorrentState),
 		abortingHashes: make(map[string]chan struct{}),
 		qbClient:       mock,
@@ -90,7 +88,7 @@ func TestStartTorrent(t *testing.T) {
 		mock := &mockQBClient{
 			torrents: []qbittorrent.Torrent{{Hash: "abc123"}},
 		}
-		s := newTestServerWithQB(mock)
+		s := newTestServerWithQB(t, mock)
 
 		resp, err := s.StartTorrent(context.Background(), &pb.StartTorrentRequest{
 			TorrentHash: "abc123",
@@ -119,7 +117,7 @@ func TestStartTorrent(t *testing.T) {
 		mock := &mockQBClient{
 			torrents: []qbittorrent.Torrent{{Hash: "abc123"}},
 		}
-		s := newTestServerWithQB(mock)
+		s := newTestServerWithQB(t, mock)
 
 		resp, err := s.StartTorrent(context.Background(), &pb.StartTorrentRequest{
 			TorrentHash: "abc123",
@@ -143,7 +141,7 @@ func TestStartTorrent(t *testing.T) {
 			torrents:   []qbittorrent.Torrent{{Hash: "abc123"}},
 			addTagsErr: errors.New("qBittorrent API error"),
 		}
-		s := newTestServerWithQB(mock)
+		s := newTestServerWithQB(t, mock)
 
 		resp, err := s.StartTorrent(context.Background(), &pb.StartTorrentRequest{
 			TorrentHash: "abc123",
@@ -164,7 +162,7 @@ func TestStartTorrent(t *testing.T) {
 
 	t.Run("returns error when qbClient is nil", func(t *testing.T) {
 		t.Parallel()
-		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+		logger := testLogger(t)
 		s := &Server{
 			config:         ServerConfig{BasePath: "/tmp"},
 			logger:         logger,
@@ -193,7 +191,7 @@ func TestStartTorrent(t *testing.T) {
 		mock := &mockQBClient{
 			torrents: nil, // empty — torrent not found
 		}
-		s := newTestServerWithQB(mock)
+		s := newTestServerWithQB(t, mock)
 
 		resp, err := s.StartTorrent(context.Background(), &pb.StartTorrentRequest{
 			TorrentHash: "missing",
@@ -216,7 +214,7 @@ func TestStartTorrent(t *testing.T) {
 			torrents:  []qbittorrent.Torrent{{Hash: "abc123"}},
 			resumeErr: errors.New("resume failed"),
 		}
-		s := newTestServerWithQB(mock)
+		s := newTestServerWithQB(t, mock)
 
 		resp, err := s.StartTorrent(context.Background(), &pb.StartTorrentRequest{
 			TorrentHash: "abc123",

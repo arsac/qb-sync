@@ -3,7 +3,6 @@ package cold
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,7 +27,7 @@ func TestVerifyFinalizedPieces_ConcurrencyLimit(t *testing.T) {
 	const totalSize = pieceSize * numPieces
 
 	tmpDir := t.TempDir()
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger(t)
 
 	s := &Server{
 		config:         ServerConfig{BasePath: tmpDir},
@@ -91,7 +90,7 @@ func TestVerifyFinalizedPieces_FailsOnHashMismatch(t *testing.T) {
 	const totalSize = pieceSize * numPieces
 
 	tmpDir := t.TempDir()
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger(t)
 
 	s := &Server{
 		config:         ServerConfig{BasePath: tmpDir},
@@ -141,7 +140,7 @@ func TestFinalizeTorrent_PollReturnsVerifying(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger(t)
 
 	s := &Server{
 		config:         ServerConfig{BasePath: tmpDir},
@@ -187,7 +186,7 @@ func TestFinalizeTorrent_PollReturnsCompletedResult(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger(t)
 
 	s := &Server{
 		config:         ServerConfig{BasePath: tmpDir},
@@ -258,7 +257,7 @@ func TestFinalizeTorrent_PollReturnsFailedResult(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger(t)
 
 	s := &Server{
 		config:         ServerConfig{BasePath: tmpDir},
@@ -340,7 +339,7 @@ func TestFinalizeTorrent_ConcurrentPollDuringSetup(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger(t)
 
 	s := &Server{
 		config:         ServerConfig{BasePath: tmpDir},
@@ -388,7 +387,7 @@ func TestRunBackgroundFinalization_SerializesViaSemaphore(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger(t)
 
 	// createTorrentState writes deterministic file data to disk and returns the
 	// corresponding serverTorrentState ready for finalization.
@@ -528,7 +527,7 @@ func TestVerifyFinalizedPieces_RequiresPieceHashes(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger(t)
 
 	s := &Server{
 		config:         ServerConfig{BasePath: tmpDir},

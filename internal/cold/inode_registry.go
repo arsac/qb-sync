@@ -195,7 +195,7 @@ func (r *InodeRegistry) Save() error {
 		return mkdirErr
 	}
 
-	return atomicWriteFile(mapFile, data, serverFilePermissions)
+	return atomicWriteFile(mapFile, data)
 }
 
 // CleanupStale removes entries where the file no longer exists on disk.

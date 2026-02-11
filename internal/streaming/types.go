@@ -7,7 +7,6 @@ package streaming
 import (
 	"context"
 	"errors"
-	"io"
 
 	pb "github.com/arsac/qb-sync/proto"
 )
@@ -92,16 +91,4 @@ type StreamProgress struct {
 	Complete     bool
 	LastError    error
 	LastPieceIdx int
-}
-
-// ProgressWriter wraps an io.Writer to track bytes written.
-type ProgressWriter struct {
-	Writer    io.Writer
-	BytesSent int64
-}
-
-func (pw *ProgressWriter) Write(p []byte) (int, error) {
-	n, err := pw.Writer.Write(p)
-	pw.BytesSent += int64(n)
-	return n, err
 }

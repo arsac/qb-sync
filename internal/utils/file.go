@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"syscall"
 )
 
@@ -69,6 +70,7 @@ func ReadChunkFromFile(path string, offset, size int64) ([]byte, error) {
 	return data[:n], nil
 }
 
+// AreHardlinked reports whether two paths refer to the same underlying file (i.e., share an inode).
 func AreHardlinked(path1, path2 string) (bool, error) {
 	info1, err := os.Stat(path1)
 	if err != nil {
@@ -98,13 +100,41 @@ func GetInode(path string) (uint64, error) {
 	return stat.Ino, nil
 }
 
-func FileExistsWithSize(path string, expectedSize int64) (bool, error) {
-	info, err := os.Stat(path)
-	if os.IsNotExist(err) {
-		return false, nil
-	}
+// AtomicWriteFile writes data to a file atomically using write-to-temp + fsync + rename.
+// This prevents corruption from crashes or NFS connection drops mid-write.
+func AtomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".tmp-*")
 	if err != nil {
-		return false, err
+		return fmt.Errorf("creating temp file: %w", err)
 	}
-	return info.Size() == expectedSize, nil
+	tmpPath := tmp.Name()
+
+	// Clean up temp file on any failure path
+	success := false
+	defer func() {
+		if !success {
+			_ = tmp.Close()
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, writeErr := tmp.Write(data); writeErr != nil {
+		return fmt.Errorf("writing temp file: %w", writeErr)
+	}
+	if syncErr := tmp.Sync(); syncErr != nil {
+		return fmt.Errorf("syncing temp file: %w", syncErr)
+	}
+	if closeErr := tmp.Close(); closeErr != nil {
+		return fmt.Errorf("closing temp file: %w", closeErr)
+	}
+	if chmodErr := os.Chmod(tmpPath, perm); chmodErr != nil {
+		return fmt.Errorf("setting permissions: %w", chmodErr)
+	}
+	if renameErr := os.Rename(tmpPath, path); renameErr != nil {
+		return fmt.Errorf("renaming temp file: %w", renameErr)
+	}
+
+	success = true
+	return nil
 }
