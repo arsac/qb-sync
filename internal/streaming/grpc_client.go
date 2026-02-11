@@ -74,6 +74,12 @@ const (
 // without counting this as a failure.
 var ErrFinalizeVerifying = errors.New("finalization in progress: cold server is verifying pieces")
 
+// ErrFinalizeIncomplete is returned by FinalizeTorrent when cold reports that
+// not all pieces are written. This typically happens after a cold restart where
+// the persisted state is stale. The caller should re-sync with cold to discover
+// which pieces are actually missing and re-stream them.
+var ErrFinalizeIncomplete = errors.New("finalization failed: incomplete pieces on cold")
+
 // successResponse is implemented by gRPC response types that have Success/Error fields.
 type successResponse interface {
 	GetSuccess() bool
@@ -436,6 +442,13 @@ func (d *GRPCDestination) FinalizeTorrent(
 		return fmt.Errorf("finalize torrent RPC failed: %w", err)
 	}
 	if respErr := checkRPCResponse(resp, "finalize"); respErr != nil {
+		// Detect incomplete-pieces error from cold — this means cold's written
+		// state diverged from hot's streamed state (typically after cold restart
+		// where flushed state was stale). Return a sentinel so the orchestrator
+		// can re-sync instead of endlessly retrying.
+		if resp.GetErrorCode() == pb.FinalizeErrorCode_FINALIZE_ERROR_INCOMPLETE {
+			return fmt.Errorf("%w: %s", ErrFinalizeIncomplete, resp.GetError())
+		}
 		return respErr
 	}
 

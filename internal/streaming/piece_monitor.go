@@ -179,6 +179,38 @@ func (t *PieceMonitor) MarkStreamedBatch(hash string, written []bool) int {
 	return count
 }
 
+// ResyncStreamed resets the streamed state for a torrent to match cold's actual
+// written state. Pieces that cold has are marked streamed; pieces cold is missing
+// are unmarked so they get re-queued by the next poll cycle.
+// Returns the number of pieces that were reset (streamed→unstreamed).
+func (t *PieceMonitor) ResyncStreamed(hash string, writtenOnCold []bool) int {
+	t.mu.RLock()
+	state, ok := t.torrents[hash]
+	t.mu.RUnlock()
+
+	if !ok {
+		return 0
+	}
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	var reset int
+	for i := range state.streamed {
+		coldHas := i < len(writtenOnCold) && writtenOnCold[i]
+		if coldHas {
+			state.streamed[i] = true
+			state.failed[i] = false
+		} else if state.streamed[i] {
+			// Was marked streamed but cold doesn't have it — un-mark for re-streaming
+			state.streamed[i] = false
+			reset++
+		}
+	}
+
+	return reset
+}
+
 // MarkFailed marks a piece as failed (for retry).
 func (t *PieceMonitor) MarkFailed(hash string, pieceIndex int) {
 	t.mu.RLock()

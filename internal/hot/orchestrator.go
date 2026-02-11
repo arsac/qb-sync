@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -689,12 +690,7 @@ func (t *QBTask) startTrackingReady(
 		)
 	}
 
-	// Convert pieces_needed to already_written for tracker
-	// pieces_needed[i] = true means NOT written
-	alreadyWritten := make([]bool, len(resp.PiecesNeeded))
-	for i, needed := range resp.PiecesNeeded {
-		alreadyWritten[i] = !needed
-	}
+	alreadyWritten := invertPiecesNeeded(resp.PiecesNeeded)
 
 	if trackErr := t.tracker.TrackTorrentWithResume(ctx, torrent.Hash, alreadyWritten); trackErr != nil {
 		t.logger.WarnContext(ctx, "failed to track torrent",
@@ -765,6 +761,20 @@ func (t *QBTask) finalizeCompletedStreams(ctx context.Context) error {
 				)
 				continue
 			}
+
+			// Cold says pieces are missing — hot's streamed state diverged from
+			// cold's written state (e.g., cold restarted with stale flush).
+			// Re-sync: clear init cache, re-init to get actual PiecesNeeded,
+			// and reset tracker so missing pieces get re-streamed.
+			if errors.Is(finalizeErr, streaming.ErrFinalizeIncomplete) {
+				t.logger.WarnContext(ctx, "cold reports incomplete, re-syncing streamed state",
+					"hash", hash,
+					"error", finalizeErr,
+				)
+				t.resyncWithCold(ctx, hash)
+				continue
+			}
+
 			metrics.FinalizationErrorsTotal.WithLabelValues(metrics.ModeHot).Inc()
 			t.logger.ErrorContext(ctx, "finalize failed",
 				"hash", hash,
@@ -976,6 +986,16 @@ func (t *QBTask) recordCleanupMetrics(ctx context.Context, s cleanupStats) {
 	t.logger.InfoContext(ctx, "hot cleanup cycle complete", logAttrs...)
 }
 
+// hasTag reports whether the comma-separated tag list contains the target tag.
+func hasTag(tags, target string) bool {
+	for tag := range strings.SplitSeq(tags, ",") {
+		if strings.TrimSpace(tag) == target {
+			return true
+		}
+	}
+	return false
+}
+
 // fetchTorrentsCompletedOnCold returns hot torrents that are known to be complete on cold.
 func (t *QBTask) fetchTorrentsCompletedOnCold(ctx context.Context) ([]qbittorrent.Torrent, error) {
 	// Reuse the torrents list from trackNewTorrents if available
@@ -996,9 +1016,14 @@ func (t *QBTask) fetchTorrentsCompletedOnCold(ctx context.Context) ([]qbittorren
 
 	var result []qbittorrent.Torrent
 	for _, torrent := range allTorrents {
-		if t.completedOnCold[torrent.Hash] {
-			result = append(result, torrent)
+		if !t.completedOnCold[torrent.Hash] {
+			continue
 		}
+		if !t.draining.Load() && t.cfg.ExcludeCleanupTag != "" &&
+			hasTag(torrent.Tags, t.cfg.ExcludeCleanupTag) {
+			continue
+		}
+		result = append(result, torrent)
 	}
 
 	slices.SortFunc(result, func(a, b qbittorrent.Torrent) int {
@@ -1250,6 +1275,57 @@ func (t *QBTask) clearFinalizeBackoff(hash string) {
 	defer t.backoffMu.Unlock()
 	delete(t.finalizeBackoffs, hash)
 	metrics.ActiveFinalizationBackoffs.Set(float64(len(t.finalizeBackoffs)))
+}
+
+// invertPiecesNeeded converts PiecesNeeded (true=missing) to written (true=have).
+func invertPiecesNeeded(piecesNeeded []bool) []bool {
+	written := make([]bool, len(piecesNeeded))
+	for i, needed := range piecesNeeded {
+		written[i] = !needed
+	}
+	return written
+}
+
+// resyncWithCold re-initializes a torrent on cold to discover which pieces are
+// actually written, then resets the tracker's streamed state to match. This
+// recovers from divergence after a cold restart where flushed state was stale.
+func (t *QBTask) resyncWithCold(ctx context.Context, hash string) {
+	// Clear cached init result so InitTorrent actually calls cold
+	t.grpcDest.ClearInitResult(hash)
+
+	meta, ok := t.tracker.GetTorrentMetadata(hash)
+	if !ok {
+		t.logger.ErrorContext(ctx, "resync failed: torrent metadata not found",
+			"hash", hash,
+		)
+		return
+	}
+
+	result, initErr := t.grpcDest.InitTorrent(ctx, meta.InitTorrentRequest)
+	if initErr != nil {
+		t.logger.ErrorContext(ctx, "resync failed: InitTorrent error",
+			"hash", hash,
+			"error", initErr,
+		)
+		return
+	}
+
+	if result == nil || len(result.PiecesNeeded) == 0 {
+		t.logger.InfoContext(ctx, "resync: cold reports all pieces written",
+			"hash", hash,
+		)
+		return
+	}
+
+	writtenOnCold := invertPiecesNeeded(result.PiecesNeeded)
+	reset := t.tracker.ResyncStreamed(hash, writtenOnCold)
+
+	t.logger.InfoContext(ctx, "resync complete, pieces will be re-streamed",
+		"hash", hash,
+		"piecesReset", reset,
+		"coldHas", result.PiecesHaveCount,
+		"coldNeeds", result.PiecesNeededCount,
+	)
 }
 
 // listenForRemovals watches for torrents removed from hot qBittorrent

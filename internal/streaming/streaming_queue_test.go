@@ -292,3 +292,170 @@ func TestSenderWorkersConcurrency(t *testing.T) {
 		t.Errorf("expected %d piecesFail, got %d", numPieces, got)
 	}
 }
+
+// makeTestPoolWithStaleKeys creates a StreamPool with the given number of
+// streams, each with pieces that become stale after a short sleep.
+func makeTestPoolWithStaleKeys(t *testing.T, streamKeys [][]string) (*StreamPool, []*PooledStream) {
+	t.Helper()
+
+	logger := testQueueLogger(t)
+	pool := NewStreamPool(nil, logger, StreamPoolConfig{
+		MaxNumStreams:  len(streamKeys),
+		AckChannelSize: 100,
+	})
+	pool.ctx, pool.cancel = context.WithCancel(context.Background())
+
+	streams := make([]*PooledStream, len(streamKeys))
+	pool.mu.Lock()
+	for i, keys := range streamKeys {
+		window := congestion.NewAdaptiveWindow(congestion.Config{
+			MinWindow:     2,
+			MaxWindow:     100,
+			InitialWindow: 10,
+			PieceTimeout:  50 * time.Millisecond,
+		})
+		for _, key := range keys {
+			window.OnSend(key)
+		}
+		ps := &PooledStream{window: window, id: i}
+		pool.streams = append(pool.streams, ps)
+		streams[i] = ps
+	}
+	pool.mu.Unlock()
+
+	return pool, streams
+}
+
+func TestGetAllStaleKeys_PairsKeyWithOwningStream(t *testing.T) {
+	// Two streams, each with one piece. Verify that GetAllStaleKeys pairs
+	// each key with the correct owning PooledStream.
+	pool, streams := makeTestPoolWithStaleKeys(t, [][]string{
+		{"hash1:0"},
+		{"hash2:0"},
+	})
+	defer pool.cancel()
+
+	// Nothing stale yet.
+	if got := pool.GetAllStaleKeys(); len(got) != 0 {
+		t.Fatalf("expected 0 stale keys initially, got %d", len(got))
+	}
+
+	// Wait for pieces to become stale.
+	time.Sleep(60 * time.Millisecond)
+
+	stale := pool.GetAllStaleKeys()
+	if len(stale) != 2 {
+		t.Fatalf("expected 2 stale keys, got %d", len(stale))
+	}
+
+	// Build map for easier assertion.
+	byKey := make(map[string]*PooledStream, len(stale))
+	for _, sk := range stale {
+		byKey[sk.Key] = sk.Stream
+	}
+
+	if byKey["hash1:0"] != streams[0] {
+		t.Errorf("hash1:0 should be paired with stream 0, got stream %d", byKey["hash1:0"].id)
+	}
+	if byKey["hash2:0"] != streams[1] {
+		t.Errorf("hash2:0 should be paired with stream 1, got stream %d", byKey["hash2:0"].id)
+	}
+}
+
+func TestRemovePieceStreamIfMatch_DeletesOnMatch(t *testing.T) {
+	q := makeDrainTestQueue(t)
+
+	ps := &PooledStream{id: 1}
+	q.pieceStreamsMu.Lock()
+	q.pieceStreams["key1"] = ps
+	q.pieceStreamsMu.Unlock()
+
+	q.removePieceStreamIfMatch("key1", ps)
+
+	q.pieceStreamsMu.RLock()
+	_, exists := q.pieceStreams["key1"]
+	q.pieceStreamsMu.RUnlock()
+
+	if exists {
+		t.Error("expected key1 to be deleted when stream matches")
+	}
+}
+
+func TestRemovePieceStreamIfMatch_PreservesOnMismatch(t *testing.T) {
+	q := makeDrainTestQueue(t)
+
+	streamA := &PooledStream{id: 1}
+	streamB := &PooledStream{id: 2}
+
+	// Map points to streamB (simulating a retry overwrite).
+	q.pieceStreamsMu.Lock()
+	q.pieceStreams["key1"] = streamB
+	q.pieceStreamsMu.Unlock()
+
+	// Try to remove with streamA — should be a no-op.
+	q.removePieceStreamIfMatch("key1", streamA)
+
+	q.pieceStreamsMu.RLock()
+	got := q.pieceStreams["key1"]
+	q.pieceStreamsMu.RUnlock()
+
+	if got != streamB {
+		t.Errorf("expected mapping to be preserved (streamB), got %v", got)
+	}
+}
+
+func TestRemovePieceStreamIfMatch_NoopOnMissingKey(t *testing.T) {
+	q := makeDrainTestQueue(t)
+
+	// Should not panic on missing key.
+	q.removePieceStreamIfMatch("nonexistent", &PooledStream{id: 1})
+}
+
+func TestHandleStalePiecesPool_RemovesFromCorrectWindow(t *testing.T) {
+	// Reproduce the race scenario:
+	// 1. streamA has a stale key "hash:0"
+	// 2. Between GetAllStaleKeys and OnFail, pieceStreams is overwritten to streamB
+	// 3. Verify OnFail targets streamA (not streamB) and streamB mapping is preserved.
+
+	pool, streams := makeTestPoolWithStaleKeys(t, [][]string{
+		{"hash:0"}, // streamA — will have the stale key
+		{},         // streamB — empty, will be the "retry" target
+	})
+	defer pool.cancel()
+
+	streamA := streams[0]
+	streamB := streams[1]
+
+	q := makeDrainTestQueue(t)
+
+	// Simulate the retry overwrite: pieceStreams maps hash:0 → streamB.
+	// In the real race, this happens between GetAllStaleKeys and the loop.
+	q.pieceStreamsMu.Lock()
+	q.pieceStreams["hash:0"] = streamB
+	q.pieceStreamsMu.Unlock()
+
+	// Wait for the piece in streamA to become stale.
+	time.Sleep(60 * time.Millisecond)
+
+	// Verify the stale key is in streamA.
+	if streamA.window.InFlight() != 1 {
+		t.Fatalf("streamA should have 1 in-flight, got %d", streamA.window.InFlight())
+	}
+
+	q.handleStalePiecesPool(context.Background(), pool)
+
+	// The fix: OnFail targeted streamA (the actual owner), not streamB.
+	if streamA.window.InFlight() != 0 {
+		t.Errorf("streamA should have 0 in-flight after stale cleanup, got %d",
+			streamA.window.InFlight())
+	}
+
+	// streamB's mapping should be preserved (removePieceStreamIfMatch sees mismatch).
+	q.pieceStreamsMu.RLock()
+	got := q.pieceStreams["hash:0"]
+	q.pieceStreamsMu.RUnlock()
+
+	if got != streamB {
+		t.Errorf("streamB mapping should be preserved, got %v", got)
+	}
+}

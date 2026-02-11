@@ -55,7 +55,7 @@ func (s *Server) FinalizeTorrent(
 	// Helper to clear finalizing state, close the done channel, record failure
 	// metrics, and return error response. Used on all early exit paths before
 	// the background goroutine is launched.
-	failureResponse := func(errMsg string) *pb.FinalizeTorrentResponse {
+	failureResponse := func(errMsg string, code pb.FinalizeErrorCode) *pb.FinalizeTorrentResponse {
 		close(done)
 		state.mu.Lock()
 		state.finalizing = false
@@ -64,7 +64,7 @@ func (s *Server) FinalizeTorrent(
 		state.mu.Unlock()
 		metrics.FinalizationDuration.WithLabelValues(metrics.ResultFailure).Observe(time.Since(startTime).Seconds())
 		metrics.FinalizationErrorsTotal.WithLabelValues(metrics.ModeCold).Inc()
-		return &pb.FinalizeTorrentResponse{Success: false, Error: errMsg}
+		return &pb.FinalizeTorrentResponse{Success: false, Error: errMsg, ErrorCode: code}
 	}
 
 	// Relocate files if save_sub_path changed (e.g., hot moved torrent to different category).
@@ -72,19 +72,21 @@ func (s *Server) FinalizeTorrent(
 	// from an old hot version that doesn't send this field.
 	if newSubPath := req.GetSaveSubPath(); newSubPath != "" && newSubPath != state.saveSubPath {
 		if relocErr := s.relocateForSubPathChange(ctx, hash, state, newSubPath); relocErr != nil {
-			return failureResponse(relocErr.Error()), nil
+			return failureResponse(relocErr.Error(), pb.FinalizeErrorCode_FINALIZE_ERROR_NONE), nil
 		}
 	}
 
 	// Verify all pieces are written.
 	if writtenCount < totalPieces {
-		return failureResponse(fmt.Sprintf("incomplete: %d/%d pieces", writtenCount, totalPieces)), nil
+		msg := fmt.Sprintf("incomplete: %d/%d pieces", writtenCount, totalPieces)
+		return failureResponse(msg, pb.FinalizeErrorCode_FINALIZE_ERROR_INCOMPLETE), nil
 	}
 
 	// Finalize files (sync, close, rename .partial -> final).
 	// This is idempotent — already renamed files are detected and skipped.
 	if finalizeErr := s.finalizeFiles(ctx, hash, state); finalizeErr != nil {
-		return failureResponse(fmt.Sprintf("finalizing files: %v", finalizeErr)), nil
+		msg := fmt.Sprintf("finalizing files: %v", finalizeErr)
+		return failureResponse(msg, pb.FinalizeErrorCode_FINALIZE_ERROR_NONE), nil
 	}
 
 	// Launch verification and post-verification steps in the background.
@@ -113,12 +115,6 @@ func (s *Server) runBackgroundFinalization(
 ) {
 	defer close(done)
 
-	// Use a background context with an upper-bound timeout — this work must not be
-	// cancelled by the RPC deadline, but we cap the total wall-clock time to prevent
-	// indefinite background work (e.g., qBittorrent operations hanging).
-	ctx, cancel := context.WithTimeout(context.Background(), backgroundFinalizeTimeout)
-	defer cancel()
-
 	// storeFailure records failure metrics and stores the error for the next poll.
 	storeFailure := func(errMsg string) {
 		metrics.FinalizationDuration.WithLabelValues(metrics.ResultFailure).Observe(time.Since(startTime).Seconds())
@@ -127,6 +123,32 @@ func (s *Server) runBackgroundFinalization(
 		state.finalizeResult = &finalizeResult{err: errMsg}
 		state.mu.Unlock()
 	}
+
+	// Serialize background finalizations to prevent disk I/O and qBittorrent
+	// API saturation when many torrents complete around the same time.
+	// Use a generous wait context — queue time doesn't count against actual work.
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), finalizeQueueTimeout)
+	if acquireErr := s.finalizeSem.Acquire(waitCtx, 1); acquireErr != nil {
+		waitCancel()
+		s.logger.WarnContext(context.Background(), "finalization queue timeout",
+			"hash", hash,
+			"error", acquireErr,
+		)
+		storeFailure(fmt.Sprintf("finalization queue timeout: %v", acquireErr))
+		return
+	}
+	waitCancel()
+	defer s.finalizeSem.Release(1)
+
+	s.logger.InfoContext(context.Background(), "acquired finalization slot",
+		"hash", hash,
+		"queueWait", time.Since(startTime).Round(time.Millisecond),
+	)
+
+	// Work timeout starts after acquiring the semaphore — queue wait doesn't
+	// eat into the time budget for verification and qBittorrent operations.
+	ctx, cancel := context.WithTimeout(context.Background(), backgroundFinalizeTimeout)
+	defer cancel()
 
 	// Verify all pieces by reading back from finalized files.
 	if verifyErr := s.verifyFinalizedPieces(ctx, hash, state); verifyErr != nil {

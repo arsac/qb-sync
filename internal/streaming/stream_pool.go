@@ -932,15 +932,25 @@ func (p *StreamPool) ClearAllInflight() []string {
 	return allKeys
 }
 
-// GetAllStaleKeys returns stale keys from all streams.
-func (p *StreamPool) GetAllStaleKeys() []string {
+// StaleKey pairs a stale piece key with the stream whose congestion window owns it.
+type StaleKey struct {
+	Key    string
+	Stream *PooledStream
+}
+
+// GetAllStaleKeys returns stale keys from all streams, each paired with the
+// owning stream. This avoids a TOCTOU race: between discovering the stale key
+// and calling OnFail, a retry could overwrite the pieceStreams mapping, causing
+// OnFail to target the wrong window and leaving the key permanently stuck.
+func (p *StreamPool) GetAllStaleKeys() []StaleKey {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	var allKeys []string
+	var allKeys []StaleKey
 	for _, ps := range p.streams {
-		keys := ps.window.GetStaleKeys()
-		allKeys = append(allKeys, keys...)
+		for _, key := range ps.window.GetStaleKeys() {
+			allKeys = append(allKeys, StaleKey{Key: key, Stream: ps})
+		}
 	}
 	return allKeys
 }

@@ -77,6 +77,53 @@ func (PieceErrorCode) EnumDescriptor() ([]byte, []int) {
 	return file_qbsync_proto_rawDescGZIP(), []int{0}
 }
 
+// FinalizeErrorCode categorizes finalization failures for retry decisions.
+type FinalizeErrorCode int32
+
+const (
+	FinalizeErrorCode_FINALIZE_ERROR_NONE       FinalizeErrorCode = 0 // Default / unknown
+	FinalizeErrorCode_FINALIZE_ERROR_INCOMPLETE FinalizeErrorCode = 1 // Not all pieces written
+)
+
+// Enum value maps for FinalizeErrorCode.
+var (
+	FinalizeErrorCode_name = map[int32]string{
+		0: "FINALIZE_ERROR_NONE",
+		1: "FINALIZE_ERROR_INCOMPLETE",
+	}
+	FinalizeErrorCode_value = map[string]int32{
+		"FINALIZE_ERROR_NONE":       0,
+		"FINALIZE_ERROR_INCOMPLETE": 1,
+	}
+)
+
+func (x FinalizeErrorCode) Enum() *FinalizeErrorCode {
+	p := new(FinalizeErrorCode)
+	*p = x
+	return p
+}
+
+func (x FinalizeErrorCode) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (FinalizeErrorCode) Descriptor() protoreflect.EnumDescriptor {
+	return file_qbsync_proto_enumTypes[1].Descriptor()
+}
+
+func (FinalizeErrorCode) Type() protoreflect.EnumType {
+	return &file_qbsync_proto_enumTypes[1]
+}
+
+func (x FinalizeErrorCode) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use FinalizeErrorCode.Descriptor instead.
+func (FinalizeErrorCode) EnumDescriptor() ([]byte, []int) {
+	return file_qbsync_proto_rawDescGZIP(), []int{1}
+}
+
 // TorrentSyncStatus indicates the current state of a torrent on cold.
 type TorrentSyncStatus int32
 
@@ -117,11 +164,11 @@ func (x TorrentSyncStatus) String() string {
 }
 
 func (TorrentSyncStatus) Descriptor() protoreflect.EnumDescriptor {
-	return file_qbsync_proto_enumTypes[1].Descriptor()
+	return file_qbsync_proto_enumTypes[2].Descriptor()
 }
 
 func (TorrentSyncStatus) Type() protoreflect.EnumType {
-	return &file_qbsync_proto_enumTypes[1]
+	return &file_qbsync_proto_enumTypes[2]
 }
 
 func (x TorrentSyncStatus) Number() protoreflect.EnumNumber {
@@ -130,7 +177,7 @@ func (x TorrentSyncStatus) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use TorrentSyncStatus.Descriptor instead.
 func (TorrentSyncStatus) EnumDescriptor() ([]byte, []int) {
-	return file_qbsync_proto_rawDescGZIP(), []int{1}
+	return file_qbsync_proto_rawDescGZIP(), []int{2}
 }
 
 type WritePieceRequest struct {
@@ -1114,7 +1161,8 @@ type FinalizeTorrentResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
 	Error         string                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
-	State         string                 `protobuf:"bytes,3,opt,name=state,proto3" json:"state,omitempty"` // Final qBittorrent state
+	State         string                 `protobuf:"bytes,3,opt,name=state,proto3" json:"state,omitempty"`                                                         // Final qBittorrent state
+	ErrorCode     FinalizeErrorCode      `protobuf:"varint,4,opt,name=error_code,json=errorCode,proto3,enum=qbsync.FinalizeErrorCode" json:"error_code,omitempty"` // Structured error code for retry decisions
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1168,6 +1216,13 @@ func (x *FinalizeTorrentResponse) GetState() string {
 		return x.State
 	}
 	return ""
+}
+
+func (x *FinalizeTorrentResponse) GetErrorCode() FinalizeErrorCode {
+	if x != nil {
+		return x.ErrorCode
+	}
+	return FinalizeErrorCode_FINALIZE_ERROR_NONE
 }
 
 type AbortTorrentRequest struct {
@@ -1553,11 +1608,13 @@ const file_qbsync_proto_rawDesc = "" +
 	"\tsave_path\x18\x02 \x01(\tR\bsavePath\x12\x1a\n" +
 	"\bcategory\x18\x03 \x01(\tR\bcategory\x12\x12\n" +
 	"\x04tags\x18\x04 \x01(\tR\x04tags\x12\"\n" +
-	"\rsave_sub_path\x18\x05 \x01(\tR\vsaveSubPath\"_\n" +
+	"\rsave_sub_path\x18\x05 \x01(\tR\vsaveSubPath\"\x99\x01\n" +
 	"\x17FinalizeTorrentResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\x12\x14\n" +
-	"\x05state\x18\x03 \x01(\tR\x05state\"[\n" +
+	"\x05state\x18\x03 \x01(\tR\x05state\x128\n" +
+	"\n" +
+	"error_code\x18\x04 \x01(\x0e2\x19.qbsync.FinalizeErrorCodeR\terrorCode\"[\n" +
 	"\x13AbortTorrentRequest\x12!\n" +
 	"\ftorrent_hash\x18\x01 \x01(\tR\vtorrentHash\x12!\n" +
 	"\fdelete_files\x18\x02 \x01(\bR\vdeleteFiles\"k\n" +
@@ -1582,7 +1639,10 @@ const file_qbsync_proto_rawDesc = "" +
 	"\x0ePIECE_ERROR_IO\x10\x01\x12\x1d\n" +
 	"\x19PIECE_ERROR_HASH_MISMATCH\x10\x02\x12\x1f\n" +
 	"\x1bPIECE_ERROR_NOT_INITIALIZED\x10\x03\x12\x1a\n" +
-	"\x16PIECE_ERROR_FINALIZING\x10\x04*_\n" +
+	"\x16PIECE_ERROR_FINALIZING\x10\x04*K\n" +
+	"\x11FinalizeErrorCode\x12\x17\n" +
+	"\x13FINALIZE_ERROR_NONE\x10\x00\x12\x1d\n" +
+	"\x19FINALIZE_ERROR_INCOMPLETE\x10\x01*_\n" +
 	"\x11TorrentSyncStatus\x12\x15\n" +
 	"\x11SYNC_STATUS_READY\x10\x00\x12\x18\n" +
 	"\x14SYNC_STATUS_COMPLETE\x10\x01\x12\x19\n" +
@@ -1611,61 +1671,63 @@ func file_qbsync_proto_rawDescGZIP() []byte {
 	return file_qbsync_proto_rawDescData
 }
 
-var file_qbsync_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_qbsync_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
 var file_qbsync_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
 var file_qbsync_proto_goTypes = []any{
 	(PieceErrorCode)(0),             // 0: qbsync.PieceErrorCode
-	(TorrentSyncStatus)(0),          // 1: qbsync.TorrentSyncStatus
-	(*WritePieceRequest)(nil),       // 2: qbsync.WritePieceRequest
-	(*WritePieceResponse)(nil),      // 3: qbsync.WritePieceResponse
-	(*PieceAck)(nil),                // 4: qbsync.PieceAck
-	(*InitTorrentRequest)(nil),      // 5: qbsync.InitTorrentRequest
-	(*FileInfo)(nil),                // 6: qbsync.FileInfo
-	(*InitTorrentResponse)(nil),     // 7: qbsync.InitTorrentResponse
-	(*HardlinkResult)(nil),          // 8: qbsync.HardlinkResult
-	(*CreateHardlinkRequest)(nil),   // 9: qbsync.CreateHardlinkRequest
-	(*CreateHardlinkResponse)(nil),  // 10: qbsync.CreateHardlinkResponse
-	(*GetFileByInodeRequest)(nil),   // 11: qbsync.GetFileByInodeRequest
-	(*GetFileByInodeResponse)(nil),  // 12: qbsync.GetFileByInodeResponse
-	(*RegisterFileRequest)(nil),     // 13: qbsync.RegisterFileRequest
-	(*RegisterFileResponse)(nil),    // 14: qbsync.RegisterFileResponse
-	(*FinalizeTorrentRequest)(nil),  // 15: qbsync.FinalizeTorrentRequest
-	(*FinalizeTorrentResponse)(nil), // 16: qbsync.FinalizeTorrentResponse
-	(*AbortTorrentRequest)(nil),     // 17: qbsync.AbortTorrentRequest
-	(*AbortTorrentResponse)(nil),    // 18: qbsync.AbortTorrentResponse
-	(*StartTorrentRequest)(nil),     // 19: qbsync.StartTorrentRequest
-	(*StartTorrentResponse)(nil),    // 20: qbsync.StartTorrentResponse
-	(*Piece)(nil),                   // 21: qbsync.Piece
+	(FinalizeErrorCode)(0),          // 1: qbsync.FinalizeErrorCode
+	(TorrentSyncStatus)(0),          // 2: qbsync.TorrentSyncStatus
+	(*WritePieceRequest)(nil),       // 3: qbsync.WritePieceRequest
+	(*WritePieceResponse)(nil),      // 4: qbsync.WritePieceResponse
+	(*PieceAck)(nil),                // 5: qbsync.PieceAck
+	(*InitTorrentRequest)(nil),      // 6: qbsync.InitTorrentRequest
+	(*FileInfo)(nil),                // 7: qbsync.FileInfo
+	(*InitTorrentResponse)(nil),     // 8: qbsync.InitTorrentResponse
+	(*HardlinkResult)(nil),          // 9: qbsync.HardlinkResult
+	(*CreateHardlinkRequest)(nil),   // 10: qbsync.CreateHardlinkRequest
+	(*CreateHardlinkResponse)(nil),  // 11: qbsync.CreateHardlinkResponse
+	(*GetFileByInodeRequest)(nil),   // 12: qbsync.GetFileByInodeRequest
+	(*GetFileByInodeResponse)(nil),  // 13: qbsync.GetFileByInodeResponse
+	(*RegisterFileRequest)(nil),     // 14: qbsync.RegisterFileRequest
+	(*RegisterFileResponse)(nil),    // 15: qbsync.RegisterFileResponse
+	(*FinalizeTorrentRequest)(nil),  // 16: qbsync.FinalizeTorrentRequest
+	(*FinalizeTorrentResponse)(nil), // 17: qbsync.FinalizeTorrentResponse
+	(*AbortTorrentRequest)(nil),     // 18: qbsync.AbortTorrentRequest
+	(*AbortTorrentResponse)(nil),    // 19: qbsync.AbortTorrentResponse
+	(*StartTorrentRequest)(nil),     // 20: qbsync.StartTorrentRequest
+	(*StartTorrentResponse)(nil),    // 21: qbsync.StartTorrentResponse
+	(*Piece)(nil),                   // 22: qbsync.Piece
 }
 var file_qbsync_proto_depIdxs = []int32{
 	0,  // 0: qbsync.WritePieceResponse.error_code:type_name -> qbsync.PieceErrorCode
 	0,  // 1: qbsync.PieceAck.error_code:type_name -> qbsync.PieceErrorCode
-	6,  // 2: qbsync.InitTorrentRequest.files:type_name -> qbsync.FileInfo
-	1,  // 3: qbsync.InitTorrentResponse.status:type_name -> qbsync.TorrentSyncStatus
-	8,  // 4: qbsync.InitTorrentResponse.hardlink_results:type_name -> qbsync.HardlinkResult
-	2,  // 5: qbsync.QBSyncService.WritePiece:input_type -> qbsync.WritePieceRequest
-	2,  // 6: qbsync.QBSyncService.StreamPiecesBidi:input_type -> qbsync.WritePieceRequest
-	5,  // 7: qbsync.QBSyncService.InitTorrent:input_type -> qbsync.InitTorrentRequest
-	9,  // 8: qbsync.QBSyncService.CreateHardlink:input_type -> qbsync.CreateHardlinkRequest
-	11, // 9: qbsync.QBSyncService.GetFileByInode:input_type -> qbsync.GetFileByInodeRequest
-	13, // 10: qbsync.QBSyncService.RegisterFile:input_type -> qbsync.RegisterFileRequest
-	15, // 11: qbsync.QBSyncService.FinalizeTorrent:input_type -> qbsync.FinalizeTorrentRequest
-	17, // 12: qbsync.QBSyncService.AbortTorrent:input_type -> qbsync.AbortTorrentRequest
-	19, // 13: qbsync.QBSyncService.StartTorrent:input_type -> qbsync.StartTorrentRequest
-	3,  // 14: qbsync.QBSyncService.WritePiece:output_type -> qbsync.WritePieceResponse
-	4,  // 15: qbsync.QBSyncService.StreamPiecesBidi:output_type -> qbsync.PieceAck
-	7,  // 16: qbsync.QBSyncService.InitTorrent:output_type -> qbsync.InitTorrentResponse
-	10, // 17: qbsync.QBSyncService.CreateHardlink:output_type -> qbsync.CreateHardlinkResponse
-	12, // 18: qbsync.QBSyncService.GetFileByInode:output_type -> qbsync.GetFileByInodeResponse
-	14, // 19: qbsync.QBSyncService.RegisterFile:output_type -> qbsync.RegisterFileResponse
-	16, // 20: qbsync.QBSyncService.FinalizeTorrent:output_type -> qbsync.FinalizeTorrentResponse
-	18, // 21: qbsync.QBSyncService.AbortTorrent:output_type -> qbsync.AbortTorrentResponse
-	20, // 22: qbsync.QBSyncService.StartTorrent:output_type -> qbsync.StartTorrentResponse
-	14, // [14:23] is the sub-list for method output_type
-	5,  // [5:14] is the sub-list for method input_type
-	5,  // [5:5] is the sub-list for extension type_name
-	5,  // [5:5] is the sub-list for extension extendee
-	0,  // [0:5] is the sub-list for field type_name
+	7,  // 2: qbsync.InitTorrentRequest.files:type_name -> qbsync.FileInfo
+	2,  // 3: qbsync.InitTorrentResponse.status:type_name -> qbsync.TorrentSyncStatus
+	9,  // 4: qbsync.InitTorrentResponse.hardlink_results:type_name -> qbsync.HardlinkResult
+	1,  // 5: qbsync.FinalizeTorrentResponse.error_code:type_name -> qbsync.FinalizeErrorCode
+	3,  // 6: qbsync.QBSyncService.WritePiece:input_type -> qbsync.WritePieceRequest
+	3,  // 7: qbsync.QBSyncService.StreamPiecesBidi:input_type -> qbsync.WritePieceRequest
+	6,  // 8: qbsync.QBSyncService.InitTorrent:input_type -> qbsync.InitTorrentRequest
+	10, // 9: qbsync.QBSyncService.CreateHardlink:input_type -> qbsync.CreateHardlinkRequest
+	12, // 10: qbsync.QBSyncService.GetFileByInode:input_type -> qbsync.GetFileByInodeRequest
+	14, // 11: qbsync.QBSyncService.RegisterFile:input_type -> qbsync.RegisterFileRequest
+	16, // 12: qbsync.QBSyncService.FinalizeTorrent:input_type -> qbsync.FinalizeTorrentRequest
+	18, // 13: qbsync.QBSyncService.AbortTorrent:input_type -> qbsync.AbortTorrentRequest
+	20, // 14: qbsync.QBSyncService.StartTorrent:input_type -> qbsync.StartTorrentRequest
+	4,  // 15: qbsync.QBSyncService.WritePiece:output_type -> qbsync.WritePieceResponse
+	5,  // 16: qbsync.QBSyncService.StreamPiecesBidi:output_type -> qbsync.PieceAck
+	8,  // 17: qbsync.QBSyncService.InitTorrent:output_type -> qbsync.InitTorrentResponse
+	11, // 18: qbsync.QBSyncService.CreateHardlink:output_type -> qbsync.CreateHardlinkResponse
+	13, // 19: qbsync.QBSyncService.GetFileByInode:output_type -> qbsync.GetFileByInodeResponse
+	15, // 20: qbsync.QBSyncService.RegisterFile:output_type -> qbsync.RegisterFileResponse
+	17, // 21: qbsync.QBSyncService.FinalizeTorrent:output_type -> qbsync.FinalizeTorrentResponse
+	19, // 22: qbsync.QBSyncService.AbortTorrent:output_type -> qbsync.AbortTorrentResponse
+	21, // 23: qbsync.QBSyncService.StartTorrent:output_type -> qbsync.StartTorrentResponse
+	15, // [15:24] is the sub-list for method output_type
+	6,  // [6:15] is the sub-list for method input_type
+	6,  // [6:6] is the sub-list for extension type_name
+	6,  // [6:6] is the sub-list for extension extendee
+	0,  // [0:6] is the sub-list for field type_name
 }
 
 func init() { file_qbsync_proto_init() }
@@ -1678,7 +1740,7 @@ func file_qbsync_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_qbsync_proto_rawDesc), len(file_qbsync_proto_rawDesc)),
-			NumEnums:      2,
+			NumEnums:      3,
 			NumMessages:   20,
 			NumExtensions: 0,
 			NumServices:   1,

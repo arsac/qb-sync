@@ -72,6 +72,7 @@ func newTestServer(t *testing.T, budgetBytes int64) *Server {
 		abortingHashes: make(map[string]chan struct{}),
 		inodes:         NewInodeRegistry(tmpDir, logger),
 		memBudget:      semaphore.NewWeighted(budgetBytes),
+		finalizeSem:    semaphore.NewWeighted(1),
 	}
 }
 

@@ -373,7 +373,7 @@ func TestE2E_TempPathSync(t *testing.T) {
 			return false
 		}
 		return strings.Contains(torrents[0].Tags, "synced")
-	}, 10*time.Second, time.Second, "hot torrent should have 'synced' tag (visibility only)")
+	}, 30*time.Second, time.Second, "hot torrent should have 'synced' tag (visibility only)")
 
 	if !hasSyncedTag {
 		torrents, _ := env.HotClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
@@ -532,7 +532,7 @@ func TestE2E_StopBeforeDeleteOnDiskPressure(t *testing.T) {
 	// qBittorrent may take a moment to transition from stoppedUP to an active state.
 	require.Eventually(t, func() bool {
 		return !env.IsTorrentStopped(ctx, env.ColdClient(), wiredCDHash)
-	}, 15*time.Second, time.Second,
+	}, 30*time.Second, time.Second,
 		"torrent on cold should be seeding after drain handoff")
 
 	t.Log("Torrent handed off: hot deleted, cold now seeding!")

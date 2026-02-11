@@ -678,6 +678,138 @@ func TestPieceMonitor_RetryFailed(t *testing.T) {
 	})
 }
 
+func TestPieceMonitor_ResyncStreamed(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	newMonitor := func() *PieceMonitor {
+		return &PieceMonitor{
+			logger:    logger,
+			torrents:  make(map[string]*torrentState),
+			completed: make(chan *pb.Piece, completedChannelBufSize),
+			removed:   make(chan string, removedChannelBufSize),
+		}
+	}
+
+	t.Run("resets streamed pieces missing on cold", func(t *testing.T) {
+		monitor := newMonitor()
+		hash := "abc123"
+		numPieces := 10
+		monitor.torrents[hash] = &torrentState{
+			streamed: make([]bool, numPieces),
+			failed:   make([]bool, numPieces),
+		}
+
+		// Simulate: hot thinks all 10 are streamed
+		state := monitor.torrents[hash]
+		for i := range state.streamed {
+			state.streamed[i] = true
+		}
+
+		// Cold only has 7 pieces (0-6)
+		writtenOnCold := make([]bool, numPieces)
+		for i := range 7 {
+			writtenOnCold[i] = true
+		}
+
+		reset := monitor.ResyncStreamed(hash, writtenOnCold)
+
+		if reset != 3 {
+			t.Errorf("expected 3 pieces reset, got %d", reset)
+		}
+
+		state.mu.RLock()
+		defer state.mu.RUnlock()
+		for i := range numPieces {
+			expected := i < 7
+			if state.streamed[i] != expected {
+				t.Errorf("piece %d: expected streamed=%v, got %v", i, expected, state.streamed[i])
+			}
+		}
+	})
+
+	t.Run("clears failed flag for pieces cold has", func(t *testing.T) {
+		monitor := newMonitor()
+		hash := "abc123"
+		numPieces := 5
+		monitor.torrents[hash] = &torrentState{
+			streamed: make([]bool, numPieces),
+			failed:   make([]bool, numPieces),
+		}
+
+		state := monitor.torrents[hash]
+		// Pieces 2 and 3 are failed
+		state.failed[2] = true
+		state.failed[3] = true
+
+		// Cold has piece 2 but not 3
+		writtenOnCold := []bool{false, false, true, false, false}
+		monitor.ResyncStreamed(hash, writtenOnCold)
+
+		state.mu.RLock()
+		defer state.mu.RUnlock()
+		if state.failed[2] {
+			t.Error("piece 2 should have failed cleared (cold has it)")
+		}
+		if state.streamed[2] != true {
+			t.Error("piece 2 should be marked streamed")
+		}
+		// Piece 3: cold doesn't have it, so failed stays as-is (not touched by resync)
+	})
+
+	t.Run("no-op when already in sync", func(t *testing.T) {
+		monitor := newMonitor()
+		hash := "abc123"
+		numPieces := 5
+		monitor.torrents[hash] = &torrentState{
+			streamed: make([]bool, numPieces),
+			failed:   make([]bool, numPieces),
+		}
+
+		state := monitor.torrents[hash]
+		state.streamed[0] = true
+		state.streamed[2] = true
+
+		writtenOnCold := []bool{true, false, true, false, false}
+		reset := monitor.ResyncStreamed(hash, writtenOnCold)
+
+		if reset != 0 {
+			t.Errorf("expected 0 pieces reset, got %d", reset)
+		}
+	})
+
+	t.Run("handles mismatched sizes", func(t *testing.T) {
+		monitor := newMonitor()
+		hash := "abc123"
+		numPieces := 5
+		monitor.torrents[hash] = &torrentState{
+			streamed: make([]bool, numPieces),
+			failed:   make([]bool, numPieces),
+		}
+
+		state := monitor.torrents[hash]
+		for i := range state.streamed {
+			state.streamed[i] = true
+		}
+
+		// Cold reports fewer pieces than tracker has
+		writtenOnCold := []bool{true, true, true}
+		reset := monitor.ResyncStreamed(hash, writtenOnCold)
+
+		// Pieces 3 and 4 should be reset (out of range = cold doesn't have)
+		if reset != 2 {
+			t.Errorf("expected 2 pieces reset, got %d", reset)
+		}
+	})
+
+	t.Run("returns 0 for untracked torrent", func(t *testing.T) {
+		monitor := newMonitor()
+		reset := monitor.ResyncStreamed("nonexistent", []bool{true})
+		if reset != 0 {
+			t.Errorf("expected 0 for untracked torrent, got %d", reset)
+		}
+	})
+}
+
 func TestPieceMonitor_RemovalNotification_Integration(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 

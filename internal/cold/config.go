@@ -57,10 +57,14 @@ const (
 	// A value of 2 means the watchdog checks at half the timeout interval.
 	verifyIdleCheckDivisor = 2
 
-	// backgroundFinalizeTimeout is the upper-bound timeout for the entire
-	// background finalization (verification + inode registration + qBittorrent).
-	// Defense-in-depth: the idle watchdog covers verification stalls, but this
-	// caps the total wall-clock time including qBittorrent operations.
+	// finalizeQueueTimeout is how long a finalization can wait for its turn
+	// in the semaphore queue. Generous because many torrents may finish at once,
+	// and each finalization can take up to backgroundFinalizeTimeout to complete.
+	finalizeQueueTimeout = 2 * time.Hour
+
+	// backgroundFinalizeTimeout is the upper-bound timeout for the actual
+	// finalization work (verification + inode registration + qBittorrent).
+	// Starts after the semaphore is acquired, so queue wait doesn't count.
 	backgroundFinalizeTimeout = 30 * time.Minute
 )
 

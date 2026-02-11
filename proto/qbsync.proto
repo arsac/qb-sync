@@ -59,6 +59,12 @@ enum PieceErrorCode {
   PIECE_ERROR_FINALIZING = 4;      // Torrent is being finalized
 }
 
+// FinalizeErrorCode categorizes finalization failures for retry decisions.
+enum FinalizeErrorCode {
+  FINALIZE_ERROR_NONE = 0;       // Default / unknown
+  FINALIZE_ERROR_INCOMPLETE = 1; // Not all pieces written
+}
+
 message WritePieceRequest {
   string torrent_hash = 1;
   int32 piece_index = 2;
@@ -200,7 +206,8 @@ message FinalizeTorrentRequest {
 message FinalizeTorrentResponse {
   bool success = 1;
   string error = 2;
-  string state = 3;        // Final qBittorrent state
+  string state = 3;                  // Final qBittorrent state
+  FinalizeErrorCode error_code = 4;  // Structured error code for retry decisions
 }
 
 message AbortTorrentRequest {

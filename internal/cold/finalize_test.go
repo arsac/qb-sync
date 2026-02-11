@@ -2,11 +2,15 @@ package cold
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"golang.org/x/sync/semaphore"
 
@@ -33,6 +37,7 @@ func TestVerifyFinalizedPieces_ConcurrencyLimit(t *testing.T) {
 		abortingHashes: make(map[string]chan struct{}),
 		inodes:         NewInodeRegistry(tmpDir, logger),
 		memBudget:      semaphore.NewWeighted(512 * 1024 * 1024),
+		finalizeSem:    semaphore.NewWeighted(1),
 	}
 
 	// Create file data and compute piece hashes
@@ -95,6 +100,7 @@ func TestVerifyFinalizedPieces_FailsOnHashMismatch(t *testing.T) {
 		abortingHashes: make(map[string]chan struct{}),
 		inodes:         NewInodeRegistry(tmpDir, logger),
 		memBudget:      semaphore.NewWeighted(512 * 1024 * 1024),
+		finalizeSem:    semaphore.NewWeighted(1),
 	}
 
 	fileData := make([]byte, totalSize)
@@ -144,6 +150,7 @@ func TestFinalizeTorrent_PollReturnsVerifying(t *testing.T) {
 		abortingHashes: make(map[string]chan struct{}),
 		inodes:         NewInodeRegistry(tmpDir, logger),
 		memBudget:      semaphore.NewWeighted(512 * 1024 * 1024),
+		finalizeSem:    semaphore.NewWeighted(1),
 	}
 
 	hash := "poll-verify-test"
@@ -189,6 +196,7 @@ func TestFinalizeTorrent_PollReturnsCompletedResult(t *testing.T) {
 		abortingHashes: make(map[string]chan struct{}),
 		inodes:         NewInodeRegistry(tmpDir, logger),
 		memBudget:      semaphore.NewWeighted(512 * 1024 * 1024),
+		finalizeSem:    semaphore.NewWeighted(1),
 	}
 
 	hash := "poll-complete-test"
@@ -259,6 +267,7 @@ func TestFinalizeTorrent_PollReturnsFailedResult(t *testing.T) {
 		abortingHashes: make(map[string]chan struct{}),
 		inodes:         NewInodeRegistry(tmpDir, logger),
 		memBudget:      semaphore.NewWeighted(512 * 1024 * 1024),
+		finalizeSem:    semaphore.NewWeighted(1),
 	}
 
 	hash := "poll-fail-test"
@@ -322,6 +331,9 @@ func TestFinalizeTorrent_PollReturnsFailedResult(t *testing.T) {
 	if !strings.Contains(resp2.GetError(), "incomplete") {
 		t.Errorf("retry should return incomplete error, got: %s", resp2.GetError())
 	}
+	if resp2.GetErrorCode() != pb.FinalizeErrorCode_FINALIZE_ERROR_INCOMPLETE {
+		t.Errorf("retry should return FINALIZE_ERROR_INCOMPLETE, got: %v", resp2.GetErrorCode())
+	}
 }
 
 func TestFinalizeTorrent_ConcurrentPollDuringSetup(t *testing.T) {
@@ -337,6 +349,7 @@ func TestFinalizeTorrent_ConcurrentPollDuringSetup(t *testing.T) {
 		abortingHashes: make(map[string]chan struct{}),
 		inodes:         NewInodeRegistry(tmpDir, logger),
 		memBudget:      semaphore.NewWeighted(512 * 1024 * 1024),
+		finalizeSem:    semaphore.NewWeighted(1),
 	}
 
 	hash := "concurrent-setup-test"
@@ -371,6 +384,146 @@ func TestFinalizeTorrent_ConcurrentPollDuringSetup(t *testing.T) {
 	}
 }
 
+func TestRunBackgroundFinalization_SerializesViaSemaphore(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	// createTorrentState writes deterministic file data to disk and returns the
+	// corresponding serverTorrentState ready for finalization.
+	createTorrentState := func(
+		t *testing.T, dir, hash string, numPieces int, pieceSize int64,
+	) *serverTorrentState {
+		t.Helper()
+		totalSize := int64(numPieces) * pieceSize
+		fileData := make([]byte, totalSize)
+		for j := range fileData {
+			fileData[j] = byte(j % 251)
+		}
+
+		pieceHashes := make([]string, numPieces)
+		for p := range numPieces {
+			offset := int64(p) * pieceSize
+			pieceHashes[p] = utils.ComputeSHA1(fileData[offset : offset+pieceSize])
+		}
+
+		filePath := filepath.Join(dir, hash+".bin")
+		if writeErr := os.WriteFile(filePath, fileData, 0o644); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+
+		return &serverTorrentState{
+			pieceHashes: pieceHashes,
+			pieceLength: pieceSize,
+			totalSize:   totalSize,
+			files:       []*serverFileInfo{{path: filePath, offset: 0, size: totalSize}},
+			torrentPath: filepath.Join(dir, metaDirName, hash, "test.torrent"),
+		}
+	}
+
+	newServer := func() *Server {
+		return &Server{
+			config:         ServerConfig{BasePath: tmpDir},
+			logger:         logger,
+			torrents:       make(map[string]*serverTorrentState),
+			abortingHashes: make(map[string]chan struct{}),
+			inodes:         NewInodeRegistry(tmpDir, logger),
+			memBudget:      semaphore.NewWeighted(512 * 1024 * 1024),
+			finalizeSem:    semaphore.NewWeighted(1),
+		}
+	}
+
+	t.Run("blocks when semaphore is held", func(t *testing.T) {
+		t.Parallel()
+
+		s := newServer()
+		s.finalizeSem.Acquire(context.Background(), 1)
+
+		hash := "sem-block-test"
+		state := createTorrentState(t, tmpDir, hash, 1, 256)
+
+		s.mu.Lock()
+		s.torrents[hash] = state
+		s.mu.Unlock()
+
+		done := make(chan struct{})
+		go s.runBackgroundFinalization(
+			hash, state, &pb.FinalizeTorrentRequest{TorrentHash: hash}, time.Now(), done,
+		)
+
+		// Give goroutine time to start and block on semaphore acquire.
+		time.Sleep(50 * time.Millisecond)
+
+		select {
+		case <-done:
+			t.Fatal("finalization completed while semaphore was held")
+		default:
+		}
+
+		s.finalizeSem.Release(1)
+
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("finalization timed out after semaphore release")
+		}
+	})
+
+	t.Run("multiple finalizations serialize", func(t *testing.T) {
+		t.Parallel()
+
+		const numTorrents = 3
+
+		var maxConcurrent atomic.Int32
+		var running atomic.Int32
+
+		// Separate server so the finalizeSem is not shared with the other subtest.
+		s := newServer()
+
+		// Replace finalizeSem with a wide semaphore so runBackgroundFinalization
+		// never blocks on it. We gate serialization through origSem (weight=1)
+		// ourselves, recording max concurrent holders.
+		origSem := s.finalizeSem
+		s.finalizeSem = semaphore.NewWeighted(int64(numTorrents))
+
+		var wg sync.WaitGroup
+		for i := range numTorrents {
+			hash := fmt.Sprintf("serial-test-%d", i)
+			state := createTorrentState(t, tmpDir, hash, 10, 1024)
+
+			s.mu.Lock()
+			s.torrents[hash] = state
+			s.mu.Unlock()
+
+			wg.Go(func() {
+				origSem.Acquire(context.Background(), 1)
+				cur := running.Add(1)
+				for {
+					old := maxConcurrent.Load()
+					if cur <= old || maxConcurrent.CompareAndSwap(old, cur) {
+						break
+					}
+				}
+
+				done := make(chan struct{})
+				s.runBackgroundFinalization(
+					hash, state, &pb.FinalizeTorrentRequest{TorrentHash: hash}, time.Now(), done,
+				)
+
+				running.Add(-1)
+				origSem.Release(1)
+			})
+		}
+
+		wg.Wait()
+
+		if mc := maxConcurrent.Load(); mc > 1 {
+			t.Errorf("max concurrent finalizations = %d, want 1", mc)
+		}
+	})
+}
+
 func TestVerifyFinalizedPieces_RequiresPieceHashes(t *testing.T) {
 	t.Parallel()
 
@@ -384,6 +537,7 @@ func TestVerifyFinalizedPieces_RequiresPieceHashes(t *testing.T) {
 		abortingHashes: make(map[string]chan struct{}),
 		inodes:         NewInodeRegistry(tmpDir, logger),
 		memBudget:      semaphore.NewWeighted(512 * 1024 * 1024),
+		finalizeSem:    semaphore.NewWeighted(1),
 	}
 
 	state := &serverTorrentState{

@@ -79,6 +79,7 @@ type HotConfig struct {
 	MinGRPCConnections int           // Minimum TCP connections to cold server (default: 2)
 	MaxGRPCConnections int           // Maximum TCP connections to cold server (default: 8)
 	SourceRemovedTag   string        // Tag applied on cold when torrent is removed from hot (empty to disable)
+	ExcludeCleanupTag  string        // Tag that prevents torrents from being cleaned up from hot (empty to disable)
 }
 
 // Validate validates the base configuration shared by hot and cold.
@@ -219,6 +220,11 @@ func SetupHotFlags(cmd *cobra.Command) {
 		defaultSourceRemovedTag,
 		"Tag to apply on cold torrent when source is removed from hot (empty to disable)",
 	)
+	flags.String(
+		"exclude-cleanup-tag",
+		"",
+		"Tag that prevents torrents from being cleaned up from hot (empty to disable)",
+	)
 	flags.String("health-addr", defaultHealthAddr, "HTTP health endpoint address (empty to disable)")
 	flags.String("synced-tag", defaultSyncedTag, "Tag to apply to synced torrents (empty to disable)")
 	flags.Bool("dry-run", false, "Run without making changes")
@@ -260,7 +266,7 @@ func BindHotFlags(cmd *cobra.Command, v *viper.Viper) error {
 		"cold-addr", "min-space", "min-seeding-time", "sleep",
 		"rate-limit", "piece-timeout", "reconnect-max-delay",
 		"num-senders", "min-connections", "max-connections",
-		"source-removed-tag", "health-addr", "synced-tag",
+		"source-removed-tag", "exclude-cleanup-tag", "health-addr", "synced-tag",
 		"dry-run", "log-level", "drain-annotation", "drain-timeout",
 	}
 
@@ -325,6 +331,7 @@ func LoadHot(v *viper.Viper) (*HotConfig, error) {
 		MinGRPCConnections: v.GetInt("min-connections"),
 		MaxGRPCConnections: v.GetInt("max-connections"),
 		SourceRemovedTag:   v.GetString("source-removed-tag"),
+		ExcludeCleanupTag:  v.GetString("exclude-cleanup-tag"),
 	}
 
 	// Support conventional env vars as fallbacks

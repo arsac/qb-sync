@@ -62,6 +62,7 @@ All flags can be set via environment variables with the prefix `QBSYNC_HOT_` or 
 | `QBSYNC_HOT_MAX_CONNECTIONS` | `--max-connections` | Maximum TCP connections to cold server | `8` |
 | `QBSYNC_HOT_SYNCED_TAG` | `--synced-tag` | Tag for synced torrents (empty to disable) | `synced` |
 | `QBSYNC_HOT_SOURCE_REMOVED_TAG` | `--source-removed-tag` | Tag on cold when source removed (empty to disable) | `source-removed` |
+| `QBSYNC_HOT_EXCLUDE_CLEANUP_TAG` | `--exclude-cleanup-tag` | Tag that prevents cleanup from hot (empty to disable) | |
 | `QBSYNC_HOT_DRAIN_ANNOTATION` | `--drain-annotation` | Pod annotation key to gate shutdown drain (empty to drain unconditionally) | `qbsync/drain` |
 | `QBSYNC_HOT_DRAIN_TIMEOUT` | `--drain-timeout` | Shutdown drain timeout (seconds) | `300` |
 | `QBSYNC_HOT_HEALTH_ADDR` | `--health-addr` | Health/metrics endpoint | `:8080` |

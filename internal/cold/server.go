@@ -89,6 +89,11 @@ type Server struct {
 	// Global memory budget for buffered piece data
 	memBudget *semaphore.Weighted
 
+	// finalizeSem serializes background finalizations so only one torrent
+	// is verified/added to qBittorrent at a time. This prevents disk I/O
+	// and qBittorrent API saturation when many torrents complete together.
+	finalizeSem *semaphore.Weighted
+
 	// Health server for K8s probes
 	healthServer *health.Server
 
@@ -110,6 +115,7 @@ func NewServer(config ServerConfig, logger *slog.Logger) *Server {
 		abortingHashes: make(map[string]chan struct{}),
 		inodes:         NewInodeRegistry(config.BasePath, logger),
 		memBudget:      semaphore.NewWeighted(bufferBytes),
+		finalizeSem:    semaphore.NewWeighted(1),
 	}
 
 	if config.ColdQB != nil && config.ColdQB.URL != "" {

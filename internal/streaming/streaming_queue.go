@@ -191,6 +191,17 @@ func (q *BidiQueue) deletePieceStream(key string) {
 	q.pieceStreamsMu.Unlock()
 }
 
+// removePieceStreamIfMatch removes a piece from stream tracking only if it
+// still points to the given stream. If a retry overwrote the mapping to a
+// different stream, the mapping is preserved.
+func (q *BidiQueue) removePieceStreamIfMatch(key string, ps *PooledStream) {
+	q.pieceStreamsMu.Lock()
+	if q.pieceStreams[key] == ps {
+		delete(q.pieceStreams, key)
+	}
+	q.pieceStreamsMu.Unlock()
+}
+
 // clearPieceStreams removes multiple pieces from stream tracking.
 func (q *BidiQueue) clearPieceStreams(keys []string) {
 	q.pieceStreamsMu.Lock()
@@ -573,12 +584,13 @@ func (q *BidiQueue) handleStalePiecesPool(ctx context.Context, pool *StreamPool)
 		"count", len(staleKeys),
 	)
 
-	for _, key := range staleKeys {
-		// Find which stream this piece was on and call OnFail on that stream's window
-		if ps := q.getPieceStream(key); ps != nil {
-			ps.window.OnFail(key)
-		}
-		q.requeuePieceByKey(ctx, key)
+	for _, sk := range staleKeys {
+		// OnFail on the stream that actually owns the key in its window,
+		// bypassing the pieceStreams map to avoid the TOCTOU race where a
+		// retry overwrites the mapping to a different stream.
+		sk.Stream.window.OnFail(sk.Key)
+		q.removePieceStreamIfMatch(sk.Key, sk.Stream)
+		q.requeuePieceByKey(ctx, sk.Key)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -393,6 +394,11 @@ type mockColdDest struct {
 	startHash   string
 	startTag    string
 	startErr    error
+
+	initResult      *streaming.InitTorrentResult
+	initErr         error
+	clearInitCalled bool
+	clearInitHash   string
 }
 
 var _ ColdDestination = (*mockColdDest)(nil)
@@ -429,6 +435,18 @@ func (m *mockColdDest) StartTorrent(_ context.Context, hash string, tag string) 
 	m.startHash = hash
 	m.startTag = tag
 	return m.startErr
+}
+
+func (m *mockColdDest) ClearInitResult(hash string) {
+	m.clearInitCalled = true
+	m.clearInitHash = hash
+}
+
+func (m *mockColdDest) InitTorrent(_ context.Context, _ *pb.InitTorrentRequest) (*streaming.InitTorrentResult, error) {
+	if m.initErr != nil {
+		return nil, m.initErr
+	}
+	return m.initResult, nil
 }
 
 func TestHandleTorrentRemoval(t *testing.T) {
@@ -1111,6 +1129,156 @@ func TestFinalizeTorrent_ErrFinalizeVerifyingPropagates(t *testing.T) {
 		// Next attempt should be allowed immediately
 		if !task.shouldAttemptFinalize("abc123") {
 			t.Error("should allow immediate retry after ErrFinalizeVerifying")
+		}
+	})
+}
+
+func TestFinalizeTorrent_ErrFinalizeIncompletePropagates(t *testing.T) {
+	logger := testLogger(t)
+
+	t.Run("ErrFinalizeIncomplete is returned by finalizeTorrent", func(t *testing.T) {
+		mockClient := &mockQBClient{
+			getTorrentsResult: []qbittorrent.Torrent{
+				{Hash: "abc123", SavePath: "/data", Category: "movies"},
+			},
+		}
+		coldDest := &mockColdDest{
+			finalizeErr: fmt.Errorf("%w: incomplete: 100/200 pieces", streaming.ErrFinalizeIncomplete),
+		}
+		task := &QBTask{
+			cfg:       &config.HotConfig{},
+			logger:    logger,
+			srcClient: mockClient,
+			grpcDest:  coldDest,
+			source:    qbclient.NewSource(nil, ""),
+		}
+
+		err := task.finalizeTorrent(context.Background(), "abc123")
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !errors.Is(err, streaming.ErrFinalizeIncomplete) {
+			t.Errorf("expected ErrFinalizeIncomplete, got: %v", err)
+		}
+	})
+
+	t.Run("ErrFinalizeIncomplete does not increment backoff", func(t *testing.T) {
+		mockClient := &mockQBClient{
+			getTorrentsResult: []qbittorrent.Torrent{
+				{Hash: "abc123", SavePath: "/data"},
+			},
+		}
+		coldDest := &mockColdDest{
+			finalizeErr: fmt.Errorf("%w: incomplete: 50/100 pieces", streaming.ErrFinalizeIncomplete),
+		}
+		task := &QBTask{
+			cfg:              &config.HotConfig{},
+			logger:           logger,
+			srcClient:        mockClient,
+			grpcDest:         coldDest,
+			source:           qbclient.NewSource(nil, ""),
+			finalizeBackoffs: make(map[string]*finalizeBackoff),
+		}
+
+		_ = task.finalizeTorrent(context.Background(), "abc123")
+
+		task.backoffMu.Lock()
+		_, hasBackoff := task.finalizeBackoffs["abc123"]
+		task.backoffMu.Unlock()
+
+		if hasBackoff {
+			t.Error("ErrFinalizeIncomplete should not create a backoff entry")
+		}
+	})
+}
+
+func TestResyncWithCold(t *testing.T) {
+	logger := testLogger(t)
+
+	t.Run("resyncs streamed state from cold init response", func(t *testing.T) {
+		// Set up a PieceMonitor with a torrent where all pieces are "streamed"
+		monitor := streaming.NewPieceMonitor(nil, nil, logger, streaming.PieceMonitorConfig{
+			PollInterval: time.Second,
+		})
+
+		hash := "resync-test"
+		numPieces := 10
+
+		// Manually add a torrent state to the monitor
+		monitor.AddTestState(hash, numPieces)
+
+		// Mark all pieces as streamed (simulates hot thinking everything is done)
+		allWritten := make([]bool, numPieces)
+		for i := range allWritten {
+			allWritten[i] = true
+		}
+		monitor.MarkStreamedBatch(hash, allWritten)
+
+		// Verify all are streamed before resync
+		progress, _ := monitor.GetProgress(hash)
+		if progress.Streamed != numPieces {
+			t.Fatalf("expected %d streamed, got %d", numPieces, progress.Streamed)
+		}
+
+		// Cold only has 7 pieces — PiecesNeeded[i]=true means missing
+		piecesNeeded := make([]bool, numPieces)
+		piecesNeeded[7] = true
+		piecesNeeded[8] = true
+		piecesNeeded[9] = true
+
+		coldDest := &mockColdDest{
+			initResult: &streaming.InitTorrentResult{
+				PiecesNeeded:      piecesNeeded,
+				PiecesNeededCount: 3,
+				PiecesHaveCount:   7,
+			},
+		}
+
+		task := &QBTask{
+			cfg:      &config.HotConfig{},
+			logger:   logger,
+			grpcDest: coldDest,
+			tracker:  monitor,
+		}
+
+		task.resyncWithCold(context.Background(), hash)
+
+		// After resync, only 7 should be streamed
+		progress, _ = monitor.GetProgress(hash)
+		if progress.Streamed != 7 {
+			t.Errorf("expected 7 streamed after resync, got %d", progress.Streamed)
+		}
+		if progress.Complete {
+			t.Error("should not be complete after resync")
+		}
+	})
+
+	t.Run("handles init error gracefully", func(t *testing.T) {
+		monitor := streaming.NewPieceMonitor(nil, nil, logger, streaming.PieceMonitorConfig{
+			PollInterval: time.Second,
+		})
+
+		hash := "resync-fail"
+		monitor.AddTestState(hash, 5)
+
+		coldDest := &mockColdDest{
+			initErr: errors.New("cold unreachable"),
+		}
+
+		task := &QBTask{
+			cfg:      &config.HotConfig{},
+			logger:   logger,
+			grpcDest: coldDest,
+			tracker:  monitor,
+		}
+
+		// Should not panic
+		task.resyncWithCold(context.Background(), hash)
+
+		// State should be unchanged
+		progress, _ := monitor.GetProgress(hash)
+		if progress.Streamed != 0 {
+			t.Errorf("expected 0 streamed (unchanged), got %d", progress.Streamed)
 		}
 	})
 }
@@ -1915,6 +2083,149 @@ func TestGetFreeSpaceGB(t *testing.T) {
 		_, err := task.getFreeSpaceGB(context.Background())
 		if err == nil {
 			t.Error("expected error when API fails")
+		}
+	})
+}
+
+func TestHasTag(t *testing.T) {
+	t.Run("finds tag in comma-separated list", func(t *testing.T) {
+		if !hasTag("foo,bar,baz", "bar") {
+			t.Error("expected to find 'bar'")
+		}
+	})
+
+	t.Run("finds tag with spaces", func(t *testing.T) {
+		if !hasTag("foo, bar , baz", "bar") {
+			t.Error("expected to find 'bar' with surrounding spaces")
+		}
+	})
+
+	t.Run("finds single tag", func(t *testing.T) {
+		if !hasTag("keep", "keep") {
+			t.Error("expected to find single tag")
+		}
+	})
+
+	t.Run("returns false for missing tag", func(t *testing.T) {
+		if hasTag("foo,bar,baz", "qux") {
+			t.Error("should not find 'qux'")
+		}
+	})
+
+	t.Run("returns false for empty tags", func(t *testing.T) {
+		if hasTag("", "foo") {
+			t.Error("should not find tag in empty string")
+		}
+	})
+
+	t.Run("no partial match", func(t *testing.T) {
+		if hasTag("foobar,baz", "foo") {
+			t.Error("should not partial-match 'foo' in 'foobar'")
+		}
+	})
+}
+
+func TestFetchTorrentsCompletedOnCold_ExcludeCleanupTag(t *testing.T) {
+	logger := testLogger(t)
+
+	t.Run("excludes torrents with the cleanup tag", func(t *testing.T) {
+		mockClient := &mockQBClient{
+			getTorrentsResult: []qbittorrent.Torrent{
+				{Hash: "hash1", Tags: "keep-on-hot", Size: 100},
+				{Hash: "hash2", Tags: "other", Size: 200},
+				{Hash: "hash3", Tags: "foo, keep-on-hot, bar", Size: 300},
+			},
+		}
+		task := &QBTask{
+			cfg:             &config.HotConfig{ExcludeCleanupTag: "keep-on-hot"},
+			logger:          logger,
+			srcClient:       mockClient,
+			completedOnCold: map[string]bool{"hash1": true, "hash2": true, "hash3": true},
+		}
+
+		result, err := task.fetchTorrentsCompletedOnCold(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if len(result) != 1 {
+			t.Fatalf("expected 1 torrent, got %d", len(result))
+		}
+		if result[0].Hash != "hash2" {
+			t.Errorf("expected hash2, got %s", result[0].Hash)
+		}
+	})
+
+	t.Run("returns all when ExcludeCleanupTag is empty", func(t *testing.T) {
+		mockClient := &mockQBClient{
+			getTorrentsResult: []qbittorrent.Torrent{
+				{Hash: "hash1", Tags: "keep-on-hot", Size: 100},
+				{Hash: "hash2", Tags: "other", Size: 200},
+			},
+		}
+		task := &QBTask{
+			cfg:             &config.HotConfig{},
+			logger:          logger,
+			srcClient:       mockClient,
+			completedOnCold: map[string]bool{"hash1": true, "hash2": true},
+		}
+
+		result, err := task.fetchTorrentsCompletedOnCold(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if len(result) != 2 {
+			t.Fatalf("expected 2 torrents, got %d", len(result))
+		}
+	})
+
+	t.Run("drain overrides exclusion tag", func(t *testing.T) {
+		mockClient := &mockQBClient{
+			getTorrentsResult: []qbittorrent.Torrent{
+				{Hash: "hash1", Tags: "keep-on-hot", Size: 100},
+				{Hash: "hash2", Tags: "other", Size: 200},
+			},
+		}
+		task := &QBTask{
+			cfg:             &config.HotConfig{ExcludeCleanupTag: "keep-on-hot"},
+			logger:          logger,
+			srcClient:       mockClient,
+			completedOnCold: map[string]bool{"hash1": true, "hash2": true},
+		}
+		task.draining.Store(true)
+
+		result, err := task.fetchTorrentsCompletedOnCold(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if len(result) != 2 {
+			t.Fatalf("expected 2 torrents (drain overrides tag), got %d", len(result))
+		}
+	})
+
+	t.Run("uses cycle cache when available", func(t *testing.T) {
+		task := &QBTask{
+			cfg:    &config.HotConfig{ExcludeCleanupTag: "protected"},
+			logger: logger,
+			cycleTorrents: []qbittorrent.Torrent{
+				{Hash: "hash1", Tags: "protected", Size: 100},
+				{Hash: "hash2", Tags: "", Size: 200},
+			},
+			completedOnCold: map[string]bool{"hash1": true, "hash2": true},
+		}
+
+		result, err := task.fetchTorrentsCompletedOnCold(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if len(result) != 1 {
+			t.Fatalf("expected 1 torrent, got %d", len(result))
+		}
+		if result[0].Hash != "hash2" {
+			t.Errorf("expected hash2, got %s", result[0].Hash)
 		}
 	})
 }
