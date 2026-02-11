@@ -48,6 +48,34 @@ func TestHotConfig_Validate(t *testing.T) {
 			},
 			wantErr: "cold server address is required",
 		},
+		{
+			name: "negative min connections",
+			cfg: HotConfig{
+				BaseConfig:         BaseConfig{DataPath: "/data", QBURL: "http://qb:8080"},
+				ColdAddr:           "cold:50051",
+				MinGRPCConnections: -1,
+			},
+			wantErr: "min connections cannot be negative",
+		},
+		{
+			name: "negative max connections",
+			cfg: HotConfig{
+				BaseConfig:         BaseConfig{DataPath: "/data", QBURL: "http://qb:8080"},
+				ColdAddr:           "cold:50051",
+				MaxGRPCConnections: -1,
+			},
+			wantErr: "max connections cannot be negative",
+		},
+		{
+			name: "min exceeds max",
+			cfg: HotConfig{
+				BaseConfig:         BaseConfig{DataPath: "/data", QBURL: "http://qb:8080"},
+				ColdAddr:           "cold:50051",
+				MinGRPCConnections: 5,
+				MaxGRPCConnections: 2,
+			},
+			wantErr: "min connections cannot exceed max connections",
+		},
 	}
 
 	for _, tt := range tests {
@@ -151,7 +179,8 @@ func TestLoadHot(t *testing.T) {
 		v.Set("sleep", 60)
 		v.Set("rate-limit", int64(1000000))
 		v.Set("synced-tag", "my-synced")
-		v.Set("grpc-connections", 3)
+		v.Set("min-connections", 3)
+		v.Set("max-connections", 6)
 		v.Set("num-senders", 8)
 		v.Set("source-removed-tag", "custom-removed")
 		v.Set("drain-annotation", "my/drain")
@@ -171,7 +200,8 @@ func TestLoadHot(t *testing.T) {
 		assert.Equal(t, 60, int(cfg.SleepInterval.Seconds()))
 		assert.Equal(t, int64(1000000), cfg.MaxBytesPerSec)
 		assert.Equal(t, "my-synced", cfg.SyncedTag)
-		assert.Equal(t, 3, cfg.GRPCConnections)
+		assert.Equal(t, 3, cfg.MinGRPCConnections)
+		assert.Equal(t, 6, cfg.MaxGRPCConnections)
 		assert.Equal(t, 8, cfg.NumSenders)
 		assert.Equal(t, "custom-removed", cfg.SourceRemovedTag)
 		assert.Equal(t, "my/drain", cfg.DrainAnnotation)
@@ -287,7 +317,7 @@ func TestSetupHotFlags(t *testing.T) {
 		"data", "qb-url", "qb-username", "qb-password",
 		"cold-addr", "min-space", "min-seeding-time",
 		"dry-run", "sleep", "rate-limit", "synced-tag",
-		"grpc-connections", "num-senders", "source-removed-tag",
+		"min-connections", "max-connections", "num-senders", "source-removed-tag",
 		"drain-annotation", "drain-timeout",
 	}
 
@@ -299,9 +329,13 @@ func TestSetupHotFlags(t *testing.T) {
 	syncedTagFlag := cmd.Flags().Lookup("synced-tag")
 	assert.Equal(t, "synced", syncedTagFlag.DefValue)
 
-	// Verify grpc-connections default value
-	grpcConnsFlag := cmd.Flags().Lookup("grpc-connections")
-	assert.Equal(t, "2", grpcConnsFlag.DefValue)
+	// Verify min-connections default value
+	minConnsFlag := cmd.Flags().Lookup("min-connections")
+	assert.Equal(t, "2", minConnsFlag.DefValue)
+
+	// Verify max-connections default value
+	maxConnsFlag := cmd.Flags().Lookup("max-connections")
+	assert.Equal(t, "8", maxConnsFlag.DefValue)
 
 	// Verify num-senders default value
 	numSendersFlag := cmd.Flags().Lookup("num-senders")

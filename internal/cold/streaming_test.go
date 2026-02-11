@@ -2,6 +2,7 @@ package cold
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -20,8 +21,8 @@ import (
 type mockBidiStream struct {
 	ctx     context.Context
 	recvCh  chan *pb.WritePieceRequest // Feed requests via this channel; close for EOF
-	sendCh  chan *pb.PieceAck         // Acks are sent here
-	sendErr error                     // If non-nil, Send returns this error
+	sendCh  chan *pb.PieceAck          // Acks are sent here
+	sendErr error                      // If non-nil, Send returns this error
 }
 
 func (m *mockBidiStream) Recv() (*pb.WritePieceRequest, error) {
@@ -48,12 +49,12 @@ func (m *mockBidiStream) Send(ack *pb.PieceAck) error {
 	}
 }
 
-func (m *mockBidiStream) Context() context.Context           { return m.ctx }
-func (m *mockBidiStream) SetHeader(metadata.MD) error        { return nil }
-func (m *mockBidiStream) SendHeader(metadata.MD) error       { return nil }
-func (m *mockBidiStream) SetTrailer(metadata.MD)             {}
-func (m *mockBidiStream) SendMsg(any) error                  { return nil }
-func (m *mockBidiStream) RecvMsg(any) error                  { return nil }
+func (m *mockBidiStream) Context() context.Context     { return m.ctx }
+func (m *mockBidiStream) SetHeader(metadata.MD) error  { return nil }
+func (m *mockBidiStream) SendHeader(metadata.MD) error { return nil }
+func (m *mockBidiStream) SetTrailer(metadata.MD)       {}
+func (m *mockBidiStream) SendMsg(any) error            { return nil }
+func (m *mockBidiStream) RecvMsg(any) error            { return nil }
 
 // newTestServer creates a minimal Server with a configured memBudget for testing.
 func newTestServer(t *testing.T, budgetBytes int64) *Server {
@@ -80,8 +81,7 @@ func TestStreamReceiver_AcquiresBudget(t *testing.T) {
 	budgetBytes := int64(1024) // 1 KB budget
 	s := newTestServer(t, budgetBytes)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	workCh := make(chan *pb.WritePieceRequest, 10)
 	stream := &mockBidiStream{
@@ -129,8 +129,7 @@ func TestStreamReceiver_ZeroDataSkipsBudget(t *testing.T) {
 	budgetBytes := int64(100)
 	s := newTestServer(t, budgetBytes)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	workCh := make(chan *pb.WritePieceRequest, 10)
 	stream := &mockBidiStream{
@@ -274,7 +273,7 @@ func TestStreamReceiver_ReleasesOnContextCancel(t *testing.T) {
 
 	select {
 	case err := <-recvDone:
-		if err != context.Canceled {
+		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("expected context.Canceled, got %v", err)
 		}
 	case <-time.After(time.Second):

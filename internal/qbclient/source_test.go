@@ -565,8 +565,8 @@ func TestReadChunkCached_StaleHandleRetry(t *testing.T) {
 	// but ReadAt on the old fd still works (reads old content via inode).
 	// Instead, we test the cache evictPath codepath directly by evicting and verifying
 	// the new handle sees fresh content.
-	if err := os.WriteFile(path, []byte("replaced"), 0o644); err != nil {
-		t.Fatal(err)
+	if writeErr := os.WriteFile(path, []byte("replaced"), 0o644); writeErr != nil {
+		t.Fatal(writeErr)
 	}
 
 	// Evict and re-read to prove the retry path works.

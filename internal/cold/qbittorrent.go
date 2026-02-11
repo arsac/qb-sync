@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"time"
 
 	"github.com/autobrr/go-qbittorrent"
 
@@ -66,7 +65,6 @@ func (s *Server) addAndVerifyTorrent(
 		return existingTorrent.State, nil
 	}
 
-
 	// Torrent doesn't exist - add it
 	torrentData, readErr := os.ReadFile(state.torrentPath)
 	if readErr != nil {
@@ -79,9 +77,9 @@ func (s *Server) addAndVerifyTorrent(
 
 	opts := map[string]string{
 		"savepath":           savePath,
-		"skip_checking":      "true",  // We verified pieces on write via SHA1 hash
-		"stopped":            "true",  // Add stopped so hot controls when cold starts seeding (qB v5+)
-		"paused":             "true",  // Compat alias for qB v4.x
+		"skip_checking":      "true", // We verified pieces on write via SHA1 hash
+		"stopped":            "true", // Add stopped so hot controls when cold starts seeding (qB v5+)
+		"paused":             "true", // Compat alias for qB v4.x
 		"autoTMM":            "false",
 		"sequentialDownload": "false",
 	}
@@ -110,7 +108,7 @@ func (s *Server) addAndVerifyTorrent(
 	// gRPC caller may cancel before the wait completes, but the stop must succeed
 	// to prevent dual seeding. qBittorrent may also briefly transition through an
 	// active state (e.g. stalledUP) even with stopped=true+skip_checking=true.
-	stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), stopTorrentTimeout)
 	defer stopCancel()
 	if stopErr := s.qbClient.StopCtx(stopCtx, []string{hash}); stopErr != nil {
 		s.logger.WarnContext(ctx, "failed to stop torrent after add (may already be stopped)",

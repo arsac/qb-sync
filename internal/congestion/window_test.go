@@ -707,9 +707,9 @@ func TestLoss_CompetingFlows(t *testing.T) {
 	w.OnFail("piece:1")
 
 	lmw := 70.0 * cubicBetaLastMax
-	expectedLastMax := int(lmw)                  // 59
+	expectedLastMax := int(lmw) // 59
 	ew := 70.0 * cubicBeta
-	expectedWindow := int(ew)                    // 49
+	expectedWindow := int(ew) // 49
 
 	if w.Window() != expectedWindow {
 		t.Errorf("expected window %d, got %d", expectedWindow, w.Window())

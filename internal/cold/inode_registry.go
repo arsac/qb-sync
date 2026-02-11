@@ -132,23 +132,12 @@ func (r *InodeRegistry) mapPath() string {
 
 // Load loads the persisted inode-to-path mapping from disk.
 func (r *InodeRegistry) Load() error {
-	data, err := os.ReadFile(r.mapPath())
+	data, err := r.readInodeMap()
 	if err != nil {
-		if os.IsNotExist(err) {
-			// Migrate from legacy location (basePath/.inode_map.json)
-			legacyPath := filepath.Join(r.basePath, ".inode_map.json")
-			data, err = os.ReadFile(legacyPath)
-			if err != nil {
-				if os.IsNotExist(err) {
-					return nil // No persisted state yet
-				}
-				return err
-			}
-			// Clean up legacy file after successful read
-			defer os.Remove(legacyPath)
-		} else {
-			return err
-		}
+		return err
+	}
+	if data == nil {
+		return nil // No persisted state yet
 	}
 
 	var loaded map[Inode]string
@@ -162,6 +151,33 @@ func (r *InodeRegistry) Load() error {
 	r.registeredMu.Unlock()
 
 	return nil
+}
+
+// readInodeMap reads the inode map from the current location, falling back to
+// the legacy location for migration. Returns (nil, nil) when no file exists.
+func (r *InodeRegistry) readInodeMap() ([]byte, error) {
+	data, err := os.ReadFile(r.mapPath())
+	if err == nil {
+		return data, nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	// Migrate from legacy location (basePath/.inode_map.json)
+	legacyPath := filepath.Join(r.basePath, ".inode_map.json")
+	data, err = os.ReadFile(legacyPath)
+	if err == nil {
+		// Best-effort cleanup of legacy file after successful read.
+		if removeErr := os.Remove(legacyPath); removeErr != nil {
+			r.logger.Warn("failed to remove legacy inode map", "path", legacyPath, "error", removeErr)
+		}
+		return data, nil
+	}
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	return nil, err
 }
 
 // Save persists the inode-to-path mapping to disk.

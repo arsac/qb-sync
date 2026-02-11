@@ -528,6 +528,21 @@ func (env *TestEnv) WaitForTorrentCompleteOnCold(
 	}, timeout, 2*time.Second, msg)
 }
 
+// WaitForSyncedTagOnCold waits for the synced tag to appear on a cold torrent.
+// The synced tag is applied in background finalization after addAndVerifyTorrent completes.
+func (env *TestEnv) WaitForSyncedTagOnCold(ctx context.Context, hash string, timeout time.Duration, msg string) {
+	env.t.Helper()
+	require.Eventually(env.t, func() bool {
+		torrents, err := env.coldClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+			Hashes: []string{hash},
+		})
+		if err != nil || len(torrents) == 0 {
+			return false
+		}
+		return strings.Contains(torrents[0].Tags, "synced")
+	}, timeout, time.Second, msg)
+}
+
 // IsTorrentStopped checks if a torrent on hot qBittorrent is in a stopped/paused state.
 func (env *TestEnv) IsTorrentStopped(ctx context.Context, client *qbittorrent.Client, hash string) bool {
 	torrents, err := client.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
@@ -548,9 +563,9 @@ func (env *TestEnv) IsTorrentStopped(ctx context.Context, client *qbittorrent.Cl
 }
 
 // CreateGRPCDestination creates a gRPC destination for testing with 2 connections
-// (matching the default GRPCConnections value used in production).
+// (matching the default MinGRPCConnections value used in production).
 func (env *TestEnv) CreateGRPCDestination() (*streaming.GRPCDestination, error) {
-	return streaming.NewGRPCDestination(env.grpcAddr, 2)
+	return streaming.NewGRPCDestination(env.grpcAddr, 2, 8)
 }
 
 // CreateHotConfig creates a hot config for testing.
@@ -566,7 +581,8 @@ func (env *TestEnv) CreateHotConfig(opts ...HotConfigOption) *config.HotConfig {
 		MinSpaceGB:      1,
 		MinSeedingTime:  0,
 		SleepInterval:   time.Second,
-		GRPCConnections: 2,
+		MinGRPCConnections: 2,
+		MaxGRPCConnections: 8,
 		NumSenders:       4,
 		SourceRemovedTag: "source-removed",
 	}
@@ -593,10 +609,11 @@ func WithMinSeedingTime(d time.Duration) HotConfigOption {
 	}
 }
 
-// WithGRPCConnections sets the number of gRPC connections.
-func WithGRPCConnections(n int) HotConfigOption {
+// WithGRPCConnections sets the min and max gRPC connections.
+func WithGRPCConnections(min, max int) HotConfigOption {
 	return func(cfg *config.HotConfig) {
-		cfg.GRPCConnections = n
+		cfg.MinGRPCConnections = min
+		cfg.MaxGRPCConnections = max
 	}
 }
 

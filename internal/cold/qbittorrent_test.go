@@ -30,7 +30,11 @@ type mockQBClient struct {
 }
 
 func (m *mockQBClient) LoginCtx(context.Context) error { return m.loginErr }
-func (m *mockQBClient) GetTorrentsCtx(_ context.Context, _ qbittorrent.TorrentFilterOptions) ([]qbittorrent.Torrent, error) {
+
+func (m *mockQBClient) GetTorrentsCtx(
+	_ context.Context,
+	_ qbittorrent.TorrentFilterOptions,
+) ([]qbittorrent.Torrent, error) {
 	return m.torrents, m.getTorrErr
 }
 func (m *mockQBClient) ResumeCtx(_ context.Context, hashes []string) error {
@@ -96,8 +100,8 @@ func TestStartTorrent(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if !resp.Success {
-			t.Fatalf("expected success, got error: %s", resp.Error)
+		if !resp.GetSuccess() {
+			t.Fatalf("expected success, got error: %s", resp.GetError())
 		}
 		if len(mock.resumeHash) != 1 || mock.resumeHash[0] != "abc123" {
 			t.Fatalf("expected ResumeCtx called with [abc123], got %v", mock.resumeHash)
@@ -125,8 +129,8 @@ func TestStartTorrent(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if !resp.Success {
-			t.Fatalf("expected success, got error: %s", resp.Error)
+		if !resp.GetSuccess() {
+			t.Fatalf("expected success, got error: %s", resp.GetError())
 		}
 		if mock.addTagsArgs.tags != "" {
 			t.Fatalf("expected AddTagsCtx NOT called, but was called with tag %q", mock.addTagsArgs.tags)
@@ -149,8 +153,8 @@ func TestStartTorrent(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if !resp.Success {
-			t.Fatalf("expected success despite tag failure, got error: %s", resp.Error)
+		if !resp.GetSuccess() {
+			t.Fatalf("expected success despite tag failure, got error: %s", resp.GetError())
 		}
 		// Tag was attempted but failed — still returns success
 		if mock.addTagsArgs.tags != "source-removed" {
@@ -176,11 +180,11 @@ func TestStartTorrent(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if resp.Success {
+		if resp.GetSuccess() {
 			t.Fatal("expected failure when qbClient is nil")
 		}
-		if resp.Error != "cold qBittorrent not configured" {
-			t.Fatalf("unexpected error message: %s", resp.Error)
+		if resp.GetError() != "cold qBittorrent not configured" {
+			t.Fatalf("unexpected error message: %s", resp.GetError())
 		}
 	})
 
@@ -198,11 +202,11 @@ func TestStartTorrent(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if resp.Success {
+		if resp.GetSuccess() {
 			t.Fatal("expected failure when torrent not found")
 		}
-		if resp.Error != "torrent does not exist on cold qBittorrent" {
-			t.Fatalf("unexpected error message: %s", resp.Error)
+		if resp.GetError() != "torrent does not exist on cold qBittorrent" {
+			t.Fatalf("unexpected error message: %s", resp.GetError())
 		}
 	})
 
@@ -222,7 +226,7 @@ func TestStartTorrent(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if resp.Success {
+		if resp.GetSuccess() {
 			t.Fatal("expected failure when resume fails")
 		}
 		if mock.addTagsArgs.tags != "" {

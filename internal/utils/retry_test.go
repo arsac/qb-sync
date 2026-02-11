@@ -88,7 +88,10 @@ func TestIsCircuitBreakerFailure_Excluded(t *testing.T) {
 		{"context deadline", context.DeadlineExceeded},
 		{"wrapped context canceled", fmt.Errorf("op: %w", context.Canceled)},
 		// Uppercase 'N' is intentional: verifies case-insensitive match (strings.ToLower in production code)
-		{"qbt unmarshal quirk", errors.New("could not unmarshal body: invalid character 'N' looking for beginning of value")},
+		{
+			"qbt unmarshal quirk",
+			errors.New("could not unmarshal body: invalid character 'N' looking for beginning of value"),
+		},
 	}
 
 	for _, tt := range tests {

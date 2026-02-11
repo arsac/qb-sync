@@ -39,7 +39,7 @@ func (c *fileHandleCache) get(hash, path string) (*os.File, error) {
 	c.mu.Lock()
 	if c.byHash != nil {
 		if perHash, ok := c.byHash[hash]; ok {
-			if f, ok := perHash[path]; ok {
+			if f, found := perHash[path]; found {
 				c.mu.Unlock()
 				metrics.FileHandleCacheTotal.WithLabelValues(metrics.ResultHit).Inc()
 				return f, nil
@@ -65,9 +65,9 @@ func (c *fileHandleCache) get(hash, path string) (*os.File, error) {
 		c.byHash[hash] = perHash
 	}
 
-	if existing, ok := perHash[path]; ok {
+	if existing, exists := perHash[path]; exists {
 		// Another goroutine won the race — use its handle, close ours.
-		f.Close()
+		_ = f.Close()
 		metrics.FileHandleCacheTotal.WithLabelValues(metrics.ResultHit).Inc()
 		return existing, nil
 	}
@@ -87,7 +87,7 @@ func (c *fileHandleCache) evict(hash string) {
 		metrics.FileHandleEvictionsTotal.Inc()
 	}
 	for _, f := range handles {
-		f.Close()
+		_ = f.Close()
 	}
 }
 
@@ -103,7 +103,7 @@ func (c *fileHandleCache) evictPath(hash, path string) {
 
 	if f != nil {
 		metrics.FileHandleEvictionsTotal.Inc()
-		f.Close()
+		_ = f.Close()
 	}
 }
 
@@ -340,8 +340,8 @@ func (s *Source) ReadPiece(ctx context.Context, piece *pb.Piece) ([]byte, error)
 
 	// ENOENT: torrent moved (download→save or *arr recategorization).
 	// Re-query content_path which reflects the new location.
-	if err := ctx.Err(); err != nil {
-		return nil, err
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
 	}
 	s.handles.evict(hash)
 	s.fileCache.Delete(hash)
@@ -355,7 +355,11 @@ func (s *Source) ReadPiece(ctx context.Context, piece *pb.Piece) ([]byte, error)
 // cachedTorrentMeta returns the cached metadata for a torrent, fetching on first access.
 func (s *Source) cachedTorrentMeta(ctx context.Context, hash string) (*cachedMeta, error) {
 	if cached, ok := s.fileCache.Load(hash); ok {
-		return cached.(*cachedMeta), nil
+		cm, valid := cached.(*cachedMeta)
+		if !valid {
+			return nil, fmt.Errorf("invalid cached type for %s", hash)
+		}
+		return cm, nil
 	}
 
 	meta, err := s.GetTorrentMetadata(ctx, hash)
@@ -404,7 +408,11 @@ func (s *Source) readChunkCached(hash, path string, offset, size int64) ([]byte,
 }
 
 // readPieceFromRegions reads piece data spanning multiple files using cached handles.
-func (s *Source) readPieceFromRegions(hash string, regions []utils.FileRegion, pieceOffset, pieceSize int64) ([]byte, error) {
+func (s *Source) readPieceFromRegions(
+	hash string,
+	regions []utils.FileRegion,
+	pieceOffset, pieceSize int64,
+) ([]byte, error) {
 	data := make([]byte, 0, pieceSize)
 	remaining := pieceSize
 	currentOffset := pieceOffset

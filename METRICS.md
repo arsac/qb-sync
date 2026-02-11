@@ -11,8 +11,10 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `operation` | `GetTorrents`, `Login`, ... | qBittorrent API operation name |
 | `component` | `qb_client`, `stream_queue` | Internal component |
 | `reason` | `context_cancel`, `eof`, `error`, `ack_channel_blocked` | Goroutine exit reason |
+| `connection` | gRPC connection index | Per-TCP-connection identifier |
 | `hash` | torrent info hash | Per-torrent identifier |
 | `name` | torrent name | Per-torrent human-readable name |
+| `direction` | `up`, `down` | Connection scaling direction |
 
 ## Counters
 
@@ -56,6 +58,7 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_send_timeout_total` | | Send() timed out on HTTP/2 flow control backpressure |
 | `qbsync_receive_acks_exit_total` | `reason` | receiveAcks goroutine exits by reason |
 | `qbsync_ack_channel_blocked_total` | | receiveAcks exited because ack channel was blocked too long |
+| `qbsync_connection_scale_events_total` | `direction` | TCP connection scaling events (up/down) |
 
 ## Gauges
 
@@ -72,14 +75,15 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_torrents_with_dirty_state` | | Torrents with state not yet flushed to disk (cold) |
 | `qbsync_active_finalization_backoffs` | | Torrents in finalization backoff (hot) |
 | `qbsync_oldest_pending_sync_seconds` | `hash`, `name` | Age of each torrent waiting to sync |
-| `qbsync_torrent_pieces_total` | `hash`, `name` | Total pieces per tracked torrent |
+| `qbsync_torrent_pieces` | `hash`, `name` | Total pieces per tracked torrent |
 | `qbsync_torrent_pieces_streamed` | `hash`, `name` | Pieces synced to cold per tracked torrent |
-| `qbsync_torrent_size_bytes_total` | `hash`, `name` | Total size in bytes per tracked torrent |
+| `qbsync_torrent_size_bytes` | `hash`, `name` | Total size in bytes per tracked torrent |
 | `qbsync_completed_on_cold_cache_size` | | Torrents cached as complete on cold (hot) |
 | `qbsync_inode_registry_size` | | Registered inodes for hardlink deduplication (cold) |
 | `qbsync_cold_worker_queue_depth` | | Pieces queued waiting for a cold write worker |
 | `qbsync_cold_workers_busy` | | Cold write workers currently processing |
-| `qbsync_grpc_connections_configured` | | TCP connections configured for gRPC streaming (hot) |
+| `qbsync_grpc_connections_configured` | | Maximum TCP connections configured for gRPC streaming (hot) |
+| `qbsync_grpc_connections_active` | | Current active TCP connections to cold server (hot) |
 | `qbsync_sender_workers_configured` | | Concurrent sender workers configured (hot) |
 | `qbsync_draining` | | Shutdown drain in progress: 1=draining, 0=normal (hot) |
 
@@ -110,12 +114,12 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 
 | Panel | PromQL |
 |-------|--------|
-| Progress bar per torrent | `qbsync_torrent_pieces_streamed / qbsync_torrent_pieces_total` |
-| Pieces remaining | `qbsync_torrent_pieces_total - qbsync_torrent_pieces_streamed` |
-| Torrent size | `qbsync_torrent_size_bytes_total` |
-| Bytes synced (estimated) | `qbsync_torrent_pieces_streamed / qbsync_torrent_pieces_total * qbsync_torrent_size_bytes_total` |
+| Progress bar per torrent | `qbsync_torrent_pieces_streamed / qbsync_torrent_pieces` |
+| Pieces remaining | `qbsync_torrent_pieces - qbsync_torrent_pieces_streamed` |
+| Torrent size | `qbsync_torrent_size_bytes` |
+| Bytes synced (estimated) | `qbsync_torrent_pieces_streamed / qbsync_torrent_pieces * qbsync_torrent_size_bytes` |
 | Sync rate | `rate(qbsync_torrent_pieces_streamed[5m])` per torrent |
-| Active torrent list | Table panel filtering on `qbsync_torrent_pieces_total > 0` |
+| Active torrent list | Table panel filtering on `qbsync_torrent_pieces > 0` |
 
 **Sync latency distribution** (aggregated across all torrents):
 

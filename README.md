@@ -58,7 +58,8 @@ All flags can be set via environment variables with the prefix `QBSYNC_HOT_` or 
 | `QBSYNC_HOT_PIECE_TIMEOUT` | `--piece-timeout` | Timeout for stale in-flight pieces (seconds) | `60` |
 | `QBSYNC_HOT_RECONNECT_MAX_DELAY` | `--reconnect-max-delay` | Max reconnect backoff delay (seconds) | `30` |
 | `QBSYNC_HOT_NUM_SENDERS` | `--num-senders` | Concurrent sender workers | `4` |
-| `QBSYNC_HOT_GRPC_CONNECTIONS` | `--grpc-connections` | TCP connections to cold server | `2` |
+| `QBSYNC_HOT_MIN_CONNECTIONS` | `--min-connections` | Minimum TCP connections to cold server | `2` |
+| `QBSYNC_HOT_MAX_CONNECTIONS` | `--max-connections` | Maximum TCP connections to cold server | `8` |
 | `QBSYNC_HOT_SYNCED_TAG` | `--synced-tag` | Tag for synced torrents (empty to disable) | `synced` |
 | `QBSYNC_HOT_SOURCE_REMOVED_TAG` | `--source-removed-tag` | Tag on cold when source removed (empty to disable) | `source-removed` |
 | `QBSYNC_HOT_DRAIN_ANNOTATION` | `--drain-annotation` | Pod annotation key to gate shutdown drain (empty to drain unconditionally) | `qbsync/drain` |
@@ -117,6 +118,38 @@ Drain is gated by a pod annotation. On SIGTERM, the hot server checks the annota
 - **Annotation check fails** (K8s API unreachable): drain is skipped (fail-closed)
 - **No `--drain-annotation` configured** (empty string): drain runs unconditionally on SIGTERM
 
+### RBAC
+
+The drain annotation check reads the pod's own metadata via the Kubernetes API. The service account needs `get` on `pods` in its namespace:
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: qbsync-hot
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: qbsync-hot
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: qbsync-hot
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: qbsync-hot
+subjects:
+  - kind: ServiceAccount
+    name: qbsync-hot
+```
+
 ### Pod spec
 
 ```yaml
@@ -124,6 +157,7 @@ metadata:
   annotations:
     qbsync/drain: "false"  # Set to "true" before node maintenance
 spec:
+  serviceAccountName: qbsync-hot
   terminationGracePeriodSeconds: 600
   containers:
   - name: qbsync-hot

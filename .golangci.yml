@@ -279,8 +279,11 @@ linters:
           - dupl
           - errcheck
           - funlen
+          - gochecknoglobals
+          - gocognit
           - goconst
           - gosec
+          - nilnil
           - noctx
           - testpackage
           - wrapcheck

@@ -359,8 +359,13 @@ func TestE2E_TempPathSync(t *testing.T) {
 	env.WaitForTorrentCompleteOnCold(ctx, wiredCDHash, syncCompleteTimeout,
 		"torrent with temp_path should sync to cold")
 
-	// Wait for "synced" tag on hot before cancelling the orchestrator.
-	require.Eventually(t, func() bool {
+	// Wait for synced tag on cold (reliable, applied via background context).
+	env.WaitForSyncedTagOnCold(ctx, wiredCDHash, 30*time.Second,
+		"cold torrent should have 'synced' tag")
+
+	// Hot synced tag is for visibility only. With temp_path enabled, qBittorrent's
+	// addTags API may silently drop the request. Use non-fatal assertion.
+	hasSyncedTag := assert.Eventually(t, func() bool {
 		torrents, tagErr := env.HotClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
 			Hashes: []string{wiredCDHash},
 		})
@@ -368,7 +373,16 @@ func TestE2E_TempPathSync(t *testing.T) {
 			return false
 		}
 		return strings.Contains(torrents[0].Tags, "synced")
-	}, 30*time.Second, time.Second, "hot torrent should have 'synced' tag")
+	}, 10*time.Second, time.Second, "hot torrent should have 'synced' tag (visibility only)")
+
+	if !hasSyncedTag {
+		torrents, _ := env.HotClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+			Hashes: []string{wiredCDHash},
+		})
+		if len(torrents) > 0 {
+			t.Logf("Hot torrent tags (temp_path quirk): %q", torrents[0].Tags)
+		}
+	}
 
 	cancelOrchestrator()
 	<-orchestratorDone
@@ -558,6 +572,11 @@ func TestE2E_SourceRemovedTagOnDiskPressure(t *testing.T) {
 
 	t.Log("Waiting for torrent to be synced to cold...")
 	env.WaitForTorrentCompleteOnCold(ctx, wiredCDHash, syncCompleteTimeout, "torrent should be complete on cold")
+
+	// Wait for background finalization to apply the synced tag on cold before canceling the orchestrator.
+	// The synced tag is applied after addAndVerifyTorrent completes.
+	env.WaitForSyncedTagOnCold(ctx, wiredCDHash, 30*time.Second,
+		"cold torrent should have 'synced' tag after finalization")
 
 	cancelOrchestrator()
 	<-orchestratorDone

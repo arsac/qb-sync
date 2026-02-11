@@ -43,11 +43,12 @@ func (r *Runner) SetHealthServer(hs *health.Server) {
 // Run starts the hot server orchestration.
 func (r *Runner) Run(ctx context.Context) error {
 	// Connect to cold server
-	numConns := r.cfg.GRPCConnections
-	if numConns <= 0 {
-		numConns = 1
+	minConns := r.cfg.MinGRPCConnections
+	if minConns <= 0 {
+		minConns = 1
 	}
-	dest, err := streaming.NewGRPCDestination(r.cfg.ColdAddr, numConns)
+	maxConns := max(r.cfg.MaxGRPCConnections, minConns)
+	dest, err := streaming.NewGRPCDestination(r.cfg.ColdAddr, minConns, maxConns)
 	if err != nil {
 		return fmt.Errorf("connecting to cold server: %w", err)
 	}
@@ -58,8 +59,13 @@ func (r *Runner) Run(ctx context.Context) error {
 		return fmt.Errorf("cold server connection validation failed: %w", validateErr)
 	}
 
-	metrics.GRPCConnectionsConfigured.Set(float64(numConns))
-	r.logger.InfoContext(ctx, "connected to cold server", "addr", r.cfg.ColdAddr, "connections", numConns)
+	metrics.GRPCConnectionsConfigured.Set(float64(maxConns))
+	metrics.GRPCConnectionsActive.Set(float64(minConns))
+	r.logger.InfoContext(ctx, "connected to cold server",
+		"addr", r.cfg.ColdAddr,
+		"minConnections", minConns,
+		"maxConnections", maxConns,
+	)
 
 	// Create QBTask with streaming destination
 	qbTask, taskErr := NewQBTask(r.cfg, dest, r.logger.With("task", "qb"))

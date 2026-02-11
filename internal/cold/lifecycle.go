@@ -172,27 +172,15 @@ func (s *Server) isOrphanedTorrent(ctx context.Context, hash string, timeout tim
 
 	// Check state file modification time
 	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
-	statePath := filepath.Join(metaDir, ".state")
-	info, statErr := os.Stat(statePath)
+	info, statErr := s.statOrphanMetadata(metaDir)
 	if statErr != nil {
-		if os.IsNotExist(statErr) {
-			// No state file - check for .torrent file as fallback timestamp
-			torrentPath, findErr := findTorrentFile(metaDir)
-			if findErr != nil {
-				return false
-			}
-			torrentInfo, torrentStatErr := os.Stat(torrentPath)
-			if torrentStatErr != nil {
-				return false
-			}
-			info = torrentInfo
-		} else {
-			s.logger.DebugContext(ctx, "failed to stat state file",
+		if !os.IsNotExist(statErr) {
+			s.logger.DebugContext(ctx, "failed to stat metadata for orphan check",
 				"hash", hash,
 				"error", statErr,
 			)
-			return false
 		}
+		return false
 	}
 
 	age := time.Since(info.ModTime())
@@ -207,6 +195,27 @@ func (s *Server) isOrphanedTorrent(ctx context.Context, hash string, timeout tim
 		"timeout", timeout,
 	)
 	return true
+}
+
+// statOrphanMetadata returns FileInfo for the torrent's metadata, checking
+// .state first and falling back to the .torrent file. Returns os.ErrNotExist
+// when neither file exists.
+func (s *Server) statOrphanMetadata(metaDir string) (os.FileInfo, error) {
+	statePath := filepath.Join(metaDir, ".state")
+	info, err := os.Stat(statePath)
+	if err == nil {
+		return info, nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	// No state file - check for .torrent file as fallback timestamp
+	torrentPath, findErr := findTorrentFile(metaDir)
+	if findErr != nil {
+		return nil, os.ErrNotExist
+	}
+	return os.Stat(torrentPath)
 }
 
 // cleanupOrphan removes all data associated with an orphaned torrent.

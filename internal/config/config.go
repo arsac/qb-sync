@@ -25,9 +25,10 @@ const (
 	defaultSourceRemovedTag     = "source-removed"
 	defaultReconnectMaxDelaySec = 30
 	defaultNumSenders           = 4
-	defaultGRPCConnections      = 2
+	defaultMinGRPCConnections   = 2
+	defaultMaxGRPCConnections   = 8
 	DefaultDrainTimeoutSec      = 300 // 5 minutes
-
+	defaultMaxStreamBufferMB    = 512
 )
 
 // BaseConfig contains configuration shared between hot and cold servers.
@@ -71,12 +72,13 @@ type HotConfig struct {
 	DrainTimeout time.Duration
 
 	// Streaming tuning
-	PieceTimeout      time.Duration // Timeout for stale in-flight pieces (default: 60s)
-	MaxBytesPerSec    int64
-	ReconnectMaxDelay time.Duration // Max reconnect backoff delay (default: 30s)
-	NumSenders        int           // Concurrent sender workers for streaming (default: 4)
-	GRPCConnections   int           // Number of TCP connections to cold server (default: 2)
-	SourceRemovedTag  string        // Tag applied on cold when torrent is removed from hot (empty to disable)
+	PieceTimeout       time.Duration // Timeout for stale in-flight pieces (default: 60s)
+	MaxBytesPerSec     int64
+	ReconnectMaxDelay  time.Duration // Max reconnect backoff delay (default: 30s)
+	NumSenders         int           // Concurrent sender workers for streaming (default: 4)
+	MinGRPCConnections int           // Minimum TCP connections to cold server (default: 2)
+	MaxGRPCConnections int           // Maximum TCP connections to cold server (default: 8)
+	SourceRemovedTag   string        // Tag applied on cold when torrent is removed from hot (empty to disable)
 }
 
 // Validate validates the base configuration shared by hot and cold.
@@ -113,6 +115,15 @@ func (c *HotConfig) Validate() error {
 	if c.ReconnectMaxDelay < 0 {
 		return errors.New("reconnect max delay cannot be negative")
 	}
+	if c.MinGRPCConnections < 0 {
+		return errors.New("min connections cannot be negative")
+	}
+	if c.MaxGRPCConnections < 0 {
+		return errors.New("max connections cannot be negative")
+	}
+	if c.MinGRPCConnections > 0 && c.MaxGRPCConnections > 0 && c.MinGRPCConnections > c.MaxGRPCConnections {
+		return errors.New("min connections cannot exceed max connections")
+	}
 	return nil
 }
 
@@ -132,8 +143,8 @@ type ColdConfig struct {
 	PollTimeout  time.Duration
 
 	// Streaming tuning
-	StreamWorkers      int // Number of concurrent piece writers (0 = use default 8)
-	MaxStreamBufferMB  int // Global memory budget in MB for buffered piece data (default: 512)
+	StreamWorkers     int // Number of concurrent piece writers (0 = use default 8)
+	MaxStreamBufferMB int // Global memory budget in MB for buffered piece data (default: 512)
 }
 
 // Validate validates the cold configuration.
@@ -171,14 +182,43 @@ func SetupHotFlags(cmd *cobra.Command) {
 	flags.Int64("min-space", defaultMinSpaceGB, "Minimum free space in GB before moving torrents")
 	flags.Int("min-seeding-time", defaultMinSeedingTimeSec, "Minimum seeding time in seconds before moving")
 	flags.Int("sleep", defaultSleepIntervalSec, "Sleep interval between checks in seconds")
-	flags.String("drain-annotation", "qbsync/drain", "Pod annotation key checked on shutdown to gate drain (empty = drain unconditionally on SIGTERM)")
+	flags.String(
+		"drain-annotation",
+		"qbsync/drain",
+		"Pod annotation key checked on shutdown to gate drain (empty = drain unconditionally on SIGTERM)",
+	)
 	flags.Int("drain-timeout", DefaultDrainTimeoutSec, "Timeout in seconds for shutdown drain operation")
 	flags.Int64("rate-limit", 0, "Max bytes/sec for streaming (0 = unlimited)")
-	flags.Int("piece-timeout", defaultPieceTimeoutSec, "Timeout in seconds for stale in-flight pieces (increase for high-latency links)")
-	flags.Int("reconnect-max-delay", defaultReconnectMaxDelaySec, "Max reconnect backoff delay in seconds (decrease for unstable links)")
-	flags.Int("num-senders", defaultNumSenders, "Concurrent sender workers for streaming (increase for high-throughput links)")
-	flags.Int("grpc-connections", defaultGRPCConnections, "Number of TCP connections for gRPC streaming (increase for high-throughput links)")
-	flags.String("source-removed-tag", defaultSourceRemovedTag, "Tag to apply on cold torrent when source is removed from hot (empty to disable)")
+	flags.Int(
+		"piece-timeout",
+		defaultPieceTimeoutSec,
+		"Timeout in seconds for stale in-flight pieces (increase for high-latency links)",
+	)
+	flags.Int(
+		"reconnect-max-delay",
+		defaultReconnectMaxDelaySec,
+		"Max reconnect backoff delay in seconds (decrease for unstable links)",
+	)
+	flags.Int(
+		"num-senders",
+		defaultNumSenders,
+		"Concurrent sender workers for streaming (increase for high-throughput links)",
+	)
+	flags.Int(
+		"min-connections",
+		defaultMinGRPCConnections,
+		"Minimum TCP connections for gRPC streaming (connections scale up from this)",
+	)
+	flags.Int(
+		"max-connections",
+		defaultMaxGRPCConnections,
+		"Maximum TCP connections for gRPC streaming (connections scale up to this)",
+	)
+	flags.String(
+		"source-removed-tag",
+		defaultSourceRemovedTag,
+		"Tag to apply on cold torrent when source is removed from hot (empty to disable)",
+	)
 	flags.String("health-addr", defaultHealthAddr, "HTTP health endpoint address (empty to disable)")
 	flags.String("synced-tag", defaultSyncedTag, "Tag to apply to synced torrents (empty to disable)")
 	flags.Bool("dry-run", false, "Run without making changes")
@@ -198,7 +238,11 @@ func SetupColdFlags(cmd *cobra.Command) {
 	flags.Int("poll-interval", defaultPollIntervalSec, "Poll interval in seconds for torrent verification")
 	flags.Int("poll-timeout", defaultPollTimeoutSec, "Poll timeout in seconds for torrent verification")
 	flags.Int("stream-workers", 0, "Number of concurrent piece writers (0 = auto: 8, increase for SSD/NVMe)")
-	flags.Int("max-stream-buffer", 512, "Global memory budget in MB for buffered piece data across all streams")
+	flags.Int(
+		"max-stream-buffer",
+		defaultMaxStreamBufferMB,
+		"Global memory budget in MB for buffered piece data across all streams",
+	)
 	flags.String("health-addr", defaultHealthAddr, "HTTP health endpoint address (empty to disable)")
 	flags.String("synced-tag", defaultSyncedTag, "Tag to apply to synced torrents (empty to disable)")
 	flags.Bool("dry-run", false, "Run without making changes")
@@ -213,10 +257,11 @@ func BindHotFlags(cmd *cobra.Command, v *viper.Viper) error {
 
 	flags := []string{
 		"data", "qb-url", "qb-username", "qb-password",
-		"cold-addr", "min-space", "min-seeding-time",
-		"sleep", "rate-limit", "piece-timeout",
-		"reconnect-max-delay", "num-senders", "grpc-connections", "source-removed-tag", "health-addr", "synced-tag", "dry-run",
-		"log-level", "drain-annotation", "drain-timeout",
+		"cold-addr", "min-space", "min-seeding-time", "sleep",
+		"rate-limit", "piece-timeout", "reconnect-max-delay",
+		"num-senders", "min-connections", "max-connections",
+		"source-removed-tag", "health-addr", "synced-tag",
+		"dry-run", "log-level", "drain-annotation", "drain-timeout",
 	}
 
 	for _, flag := range flags {
@@ -266,19 +311,20 @@ func loadBase(v *viper.Viper) BaseConfig {
 // LoadHot loads the hot server configuration from viper.
 func LoadHot(v *viper.Viper) (*HotConfig, error) {
 	cfg := &HotConfig{
-		BaseConfig:        loadBase(v),
-		ColdAddr:          v.GetString("cold-addr"),
-		MinSpaceGB:      v.GetInt64("min-space"),
-		MinSeedingTime:  time.Duration(v.GetInt("min-seeding-time")) * time.Second,
-		SleepInterval:   time.Duration(v.GetInt("sleep")) * time.Second,
-		DrainAnnotation: v.GetString("drain-annotation"),
-		DrainTimeout:    time.Duration(v.GetInt("drain-timeout")) * time.Second,
-		PieceTimeout:      time.Duration(v.GetInt("piece-timeout")) * time.Second,
-		MaxBytesPerSec:    v.GetInt64("rate-limit"),
-		ReconnectMaxDelay: time.Duration(v.GetInt("reconnect-max-delay")) * time.Second,
-		NumSenders:        v.GetInt("num-senders"),
-		GRPCConnections:   v.GetInt("grpc-connections"),
-		SourceRemovedTag:  v.GetString("source-removed-tag"),
+		BaseConfig:         loadBase(v),
+		ColdAddr:           v.GetString("cold-addr"),
+		MinSpaceGB:         v.GetInt64("min-space"),
+		MinSeedingTime:     time.Duration(v.GetInt("min-seeding-time")) * time.Second,
+		SleepInterval:      time.Duration(v.GetInt("sleep")) * time.Second,
+		DrainAnnotation:    v.GetString("drain-annotation"),
+		DrainTimeout:       time.Duration(v.GetInt("drain-timeout")) * time.Second,
+		PieceTimeout:       time.Duration(v.GetInt("piece-timeout")) * time.Second,
+		MaxBytesPerSec:     v.GetInt64("rate-limit"),
+		ReconnectMaxDelay:  time.Duration(v.GetInt("reconnect-max-delay")) * time.Second,
+		NumSenders:         v.GetInt("num-senders"),
+		MinGRPCConnections: v.GetInt("min-connections"),
+		MaxGRPCConnections: v.GetInt("max-connections"),
+		SourceRemovedTag:   v.GetString("source-removed-tag"),
 	}
 
 	// Support conventional env vars as fallbacks

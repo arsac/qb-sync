@@ -17,6 +17,7 @@ const (
 	defaultMaxAttempts  = 3
 	defaultInitialDelay = 500 * time.Millisecond
 	defaultMaxDelay     = 5 * time.Second
+	retryJitterFactor   = 0.1 // 10% randomization on retry delays
 )
 
 // RetryConfig configures retry behavior with exponential backoff.
@@ -54,7 +55,7 @@ func NewRetryPolicy(config RetryConfig, logger *slog.Logger, onRetry ...func()) 
 	return retrypolicy.NewBuilder[any]().
 		WithMaxAttempts(config.MaxAttempts).
 		WithBackoff(config.InitialDelay, config.MaxDelay).
-		WithJitterFactor(0.1).
+		WithJitterFactor(retryJitterFactor).
 		HandleIf(func(_ any, err error) bool {
 			return checker(err)
 		}).

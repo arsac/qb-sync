@@ -26,6 +26,10 @@ const (
 	defaultQBPollInterval = 2 * time.Second
 	defaultQBPollTimeout  = 5 * time.Minute
 
+	// stopTorrentTimeout is how long to wait when stopping a torrent after adding to qBittorrent.
+	// Uses a detached context because the gRPC caller may cancel before the stop completes.
+	stopTorrentTimeout = 10 * time.Second
+
 	// Default orphan cleanup settings.
 	defaultOrphanCleanupInterval = 1 * time.Hour  // How often to scan for orphans
 	defaultOrphanTimeout         = 24 * time.Hour // Consider torrent orphaned after this inactive period
@@ -41,12 +45,17 @@ const (
 	partialSuffix = ".partial"
 
 	// Memory management.
+	bytesPerMB               = 1024 * 1024
 	defaultMaxStreamBufferMB = 512 // Default global memory budget for buffered piece data
 	maxVerifyConcurrency     = 4   // Limit concurrent piece reads during finalization to cap transient memory
 
 	// verifyIdleTimeout is how long verification can go without verifying a piece
 	// before it is considered stalled. Resets on each successfully verified piece.
 	verifyIdleTimeout = 60 * time.Second
+
+	// verifyIdleCheckDivisor divides verifyIdleTimeout to determine the watchdog tick interval.
+	// A value of 2 means the watchdog checks at half the timeout interval.
+	verifyIdleCheckDivisor = 2
 
 	// backgroundFinalizeTimeout is the upper-bound timeout for the entire
 	// background finalization (verification + inode registration + qBittorrent).

@@ -31,12 +31,20 @@ const (
 	DefaultAckChannelSize = 1000
 
 	// Adaptive scaling constants.
-	defaultScaleInterval      = 5 * time.Second  // How often to check for scaling
-	defaultScaleUpThreshold   = 0.05             // 5% throughput increase to scale up
-	defaultScaleDownThreshold = 0.15             // 15% throughput decrease to scale down
-	defaultPlateauThreshold   = 0.03             // <3% change considered plateau
-	defaultPlateauCount       = 3                // Consecutive plateaus before stopping
-	scalingCooldownPeriod     = 2 * time.Minute  // Cooldown before resuming scaling after pause
+	defaultScaleInterval      = 5 * time.Second // How often to check for scaling
+	defaultScaleUpThreshold   = 0.05            // 5% throughput increase to scale up
+	defaultScaleDownThreshold = 0.15            // 15% throughput decrease to scale down
+	defaultPlateauThreshold   = 0.03            // <3% change considered plateau
+	defaultPlateauCount       = 3               // Consecutive plateaus before stopping
+	scalingCooldownPeriod     = 2 * time.Minute // Cooldown before resuming scaling after pause
+
+	// streamDrainTimeout is how long drainAndRemoveStream waits for in-flight
+	// pieces to complete before closing the stream anyway.
+	streamDrainTimeout = 30 * time.Second
+
+	// drainPollInterval is how often drainAndRemoveStream checks whether
+	// in-flight pieces have completed.
+	drainPollInterval = 100 * time.Millisecond
 
 	// Conversion constants.
 	bytesPerMB      = 1024 * 1024
@@ -57,6 +65,10 @@ type PooledStream struct {
 	window    *congestion.AdaptiveWindow
 	id        int
 	connLabel string // Pre-computed gRPC connection index label for metrics
+
+	// Graceful drain lifecycle
+	draining atomic.Bool // Set true to stop sending new pieces; stream drains in-flight
+	removed  atomic.Bool // Set true when fully drained; forwardAcks exits silently
 
 	// Stats - atomic for lock-free reads
 	bytesSent  atomic.Int64
@@ -96,6 +108,11 @@ type StreamPool struct {
 	plateauCount      int       // Consecutive intervals with <5% change
 	scalingPaused     bool      // Stop scaling after saturation detected
 	scalingPausedTime time.Time // When scaling was paused (for cooldown)
+
+	// Connection-level scaling state (protected by mu)
+	preConnectionThroughput     float64   // Throughput before last connection add
+	connectionAddedTime         time.Time // When last connection was added
+	connectionScaleCheckPending bool      // Awaiting diminishing returns check
 
 	// Lifecycle
 	ctx       context.Context
@@ -245,6 +262,11 @@ func (p *StreamPool) forwardAcks(ps *PooledStream) { //nolint:gocognit // comple
 			return
 
 		case <-ps.stream.Done():
+			// Intentionally removed stream — exit silently without error.
+			if ps.removed.Load() {
+				return
+			}
+
 			// Stream ended. Drain any pending error so it gets forwarded
 			// to the pool. Without this, a select race between Done() and
 			// Errors() can silently drop the stream error, leaving the
@@ -269,8 +291,11 @@ func (p *StreamPool) forwardAcks(ps *PooledStream) { //nolint:gocognit // comple
 					case <-p.ctx.Done():
 						// Pool closing between the check and send — no need to report.
 					default:
-						p.logger.WarnContext(p.ctx, "error channel full, dropping synthetic error on silent stream close",
-							"streamID", ps.id,
+						p.logger.WarnContext(
+							p.ctx,
+							"error channel full, dropping synthetic error on silent stream close",
+							"streamID",
+							ps.id,
 						)
 					}
 				}
@@ -463,6 +488,28 @@ func (p *StreamPool) measureThroughput() (float64, bool) {
 // applyScalingDecision applies scaling logic based on throughput change.
 // Must hold p.mu.
 func (p *StreamPool) applyScalingDecision(currentThroughput float64) {
+	// Check diminishing returns from recent connection add
+	if p.connectionScaleCheckPending && time.Since(p.connectionAddedTime) >= 2*p.scaleInterval {
+		p.connectionScaleCheckPending = false
+		var improvement float64
+		if p.preConnectionThroughput > 0 {
+			improvement = (currentThroughput - p.preConnectionThroughput) / p.preConnectionThroughput
+		}
+		if improvement < defaultScaleUpThreshold {
+			p.logger.InfoContext(p.ctx, "diminishing returns from connection add",
+				"improvementPercent", improvement*percentMultiple,
+				"connections", p.dest.ConnectionCount(),
+			)
+			p.tryConnectionScaleDown()
+			p.pauseScaling("diminishing returns")
+			return
+		}
+		p.logger.InfoContext(p.ctx, "connection add effective",
+			"improvementPercent", improvement*percentMultiple,
+			"connections", p.dest.ConnectionCount(),
+		)
+	}
+
 	var changeRatio float64
 	if p.lastThroughput > 0 {
 		changeRatio = (currentThroughput - p.lastThroughput) / p.lastThroughput
@@ -509,9 +556,16 @@ func (p *StreamPool) tryScaleUp() {
 	p.plateauCount = 0
 }
 
-// tryScaleDown attempts to remove a stream and pauses scaling. Must hold p.mu.
+// tryScaleDown attempts to remove a stream. If streams are at minimum,
+// tries removing a TCP connection instead. Pauses scaling. Must hold p.mu.
 func (p *StreamPool) tryScaleDown() {
 	if err := p.removeStreamLocked(); err != nil {
+		// Streams at minimum — try connection-level scale-down
+		if p.dest.ConnectionCount() > p.dest.MinConnections() {
+			p.tryConnectionScaleDown()
+			p.pauseScaling("throughput decreased, removing connection")
+			return
+		}
 		p.logger.WarnContext(p.ctx, "failed to remove stream", "error", err)
 		return
 	}
@@ -523,16 +577,45 @@ func (p *StreamPool) tryScaleDown() {
 	p.pauseScaling("throughput decreased")
 }
 
-// handlePlateau handles throughput plateau detection. Must hold p.mu.
+// handlePlateau handles throughput plateau detection. When stream scaling
+// plateaus, attempts to add a TCP connection (two-level staircase).
+// Must hold p.mu.
 func (p *StreamPool) handlePlateau(currentThroughput float64) {
 	p.plateauCount++
-	if p.plateauCount >= defaultPlateauCount && len(p.streams) > MinPoolSize {
-		p.logger.InfoContext(p.ctx, "saturation detected",
-			"streams", len(p.streams),
+	if p.plateauCount < defaultPlateauCount {
+		return
+	}
+
+	// Try connection-level scaling before giving up
+	if p.dest.ConnectionCount() < p.dest.MaxConnections() {
+		if err := p.dest.AddConnection(); err != nil {
+			p.logger.WarnContext(p.ctx, "failed to add connection", "error", err)
+			p.pauseScaling("connection add failed")
+			return
+		}
+
+		p.preConnectionThroughput = currentThroughput
+		p.connectionAddedTime = time.Now()
+		p.connectionScaleCheckPending = true
+		p.plateauCount = 0 // Resume stream scaling on new baseline
+
+		connCount := p.dest.ConnectionCount()
+		metrics.GRPCConnectionsActive.Set(float64(connCount))
+		metrics.ConnectionScaleEventsTotal.WithLabelValues(metrics.DirectionUp).Inc()
+		p.logger.InfoContext(p.ctx, "added TCP connection",
+			"connections", connCount,
 			"throughputMBps", currentThroughput/bytesPerMB,
 		)
-		p.pauseScaling("saturation detected")
+		return
 	}
+
+	// At max connections — full saturation, pause unconditionally
+	p.logger.InfoContext(p.ctx, "full saturation detected",
+		"streams", len(p.streams),
+		"connections", p.dest.ConnectionCount(),
+		"throughputMBps", currentThroughput/bytesPerMB,
+	)
+	p.pauseScaling("full saturation")
 }
 
 // pauseScaling pauses adaptive scaling with cooldown. Must hold p.mu.
@@ -546,7 +629,60 @@ func (p *StreamPool) pauseScaling(reason string) {
 	)
 }
 
-// removeStreamLocked removes the last stream. Must hold p.mu write lock.
+// tryConnectionScaleDown removes the last TCP connection and its streams.
+// Must hold p.mu. The actual drain runs asynchronously.
+func (p *StreamPool) tryConnectionScaleDown() {
+	connCount := p.dest.ConnectionCount()
+	if connCount <= p.dest.MinConnections() {
+		return
+	}
+
+	connIdx := connCount - 1
+	p.wg.Go(func() {
+		p.removeConnectionStreams(connIdx)
+	})
+}
+
+// removeConnectionStreams drains all streams on the given connection index,
+// then removes the connection. Called as a goroutine.
+func (p *StreamPool) removeConnectionStreams(connIdx int) {
+	p.mu.Lock()
+	var toDrain []*PooledStream
+	for _, ps := range p.streams {
+		if ps.stream.connIdx == connIdx {
+			ps.draining.Store(true)
+			toDrain = append(toDrain, ps)
+		}
+	}
+	p.mu.Unlock()
+
+	// Drain all streams on this connection
+	var wg sync.WaitGroup
+	for _, ps := range toDrain {
+		wg.Go(func() {
+			p.drainAndRemoveStream(ps)
+		})
+	}
+	wg.Wait()
+
+	// All streams drained — safe to close the connection
+	if err := p.dest.RemoveConnection(connIdx); err != nil {
+		p.logger.WarnContext(p.ctx, "failed to remove connection", "error", err)
+		return
+	}
+
+	connCount := p.dest.ConnectionCount()
+	metrics.GRPCConnectionsActive.Set(float64(connCount))
+	metrics.ConnectionScaleEventsTotal.WithLabelValues(metrics.DirectionDown).Inc()
+	metrics.StreamPoolSize.Set(float64(p.StreamCount()))
+	p.logger.InfoContext(p.ctx, "removed TCP connection",
+		"connections", connCount,
+	)
+}
+
+// removeStreamLocked initiates graceful drain of the last stream. Must hold p.mu write lock.
+// The stream stays in the slice during drain (so forwardAcks keeps running and acks flow back)
+// but findLeastLoadedStream skips it. drainAndRemoveStream removes it after drain completes.
 func (p *StreamPool) removeStreamLocked() error {
 	if len(p.streams) <= MinPoolSize {
 		return errors.New("pool at minimum capacity")
@@ -554,14 +690,58 @@ func (p *StreamPool) removeStreamLocked() error {
 
 	lastIdx := len(p.streams) - 1
 	ps := p.streams[lastIdx]
-	p.streams = p.streams[:lastIdx]
 
-	// Preserve bytes sent from removed stream for accurate throughput calculation
-	p.removedBytesSent += ps.bytesSent.Load()
+	// Mark as draining before spawning goroutine so SelectStream() skips it
+	// immediately when p.mu is released, avoiding a scheduling race.
+	ps.draining.Store(true)
 
-	ps.stream.Close()
+	// Don't remove from slice yet — drainAndRemoveStream does it after drain
+	p.wg.Go(func() {
+		p.drainAndRemoveStream(ps)
+	})
 
 	return nil
+}
+
+// drainAndRemoveStream gracefully drains a stream's in-flight pieces, then removes it from the pool.
+// Called as a goroutine by removeStreamLocked and removeConnectionStreams.
+func (p *StreamPool) drainAndRemoveStream(ps *PooledStream) {
+	ps.draining.Store(true) // Idempotent — callers pre-set this under p.mu
+
+	// Wait for in-flight pieces to drain (with timeout)
+	deadline := time.NewTimer(streamDrainTimeout)
+	ticker := time.NewTicker(drainPollInterval)
+	defer deadline.Stop()
+	defer ticker.Stop()
+
+	for ps.window.InFlight() > 0 {
+		select {
+		case <-deadline.C:
+			p.logger.WarnContext(p.ctx, "stream drain timeout, closing with in-flight pieces",
+				"streamID", ps.id,
+				"inFlight", ps.window.InFlight(),
+			)
+			goto remove
+		case <-p.ctx.Done():
+			return // Pool closing
+		case <-ticker.C:
+			// Re-check in-flight
+		}
+	}
+
+remove:
+	p.mu.Lock()
+	ps.removed.Store(true)
+	for i, s := range p.streams {
+		if s == ps {
+			p.streams = append(p.streams[:i], p.streams[i+1:]...)
+			break
+		}
+	}
+	p.removedBytesSent += ps.bytesSent.Load()
+	p.mu.Unlock()
+
+	ps.stream.Close()
 }
 
 // getTotalBytesSentLocked returns total bytes sent across all streams. Must hold p.mu.
@@ -607,6 +787,9 @@ func (p *StreamPool) findLeastLoadedStream(requireCanSend bool) *PooledStream {
 	bestInFlight := math.MaxInt
 
 	for _, ps := range p.streams {
+		if ps.draining.Load() {
+			continue
+		}
 		if requireCanSend && !ps.window.CanSend() {
 			continue
 		}
@@ -620,12 +803,15 @@ func (p *StreamPool) findLeastLoadedStream(requireCanSend bool) *PooledStream {
 	return best
 }
 
-// CanSend returns true if any stream in the pool can accept a piece.
+// CanSend returns true if any non-draining stream in the pool can accept a piece.
 func (p *StreamPool) CanSend() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
 	for _, ps := range p.streams {
+		if ps.draining.Load() {
+			continue
+		}
 		if ps.window.CanSend() {
 			return true
 		}

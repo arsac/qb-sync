@@ -251,10 +251,7 @@ func (w *AdaptiveWindow) OnAck(key string) {
 	}
 
 	// Congestion avoidance: CUBIC growth.
-	target := w.cubicCongestionWindowAfterAck()
-	if target > w.maxWindow {
-		target = w.maxWindow
-	}
+	target := min(w.cubicCongestionWindowAfterAck(), w.maxWindow)
 	if target > w.window {
 		w.window = target
 	}
@@ -367,10 +364,7 @@ func (w *AdaptiveWindow) OnFail(key string) {
 	}
 
 	// Multiplicative decrease.
-	newWindow := int(float64(w.window) * cubicBeta)
-	if newWindow < w.minWindow {
-		newWindow = w.minWindow
-	}
+	newWindow := max(int(float64(w.window)*cubicBeta), w.minWindow)
 	w.window = newWindow
 
 	// Enter recovery.

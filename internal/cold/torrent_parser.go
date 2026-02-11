@@ -3,6 +3,7 @@ package cold
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"path/filepath"
 
@@ -51,7 +52,7 @@ func parseTorrentFile(data []byte) (*parsedTorrent, error) {
 
 	info := bt.Info
 	if info.Name == "" {
-		return nil, fmt.Errorf("torrent has no name")
+		return nil, errors.New("torrent has no name")
 	}
 
 	rawPieces := info.Pieces
