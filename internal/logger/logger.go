@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-// ParseLevel converts a level string to slog.Level.
+// ParseLevel converts a level string to [slog.Level].
 // Accepts: debug, info, warn, error (case-insensitive). Defaults to info.
 func ParseLevel(s string) slog.Level {
 	switch strings.ToLower(strings.TrimSpace(s)) {

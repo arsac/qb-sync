@@ -24,7 +24,7 @@ import (
 var _ streaming.PieceSource = (*Source)(nil)
 
 // fileHandleCache caches open file handles per torrent to avoid repeated
-// open/close syscalls on the hot read path. os.File.ReadAt maps to pread(2)
+// open/close syscalls on the hot read path. [os.File.ReadAt] maps to pread(2)
 // which is safe for concurrent use on the same fd.
 type fileHandleCache struct {
 	mu     sync.Mutex
@@ -32,7 +32,7 @@ type fileHandleCache struct {
 }
 
 // get returns a cached handle or opens the file and caches it.
-// The lock is released before os.Open to avoid holding the mutex during the syscall.
+// The lock is released before [os.Open] to avoid holding the mutex during the syscall.
 // On re-acquire, a double-check handles the race where another goroutine opened the
 // same file concurrently — the loser closes its duplicate fd.
 func (c *fileHandleCache) get(hash, path string) (*os.File, error) {
@@ -382,7 +382,7 @@ func (s *Source) EvictCache(hash string) {
 }
 
 // readChunkCached reads a chunk using a cached file handle. On ReadAt error
-// (not io.EOF), it evicts the stale handle and retries once with a fresh open.
+// (not [io.EOF]), it evicts the stale handle and retries once with a fresh open.
 func (s *Source) readChunkCached(hash, path string, offset, size int64) ([]byte, error) {
 	f, err := s.handles.get(hash, path)
 	if err != nil {

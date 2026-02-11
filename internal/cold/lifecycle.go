@@ -198,7 +198,7 @@ func (s *Server) isOrphanedTorrent(ctx context.Context, hash string, timeout tim
 }
 
 // statOrphanMetadata returns FileInfo for the torrent's metadata, checking
-// .state first and falling back to the .torrent file. Returns os.ErrNotExist
+// .state first and falling back to the .torrent file. Returns [os.ErrNotExist]
 // when neither file exists.
 func (s *Server) statOrphanMetadata(metaDir string) (os.FileInfo, error) {
 	statePath := filepath.Join(metaDir, ".state")

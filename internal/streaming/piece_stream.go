@@ -255,7 +255,7 @@ func (ps *PieceStream) Done() <-chan struct{} {
 // CloseSend signals that no more pieces will be sent.
 // It signals sendLoop to stop via stopSend, waits for it to finish any
 // in-progress send, then calls stream.CloseSend(). Safe for concurrent
-// and repeated calls via sync.Once. Does not cancel the stream context,
+// and repeated calls via [sync.Once]. Does not cancel the stream context,
 // so receiveAcks continues to drain acks after the send side closes.
 func (ps *PieceStream) CloseSend() error {
 	ps.closeSendOnce.Do(func() {

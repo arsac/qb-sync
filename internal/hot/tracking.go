@@ -14,8 +14,8 @@ import (
 	pb "github.com/arsac/qb-sync/proto"
 )
 
-// completionTimeOrNow converts a qBittorrent CompletionOn unix timestamp to time.Time.
-// Returns time.Now() as fallback when the value is invalid (qBittorrent uses -1 for
+// completionTimeOrNow converts a qBittorrent CompletionOn unix timestamp to [time.Time].
+// Returns [time.Now] as fallback when the value is invalid (qBittorrent uses -1 for
 // torrents that were never tracked for completion).
 func completionTimeOrNow(completionOn int64) time.Time {
 	if completionOn > 0 {

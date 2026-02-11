@@ -11,8 +11,8 @@ import (
 )
 
 // grpcStatusProvider is implemented by errors that wrap a gRPC status
-// (e.g., fmt.Errorf("...: %w", statusErr)). status.FromError only checks
-// the outermost error, so we fall back to errors.As for wrapped errors.
+// (e.g., [fmt.Errorf]("...: %%w", statusErr)). status.FromError only checks
+// the outermost error, so we fall back to [errors.As] for wrapped errors.
 type grpcStatusProvider interface {
 	GRPCStatus() *status.Status
 }

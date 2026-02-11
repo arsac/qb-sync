@@ -291,7 +291,7 @@ func BindColdFlags(cmd *cobra.Command, v *viper.Viper) error {
 	})
 }
 
-// seconds returns a viper int key as a time.Duration in seconds.
+// seconds returns a viper int key as a [time.Duration] in seconds.
 func seconds(v *viper.Viper, key string) time.Duration {
 	return time.Duration(v.GetInt(key)) * time.Second
 }

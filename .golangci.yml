@@ -1,13 +1,13 @@
 # This file is licensed under the terms of the MIT license https://opensource.org/license/mit
 # Copyright (c) 2021-2025 Marat Reymers
 
-## Golden config for golangci-lint v2.7.1
+## Golden config for golangci-lint v2.8.0
 #
 # This is the best config for golangci-lint based on my experience and opinion.
 # It is very strict, but not extremely strict.
 # Feel free to adapt it to suit your needs.
 
-# Based on https://gist.github.com/maratori/47a4d00457a92aa426dbd48a18776322
+# Based on https://github.com/maratori/golangci-lint-config
 
 version: "2"
 
@@ -103,6 +103,7 @@ linters:
     - tparallel # detects inappropriate usage of t.Parallel() method in your Go test codes
     - unconvert # removes unnecessary type conversions
     - unparam # reports unused function parameters
+    - unqueryvet # detects SELECT * in SQL queries and SQL builders, encouraging explicit column selection
     - unused # checks for unused constants, variables, functions and types
     - usestdlibvars # detects the possibility to use variables/constants from the Go standard library
     - usetesting # reports uses of functions with replacement inside the testing package
@@ -148,7 +149,7 @@ linters:
     exhaustive:
       check:
         - switch
-        # Not checking maps - we intentionally use sparse maps for state checks.
+        - map
 
     exhaustruct:
       exclude:
@@ -198,6 +199,7 @@ linters:
     godoclint:
       enable:
         - no-unused-link
+        - require-stdlib-doclink
 
     govet:
       enable-all: true

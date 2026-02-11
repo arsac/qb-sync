@@ -1363,7 +1363,7 @@ func TestStreamConnIdx_RoundRobin_Concurrent(t *testing.T) {
 }
 
 // TestClose_Idempotent verifies that Close() can be called multiple times
-// safely and returns the same error each time via sync.Once.
+// safely and returns the same error each time via [sync.Once].
 func TestClose_Idempotent(t *testing.T) {
 	t.Parallel()
 
