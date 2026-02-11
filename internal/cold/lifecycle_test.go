@@ -132,11 +132,9 @@ func TestFlushDirtyStates_ConcurrentWritesDuringIO(t *testing.T) {
 	var wg sync.WaitGroup
 
 	// Start flush.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		s.flushDirtyStates(context.Background())
-	}()
+	})
 
 	// Wait for I/O phase, then simulate concurrent writes.
 	<-ioStarted

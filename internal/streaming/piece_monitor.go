@@ -60,12 +60,12 @@ type torrentState struct {
 // Uses sync/maindata for efficient polling, only fetching piece states
 // for actively downloading torrents.
 type PieceMonitor struct {
-	client      *qbittorrent.Client // Raw client for MainData.Update
-	source      PieceSource
-	logger      *slog.Logger
-	config      PieceMonitorConfig
+	client        *qbittorrent.Client // Raw client for MainData.Update
+	source        PieceSource
+	logger        *slog.Logger
+	config        PieceMonitorConfig
 	retryExecutor failsafe.Executor[any] // Retry executor for MainData.Update
-	mainData    *qbittorrent.MainData // Cached maindata with rid for incremental updates
+	mainData      *qbittorrent.MainData  // Cached maindata with rid for incremental updates
 
 	torrents  map[string]*torrentState
 	mu        sync.RWMutex
@@ -294,11 +294,6 @@ func trySend[T any](ctx context.Context, closed *atomic.Bool, ch chan<- T, val T
 	default:
 		return false
 	}
-}
-
-// trySendCompleted safely sends a piece to the completed channel (blocking).
-func (t *PieceMonitor) trySendCompleted(ctx context.Context, piece *pb.Piece) bool {
-	return trySend(ctx, &t.closed, t.completed, piece, true)
 }
 
 // trySendCompletedNonBlocking safely sends a piece without blocking.

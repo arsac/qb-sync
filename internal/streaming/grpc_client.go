@@ -63,6 +63,10 @@ const (
 	// Since Send doesn't accept a context, the caller-side timer cancels the stream
 	// context if the sendLoop's stream.Send doesn't return in time.
 	sendTimeout = 30 * time.Second
+
+	// gRPC connect backoff parameters.
+	backoffMultiplier = 1.6 // Exponential backoff multiplier between reconnect attempts
+	backoffJitter     = 0.2 // Randomization factor to prevent thundering herd
 )
 
 // ErrFinalizeVerifying is returned by FinalizeTorrent when the cold server is
@@ -96,6 +100,11 @@ var _ HardlinkDestination = (*GRPCDestination)(nil)
 // Streaming RPCs are distributed across connections via round-robin;
 // unary RPCs always use the first connection.
 type GRPCDestination struct {
+	addr     string            // Server address for dynamic connection creation
+	opts     []grpc.DialOption // Stored dial options for AddConnection
+	minConns int               // Minimum connection count
+	maxConns int               // Maximum connection count
+
 	conns       []*grpc.ClientConn
 	clients     []pb.QBSyncServiceClient
 	streamIdx   atomic.Uint32                 // Lock-free round-robin for OpenStream
@@ -106,13 +115,16 @@ type GRPCDestination struct {
 	closeErr    error
 }
 
-// NewGRPCDestination creates a new gRPC destination client with numConns
-// independent TCP connections. Each connection gets its own kernel CUBIC
-// window, avoiding the single-TCP-flow bandwidth ceiling. Streaming RPCs
-// are distributed across connections via round-robin.
-func NewGRPCDestination(addr string, numConns int) (*GRPCDestination, error) {
-	if numConns <= 0 {
-		numConns = 1
+// NewGRPCDestination creates a new gRPC destination client with minConns
+// initial TCP connections, scalable up to maxConns. Each connection gets its
+// own kernel CUBIC window, avoiding the single-TCP-flow bandwidth ceiling.
+// Streaming RPCs are distributed across connections via round-robin.
+func NewGRPCDestination(addr string, minConns, maxConns int) (*GRPCDestination, error) {
+	if minConns <= 0 {
+		minConns = 1
+	}
+	if maxConns < minConns {
+		maxConns = minConns
 	}
 
 	kaParams := keepalive.ClientParameters{
@@ -127,8 +139,8 @@ func NewGRPCDestination(addr string, numConns int) (*GRPCDestination, error) {
 		grpc.WithConnectParams(grpc.ConnectParams{
 			Backoff: backoff.Config{
 				BaseDelay:  1 * time.Second,
-				Multiplier: 1.6,
-				Jitter:     0.2,
+				Multiplier: backoffMultiplier,
+				Jitter:     backoffJitter,
 				MaxDelay:   maxReconnectBackoff,
 			},
 		}),
@@ -141,12 +153,16 @@ func NewGRPCDestination(addr string, numConns int) (*GRPCDestination, error) {
 	}
 
 	d := &GRPCDestination{
-		conns:       make([]*grpc.ClientConn, 0, numConns),
-		clients:     make([]pb.QBSyncServiceClient, 0, numConns),
+		addr:        addr,
+		opts:        opts,
+		minConns:    minConns,
+		maxConns:    maxConns,
+		conns:       make([]*grpc.ClientConn, 0, maxConns),
+		clients:     make([]pb.QBSyncServiceClient, 0, maxConns),
 		initResults: make(map[string]*InitTorrentResult),
 	}
 
-	for i := range numConns {
+	for i := range minConns {
 		conn, err := grpc.NewClient(addr, opts...)
 		if err != nil {
 			// Clean up already-opened connections
@@ -169,17 +185,26 @@ func (d *GRPCDestination) client() pb.QBSyncServiceClient {
 
 // streamConnIdx returns the next connection index for streaming RPCs (round-robin across all connections).
 func (d *GRPCDestination) streamConnIdx() int {
-	if len(d.clients) == 1 {
+	d.mu.RLock()
+	n := len(d.clients)
+	d.mu.RUnlock()
+
+	if n == 1 {
 		return 0
 	}
 	idx := d.streamIdx.Add(1) - 1
-	return int(idx % uint32(len(d.clients)))
+	return int(idx % uint32(n))
 }
 
 // ValidateConnection checks that the cold server is reachable on all
 // connections using the standard gRPC health check protocol (grpc.health.v1.Health).
 func (d *GRPCDestination) ValidateConnection(ctx context.Context) error {
-	for i, conn := range d.conns {
+	d.mu.RLock()
+	conns := make([]*grpc.ClientConn, len(d.conns))
+	copy(conns, d.conns)
+	d.mu.RUnlock()
+
+	for i, conn := range conns {
 		healthClient := healthpb.NewHealthClient(conn)
 		_, err := healthClient.Check(ctx, &healthpb.HealthCheckRequest{})
 		if err != nil {
@@ -314,7 +339,10 @@ func (d *GRPCDestination) WritePiece(ctx context.Context, req *pb.WritePieceRequ
 // unblocked without tearing down the entire pool.
 func (d *GRPCDestination) OpenStream(ctx context.Context, logger *slog.Logger) (*PieceStream, error) {
 	connIdx := d.streamConnIdx()
+
+	d.mu.RLock()
 	client := d.clients[connIdx]
+	d.mu.RUnlock()
 	streamCtx, streamCancel := context.WithCancel(ctx)
 
 	stream, err := client.StreamPiecesBidi(streamCtx)
@@ -324,7 +352,7 @@ func (d *GRPCDestination) OpenStream(ctx context.Context, logger *slog.Logger) (
 	}
 
 	ps := &PieceStream{
-		connIdx: connIdx,
+		connIdx:  connIdx,
 		ctx:      streamCtx,
 		cancel:   streamCancel,
 		stream:   stream,
@@ -465,6 +493,69 @@ func (d *GRPCDestination) ClearInitResult(hash string) {
 	d.mu.Lock()
 	delete(d.initResults, hash)
 	d.mu.Unlock()
+}
+
+// AddConnection creates a new TCP connection and appends it to the pool.
+// Returns error if already at max connections.
+func (d *GRPCDestination) AddConnection() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if len(d.conns) >= d.maxConns {
+		return errors.New("at maximum connection count")
+	}
+
+	conn, err := grpc.NewClient(d.addr, d.opts...)
+	if err != nil {
+		return fmt.Errorf("failed to create connection: %w", err)
+	}
+
+	d.conns = append(d.conns, conn)
+	d.clients = append(d.clients, pb.NewQBSyncServiceClient(conn))
+	return nil
+}
+
+// RemoveConnection removes the connection at expectedIdx. The caller must
+// drain all streams on that connection first. expectedIdx must equal the
+// current last index (len-1); if a connection was added concurrently the
+// index won't match and the call returns an error, preventing removal of
+// the wrong connection.
+// Returns error if at minimum connection count or index mismatch.
+func (d *GRPCDestination) RemoveConnection(expectedIdx int) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if len(d.conns) <= d.minConns {
+		return errors.New("at minimum connection count")
+	}
+
+	lastIdx := len(d.conns) - 1
+	if lastIdx != expectedIdx {
+		return fmt.Errorf("connection index mismatch: expected %d, current last %d", expectedIdx, lastIdx)
+	}
+
+	conn := d.conns[lastIdx]
+	d.conns = d.conns[:lastIdx]
+	d.clients = d.clients[:lastIdx]
+
+	return conn.Close()
+}
+
+// ConnectionCount returns the current number of TCP connections.
+func (d *GRPCDestination) ConnectionCount() int {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return len(d.conns)
+}
+
+// MinConnections returns the minimum connection count.
+func (d *GRPCDestination) MinConnections() int {
+	return d.minConns
+}
+
+// MaxConnections returns the maximum connection count.
+func (d *GRPCDestination) MaxConnections() int {
+	return d.maxConns
 }
 
 // Close closes all gRPC connections. Safe for repeated calls.

@@ -18,6 +18,8 @@ import (
 	"github.com/arsac/qb-sync/internal/logger"
 )
 
+const bytesPerMB = 1024 * 1024
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -154,7 +156,7 @@ func runCold(cmd *cobra.Command, _ []string) error {
 		BasePath:             cfg.DataPath,
 		SavePath:             cfg.SavePath,
 		StreamWorkers:        cfg.StreamWorkers,
-		MaxStreamBufferBytes: int64(cfg.MaxStreamBufferMB) * 1024 * 1024,
+		MaxStreamBufferBytes: int64(cfg.MaxStreamBufferMB) * bytesPerMB,
 		SyncedTag:            cfg.SyncedTag,
 		DryRun:               cfg.DryRun,
 	}

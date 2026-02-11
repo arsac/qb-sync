@@ -22,6 +22,10 @@ const (
 	// streamingRateLimiterBurst is the burst size for rate limiting (1MB).
 	streamingRateLimiterBurst = bytesPerMB
 
+	// senderRetryBackoff is the safety-net polling interval for sender workers
+	// when no stream has capacity. Handles missed AckReady signals and stale-cleanup capacity changes.
+	senderRetryBackoff = 50 * time.Millisecond
+
 	drainTimeout                  = 30 * time.Second
 	reconnectBaseDelay            = 1 * time.Second
 	reconnectMaxDelay             = 30 * time.Second
@@ -220,7 +224,8 @@ func (q *BidiQueue) Run(ctx context.Context) error {
 		// Circuit breaker: after too many consecutive failures, pause longer.
 		if consecutiveFailures >= q.config.MaxConsecutiveFailures {
 			metrics.CircuitBreakerTripsTotal.WithLabelValues(metrics.ModeHot, metrics.ComponentStreamQueue).Inc()
-			metrics.CircuitBreakerState.WithLabelValues(metrics.ModeHot, metrics.ComponentStreamQueue).Set(metrics.CircuitStateOpen)
+			metrics.CircuitBreakerState.WithLabelValues(metrics.ModeHot, metrics.ComponentStreamQueue).
+				Set(metrics.CircuitStateOpen)
 			q.logger.ErrorContext(ctx, "circuit breaker triggered, pausing reconnection",
 				"failures", consecutiveFailures,
 				"pause", q.config.CircuitBreakerPause,
@@ -230,7 +235,8 @@ func (q *BidiQueue) Run(ctx context.Context) error {
 				return ctx.Err()
 			case <-time.After(q.config.CircuitBreakerPause):
 			}
-			metrics.CircuitBreakerState.WithLabelValues(metrics.ModeHot, metrics.ComponentStreamQueue).Set(metrics.CircuitStateClosed)
+			metrics.CircuitBreakerState.WithLabelValues(metrics.ModeHot, metrics.ComponentStreamQueue).
+				Set(metrics.CircuitStateClosed)
 			consecutiveFailures = 0
 			reconnectDelay = q.config.ReconnectBaseDelay
 			continue
@@ -362,7 +368,7 @@ func (q *BidiQueue) senderWorker(ctx context.Context, pool *StreamPool, stopSend
 					return
 				case <-pool.AckReady():
 					// Fast path: woken by ack arrival.
-				case <-time.After(50 * time.Millisecond):
+				case <-time.After(senderRetryBackoff):
 					// Safety net: recheck capacity periodically.
 					// Handles missed AckReady signals and stale-cleanup capacity changes.
 				}
@@ -646,7 +652,7 @@ func (q *BidiQueue) processAck(ctx context.Context, ack *pb.PieceAck) {
 		q.piecesFail.Add(1)
 		q.tracker.MarkFailed(hash, index)
 
-		switch ack.GetErrorCode() {
+		switch ack.GetErrorCode() { //nolint:exhaustive // IO, FINALIZING, NONE handled by default.
 		case pb.PieceErrorCode_PIECE_ERROR_HASH_MISMATCH:
 			metrics.PieceHashMismatchTotal.Inc()
 			q.logger.ErrorContext(ctx, "piece hash mismatch, will retry",

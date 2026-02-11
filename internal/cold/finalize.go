@@ -42,33 +42,7 @@ func (s *Server) FinalizeTorrent(
 	if state.finalizing {
 		result, done := state.finalizeResult, state.finalizeDone
 		state.mu.Unlock()
-
-		// If we have a cached result from a completed background finalization, return it.
-		if result != nil {
-			if result.success {
-				// Clean up now that hot has received the success response.
-				s.cleanupFinalizedTorrent(hash)
-				return &pb.FinalizeTorrentResponse{Success: true, State: result.state}, nil
-			}
-			// Background finalization failed — wait for the goroutine to fully exit
-			// before clearing state, preventing concurrent background goroutines.
-			if done != nil {
-				<-done
-			}
-			state.mu.Lock()
-			state.finalizing = false
-			state.finalizeResult = nil
-			state.finalizeDone = nil
-			state.mu.Unlock()
-			return &pb.FinalizeTorrentResponse{Success: false, Error: result.err}, nil
-		}
-
-		// Background work is still running — tell hot it's in progress
-		// so it polls again without counting this as a failure.
-		return &pb.FinalizeTorrentResponse{
-			Success: true,
-			State:   "verifying",
-		}, nil
+		return s.handleExistingFinalization(hash, state, result, done)
 	}
 	// Create finalizeDone immediately so concurrent polls always see it.
 	done := make(chan struct{})
@@ -97,26 +71,8 @@ func (s *Server) FinalizeTorrent(
 	// Only relocate when request carries a non-empty sub-path to avoid accidental relocation
 	// from an old hot version that doesn't send this field.
 	if newSubPath := req.GetSaveSubPath(); newSubPath != "" && newSubPath != state.saveSubPath {
-		oldSubPath := state.saveSubPath
-		oldBase := filepath.Join(s.config.BasePath, oldSubPath)
-
-		relPaths := make([]string, len(state.files))
-		for i, fi := range state.files {
-			rel, relErr := filepath.Rel(oldBase, strings.TrimSuffix(fi.path, partialSuffix))
-			if relErr != nil {
-				return failureResponse(fmt.Sprintf("computing relative path: %v", relErr)), nil
-			}
-			relPaths[i] = rel
-		}
-
-		if _, relocErr := s.relocateFiles(ctx, hash, relPaths, oldSubPath, newSubPath); relocErr != nil {
-			return failureResponse(fmt.Sprintf("relocating files: %v", relocErr)), nil
-		}
-
-		updateStateAfterRelocate(state, s.config.BasePath, oldSubPath, newSubPath)
-		metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
-		if subPathErr := saveSubPathFile(metaDir, newSubPath); subPathErr != nil {
-			return failureResponse(fmt.Sprintf("persisting sub-path after relocation: %v", subPathErr)), nil
+		if relocErr := s.relocateForSubPathChange(ctx, hash, state, newSubPath); relocErr != nil {
+			return failureResponse(relocErr.Error()), nil
 		}
 	}
 
@@ -252,6 +208,38 @@ func (s *Server) cleanupFinalizedTorrent(hash string) {
 	}
 }
 
+// relocateForSubPathChange moves files when save_sub_path changed between init and finalize.
+func (s *Server) relocateForSubPathChange(
+	ctx context.Context,
+	hash string,
+	state *serverTorrentState,
+	newSubPath string,
+) error {
+	oldSubPath := state.saveSubPath
+	oldBase := filepath.Join(s.config.BasePath, oldSubPath)
+
+	relPaths := make([]string, len(state.files))
+	for i, fi := range state.files {
+		rel, relErr := filepath.Rel(oldBase, strings.TrimSuffix(fi.path, partialSuffix))
+		if relErr != nil {
+			return fmt.Errorf("computing relative path: %w", relErr)
+		}
+		relPaths[i] = rel
+	}
+
+	if _, relocErr := s.relocateFiles(ctx, hash, relPaths, oldSubPath, newSubPath); relocErr != nil {
+		return fmt.Errorf("relocating files: %w", relocErr)
+	}
+
+	updateStateAfterRelocate(state, s.config.BasePath, oldSubPath, newSubPath)
+	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
+	if subPathErr := saveSubPathFile(metaDir, newSubPath); subPathErr != nil {
+		return fmt.Errorf("persisting sub-path after relocation: %w", subPathErr)
+	}
+
+	return nil
+}
+
 // getOrRecoverState gets the torrent state from memory, or recovers it from disk.
 func (s *Server) getOrRecoverState(ctx context.Context, hash string) (*serverTorrentState, error) {
 	s.mu.RLock()
@@ -298,6 +286,8 @@ func (s *Server) getOrRecoverState(ctx context.Context, hash string) (*serverTor
 
 // finalizeFiles syncs all file handles, closes them, and renames from .partial to final.
 // Also resolves pending hardlinks by waiting for source files to complete.
+//
+//nolint:gocognit
 func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTorrentState) error {
 	// Phase 1: Resolve pending hardlinks without holding state.mu.
 	// Waiting on hardlink channels can block for up to defaultHardlinkWaitTimeout,
@@ -509,12 +499,14 @@ func (s *Server) registerFinalizedInodes(ctx context.Context, hash string, state
 // verifyFinalizedPieces reads back all pieces from finalized files and verifies their hashes.
 // Uses a progress-based idle timeout: as long as pieces keep being verified, it continues.
 // Only aborts if no piece is verified within verifyIdleTimeout.
+//
+//nolint:gocognit
 func (s *Server) verifyFinalizedPieces(ctx context.Context, hash string, state *serverTorrentState) error {
 	if len(state.pieceHashes) == 0 {
-		return fmt.Errorf("no piece hashes available for verification — refusing to finalize without integrity check")
+		return errors.New("no piece hashes available for verification — refusing to finalize without integrity check")
 	}
 	if state.pieceLength <= 0 || state.totalSize <= 0 {
-		return fmt.Errorf("missing piece size or total size metadata — refusing to finalize without integrity check")
+		return errors.New("missing piece size or total size metadata — refusing to finalize without integrity check")
 	}
 
 	pieceSize := state.pieceLength
@@ -543,14 +535,17 @@ func (s *Server) verifyFinalizedPieces(ctx context.Context, hash string, state *
 
 	// Idle watchdog: cancel verification if no progress within verifyIdleTimeout.
 	go func() {
-		ticker := time.NewTicker(verifyIdleTimeout / 2) // Check at half the timeout interval.
+		ticker := time.NewTicker(verifyIdleTimeout / verifyIdleCheckDivisor) // Check at half the timeout interval.
 		defer ticker.Stop()
 		for {
 			select {
 			case <-gCtx.Done():
 				return
 			case <-ticker.C:
-				last := lastProgress.Load().(time.Time)
+				last, ok := lastProgress.Load().(time.Time)
+				if !ok {
+					continue
+				}
 				if time.Since(last) > verifyIdleTimeout {
 					s.logger.ErrorContext(ctx, "verification stalled, aborting",
 						"hash", hash,
@@ -616,6 +611,43 @@ func (s *Server) verifyFinalizedPieces(ctx context.Context, hash string, state *
 
 	s.logger.InfoContext(ctx, "all pieces verified successfully", "hash", hash, "pieces", numPieces)
 	return nil
+}
+
+// handleExistingFinalization handles a FinalizeTorrent call when background
+// finalization is already in progress. It returns the cached result if available,
+// or tells hot to poll again.
+func (s *Server) handleExistingFinalization(
+	hash string,
+	state *serverTorrentState,
+	result *finalizeResult,
+	done chan struct{},
+) (*pb.FinalizeTorrentResponse, error) {
+	// Background work is still running — tell hot it's in progress
+	// so it polls again without counting this as a failure.
+	if result == nil {
+		return &pb.FinalizeTorrentResponse{
+			Success: true,
+			State:   "verifying",
+		}, nil
+	}
+
+	if result.success {
+		// Clean up now that hot has received the success response.
+		s.cleanupFinalizedTorrent(hash)
+		return &pb.FinalizeTorrentResponse{Success: true, State: result.state}, nil
+	}
+
+	// Background finalization failed — wait for the goroutine to fully exit
+	// before clearing state, preventing concurrent background goroutines.
+	if done != nil {
+		<-done
+	}
+	state.mu.Lock()
+	state.finalizing = false
+	state.finalizeResult = nil
+	state.finalizeDone = nil
+	state.mu.Unlock()
+	return &pb.FinalizeTorrentResponse{Success: false, Error: result.err}, nil
 }
 
 // readPieceFromFinalizedFiles reads piece data from finalized (non-.partial) files.

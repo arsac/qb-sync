@@ -639,61 +639,94 @@ func TestHandleTorrentRemoval(t *testing.T) {
 	})
 }
 
-func TestDeleteGroupFromHot(t *testing.T) {
-	logger := testLogger(t)
+func makeTestGroup(hashes ...string) torrentGroup {
+	torrents := make([]qbittorrent.Torrent, len(hashes))
+	for i, h := range hashes {
+		torrents[i] = qbittorrent.Torrent{Hash: h, SeedingTime: 9999}
+	}
+	return torrentGroup{torrents: torrents, minSeeding: 9999}
+}
 
-	makeGroup := func(hashes ...string) torrentGroup {
-		torrents := make([]qbittorrent.Torrent, len(hashes))
-		for i, h := range hashes {
-			torrents[i] = qbittorrent.Torrent{Hash: h, SeedingTime: 9999}
-		}
-		return torrentGroup{torrents: torrents, minSeeding: 9999}
+func newDeleteGroupTask(
+	t *testing.T,
+	client *mockQBClient,
+	dest *mockColdDest,
+	cfg *config.HotConfig,
+) *QBTask {
+	t.Helper()
+	if cfg == nil {
+		cfg = &config.HotConfig{}
+	}
+	return &QBTask{
+		cfg:       cfg,
+		logger:    testLogger(t),
+		srcClient: client,
+		grpcDest:  dest,
+	}
+}
+
+func TestDeleteGroupFromHot_HappyPath(t *testing.T) {
+	mockClient := &mockQBClient{}
+	coldDest := &mockColdDest{}
+	task := newDeleteGroupTask(t, mockClient, coldDest, nil)
+
+	group := makeTestGroup("abc123")
+	handed, err := task.deleteGroupFromHot(context.Background(), group)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if handed != 1 {
+		t.Errorf("expected 1 handed off, got %d", handed)
 	}
 
-	t.Run("happy path: stop → start cold → delete", func(t *testing.T) {
-		mockClient := &mockQBClient{}
-		coldDest := &mockColdDest{}
-		task := &QBTask{
-			cfg:       &config.HotConfig{},
-			logger:    logger,
-			srcClient: mockClient,
-			grpcDest:  coldDest,
-		}
+	if !mockClient.stopCalled {
+		t.Error("StopCtx should have been called")
+	}
+	if coldDest.startHash != "abc123" {
+		t.Errorf("expected StartTorrent hash 'abc123', got '%s'", coldDest.startHash)
+	}
+	if !mockClient.deleteCalled {
+		t.Error("DeleteTorrentsCtx should have been called")
+	}
+	if mockClient.resumeCalled {
+		t.Error("ResumeCtx should NOT have been called on happy path")
+	}
+}
 
-		group := makeGroup("abc123")
-		handed, err := task.deleteGroupFromHot(context.Background(), group)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if handed != 1 {
-			t.Errorf("expected 1 handed off, got %d", handed)
-		}
-
-		if !mockClient.stopCalled {
-			t.Error("StopCtx should have been called")
-		}
-		if coldDest.startHash != "abc123" {
-			t.Errorf("expected StartTorrent hash 'abc123', got '%s'", coldDest.startHash)
-		}
-		if !mockClient.deleteCalled {
-			t.Error("DeleteTorrentsCtx should have been called")
-		}
-		if mockClient.resumeCalled {
-			t.Error("ResumeCtx should NOT have been called on happy path")
-		}
+func TestDeleteGroupFromHot_DryRun(t *testing.T) {
+	mockClient := &mockQBClient{}
+	coldDest := &mockColdDest{}
+	task := newDeleteGroupTask(t, mockClient, coldDest, &config.HotConfig{
+		BaseConfig: config.BaseConfig{DryRun: true},
 	})
 
+	group := makeTestGroup("abc123")
+	handed, err := task.deleteGroupFromHot(context.Background(), group)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if handed != 0 {
+		t.Errorf("expected 0 handed off in dry run, got %d", handed)
+	}
+
+	if mockClient.stopCalled {
+		t.Error("StopCtx should NOT have been called in dry run")
+	}
+	if coldDest.startCalled {
+		t.Error("StartTorrent should NOT have been called in dry run")
+	}
+	if mockClient.deleteCalled {
+		t.Error("DeleteTorrentsCtx should NOT have been called in dry run")
+	}
+}
+
+func TestDeleteGroupFromHot_Failures(t *testing.T) {
 	t.Run("stop failure skips torrent", func(t *testing.T) {
 		mockClient := &mockQBClient{stopErr: errors.New("stop failed")}
 		coldDest := &mockColdDest{}
-		task := &QBTask{
-			cfg:       &config.HotConfig{},
-			logger:    logger,
-			srcClient: mockClient,
-			grpcDest:  coldDest,
-		}
+		task := newDeleteGroupTask(t, mockClient, coldDest, nil)
 
-		group := makeGroup("abc123")
+		group := makeTestGroup("abc123")
 		handed, err := task.deleteGroupFromHot(context.Background(), group)
 		if err == nil {
 			t.Fatal("expected error for failed handoff")
@@ -719,14 +752,9 @@ func TestDeleteGroupFromHot(t *testing.T) {
 	t.Run("cold start failure triggers resume on hot", func(t *testing.T) {
 		mockClient := &mockQBClient{}
 		coldDest := &mockColdDest{startErr: errors.New("cold unreachable")}
-		task := &QBTask{
-			cfg:       &config.HotConfig{},
-			logger:    logger,
-			srcClient: mockClient,
-			grpcDest:  coldDest,
-		}
+		task := newDeleteGroupTask(t, mockClient, coldDest, nil)
 
-		group := makeGroup("abc123")
+		group := makeTestGroup("abc123")
 		handed, err := task.deleteGroupFromHot(context.Background(), group)
 		if err == nil {
 			t.Fatal("expected error for failed handoff")
@@ -752,45 +780,63 @@ func TestDeleteGroupFromHot(t *testing.T) {
 		}
 	})
 
-	t.Run("dry run skips all operations", func(t *testing.T) {
-		mockClient := &mockQBClient{}
-		coldDest := &mockColdDest{}
-		task := &QBTask{
-			cfg:       &config.HotConfig{BaseConfig: config.BaseConfig{DryRun: true}},
-			logger:    logger,
-			srcClient: mockClient,
-			grpcDest:  coldDest,
+	t.Run("cold start failure with resume failure is tolerated", func(t *testing.T) {
+		mockClient := &mockQBClient{
+			resumeErr: errors.New("qBittorrent unreachable"),
+		}
+		coldDest := &mockColdDest{startErr: errors.New("cold server unreachable")}
+		task := newDeleteGroupTask(t, mockClient, coldDest, nil)
+
+		group := makeTestGroup("abc123")
+		handed, err := task.deleteGroupFromHot(context.Background(), group)
+		if err == nil {
+			t.Fatal("expected error for failed handoff")
+		}
+		if handed != 0 {
+			t.Errorf("expected 0 handed off, got %d", handed)
 		}
 
-		group := makeGroup("abc123")
+		if !mockClient.resumeCalled {
+			t.Error("ResumeCtx should have been called despite it returning an error")
+		}
+		if mockClient.deleteCalled {
+			t.Error("DeleteTorrentsCtx should NOT have been called when cold start fails")
+		}
+	})
+
+	t.Run("delete failure is tolerated (cold is seeding)", func(t *testing.T) {
+		mockClient := &mockQBClient{
+			deleteErr: errors.New("delete failed"),
+		}
+		coldDest := &mockColdDest{}
+		task := newDeleteGroupTask(t, mockClient, coldDest, nil)
+
+		group := makeTestGroup("abc123")
 		handed, err := task.deleteGroupFromHot(context.Background(), group)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if handed != 0 {
-			t.Errorf("expected 0 handed off in dry run, got %d", handed)
+		if handed != 1 {
+			t.Errorf("expected 1 handed off (delete failure still counts), got %d", handed)
 		}
 
-		if mockClient.stopCalled {
-			t.Error("StopCtx should NOT have been called in dry run")
+		if !mockClient.stopCalled {
+			t.Error("StopCtx should have been called")
 		}
-		if coldDest.startCalled {
-			t.Error("StartTorrent should NOT have been called in dry run")
+		if !mockClient.deleteCalled {
+			t.Error("DeleteTorrentsCtx should have been called")
 		}
-		if mockClient.deleteCalled {
-			t.Error("DeleteTorrentsCtx should NOT have been called in dry run")
+		if mockClient.resumeCalled {
+			t.Error("ResumeCtx should NOT have been called -- cold is seeding, delete retry next cycle")
 		}
 	})
+}
 
+func TestDeleteGroupFromHot_MultiTorrent(t *testing.T) {
 	t.Run("returns count of handed-off torrents", func(t *testing.T) {
 		mockClient := &mockQBClient{}
 		coldDest := &mockColdDest{}
-		task := &QBTask{
-			cfg:       &config.HotConfig{},
-			logger:    logger,
-			srcClient: mockClient,
-			grpcDest:  coldDest,
-		}
+		task := newDeleteGroupTask(t, mockClient, coldDest, nil)
 
 		group := torrentGroup{
 			torrents: []qbittorrent.Torrent{
@@ -813,12 +859,7 @@ func TestDeleteGroupFromHot(t *testing.T) {
 			stopFailHash: map[string]bool{"def456": true},
 		}
 		coldDest := &mockColdDest{}
-		task := &QBTask{
-			cfg:       &config.HotConfig{},
-			logger:    logger,
-			srcClient: mockClient,
-			grpcDest:  coldDest,
-		}
+		task := newDeleteGroupTask(t, mockClient, coldDest, nil)
 
 		group := torrentGroup{
 			torrents: []qbittorrent.Torrent{
@@ -835,81 +876,17 @@ func TestDeleteGroupFromHot(t *testing.T) {
 			t.Errorf("expected 1 handed off (partial success), got %d", handed)
 		}
 	})
+}
 
-	t.Run("cold start failure with resume failure is tolerated", func(t *testing.T) {
-		mockClient := &mockQBClient{
-			resumeErr: errors.New("qBittorrent unreachable"),
-		}
-		coldDest := &mockColdDest{startErr: errors.New("cold server unreachable")}
-		task := &QBTask{
-			cfg:       &config.HotConfig{},
-			logger:    logger,
-			srcClient: mockClient,
-			grpcDest:  coldDest,
-		}
-
-		group := makeGroup("abc123")
-		handed, err := task.deleteGroupFromHot(context.Background(), group)
-		if err == nil {
-			t.Fatal("expected error for failed handoff")
-		}
-		if handed != 0 {
-			t.Errorf("expected 0 handed off, got %d", handed)
-		}
-
-		if !mockClient.resumeCalled {
-			t.Error("ResumeCtx should have been called despite it returning an error")
-		}
-		if mockClient.deleteCalled {
-			t.Error("DeleteTorrentsCtx should NOT have been called when cold start fails")
-		}
-	})
-
-	t.Run("delete failure is tolerated (cold is seeding)", func(t *testing.T) {
-		mockClient := &mockQBClient{
-			deleteErr: errors.New("delete failed"),
-		}
-		coldDest := &mockColdDest{}
-		task := &QBTask{
-			cfg:       &config.HotConfig{},
-			logger:    logger,
-			srcClient: mockClient,
-			grpcDest:  coldDest,
-		}
-
-		group := makeGroup("abc123")
-		handed, err := task.deleteGroupFromHot(context.Background(), group)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if handed != 1 {
-			t.Errorf("expected 1 handed off (delete failure still counts), got %d", handed)
-		}
-
-		if !mockClient.stopCalled {
-			t.Error("StopCtx should have been called")
-		}
-		if !mockClient.deleteCalled {
-			t.Error("DeleteTorrentsCtx should have been called")
-		}
-		if mockClient.resumeCalled {
-			t.Error("ResumeCtx should NOT have been called — cold is seeding, delete retry next cycle")
-		}
-	})
-
+func TestDeleteGroupFromHot_Tags(t *testing.T) {
 	t.Run("passes SourceRemovedTag to StartTorrent", func(t *testing.T) {
 		mockClient := &mockQBClient{}
 		coldDest := &mockColdDest{}
-		task := &QBTask{
-			cfg: &config.HotConfig{
-				SourceRemovedTag: "source-removed",
-			},
-			logger:    logger,
-			srcClient: mockClient,
-			grpcDest:  coldDest,
-		}
+		task := newDeleteGroupTask(t, mockClient, coldDest, &config.HotConfig{
+			SourceRemovedTag: "source-removed",
+		})
 
-		group := makeGroup("abc123")
+		group := makeTestGroup("abc123")
 		_, err := task.deleteGroupFromHot(context.Background(), group)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -926,14 +903,9 @@ func TestDeleteGroupFromHot(t *testing.T) {
 	t.Run("passes empty tag when SourceRemovedTag is empty", func(t *testing.T) {
 		mockClient := &mockQBClient{}
 		coldDest := &mockColdDest{}
-		task := &QBTask{
-			cfg:       &config.HotConfig{},
-			logger:    logger,
-			srcClient: mockClient,
-			grpcDest:  coldDest,
-		}
+		task := newDeleteGroupTask(t, mockClient, coldDest, nil)
 
-		group := makeGroup("abc123")
+		group := makeTestGroup("abc123")
 		_, err := task.deleteGroupFromHot(context.Background(), group)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -1179,7 +1151,7 @@ func TestSyncedTagApplication(t *testing.T) {
 	t.Run("skips tag when empty", func(t *testing.T) {
 		mockClient := &mockQBClient{}
 		task := &QBTask{
-			cfg: &config.HotConfig{},
+			cfg:             &config.HotConfig{},
 			logger:          logger,
 			srcClient:       mockClient,
 			completedOnCold: make(map[string]bool),
@@ -1248,7 +1220,7 @@ func TestQueryColdStatus(t *testing.T) {
 		}
 	})
 
-	t.Run("non-transient error returns (nil, nil)", func(t *testing.T) {
+	t.Run("non-transient error returns errSkipTorrent", func(t *testing.T) {
 		nonTransientErr := errors.New("some application error")
 		coldDest := &mockColdDest{checkStatusErr: nonTransientErr}
 		task := &QBTask{
@@ -1263,15 +1235,15 @@ func TestQueryColdStatus(t *testing.T) {
 
 		torrent := qbittorrent.Torrent{Hash: "abc123", Name: "test"}
 		result, err := task.queryColdStatus(context.Background(), torrent)
-		if err != nil {
-			t.Errorf("non-transient error should not be returned: %v", err)
+		if !errors.Is(err, errSkipTorrent) {
+			t.Errorf("expected errSkipTorrent, got: %v", err)
 		}
 		if result != nil {
 			t.Error("result should be nil for non-transient error")
 		}
 	})
 
-	t.Run("COMPLETE status returns (nil, nil) and caches", func(t *testing.T) {
+	t.Run("COMPLETE status returns errSkipTorrent and caches", func(t *testing.T) {
 		coldDest := &mockColdDest{
 			checkStatusResults: map[string]*streaming.InitTorrentResult{
 				"abc123": {Status: pb.TorrentSyncStatus_SYNC_STATUS_COMPLETE},
@@ -1291,8 +1263,8 @@ func TestQueryColdStatus(t *testing.T) {
 
 		torrent := qbittorrent.Torrent{Hash: "abc123", Name: "test"}
 		result, err := task.queryColdStatus(context.Background(), torrent)
-		if err != nil {
-			t.Errorf("unexpected error: %v", err)
+		if !errors.Is(err, errSkipTorrent) {
+			t.Errorf("expected errSkipTorrent, got: %v", err)
 		}
 		if result != nil {
 			t.Error("result should be nil for COMPLETE torrent")
@@ -1631,7 +1603,11 @@ func TestTrackNewTorrents_StateAndProgressFiltering(t *testing.T) {
 		coldDest := &mockColdDest{
 			checkStatusResults: map[string]*streaming.InitTorrentResult{
 				"downloading": {Status: pb.TorrentSyncStatus_SYNC_STATUS_READY, PiecesNeeded: makePiecesNeeded(0)},
-				"completed":   {Status: pb.TorrentSyncStatus_SYNC_STATUS_READY, PiecesNeeded: makePiecesNeeded(5), PiecesHaveCount: 5},
+				"completed": {
+					Status:          pb.TorrentSyncStatus_SYNC_STATUS_READY,
+					PiecesNeeded:    makePiecesNeeded(5),
+					PiecesHaveCount: 5,
+				},
 			},
 		}
 
@@ -1717,9 +1693,27 @@ func TestTrackNewTorrents_PrioritizesByProgress(t *testing.T) {
 		// API returns A, B, C in arbitrary order
 		mockClient := &mockQBClient{
 			getTorrentsResult: []qbittorrent.Torrent{
-				{Hash: "hashA", Name: "torrentA", CompletionOn: 100, State: qbittorrent.TorrentStateStalledUp, Progress: 1.0},
-				{Hash: "hashB", Name: "torrentB", CompletionOn: 200, State: qbittorrent.TorrentStateStalledUp, Progress: 1.0},
-				{Hash: "hashC", Name: "torrentC", CompletionOn: 300, State: qbittorrent.TorrentStateStalledUp, Progress: 1.0},
+				{
+					Hash:         "hashA",
+					Name:         "torrentA",
+					CompletionOn: 100,
+					State:        qbittorrent.TorrentStateStalledUp,
+					Progress:     1.0,
+				},
+				{
+					Hash:         "hashB",
+					Name:         "torrentB",
+					CompletionOn: 200,
+					State:        qbittorrent.TorrentStateStalledUp,
+					Progress:     1.0,
+				},
+				{
+					Hash:         "hashC",
+					Name:         "torrentC",
+					CompletionOn: 300,
+					State:        qbittorrent.TorrentStateStalledUp,
+					Progress:     1.0,
+				},
 			},
 		}
 
@@ -2005,4 +1999,3 @@ func TestDrain(t *testing.T) {
 		task.draining.Store(false)
 	})
 }
-

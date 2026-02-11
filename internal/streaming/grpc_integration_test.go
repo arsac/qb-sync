@@ -21,6 +21,7 @@ import (
 // Only StreamPiecesBidi is controllable; all other RPCs return unimplemented.
 type testGRPCServer struct {
 	pb.UnimplementedQBSyncServiceServer
+
 	handler func(pb.QBSyncService_StreamPiecesBidiServer) error
 }
 
@@ -36,7 +37,10 @@ const testWindowSize int32 = 64 * 1024 // 64 KB
 // StreamPiecesBidi handler and returns a connected client. Both use small
 // HTTP/2 windows so flow control kicks in quickly during stall tests.
 // The server is stopped when the test completes.
-func startTestGRPCServer(t *testing.T, handler func(pb.QBSyncService_StreamPiecesBidiServer) error) pb.QBSyncServiceClient {
+func startTestGRPCServer(
+	t *testing.T,
+	handler func(pb.QBSyncService_StreamPiecesBidiServer) error,
+) pb.QBSyncServiceClient {
 	t.Helper()
 
 	lis, err := net.Listen("tcp", "localhost:0")
@@ -50,7 +54,7 @@ func startTestGRPCServer(t *testing.T, handler func(pb.QBSyncService_StreamPiece
 	)
 	pb.RegisterQBSyncServiceServer(srv, &testGRPCServer{handler: handler})
 
-	go srv.Serve(lis) //nolint:errcheck // test server
+	go srv.Serve(lis)
 	t.Cleanup(func() { srv.Stop() })
 
 	conn, err := grpc.NewClient(
@@ -70,8 +74,8 @@ func startTestGRPCServer(t *testing.T, handler func(pb.QBSyncService_StreamPiece
 // openStreamWithTimeouts opens a real gRPC bidirectional stream and wraps it
 // in a PieceStream with configurable timeouts for integration testing.
 func openStreamWithTimeouts(
-	t *testing.T,
 	ctx context.Context,
+	t *testing.T,
 	client pb.QBSyncServiceClient,
 	ackBufSize int,
 	ackTimeout, sndTimeout time.Duration,
@@ -133,10 +137,10 @@ func TestIntegration_SendRecvAckRoundtrip(t *testing.T) {
 		}
 	})
 
-	ps := openStreamWithTimeouts(t, context.Background(), client, DefaultAckChannelSize, 0, 0)
+	ps := openStreamWithTimeouts(context.Background(), t, client, DefaultAckChannelSize, 0, 0)
 	defer ps.Close()
 
-	for i := int32(0); i < numPieces; i++ {
+	for i := range int32(numPieces) {
 		if err := ps.Send(&pb.WritePieceRequest{
 			TorrentHash: "test",
 			PieceIndex:  i,
@@ -146,7 +150,7 @@ func TestIntegration_SendRecvAckRoundtrip(t *testing.T) {
 		}
 	}
 
-	for i := int32(0); i < numPieces; i++ {
+	for i := range int32(numPieces) {
 		select {
 		case ack := <-ps.Acks():
 			if !ack.GetSuccess() {
@@ -182,7 +186,7 @@ func TestIntegration_SendTimeoutOnStallServer(t *testing.T) {
 		return stream.Context().Err()
 	})
 
-	ps := openStreamWithTimeouts(t, context.Background(), client, DefaultAckChannelSize, 0, testSendTimeout)
+	ps := openStreamWithTimeouts(context.Background(), t, client, DefaultAckChannelSize, 0, testSendTimeout)
 	defer ps.Close()
 
 	// First send succeeds — server reads it.
@@ -255,13 +259,13 @@ func TestIntegration_AckChannelBlockedRecovery(t *testing.T) {
 		}
 	})
 
-	ps := openStreamWithTimeouts(t, context.Background(), client, ackBufSize, testAckTimeout, 0)
+	ps := openStreamWithTimeouts(context.Background(), t, client, ackBufSize, testAckTimeout, 0)
 	defer ps.Close()
 
 	// Send several pieces. Server acks them immediately.
 	// With ackBufSize=1, the channel fills after 1 ack, and receiveAcks
 	// blocks trying to write the 2nd ack.
-	for i := int32(0); i < 5; i++ {
+	for i := range int32(5) {
 		err := ps.Send(&pb.WritePieceRequest{
 			TorrentHash: "test",
 			PieceIndex:  i,
@@ -299,7 +303,7 @@ func TestIntegration_ServerErrorDetection(t *testing.T) {
 		return errors.New("server internal error")
 	})
 
-	ps := openStreamWithTimeouts(t, context.Background(), client, DefaultAckChannelSize, 0, 0)
+	ps := openStreamWithTimeouts(context.Background(), t, client, DefaultAckChannelSize, 0, 0)
 	defer ps.Close()
 
 	// Trigger the server's read + error return.
@@ -372,7 +376,7 @@ func TestIntegration_PoolErrorPropagation(t *testing.T) {
 		return errors.New("server crash")
 	})
 
-	ps := openStreamWithTimeouts(t, context.Background(), client, DefaultAckChannelSize, 0, 0)
+	ps := openStreamWithTimeouts(context.Background(), t, client, DefaultAckChannelSize, 0, 0)
 	defer ps.Close()
 
 	pool, cleanup := newTestPool(t, ps, 1)
@@ -431,7 +435,7 @@ func TestIntegration_SendTimeoutErrorReachesPool(t *testing.T) {
 		return stream.Context().Err()
 	})
 
-	ps := openStreamWithTimeouts(t, context.Background(), client, DefaultAckChannelSize, 0, testSendTimeout)
+	ps := openStreamWithTimeouts(context.Background(), t, client, DefaultAckChannelSize, 0, testSendTimeout)
 	defer ps.Close()
 
 	pool, cleanup := newTestPool(t, ps, 1)
@@ -495,7 +499,7 @@ func startTestGRPCServerAddr(t *testing.T, handler func(pb.QBSyncService_StreamP
 	srv := grpc.NewServer()
 	pb.RegisterQBSyncServiceServer(srv, &testGRPCServer{handler: handler})
 
-	go srv.Serve(lis) //nolint:errcheck // test server
+	go srv.Serve(lis)
 	t.Cleanup(func() { srv.Stop() })
 
 	return lis.Addr().String()
@@ -511,7 +515,7 @@ func TestIntegration_NewGRPCDestination_MultiConn(t *testing.T) {
 		return stream.Context().Err()
 	})
 
-	d, err := NewGRPCDestination(addr, 3)
+	d, err := NewGRPCDestination(addr, 3, 3)
 	if err != nil {
 		t.Fatalf("NewGRPCDestination: %v", err)
 	}
@@ -525,7 +529,7 @@ func TestIntegration_NewGRPCDestination_MultiConn(t *testing.T) {
 	}
 
 	// Verify all connections are distinct
-	for i := 0; i < len(d.conns); i++ {
+	for i := range len(d.conns) {
 		for j := i + 1; j < len(d.conns); j++ {
 			if d.conns[i] == d.conns[j] {
 				t.Errorf("conns[%d] == conns[%d], want distinct", i, j)
@@ -533,8 +537,8 @@ func TestIntegration_NewGRPCDestination_MultiConn(t *testing.T) {
 		}
 	}
 
-	if err := d.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	if closeErr := d.Close(); closeErr != nil {
+		t.Fatalf("Close: %v", closeErr)
 	}
 }
 
@@ -548,7 +552,7 @@ func TestIntegration_NewGRPCDestination_ZeroDefaultsToOne(t *testing.T) {
 		return stream.Context().Err()
 	})
 
-	d, err := NewGRPCDestination(addr, 0)
+	d, err := NewGRPCDestination(addr, 0, 0)
 	if err != nil {
 		t.Fatalf("NewGRPCDestination: %v", err)
 	}
@@ -572,7 +576,7 @@ func TestIntegration_NewGRPCDestination_NegativeDefaultsToOne(t *testing.T) {
 		return stream.Context().Err()
 	})
 
-	d, err := NewGRPCDestination(addr, -1)
+	d, err := NewGRPCDestination(addr, -1, -1)
 	if err != nil {
 		t.Fatalf("NewGRPCDestination: %v", err)
 	}
@@ -580,6 +584,242 @@ func TestIntegration_NewGRPCDestination_NegativeDefaultsToOne(t *testing.T) {
 
 	if len(d.conns) != 1 {
 		t.Errorf("len(conns) = %d, want 1", len(d.conns))
+	}
+}
+
+// TestIntegration_AddConnection_Success verifies that AddConnection creates a
+// new TCP connection and increments ConnectionCount.
+func TestIntegration_AddConnection_Success(t *testing.T) {
+	t.Parallel()
+
+	addr := startTestGRPCServerAddr(t, func(stream pb.QBSyncService_StreamPiecesBidiServer) error {
+		<-stream.Context().Done()
+		return stream.Context().Err()
+	})
+
+	d, err := NewGRPCDestination(addr, 1, 4)
+	if err != nil {
+		t.Fatalf("NewGRPCDestination: %v", err)
+	}
+	defer d.Close()
+
+	if d.ConnectionCount() != 1 {
+		t.Fatalf("initial ConnectionCount = %d, want 1", d.ConnectionCount())
+	}
+
+	if addErr := d.AddConnection(); addErr != nil {
+		t.Fatalf("AddConnection: %v", addErr)
+	}
+
+	if d.ConnectionCount() != 2 {
+		t.Fatalf("ConnectionCount after add = %d, want 2", d.ConnectionCount())
+	}
+
+	// Verify all connections are distinct
+	d.mu.RLock()
+	if d.conns[0] == d.conns[1] {
+		t.Error("new connection should be distinct from existing")
+	}
+	d.mu.RUnlock()
+}
+
+// TestIntegration_AddConnection_AtMax verifies that AddConnection returns an
+// error when already at maximum connections.
+func TestIntegration_AddConnection_AtMax(t *testing.T) {
+	t.Parallel()
+
+	addr := startTestGRPCServerAddr(t, func(stream pb.QBSyncService_StreamPiecesBidiServer) error {
+		<-stream.Context().Done()
+		return stream.Context().Err()
+	})
+
+	d, err := NewGRPCDestination(addr, 2, 2)
+	if err != nil {
+		t.Fatalf("NewGRPCDestination: %v", err)
+	}
+	defer d.Close()
+
+	addErr := d.AddConnection()
+	if addErr == nil {
+		t.Fatal("expected error when adding connection at max, got nil")
+	}
+
+	if d.ConnectionCount() != 2 {
+		t.Fatalf("ConnectionCount should remain 2, got %d", d.ConnectionCount())
+	}
+}
+
+// TestIntegration_RemoveConnection_Success verifies that RemoveConnection
+// removes the connection at the expected index and decrements ConnectionCount.
+func TestIntegration_RemoveConnection_Success(t *testing.T) {
+	t.Parallel()
+
+	addr := startTestGRPCServerAddr(t, func(stream pb.QBSyncService_StreamPiecesBidiServer) error {
+		<-stream.Context().Done()
+		return stream.Context().Err()
+	})
+
+	d, err := NewGRPCDestination(addr, 1, 4)
+	if err != nil {
+		t.Fatalf("NewGRPCDestination: %v", err)
+	}
+	defer d.Close()
+
+	// Add a connection first so we can remove it
+	if addErr := d.AddConnection(); addErr != nil {
+		t.Fatalf("AddConnection: %v", addErr)
+	}
+	if d.ConnectionCount() != 2 {
+		t.Fatalf("ConnectionCount = %d, want 2", d.ConnectionCount())
+	}
+
+	// Remove the last connection (index 1)
+	if rmErr := d.RemoveConnection(1); rmErr != nil {
+		t.Fatalf("RemoveConnection: %v", rmErr)
+	}
+
+	if d.ConnectionCount() != 1 {
+		t.Fatalf("ConnectionCount after remove = %d, want 1", d.ConnectionCount())
+	}
+}
+
+// TestIntegration_RemoveConnection_AtMin verifies that RemoveConnection returns
+// an error when at minimum connection count.
+func TestIntegration_RemoveConnection_AtMin(t *testing.T) {
+	t.Parallel()
+
+	addr := startTestGRPCServerAddr(t, func(stream pb.QBSyncService_StreamPiecesBidiServer) error {
+		<-stream.Context().Done()
+		return stream.Context().Err()
+	})
+
+	d, err := NewGRPCDestination(addr, 2, 4)
+	if err != nil {
+		t.Fatalf("NewGRPCDestination: %v", err)
+	}
+	defer d.Close()
+
+	rmErr := d.RemoveConnection(1)
+	if rmErr == nil {
+		t.Fatal("expected error when removing connection at min, got nil")
+	}
+
+	if d.ConnectionCount() != 2 {
+		t.Fatalf("ConnectionCount should remain 2, got %d", d.ConnectionCount())
+	}
+}
+
+// TestIntegration_RemoveConnection_IndexMismatch verifies that RemoveConnection
+// returns an error when the expected index doesn't match the current last index.
+// This prevents removing the wrong connection when a concurrent add has occurred.
+func TestIntegration_RemoveConnection_IndexMismatch(t *testing.T) {
+	t.Parallel()
+
+	addr := startTestGRPCServerAddr(t, func(stream pb.QBSyncService_StreamPiecesBidiServer) error {
+		<-stream.Context().Done()
+		return stream.Context().Err()
+	})
+
+	d, err := NewGRPCDestination(addr, 1, 4)
+	if err != nil {
+		t.Fatalf("NewGRPCDestination: %v", err)
+	}
+	defer d.Close()
+
+	// Add two connections (total: 3)
+	if addErr := d.AddConnection(); addErr != nil {
+		t.Fatalf("AddConnection 1: %v", addErr)
+	}
+	if addErr := d.AddConnection(); addErr != nil {
+		t.Fatalf("AddConnection 2: %v", addErr)
+	}
+
+	// Try to remove index 1 when last is actually 2
+	rmErr := d.RemoveConnection(1)
+	if rmErr == nil {
+		t.Fatal("expected error for index mismatch, got nil")
+	}
+
+	// Connection count should be unchanged
+	if d.ConnectionCount() != 3 {
+		t.Fatalf("ConnectionCount should remain 3, got %d", d.ConnectionCount())
+	}
+
+	// Correct index should work
+	if rmErr = d.RemoveConnection(2); rmErr != nil {
+		t.Fatalf("RemoveConnection with correct index: %v", rmErr)
+	}
+	if d.ConnectionCount() != 2 {
+		t.Fatalf("ConnectionCount after correct remove = %d, want 2", d.ConnectionCount())
+	}
+}
+
+// TestIntegration_AddRemoveConnection_Concurrent verifies that AddConnection
+// and RemoveConnection are thread-safe under concurrent access.
+func TestIntegration_AddRemoveConnection_Concurrent(t *testing.T) {
+	t.Parallel()
+
+	addr := startTestGRPCServerAddr(t, func(stream pb.QBSyncService_StreamPiecesBidiServer) error {
+		<-stream.Context().Done()
+		return stream.Context().Err()
+	})
+
+	d, err := NewGRPCDestination(addr, 1, 10)
+	if err != nil {
+		t.Fatalf("NewGRPCDestination: %v", err)
+	}
+	defer d.Close()
+
+	// Concurrent adds
+	var wg sync.WaitGroup
+	for range 5 {
+		wg.Go(func() {
+			_ = d.AddConnection()
+		})
+	}
+	wg.Wait()
+
+	// Should have between 1 and 6 connections (some may fail at max)
+	count := d.ConnectionCount()
+	if count < 1 || count > 6 {
+		t.Fatalf("ConnectionCount = %d, expected between 1 and 6", count)
+	}
+
+	// Concurrent removes (some will fail at min or index mismatch — that's OK)
+	for range 5 {
+		wg.Go(func() {
+			c := d.ConnectionCount()
+			_ = d.RemoveConnection(c - 1)
+		})
+	}
+	wg.Wait()
+
+	// Should still have at least minConns
+	if d.ConnectionCount() < d.MinConnections() {
+		t.Fatalf("ConnectionCount %d < MinConnections %d", d.ConnectionCount(), d.MinConnections())
+	}
+}
+
+// TestIntegration_MinMaxConnections verifies the accessor methods.
+func TestIntegration_MinMaxConnections(t *testing.T) {
+	t.Parallel()
+
+	addr := startTestGRPCServerAddr(t, func(stream pb.QBSyncService_StreamPiecesBidiServer) error {
+		<-stream.Context().Done()
+		return stream.Context().Err()
+	})
+
+	d, err := NewGRPCDestination(addr, 2, 8)
+	if err != nil {
+		t.Fatalf("NewGRPCDestination: %v", err)
+	}
+	defer d.Close()
+
+	if d.MinConnections() != 2 {
+		t.Errorf("MinConnections = %d, want 2", d.MinConnections())
+	}
+	if d.MaxConnections() != 8 {
+		t.Errorf("MaxConnections = %d, want 8", d.MaxConnections())
 	}
 }
 
@@ -608,7 +848,7 @@ func TestIntegration_OpenStream_DistributesAcrossConns(t *testing.T) {
 		}
 	})
 
-	d, err := NewGRPCDestination(addr, 2)
+	d, err := NewGRPCDestination(addr, 2, 2)
 	if err != nil {
 		t.Fatalf("NewGRPCDestination: %v", err)
 	}

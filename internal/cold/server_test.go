@@ -272,7 +272,6 @@ func TestIsOrphanedTorrent(t *testing.T) {
 	})
 }
 
-//nolint:gocognit // Test functions have inherent complexity from setup and assertions
 func TestCleanupOrphan(t *testing.T) {
 	ctx := context.Background()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -291,7 +290,7 @@ func TestCleanupOrphan(t *testing.T) {
 		partialFile := filepath.Join(tmpDir, "test", "test.txt.partial")
 
 		// Create metadata and partial file
-		createTestTorrentFileWithPaths(t, tmpDir, hash, []string{"test.txt"}, "")
+		createTestTorrentFileWithPaths(t, tmpDir, hash, []string{"test.txt"})
 		if err := os.MkdirAll(filepath.Dir(partialFile), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -333,7 +332,7 @@ func TestCleanupOrphan(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		createTestTorrentFileWithPaths(t, tmpDir, hash, []string{"data/test.txt"}, "")
+		createTestTorrentFileWithPaths(t, tmpDir, hash, []string{"data/test.txt"})
 
 		s.cleanupOrphan(ctx, hash)
 
@@ -373,7 +372,7 @@ func TestCleanupOrphan(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		createTestTorrentFileWithPaths(t, tmpDir, hash, []string{"data/test.txt"}, "")
+		createTestTorrentFileWithPaths(t, tmpDir, hash, []string{"data/test.txt"})
 
 		s.cleanupOrphan(ctx, hash)
 
@@ -442,7 +441,7 @@ func TestCleanupOrphanedTorrents(t *testing.T) {
 		if err := os.WriteFile(orphanPartial, []byte("orphan data"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		createTestTorrentFileWithPaths(t, tmpDir, orphanHash, []string{"orphan"}, "")
+		createTestTorrentFileWithPaths(t, tmpDir, orphanHash, []string{"orphan"})
 		// Backdate the torrent file to make it appear orphaned
 		metaDir := filepath.Join(tmpDir, metaDirName, orphanHash)
 		torrentPath, _ := findTorrentFile(metaDir)
@@ -454,7 +453,7 @@ func TestCleanupOrphanedTorrents(t *testing.T) {
 		if err := os.WriteFile(freshPartial, []byte("fresh data"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		createTestTorrentFileWithPaths(t, tmpDir, freshHash, []string{"fresh"}, "")
+		createTestTorrentFileWithPaths(t, tmpDir, freshHash, []string{"fresh"})
 
 		s.cleanupOrphanedTorrents(ctx)
 
@@ -517,379 +516,304 @@ func TestCleanupOrphanedTorrents(t *testing.T) {
 	})
 }
 
-//nolint:gocognit,gocyclo,cyclop // Test functions have inherent complexity from setup and assertions
-func TestAbortTorrent(t *testing.T) {
-	ctx := context.Background()
+func newAbortTestServer(t *testing.T) *Server {
+	t.Helper()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	return &Server{
+		config:         ServerConfig{BasePath: t.TempDir()},
+		logger:         logger,
+		torrents:       make(map[string]*serverTorrentState),
+		abortingHashes: make(map[string]chan struct{}),
+	}
+}
 
-	t.Run("returns success for non-existent torrent", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
-		}
+func TestAbortTorrent_NonExistent(t *testing.T) {
+	s := newAbortTestServer(t)
 
-		resp, err := s.AbortTorrent(ctx, &pb.AbortTorrentRequest{
-			TorrentHash: "nonexistent",
-			DeleteFiles: true,
-		})
-
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if !resp.GetSuccess() {
-			t.Error("expected success for non-existent torrent")
-		}
-		if resp.GetFilesDeleted() != 0 {
-			t.Errorf("expected 0 files deleted, got %d", resp.GetFilesDeleted())
-		}
+	resp, err := s.AbortTorrent(context.Background(), &pb.AbortTorrentRequest{
+		TorrentHash: "nonexistent",
+		DeleteFiles: true,
 	})
 
-	t.Run("removes torrent from tracking", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
-		}
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !resp.GetSuccess() {
+		t.Error("expected success for non-existent torrent")
+	}
+	if resp.GetFilesDeleted() != 0 {
+		t.Errorf("expected 0 files deleted, got %d", resp.GetFilesDeleted())
+	}
+}
 
-		hash := "abc123"
-		s.torrents[hash] = &serverTorrentState{
-			files: []*serverFileInfo{},
-		}
+func TestAbortTorrent_RemovesFromTracking(t *testing.T) {
+	s := newAbortTestServer(t)
+	hash := "abc123"
+	s.torrents[hash] = &serverTorrentState{files: []*serverFileInfo{}}
 
-		_, err := s.AbortTorrent(ctx, &pb.AbortTorrentRequest{
-			TorrentHash: hash,
-			DeleteFiles: false,
-		})
-
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		s.mu.RLock()
-		_, exists := s.torrents[hash]
-		s.mu.RUnlock()
-
-		if exists {
-			t.Error("torrent should be removed from tracking")
-		}
+	_, err := s.AbortTorrent(context.Background(), &pb.AbortTorrentRequest{
+		TorrentHash: hash,
+		DeleteFiles: false,
 	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
-	t.Run("deletes files when deleteFiles is true", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
-		}
+	s.mu.RLock()
+	_, exists := s.torrents[hash]
+	s.mu.RUnlock()
 
-		hash := "abc123"
-		partialFile := filepath.Join(tmpDir, "data", "test.partial")
-		stateFile := filepath.Join(tmpDir, metaDirName, hash, ".state")
-		torrentFile := filepath.Join(tmpDir, metaDirName, hash, "test.torrent")
+	if exists {
+		t.Error("torrent should be removed from tracking")
+	}
+}
 
-		// Create files
-		if err := os.MkdirAll(filepath.Dir(partialFile), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.MkdirAll(filepath.Dir(stateFile), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(partialFile, []byte("data"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(stateFile, []byte{1, 0, 1}, 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(torrentFile, []byte("torrent"), 0o644); err != nil {
-			t.Fatal(err)
-		}
+func TestAbortTorrent_DeletesFiles(t *testing.T) {
+	s := newAbortTestServer(t)
+	hash := "abc123"
+	partialFile := filepath.Join(s.config.BasePath, "data", "test.partial")
+	stateFile := filepath.Join(s.config.BasePath, metaDirName, hash, ".state")
+	torrentFile := filepath.Join(s.config.BasePath, metaDirName, hash, "test.torrent")
 
-		s.torrents[hash] = &serverTorrentState{
-			files: []*serverFileInfo{
-				{path: partialFile, size: 4},
-			},
-			statePath:   stateFile,
-			torrentPath: torrentFile,
-		}
+	// Create files
+	if err := os.MkdirAll(filepath.Dir(partialFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(stateFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(partialFile, []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stateFile, []byte{1, 0, 1}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(torrentFile, []byte("torrent"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
-		resp, err := s.AbortTorrent(ctx, &pb.AbortTorrentRequest{
-			TorrentHash: hash,
-			DeleteFiles: true,
-		})
+	s.torrents[hash] = &serverTorrentState{
+		files:       []*serverFileInfo{{path: partialFile, size: 4}},
+		statePath:   stateFile,
+		torrentPath: torrentFile,
+	}
 
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if !resp.GetSuccess() {
-			t.Errorf("expected success, got error: %s", resp.GetError())
-		}
-		if resp.GetFilesDeleted() != 1 {
-			t.Errorf("expected 1 file deleted, got %d", resp.GetFilesDeleted())
-		}
-
-		// Verify files are deleted
-		if _, statErr := os.Stat(partialFile); !os.IsNotExist(statErr) {
-			t.Error("partial file should be deleted")
-		}
-		if _, statErr := os.Stat(stateFile); !os.IsNotExist(statErr) {
-			t.Error("state file should be deleted")
-		}
-		if _, statErr := os.Stat(torrentFile); !os.IsNotExist(statErr) {
-			t.Error("torrent file should be deleted")
-		}
+	resp, err := s.AbortTorrent(context.Background(), &pb.AbortTorrentRequest{
+		TorrentHash: hash,
+		DeleteFiles: true,
 	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !resp.GetSuccess() {
+		t.Errorf("expected success, got error: %s", resp.GetError())
+	}
+	if resp.GetFilesDeleted() != 1 {
+		t.Errorf("expected 1 file deleted, got %d", resp.GetFilesDeleted())
+	}
 
-	t.Run("does not delete files when deleteFiles is false", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
-		}
+	if _, statErr := os.Stat(partialFile); !os.IsNotExist(statErr) {
+		t.Error("partial file should be deleted")
+	}
+	if _, statErr := os.Stat(stateFile); !os.IsNotExist(statErr) {
+		t.Error("state file should be deleted")
+	}
+	if _, statErr := os.Stat(torrentFile); !os.IsNotExist(statErr) {
+		t.Error("torrent file should be deleted")
+	}
+}
 
-		hash := "abc123"
-		partialFile := filepath.Join(tmpDir, "data", "test.partial")
+func TestAbortTorrent_PreservesFiles(t *testing.T) {
+	s := newAbortTestServer(t)
+	hash := "abc123"
+	partialFile := filepath.Join(s.config.BasePath, "data", "test.partial")
 
-		// Create file
-		if err := os.MkdirAll(filepath.Dir(partialFile), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(partialFile, []byte("data"), 0o644); err != nil {
-			t.Fatal(err)
-		}
+	if err := os.MkdirAll(filepath.Dir(partialFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(partialFile, []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
-		s.torrents[hash] = &serverTorrentState{
-			files: []*serverFileInfo{
-				{path: partialFile, size: 4},
-			},
-		}
+	s.torrents[hash] = &serverTorrentState{
+		files: []*serverFileInfo{{path: partialFile, size: 4}},
+	}
 
-		resp, err := s.AbortTorrent(ctx, &pb.AbortTorrentRequest{
-			TorrentHash: hash,
-			DeleteFiles: false,
-		})
-
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if !resp.GetSuccess() {
-			t.Error("expected success")
-		}
-		if resp.GetFilesDeleted() != 0 {
-			t.Errorf("expected 0 files deleted, got %d", resp.GetFilesDeleted())
-		}
-
-		// File should still exist
-		if _, statErr := os.Stat(partialFile); os.IsNotExist(statErr) {
-			t.Error("partial file should not be deleted")
-		}
+	resp, err := s.AbortTorrent(context.Background(), &pb.AbortTorrentRequest{
+		TorrentHash: hash,
+		DeleteFiles: false,
 	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !resp.GetSuccess() {
+		t.Error("expected success")
+	}
+	if resp.GetFilesDeleted() != 0 {
+		t.Errorf("expected 0 files deleted, got %d", resp.GetFilesDeleted())
+	}
 
-	t.Run("closes open file handles before deletion", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
-		}
+	if _, statErr := os.Stat(partialFile); os.IsNotExist(statErr) {
+		t.Error("partial file should not be deleted")
+	}
+}
 
-		hash := "abc123"
-		partialFile := filepath.Join(tmpDir, "data", "test.partial")
+func TestAbortTorrent_ClosesFileHandles(t *testing.T) {
+	s := newAbortTestServer(t)
+	hash := "abc123"
+	partialFile := filepath.Join(s.config.BasePath, "data", "test.partial")
 
-		// Create and open file
-		if err := os.MkdirAll(filepath.Dir(partialFile), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		f, err := os.Create(partialFile)
-		if err != nil {
-			t.Fatal(err)
-		}
+	if err := os.MkdirAll(filepath.Dir(partialFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Create(partialFile)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-		s.torrents[hash] = &serverTorrentState{
-			files: []*serverFileInfo{
-				{path: partialFile, size: 0, file: f},
-			},
-		}
+	s.torrents[hash] = &serverTorrentState{
+		files: []*serverFileInfo{{path: partialFile, size: 0, file: f}},
+	}
 
-		resp, err := s.AbortTorrent(ctx, &pb.AbortTorrentRequest{
-			TorrentHash: hash,
-			DeleteFiles: true,
-		})
-
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if !resp.GetSuccess() {
-			t.Errorf("expected success, got error: %s", resp.GetError())
-		}
-
-		// File should be deleted (would fail if still open on Windows)
-		if _, statErr := os.Stat(partialFile); !os.IsNotExist(statErr) {
-			t.Error("partial file should be deleted")
-		}
+	resp, abortErr := s.AbortTorrent(context.Background(), &pb.AbortTorrentRequest{
+		TorrentHash: hash,
+		DeleteFiles: true,
 	})
+	if abortErr != nil {
+		t.Fatalf("unexpected error: %v", abortErr)
+	}
+	if !resp.GetSuccess() {
+		t.Errorf("expected success, got error: %s", resp.GetError())
+	}
 
-	t.Run("handles concurrent abort requests", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
-		}
+	if _, statErr := os.Stat(partialFile); !os.IsNotExist(statErr) {
+		t.Error("partial file should be deleted")
+	}
+}
 
-		hash := "abc123"
-		s.torrents[hash] = &serverTorrentState{
-			files: []*serverFileInfo{},
-		}
+func TestAbortTorrent_ConcurrentRequests(t *testing.T) {
+	s := newAbortTestServer(t)
+	ctx := context.Background()
+	hash := "abc123"
+	s.torrents[hash] = &serverTorrentState{files: []*serverFileInfo{}}
 
-		var wg sync.WaitGroup
-		results := make(chan *pb.AbortTorrentResponse, 10)
+	var wg sync.WaitGroup
+	results := make(chan *pb.AbortTorrentResponse, 10)
 
-		for range 10 {
-			wg.Go(func() {
-				resp, err := s.AbortTorrent(ctx, &pb.AbortTorrentRequest{
-					TorrentHash: hash,
-					DeleteFiles: false,
-				})
-				if err != nil {
-					t.Errorf("unexpected error: %v", err)
-					return
-				}
-				results <- resp
-			})
-		}
-
-		wg.Wait()
-		close(results)
-
-		// All should succeed
-		for resp := range results {
-			if !resp.GetSuccess() {
-				t.Error("expected all abort requests to succeed")
-			}
-		}
-
-		// Torrent should be removed
-		s.mu.RLock()
-		_, exists := s.torrents[hash]
-		s.mu.RUnlock()
-
-		if exists {
-			t.Error("torrent should be removed after concurrent aborts")
-		}
-	})
-
-	t.Run("InitTorrent waits for AbortTorrent to complete", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
-		}
-
-		hash := "racetest123"
-		partialPath := filepath.Join(tmpDir, "test.mp4.partial")
-
-		// Create a partial file that AbortTorrent will delete
-		if err := os.WriteFile(partialPath, []byte("test data"), 0o644); err != nil {
-			t.Fatalf("failed to create partial file: %v", err)
-		}
-
-		s.torrents[hash] = &serverTorrentState{
-			files: []*serverFileInfo{
-				{path: partialPath, size: 9},
-			},
-		}
-
-		// Track timing to verify wait behavior
-		var abortFinished, initFinished time.Time
-		var initErr error
-		abortStartedCh := make(chan struct{})
-
-		var wg sync.WaitGroup
-
-		// Start AbortTorrent first
+	for range 10 {
 		wg.Go(func() {
-			// Manually register the abort before signaling and sleeping.
-			// This simulates the behavior where AbortTorrent takes a long time.
-			s.mu.Lock()
-			abortCh := make(chan struct{})
-			s.abortingHashes[hash] = abortCh
-			state := s.torrents[hash]
-			delete(s.torrents, hash)
-			s.mu.Unlock()
-
-			close(abortStartedCh) // Signal that abort has registered
-
-			// Simulate slow cleanup
-			time.Sleep(50 * time.Millisecond)
-
-			// Clean up files
-			state.mu.Lock()
-			for _, fi := range state.files {
-				_ = os.Remove(fi.path)
-			}
-			state.mu.Unlock()
-
-			// Clean up abort tracking
-			s.mu.Lock()
-			delete(s.abortingHashes, hash)
-			s.mu.Unlock()
-			close(abortCh)
-
-			abortFinished = time.Now()
-		})
-
-		// Wait for AbortTorrent to register before starting InitTorrent
-		<-abortStartedCh
-
-		// Start InitTorrent - it should wait for AbortTorrent to complete
-		wg.Go(func() {
-			_, initErr = s.InitTorrent(ctx, &pb.InitTorrentRequest{
+			resp, err := s.AbortTorrent(ctx, &pb.AbortTorrentRequest{
 				TorrentHash: hash,
-				Name:        "test",
-				NumPieces:   1,
-				PieceSize:   1024,
-				TotalSize:   9,
-				Files: []*pb.FileInfo{
-					{Path: "test.mp4", Size: 9, Offset: 0},
-				},
+				DeleteFiles: false,
 			})
-			initFinished = time.Now()
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+				return
+			}
+			results <- resp
 		})
+	}
 
-		wg.Wait()
+	wg.Wait()
+	close(results)
 
-		if initErr != nil {
-			t.Fatalf("InitTorrent failed: %v", initErr)
+	for resp := range results {
+		if !resp.GetSuccess() {
+			t.Error("expected all abort requests to succeed")
 		}
+	}
 
-		// InitTorrent should have finished after AbortTorrent finished
-		// (because it waited for abort to complete)
-		if initFinished.Before(abortFinished) {
-			t.Errorf("InitTorrent finished before AbortTorrent (abortFinished: %v, initFinished: %v)",
-				abortFinished, initFinished)
+	s.mu.RLock()
+	_, exists := s.torrents[hash]
+	s.mu.RUnlock()
+
+	if exists {
+		t.Error("torrent should be removed after concurrent aborts")
+	}
+}
+
+func TestAbortTorrent_InitWaitsForAbort(t *testing.T) {
+	s := newAbortTestServer(t)
+	ctx := context.Background()
+	hash := "racetest123"
+	partialPath := filepath.Join(s.config.BasePath, "test.mp4.partial")
+
+	if err := os.WriteFile(partialPath, []byte("test data"), 0o644); err != nil {
+		t.Fatalf("failed to create partial file: %v", err)
+	}
+
+	s.torrents[hash] = &serverTorrentState{
+		files: []*serverFileInfo{{path: partialPath, size: 9}},
+	}
+
+	var abortFinished, initFinished time.Time
+	var initErr error
+	abortStartedCh := make(chan struct{})
+
+	var wg sync.WaitGroup
+
+	wg.Go(func() {
+		s.mu.Lock()
+		abortCh := make(chan struct{})
+		s.abortingHashes[hash] = abortCh
+		state := s.torrents[hash]
+		delete(s.torrents, hash)
+		s.mu.Unlock()
+
+		close(abortStartedCh)
+
+		time.Sleep(50 * time.Millisecond)
+
+		state.mu.Lock()
+		for _, fi := range state.files {
+			_ = os.Remove(fi.path)
 		}
+		state.mu.Unlock()
 
-		// The torrent should now be tracked (InitTorrent succeeded after abort)
-		s.mu.RLock()
-		_, exists := s.torrents[hash]
-		s.mu.RUnlock()
+		s.mu.Lock()
+		delete(s.abortingHashes, hash)
+		s.mu.Unlock()
+		close(abortCh)
 
-		if !exists {
-			t.Error("torrent should be tracked after InitTorrent")
-		}
+		abortFinished = time.Now()
 	})
+
+	<-abortStartedCh
+
+	wg.Go(func() {
+		_, initErr = s.InitTorrent(ctx, &pb.InitTorrentRequest{
+			TorrentHash: hash,
+			Name:        "test",
+			NumPieces:   1,
+			PieceSize:   1024,
+			TotalSize:   9,
+			Files: []*pb.FileInfo{
+				{Path: "test.mp4", Size: 9, Offset: 0},
+			},
+		})
+		initFinished = time.Now()
+	})
+
+	wg.Wait()
+
+	if initErr != nil {
+		t.Fatalf("InitTorrent failed: %v", initErr)
+	}
+
+	if initFinished.Before(abortFinished) {
+		t.Errorf(
+			"InitTorrent finished before AbortTorrent (abortFinished: %v, initFinished: %v)",
+			abortFinished, initFinished,
+		)
+	}
+
+	s.mu.RLock()
+	_, exists := s.torrents[hash]
+	s.mu.RUnlock()
+
+	if !exists {
+		t.Error("torrent should be tracked after InitTorrent")
+	}
 }
 
 func TestSetupFile_PreExisting(t *testing.T) {
@@ -1209,7 +1133,7 @@ func createTestStateFile(t *testing.T, basePath, hash string, modTime time.Time)
 // If no file paths are provided, uses a single dummy file.
 func createTestTorrentFile(t *testing.T, basePath, hash string, modTime time.Time) {
 	t.Helper()
-	createTestTorrentFileWithPaths(t, basePath, hash, nil, "")
+	createTestTorrentFileWithPaths(t, basePath, hash, nil)
 	torrentPath, err := findTorrentFile(filepath.Join(basePath, metaDirName, hash))
 	if err != nil {
 		t.Fatal(err)
@@ -1217,9 +1141,9 @@ func createTestTorrentFile(t *testing.T, basePath, hash string, modTime time.Tim
 	setModTime(t, torrentPath, modTime)
 }
 
-// createTestTorrentFileWithPaths creates a .torrent file + optional .subpath in the metaDir.
+// createTestTorrentFileWithPaths creates a .torrent file in the metaDir.
 // relPaths are torrent-relative paths (e.g., "data/test.txt"). If empty, uses a dummy file.
-func createTestTorrentFileWithPaths(t *testing.T, basePath, hash string, relPaths []string, subPath string) {
+func createTestTorrentFileWithPaths(t *testing.T, basePath, hash string, relPaths []string) {
 	t.Helper()
 	metaDir := filepath.Join(basePath, metaDirName, hash)
 	if err := os.MkdirAll(metaDir, 0o755); err != nil {
@@ -1257,13 +1181,6 @@ func createTestTorrentFileWithPaths(t *testing.T, basePath, hash string, relPath
 	torrentPath := filepath.Join(metaDir, "test.torrent")
 	if err := os.WriteFile(torrentPath, encodeTorrent(t, bt), 0o644); err != nil {
 		t.Fatal(err)
-	}
-
-	if subPath != "" {
-		subPathFile := filepath.Join(metaDir, subPathFileName)
-		if err := os.WriteFile(subPathFile, []byte(subPath), 0o644); err != nil {
-			t.Fatal(err)
-		}
 	}
 }
 
@@ -1316,7 +1233,6 @@ func newRelocateInitRequest(hash, subPath string) *pb.InitTorrentRequest {
 	}
 }
 
-//nolint:gocognit // Test functions have inherent complexity from setup and assertions
 func TestRelocateFiles(t *testing.T) {
 	t.Parallel()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))

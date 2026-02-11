@@ -3,6 +3,7 @@ package qbclient
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -33,6 +34,12 @@ type Client interface {
 	GetFreeSpaceOnDiskCtx(ctx context.Context) (int64, error)
 }
 
+// Default circuit breaker configuration values.
+const (
+	cbMaxFailures  = 5
+	cbResetTimeout = 30 * time.Second
+)
+
 // Ensure ResilientClient implements Client interface.
 var _ Client = (*ResilientClient)(nil)
 
@@ -47,8 +54,8 @@ func DefaultConfig() Config {
 	return Config{
 		Retry: utils.DefaultRetryConfig(),
 		CircuitBreaker: &utils.CircuitBreakerConfig{
-			MaxFailures:  5,
-			ResetTimeout: 30 * time.Second,
+			MaxFailures:  cbMaxFailures,
+			ResetTimeout: cbResetTimeout,
 		},
 	}
 }
@@ -99,13 +106,13 @@ func NewResilientClient(
 			HandleIf(func(_ any, err error) bool {
 				return utils.IsCircuitBreakerFailure(err)
 			}).
-			OnOpen(func(e circuitbreaker.StateChangedEvent) {
+			OnOpen(func(_ circuitbreaker.StateChangedEvent) {
 				logger.Warn("circuit breaker opened")
 			}).
-			OnHalfOpen(func(e circuitbreaker.StateChangedEvent) {
+			OnHalfOpen(func(_ circuitbreaker.StateChangedEvent) {
 				logger.Info("circuit breaker half-open, probing")
 			}).
-			OnClose(func(e circuitbreaker.StateChangedEvent) {
+			OnClose(func(_ circuitbreaker.StateChangedEvent) {
 				logger.Info("circuit breaker closed")
 			}).
 			Build()
@@ -306,7 +313,12 @@ func runWithResult[T any](
 		var zero T
 		return zero, err
 	}
-	return result.(T), nil
+	typed, ok := result.(T)
+	if !ok {
+		var zero T
+		return zero, fmt.Errorf("type assertion failed: expected %T, got %T", zero, result)
+	}
+	return typed, nil
 }
 
 // CircuitBreakerState returns the current circuit breaker state, or "disabled" if not configured.

@@ -2,6 +2,7 @@ package hot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 
@@ -25,7 +26,7 @@ func checkDrainAnnotation(ctx context.Context, annotationKey string) (bool, erro
 	podName := os.Getenv("POD_NAME")
 	namespace := os.Getenv("POD_NAMESPACE")
 	if podName == "" || namespace == "" {
-		return false, fmt.Errorf("POD_NAME or POD_NAMESPACE not set")
+		return false, errors.New("POD_NAME or POD_NAMESPACE not set")
 	}
 
 	pod, err := clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})

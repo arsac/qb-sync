@@ -47,6 +47,11 @@ const (
 	// to finish before force-stopping. Long-lived bidirectional streams (piece
 	// streaming) can block shutdown indefinitely without this timeout.
 	gracefulShutdownTimeout = 10 * time.Second
+
+	// gRPC keepalive parameters for the cold server.
+	keepalivePingInterval = 30 * time.Second // Send pings if no activity
+	keepalivePingTimeout  = 10 * time.Second // Wait for ping ack before closing
+	keepaliveMinPingTime  = 15 * time.Second // Minimum allowed client ping frequency
 )
 
 // Server receives pieces over gRPC and writes them to disk.
@@ -95,7 +100,7 @@ type Server struct {
 func NewServer(config ServerConfig, logger *slog.Logger) *Server {
 	bufferBytes := config.MaxStreamBufferBytes
 	if bufferBytes <= 0 {
-		bufferBytes = defaultMaxStreamBufferMB * 1024 * 1024
+		bufferBytes = defaultMaxStreamBufferMB * bytesPerMB
 	}
 
 	s := &Server{
@@ -114,7 +119,12 @@ func NewServer(config ServerConfig, logger *slog.Logger) *Server {
 			Password: config.ColdQB.Password,
 		})
 		qbConfig := qbclient.DefaultConfig()
-		s.qbClient = qbclient.NewResilientClient(rawClient, qbConfig, logger.With("component", "cold-qb-client"), metrics.ModeCold)
+		s.qbClient = qbclient.NewResilientClient(
+			rawClient,
+			qbConfig,
+			logger.With("component", "cold-qb-client"),
+			metrics.ModeCold,
+		)
 	}
 
 	if loadErr := s.inodes.Load(); loadErr != nil {
@@ -154,12 +164,12 @@ func (s *Server) Run(ctx context.Context) error {
 		grpc.InitialWindowSize(initialStreamWindowSize),
 		grpc.InitialConnWindowSize(initialConnWindowSize),
 		grpc.KeepaliveParams(keepalive.ServerParameters{
-			Time:    30 * time.Second, // Send pings every 30s if no activity
-			Timeout: 10 * time.Second, // Wait 10s for ping ack
+			Time:    keepalivePingInterval, // Send pings every 30s if no activity
+			Timeout: keepalivePingTimeout,  // Wait 10s for ping ack
 		}),
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
-			MinTime:             15 * time.Second, // Allow client pings as frequent as 15s
-			PermitWithoutStream: true,             // Allow pings even when no active streams
+			MinTime:             keepaliveMinPingTime, // Allow client pings as frequent as 15s
+			PermitWithoutStream: true,                 // Allow pings even when no active streams
 		}),
 	)
 	pb.RegisterQBSyncServiceServer(s.server, s)

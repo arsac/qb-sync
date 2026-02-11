@@ -58,7 +58,8 @@ All flags can be set via environment variables with the prefix `QBSYNC_HOT_` or 
 | `QBSYNC_HOT_PIECE_TIMEOUT` | `--piece-timeout` | Timeout for stale in-flight pieces (seconds) | `60` |
 | `QBSYNC_HOT_RECONNECT_MAX_DELAY` | `--reconnect-max-delay` | Max reconnect backoff delay (seconds) | `30` |
 | `QBSYNC_HOT_NUM_SENDERS` | `--num-senders` | Concurrent sender workers | `4` |
-| `QBSYNC_HOT_GRPC_CONNECTIONS` | `--grpc-connections` | TCP connections to cold server | `2` |
+| `QBSYNC_HOT_MIN_CONNECTIONS` | `--min-connections` | Minimum TCP connections to cold server | `2` |
+| `QBSYNC_HOT_MAX_CONNECTIONS` | `--max-connections` | Maximum TCP connections to cold server | `8` |
 | `QBSYNC_HOT_SYNCED_TAG` | `--synced-tag` | Tag for synced torrents (empty to disable) | `synced` |
 | `QBSYNC_HOT_SOURCE_REMOVED_TAG` | `--source-removed-tag` | Tag on cold when source removed (empty to disable) | `source-removed` |
 | `QBSYNC_HOT_DRAIN_ANNOTATION` | `--drain-annotation` | Pod annotation key to gate shutdown drain (empty to drain unconditionally) | `qbsync/drain` |

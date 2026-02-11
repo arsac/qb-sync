@@ -18,6 +18,7 @@ const (
 	LabelHash       = "hash"       // torrent info hash
 	LabelName       = "name"       // torrent name
 	LabelConnection = "connection" // gRPC connection index
+	LabelDirection  = "direction"  // scaling direction (up, down)
 )
 
 // Label value constants for consistent usage across the codebase.
@@ -33,9 +34,12 @@ const (
 
 	ComponentStreamQueue = "stream_queue"
 
-	ReasonContextCancel    = "context_cancel"
-	ReasonEOF              = "eof"
-	ReasonStreamError      = "error"
+	DirectionUp   = "up"
+	DirectionDown = "down"
+
+	ReasonContextCancel     = "context_cancel"
+	ReasonEOF               = "eof"
+	ReasonStreamError       = "error"
 	ReasonAckChannelBlocked = "ack_channel_blocked"
 )
 
@@ -405,6 +409,16 @@ var (
 			Help:      "Total file handle evictions (stale handle retry, fallback promotion, or full evict)",
 		},
 	)
+
+	// ConnectionScaleEventsTotal counts TCP connection scaling events by direction.
+	ConnectionScaleEventsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "connection_scale_events_total",
+			Help:      "Total TCP connection scaling events",
+		},
+		[]string{LabelDirection},
+	)
 )
 
 // Gauges track values that can go up or down.
@@ -511,11 +525,11 @@ var (
 		[]string{LabelHash, LabelName},
 	)
 
-	// TorrentPiecesTotal tracks the total number of pieces per tracked torrent.
-	TorrentPiecesTotal = promauto.NewGaugeVec(
+	// TorrentPieces tracks the total number of pieces per tracked torrent.
+	TorrentPieces = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: namespace,
-			Name:      "torrent_pieces_total",
+			Name:      "torrent_pieces",
 			Help:      "Total number of pieces per tracked torrent",
 		},
 		[]string{LabelHash, LabelName},
@@ -531,11 +545,11 @@ var (
 		[]string{LabelHash, LabelName},
 	)
 
-	// TorrentSizeBytesTotal tracks the total size in bytes per tracked torrent.
-	TorrentSizeBytesTotal = promauto.NewGaugeVec(
+	// TorrentSizeBytes tracks the total size in bytes per tracked torrent.
+	TorrentSizeBytes = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: namespace,
-			Name:      "torrent_size_bytes_total",
+			Name:      "torrent_size_bytes",
 			Help:      "Total size in bytes per tracked torrent",
 		},
 		[]string{LabelHash, LabelName},
@@ -586,12 +600,21 @@ var (
 		},
 	)
 
-	// GRPCConnectionsConfigured tracks the number of TCP connections to the cold server.
+	// GRPCConnectionsConfigured tracks the maximum configured TCP connections to the cold server.
 	GRPCConnectionsConfigured = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "grpc_connections_configured",
-			Help:      "Number of TCP connections configured for gRPC streaming to cold server",
+			Help:      "Maximum TCP connections configured for gRPC streaming to cold server",
+		},
+	)
+
+	// GRPCConnectionsActive tracks the current number of active TCP connections to the cold server.
+	GRPCConnectionsActive = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "grpc_connections_active",
+			Help:      "Current number of active TCP connections to cold server",
 		},
 	)
 
@@ -697,4 +720,3 @@ const (
 	CircuitStateOpen     = 1
 	CircuitStateHalfOpen = 2
 )
-

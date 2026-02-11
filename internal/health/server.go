@@ -246,7 +246,11 @@ func CachedCheck(check CheckFunc, ttl time.Duration) CheckFunc {
 		if v == nil {
 			return nil
 		}
-		return v.(error)
+		err, ok := v.(error)
+		if !ok {
+			return nil
+		}
+		return err
 	}
 }
 
