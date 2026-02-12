@@ -61,6 +61,7 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_connection_scale_events_total` | `direction` | TCP connection scaling events (up/down) |
 | `qbsync_files_early_finalized_total` | | Files synced, closed, and renamed before torrent finalization |
 | `qbsync_file_selection_resyncs_total` | | Re-syncs triggered by file selection changes (hot) |
+| `qbsync_early_finalize_verify_failures_total` | | Files that failed read-back verification during early finalization (cold) |
 
 ## Gauges
 

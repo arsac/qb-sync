@@ -65,8 +65,9 @@ func (s *Server) writePieceData(state *serverTorrentState, offset int64, data []
 		if openErr != nil {
 			return fmt.Errorf("opening %s: %w", fi.path, openErr)
 		}
-		// No per-piece fsync: data integrity is guaranteed by verifyFinalizedPieces
-		// which reads back and SHA1-verifies every piece before finalization.
+		// No per-piece fsync: data integrity is guaranteed by verifyFilePieces
+		// (early finalization) and verifyFinalizedPieces (full finalization),
+		// which read back and SHA1-verify pieces before rename.
 		// Per-piece fsync would severely degrade write throughput on NFS/spinning disks.
 		if _, writeErr := file.WriteAt(remaining[:toProcess], fileWriteOffset); writeErr != nil {
 			return fmt.Errorf("writing to %s: %w", fi.path, writeErr)
@@ -217,9 +218,53 @@ func (s *Server) WritePiece(
 	return &pb.WritePieceResponse{Success: true}, nil
 }
 
+// verifyFilePieces reads back interior pieces from a synced .partial file and
+// verifies their hashes. Returns indices of pieces that failed verification.
+// Boundary pieces (spanning adjacent files) are skipped — they are deferred to
+// verifyFinalizedPieces. Caller must hold state.mu.
+func (s *Server) verifyFilePieces(
+	state *serverTorrentState,
+	fi *serverFileInfo,
+) []int {
+	if len(state.pieceHashes) == 0 {
+		return nil
+	}
+
+	var failed []int
+	for p := fi.firstPiece; p <= fi.lastPiece; p++ {
+		if state.pieceHashes[p] == "" {
+			continue
+		}
+
+		pieceStart := int64(p) * state.pieceLength
+		pieceEnd := min(pieceStart+state.pieceLength, state.totalSize)
+
+		// Skip boundary pieces — they span adjacent files and can't be
+		// fully read from this file alone. Deferred to verifyFinalizedPieces.
+		if pieceStart < fi.offset || pieceEnd > fi.offset+fi.size {
+			continue
+		}
+
+		pieceSize := pieceEnd - pieceStart
+		fileOffset := pieceStart - fi.offset
+
+		data, readErr := utils.ReadChunkFromFile(fi.path, fileOffset, pieceSize)
+		if readErr != nil {
+			failed = append(failed, p)
+			continue
+		}
+
+		if err := utils.VerifyPieceHash(data, state.pieceHashes[p]); err != nil {
+			failed = append(failed, p)
+		}
+	}
+
+	return failed
+}
+
 // checkFileCompletions checks if the just-written piece completes any file's
-// piece coverage. If so, immediately syncs, closes, and renames that file from
-// .partial to its final path. Caller must hold state.mu.
+// piece coverage. If so, immediately syncs, closes, verifies interior pieces,
+// and renames that file from .partial to its final path. Caller must hold state.mu.
 func (s *Server) checkFileCompletions(
 	ctx context.Context,
 	hash string,
@@ -241,21 +286,55 @@ func (s *Server) checkFileCompletions(
 		if fi.piecesWritten < fi.piecesTotal {
 			continue
 		}
-		// File complete — sync, close, rename
-		if err := s.closeFileHandle(ctx, hash, fi); err != nil {
-			s.logger.WarnContext(ctx, "early finalization sync failed, deferring",
-				"hash", hash, "file", fi.path, "error", err)
-			continue // finalizeFiles() will retry
-		}
-		if err := s.renamePartialFile(ctx, hash, fi); err != nil {
-			s.logger.WarnContext(ctx, "early finalization rename failed, deferring",
-				"hash", hash, "file", fi.path, "error", err)
-			continue
-		}
-		fi.path = strings.TrimSuffix(fi.path, partialSuffix)
-		fi.earlyFinalized = true
-		metrics.FilesEarlyFinalizedTotal.Inc()
-		s.logger.InfoContext(ctx, "file early-finalized",
-			"hash", hash, "file", fi.path, "fileIndex", i)
+		s.earlyFinalizeFile(ctx, hash, state, fi, i)
 	}
+}
+
+// earlyFinalizeFile syncs, verifies, and renames a completed .partial file.
+// On verification failure, marks failed pieces as unwritten for re-streaming.
+// Caller must hold state.mu.
+func (s *Server) earlyFinalizeFile(
+	ctx context.Context,
+	hash string,
+	state *serverTorrentState,
+	fi *serverFileInfo,
+	fileIndex int,
+) {
+	if err := s.closeFileHandle(ctx, hash, fi); err != nil {
+		s.logger.WarnContext(ctx, "early finalization sync failed, deferring",
+			"hash", hash, "file", fi.path, "error", err)
+		return // finalizeFiles() will retry
+	}
+	// Verify interior pieces by reading back from disk after sync.
+	if failedPieces := s.verifyFilePieces(state, fi); len(failedPieces) > 0 {
+		for _, p := range failedPieces {
+			state.written[p] = false
+			state.writtenCount--
+			fi.piecesWritten--
+		}
+		state.dirty = true
+		if state.statePath != "" {
+			if saveErr := s.saveState(state.statePath, state.written); saveErr != nil {
+				metrics.StateSaveErrorsTotal.WithLabelValues(metrics.ModeCold).Inc()
+				s.logger.ErrorContext(ctx, "failed to persist state after verify failure",
+					"hash", hash, "file", fi.path, "error", saveErr)
+			} else {
+				state.dirty = false
+			}
+		}
+		metrics.EarlyFinalizeVerifyFailuresTotal.Inc()
+		s.logger.WarnContext(ctx, "early verify failed, pieces will be re-streamed",
+			"hash", hash, "file", fi.path, "failedPieces", len(failedPieces))
+		return // File stays as .partial
+	}
+	if err := s.renamePartialFile(ctx, hash, fi); err != nil {
+		s.logger.WarnContext(ctx, "early finalization rename failed, deferring",
+			"hash", hash, "file", fi.path, "error", err)
+		return
+	}
+	fi.path = strings.TrimSuffix(fi.path, partialSuffix)
+	fi.earlyFinalized = true
+	metrics.FilesEarlyFinalizedTotal.Inc()
+	s.logger.InfoContext(ctx, "file early-finalized",
+		"hash", hash, "file", fi.path, "fileIndex", fileIndex)
 }

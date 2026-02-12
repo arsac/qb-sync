@@ -510,6 +510,232 @@ func TestWritePiece_EarlyFinalizesCompletedFile(t *testing.T) {
 	}
 }
 
+func TestCheckFileCompletions_VerifyFailure(t *testing.T) {
+	t.Parallel()
+
+	s, tmpDir := newTestColdServer(t)
+
+	hash := "verify-failure-test"
+	correctData := []byte("correct piece data!")
+	pieceHash := utils.ComputeSHA1(correctData)
+
+	// Write corrupted data so read-back verification fails against the correct hash.
+	corruptedData := []byte("XXrrect piece data!")
+	partialPath := filepath.Join(tmpDir, "verify.bin.partial")
+	if err := os.WriteFile(partialPath, corruptedData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fi := &serverFileInfo{
+		path:          partialPath,
+		size:          int64(len(correctData)),
+		offset:        0,
+		firstPiece:    0,
+		lastPiece:     0,
+		piecesTotal:   1,
+		piecesWritten: 0,
+		selected:      true,
+	}
+	state := &serverTorrentState{
+		written:      []bool{true},
+		writtenCount: 1,
+		pieceHashes:  []string{pieceHash},
+		pieceLength:  int64(len(correctData)),
+		totalSize:    int64(len(correctData)),
+		files:        []*serverFileInfo{fi},
+		statePath:    filepath.Join(tmpDir, ".state"),
+	}
+
+	ctx := context.Background()
+	state.mu.Lock()
+	s.checkFileCompletions(ctx, hash, state, 0)
+	state.mu.Unlock()
+
+	// File should NOT be early-finalized (verification failed).
+	if fi.earlyFinalized {
+		t.Error("file should NOT be early-finalized when verification fails")
+	}
+
+	// File should still be at .partial path.
+	if fi.path != partialPath {
+		t.Errorf("path = %s, want %s", fi.path, partialPath)
+	}
+
+	// Corrupted piece should be marked unwritten.
+	if state.written[0] {
+		t.Error("corrupted piece should be marked as unwritten")
+	}
+	if state.writtenCount != 0 {
+		t.Errorf("writtenCount = %d, want 0", state.writtenCount)
+	}
+	if fi.piecesWritten != 0 {
+		t.Errorf("piecesWritten = %d, want 0", fi.piecesWritten)
+	}
+}
+
+func TestCheckFileCompletions_VerifySkipsBoundaryPieces(t *testing.T) {
+	t.Parallel()
+
+	s, tmpDir := newTestColdServer(t)
+
+	hash := "verify-boundary-test"
+
+	// Two files sharing piece 0 (boundary piece).
+	// File 0: offset=0, size=5 — piece 0 starts at 0, ends at 10 → boundary.
+	// File 1: offset=5, size=5 — piece 0 starts at 0, ends at 10 → boundary.
+	// Boundary pieces can't be verified from a single file, so verification
+	// should skip them and the file should still early-finalize.
+
+	partial1 := filepath.Join(tmpDir, "f1.bin.partial")
+	partial2 := filepath.Join(tmpDir, "f2.bin.partial")
+	data1 := []byte("hello")
+	data2 := []byte("world")
+	if err := os.WriteFile(partial1, data1, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(partial2, data2, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pieceHash := utils.ComputeSHA1(append(data1, data2...))
+
+	files := []*serverFileInfo{
+		{
+			path: partial1, size: 5, offset: 0,
+			firstPiece: 0, lastPiece: 0, piecesTotal: 1, piecesWritten: 0, selected: true,
+		},
+		{
+			path: partial2, size: 5, offset: 5,
+			firstPiece: 0, lastPiece: 0, piecesTotal: 1, piecesWritten: 0, selected: true,
+		},
+	}
+	state := &serverTorrentState{
+		written:      []bool{true},
+		writtenCount: 1,
+		pieceHashes:  []string{pieceHash},
+		pieceLength:  10,
+		totalSize:    10,
+		files:        files,
+	}
+
+	ctx := context.Background()
+	state.mu.Lock()
+	s.checkFileCompletions(ctx, hash, state, 0)
+	state.mu.Unlock()
+
+	// Both files should be early-finalized (boundary piece was skipped, not failed).
+	if !files[0].earlyFinalized {
+		t.Error("file 0 should be early-finalized (boundary piece skipped)")
+	}
+	if !files[1].earlyFinalized {
+		t.Error("file 1 should be early-finalized (boundary piece skipped)")
+	}
+}
+
+func TestCheckFileCompletions_VerifyPartialCorruption(t *testing.T) {
+	t.Parallel()
+
+	s, tmpDir := newTestColdServer(t)
+
+	hash := "verify-partial-corrupt"
+
+	// 3 interior pieces in a single file, middle piece corrupted.
+	// pieceLength=10, totalSize=30, file covers all bytes.
+	piece0 := []byte("0000000000")
+	piece1 := []byte("1111111111")
+	piece2 := []byte("2222222222")
+	hash0 := utils.ComputeSHA1(piece0)
+	hash1 := utils.ComputeSHA1(piece1)
+	hash2 := utils.ComputeSHA1(piece2)
+
+	// Write file with piece 1 corrupted.
+	corrupted1 := []byte("XXXXXXXXXX")
+	fileData := append(append(piece0, corrupted1...), piece2...)
+
+	partialPath := filepath.Join(tmpDir, "multi.bin.partial")
+	if err := os.WriteFile(partialPath, fileData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fi := &serverFileInfo{
+		path: partialPath, size: 30, offset: 0,
+		firstPiece: 0, lastPiece: 2, piecesTotal: 3, piecesWritten: 2, selected: true,
+	}
+	state := &serverTorrentState{
+		written:      []bool{true, true, true},
+		writtenCount: 3,
+		pieceHashes:  []string{hash0, hash1, hash2},
+		pieceLength:  10,
+		totalSize:    30,
+		files:        []*serverFileInfo{fi},
+		statePath:    filepath.Join(tmpDir, ".state"),
+	}
+
+	ctx := context.Background()
+	state.mu.Lock()
+	// Piece 2 is the "completing" piece.
+	s.checkFileCompletions(ctx, hash, state, 2)
+	state.mu.Unlock()
+
+	// File should NOT be early-finalized.
+	if fi.earlyFinalized {
+		t.Error("file should NOT be early-finalized with corrupted piece")
+	}
+
+	// Only piece 1 should be marked unwritten; pieces 0 and 2 stay written.
+	if !state.written[0] {
+		t.Error("piece 0 should remain written (verified OK)")
+	}
+	if state.written[1] {
+		t.Error("piece 1 should be marked unwritten (corrupted)")
+	}
+	if !state.written[2] {
+		t.Error("piece 2 should remain written (verified OK)")
+	}
+	if state.writtenCount != 2 {
+		t.Errorf("writtenCount = %d, want 2", state.writtenCount)
+	}
+	if fi.piecesWritten != 2 {
+		t.Errorf("piecesWritten = %d, want 2", fi.piecesWritten)
+	}
+}
+
+func TestCheckFileCompletions_VerifyNoPieceHashes(t *testing.T) {
+	t.Parallel()
+
+	s, tmpDir := newTestColdServer(t)
+
+	hash := "verify-nohash-test"
+
+	// No piece hashes → verifyFilePieces returns nil → rename proceeds.
+	partialPath := filepath.Join(tmpDir, "nohash.bin.partial")
+	if err := os.WriteFile(partialPath, []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fi := &serverFileInfo{
+		path: partialPath, size: 4, offset: 0,
+		firstPiece: 0, lastPiece: 0, piecesTotal: 1, piecesWritten: 0, selected: true,
+	}
+	state := &serverTorrentState{
+		written:      []bool{true},
+		writtenCount: 1,
+		pieceHashes:  nil, // No hashes available.
+		pieceLength:  4,
+		totalSize:    4,
+		files:        []*serverFileInfo{fi},
+	}
+
+	ctx := context.Background()
+	state.mu.Lock()
+	s.checkFileCompletions(ctx, hash, state, 0)
+	state.mu.Unlock()
+
+	if !fi.earlyFinalized {
+		t.Error("file should be early-finalized when no piece hashes are available")
+	}
+}
+
 func assertFileRange(t *testing.T, fi *serverFileInfo, firstPiece, lastPiece, piecesTotal int) {
 	t.Helper()
 	if fi.firstPiece != firstPiece {

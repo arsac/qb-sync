@@ -437,6 +437,16 @@ var (
 			Help:      "Number of re-syncs triggered by file selection changes on hot",
 		},
 	)
+
+	// EarlyFinalizeVerifyFailuresTotal counts files that failed read-back verification
+	// during early finalization.
+	EarlyFinalizeVerifyFailuresTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "early_finalize_verify_failures_total",
+			Help:      "Files that failed read-back verification during early finalization",
+		},
+	)
 )
 
 // Gauges track values that can go up or down.
