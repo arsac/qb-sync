@@ -102,17 +102,6 @@ func initFilePieceCounts(files []*serverFileInfo, written []bool) {
 	}
 }
 
-// anyProtoFileSelected returns true if at least one proto FileInfo has Selected=true.
-// Used for backward compatibility: if no file is selected (legacy hot), treat all as selected.
-func anyProtoFileSelected(files []*pb.FileInfo) bool {
-	for _, f := range files {
-		if f.GetSelected() {
-			return true
-		}
-	}
-	return false
-}
-
 // countSelectedFiles returns the number of selected files.
 func countSelectedFiles(files []*serverFileInfo) int {
 	count := 0

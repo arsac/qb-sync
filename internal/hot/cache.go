@@ -31,8 +31,8 @@ func (t *QBTask) MarkCompletedOnCold(hash string) {
 }
 
 // loadCompletedCache reads the persisted completed-on-cold cache from disk.
-// Supports both the new format (JSON object: hash→fingerprint) and the legacy
-// format (JSON array of hashes). Missing or corrupt file is non-fatal.
+// Format: JSON object mapping hash → selection fingerprint.
+// Missing or corrupt file is non-fatal (cache repopulates on next cycle).
 func (t *QBTask) loadCompletedCache() {
 	data, err := os.ReadFile(t.completedCachePath)
 	if err != nil {
@@ -45,24 +45,8 @@ func (t *QBTask) loadCompletedCache() {
 		return
 	}
 
-	// Try new format first (JSON object: hash → fingerprint)
 	var fingerprints map[string]string
-	if json.Unmarshal(data, &fingerprints) == nil {
-		t.completedMu.Lock()
-		maps.Copy(t.completedOnCold, fingerprints)
-		metrics.CompletedOnColdCacheSize.Set(float64(len(t.completedOnCold)))
-		t.completedMu.Unlock()
-
-		t.logger.Info("loaded completed-on-cold cache",
-			"count", len(fingerprints),
-			"path", t.completedCachePath,
-		)
-		return
-	}
-
-	// Fall back to legacy format (JSON array of hashes)
-	var hashes []string
-	if jsonErr := json.Unmarshal(data, &hashes); jsonErr != nil {
+	if jsonErr := json.Unmarshal(data, &fingerprints); jsonErr != nil {
 		t.logger.Warn("failed to parse completed cache, starting fresh",
 			"path", t.completedCachePath,
 			"error", jsonErr,
@@ -71,14 +55,12 @@ func (t *QBTask) loadCompletedCache() {
 	}
 
 	t.completedMu.Lock()
-	for _, hash := range hashes {
-		t.completedOnCold[hash] = "" // empty fingerprint triggers re-check
-	}
+	maps.Copy(t.completedOnCold, fingerprints)
 	metrics.CompletedOnColdCacheSize.Set(float64(len(t.completedOnCold)))
 	t.completedMu.Unlock()
 
-	t.logger.Info("loaded completed-on-cold cache (legacy format, will re-check fingerprints)",
-		"count", len(hashes),
+	t.logger.Info("loaded completed-on-cold cache",
+		"count", len(fingerprints),
 		"path", t.completedCachePath,
 	)
 }

@@ -18,6 +18,12 @@ const (
 	metaDirName      = ".qbsync"
 	subPathFileName  = ".subpath"
 	selectedFileName = ".selected"
+	versionFileName  = ".version"
+
+	// metaVersion is bumped when the metadata format changes.
+	// If a metadata directory has a missing or different version,
+	// it is nuked and re-initialized from scratch on next InitTorrent.
+	metaVersion = "1"
 
 	// Concurrent streaming settings.
 	defaultStreamWorkers = 8   // Number of concurrent piece writers (tuned for NFS/ZFS)

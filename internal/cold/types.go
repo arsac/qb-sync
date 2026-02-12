@@ -93,9 +93,10 @@ func (fi *serverFileInfo) skipForWriteData() bool {
 
 // finalizeResult stores the outcome of a background finalization.
 type finalizeResult struct {
-	success bool
-	state   string // qBittorrent state on success
-	err     string // Error message on failure
+	success   bool
+	state     string               // qBittorrent state on success
+	err       string               // Error message on failure
+	errorCode pb.FinalizeErrorCode // Structured error code for retry decisions
 }
 
 // torrentRef is a reference to a torrent state for safe iteration.

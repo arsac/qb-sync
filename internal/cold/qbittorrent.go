@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/autobrr/go-qbittorrent"
 
@@ -75,13 +77,22 @@ func (s *Server) addAndVerifyTorrent(
 	// joined with the sub-path from init (e.g., "movies" from category).
 	savePath := filepath.Join(s.config.GetSavePath(), state.saveSubPath)
 
+	deselectedIDs := deselectedFileIDs(state.files)
+
 	opts := map[string]string{
 		"savepath":           savePath,
-		"skip_checking":      "true", // We verified pieces on write via SHA1 hash
 		"stopped":            "true", // Add stopped so hot controls when cold starts seeding (qB v5+)
 		"paused":             "true", // Compat alias for qB v4.x
 		"autoTMM":            "false",
 		"sequentialDownload": "false",
+	}
+
+	// skip_checking is safe only when all files are present on disk. With
+	// partial file selection, deselected files are absent, and qBittorrent
+	// reports missingFiles even with skip_checking=true. In that case, we
+	// set priorities first and let qBittorrent check only selected files.
+	if deselectedIDs == "" {
+		opts["skip_checking"] = "true"
 	}
 
 	if req.GetCategory() != "" {
@@ -98,9 +109,15 @@ func (s *Server) addAndVerifyTorrent(
 	s.logger.InfoContext(ctx, "added torrent to qBittorrent",
 		"hash", hash,
 		"savePath", savePath,
+		"skipChecking", deselectedIDs == "",
 	)
 
-	// Wait for torrent to be ready (skip_checking=true so should be immediate)
+	// For partial file selection: set deselected file priorities to 0 and
+	// resume so qBittorrent checks only selected files (which exist on disk).
+	if deselectedIDs != "" {
+		s.applyDeselectedPriorities(ctx, hash, deselectedIDs)
+	}
+
 	finalState, waitErr := s.waitForTorrentReady(ctx, hash)
 
 	// Always stop the torrent after adding, even if waitForTorrentReady was
@@ -148,9 +165,18 @@ func (s *Server) waitForTorrentReady(ctx context.Context, hash string) (qbittorr
 		torrent := torrents[0]
 		finalState = torrent.State
 
-		// Check for error states - fail immediately
-		if isErrorState(torrent.State) {
+		// Hard error state — fail immediately.
+		if torrent.State == qbittorrent.TorrentStateError {
 			return false, fmt.Errorf("torrent entered error state: %s", torrent.State)
+		}
+
+		// missingFiles may be transient after partial file selection: we set
+		// deselected priorities to 0 and resume, so keep polling until
+		// qBittorrent re-evaluates (or the overall timeout expires).
+		if torrent.State == qbittorrent.TorrentStateMissingFiles {
+			s.logger.DebugContext(pollCtx, "torrent in missingFiles state, waiting for recovery",
+				"hash", hash)
+			return false, nil
 		}
 
 		// Still checking - keep waiting
@@ -249,6 +275,33 @@ func (s *Server) deleteTorrentFromQB(ctx context.Context, hash string) error {
 	s.logger.InfoContext(ctx, "deleted stale torrent from cold qBittorrent for re-sync",
 		"hash", hash)
 	return nil
+}
+
+// applyDeselectedPriorities sets file priorities to 0 for deselected files
+// and resumes the torrent so qBittorrent checks only selected files.
+func (s *Server) applyDeselectedPriorities(ctx context.Context, hash, ids string) {
+	if priorityErr := s.qbClient.SetFilePriorityCtx(ctx, hash, ids, 0); priorityErr != nil {
+		s.logger.WarnContext(ctx, "failed to set deselected file priorities",
+			"hash", hash, "error", priorityErr)
+	}
+	if resumeErr := s.qbClient.ResumeCtx(ctx, []string{hash}); resumeErr != nil {
+		s.logger.WarnContext(ctx, "failed to resume for file checking",
+			"hash", hash, "error", resumeErr)
+	}
+	s.logger.InfoContext(ctx, "set deselected file priorities and started checking",
+		"hash", hash, "deselected", ids)
+}
+
+// deselectedFileIDs returns a pipe-separated string of 0-based file indices
+// that are not selected (priority 0). Returns "" if all files are selected.
+func deselectedFileIDs(files []*serverFileInfo) string {
+	var ids []string
+	for i, f := range files {
+		if !f.selected {
+			ids = append(ids, strconv.Itoa(i))
+		}
+	}
+	return strings.Join(ids, "|")
 }
 
 // isErrorState returns true if the torrent state indicates an error.

@@ -808,6 +808,117 @@ func TestPieceMonitor_ResyncStreamed(t *testing.T) {
 	})
 }
 
+func TestDeselectedPieceMask(t *testing.T) {
+	t.Run("nil when all files selected", func(t *testing.T) {
+		files := []*pb.FileInfo{
+			{Path: "a.mp3", Size: 1000, Offset: 0, Selected: true},
+			{Path: "b.mp3", Size: 1000, Offset: 1000, Selected: true},
+		}
+		mask := deselectedPieceMask(files, 4, 500, 2000)
+		if mask != nil {
+			t.Error("expected nil when all files selected")
+		}
+	})
+
+	t.Run("marks interior pieces in deselected files", func(t *testing.T) {
+		// 3 files, 500 bytes each, piece size 100 → 15 pieces total
+		// File 0 (selected):   offset 0-499   → pieces 0-4
+		// File 1 (deselected): offset 500-999  → pieces 5-9
+		// File 2 (selected):   offset 1000-1499 → pieces 10-14
+		files := []*pb.FileInfo{
+			{Path: "a.mp3", Size: 500, Offset: 0, Selected: true},
+			{Path: "b.mp3", Size: 500, Offset: 500, Selected: false},
+			{Path: "c.mp3", Size: 500, Offset: 1000, Selected: true},
+		}
+		mask := deselectedPieceMask(files, 15, 100, 1500)
+		if mask == nil {
+			t.Fatal("expected non-nil mask")
+		}
+		if len(mask) != 15 {
+			t.Fatalf("expected 15 entries, got %d", len(mask))
+		}
+
+		// Pieces 0-4: selected file only → false
+		for i := range 5 {
+			if mask[i] {
+				t.Errorf("piece %d should NOT be deselected (in selected file)", i)
+			}
+		}
+		// Pieces 5-9: deselected file only → true
+		for i := 5; i < 10; i++ {
+			if !mask[i] {
+				t.Errorf("piece %d should be deselected (in deselected file)", i)
+			}
+		}
+		// Pieces 10-14: selected file only → false
+		for i := 10; i < 15; i++ {
+			if mask[i] {
+				t.Errorf("piece %d should NOT be deselected (in selected file)", i)
+			}
+		}
+	})
+
+	t.Run("boundary pieces are not deselected", func(t *testing.T) {
+		// 2 files, piece size spans both
+		// File 0 (selected):   offset 0-299   → ends mid-piece 0 (piece 0-499)
+		// File 1 (deselected): offset 300-599
+		files := []*pb.FileInfo{
+			{Path: "a.mp3", Size: 300, Offset: 0, Selected: true},
+			{Path: "b.mp3", Size: 300, Offset: 300, Selected: false},
+		}
+		// Piece 0: 0-499 → overlaps both files → NOT deselected (selected file overlaps)
+		// Piece 1: 500-599 → only in deselected file → deselected
+		mask := deselectedPieceMask(files, 2, 500, 600)
+		if mask == nil {
+			t.Fatal("expected non-nil mask")
+		}
+		if mask[0] {
+			t.Error("boundary piece 0 should NOT be deselected")
+		}
+		// Piece 1: offset 500-599, file 1 is offset 300-599 → overlaps
+		// Since file 1 is deselected and no selected file overlaps piece 1
+		if !mask[1] {
+			t.Error("piece 1 should be deselected (only deselected file)")
+		}
+	})
+
+	t.Run("nil for zero pieces", func(t *testing.T) {
+		files := []*pb.FileInfo{
+			{Path: "a.mp3", Size: 100, Offset: 0, Selected: false},
+		}
+		mask := deselectedPieceMask(files, 0, 100, 100)
+		if mask != nil {
+			t.Error("expected nil for zero pieces")
+		}
+	})
+
+	t.Run("nil for zero piece size", func(t *testing.T) {
+		files := []*pb.FileInfo{
+			{Path: "a.mp3", Size: 100, Offset: 0, Selected: false},
+		}
+		mask := deselectedPieceMask(files, 10, 0, 100)
+		if mask != nil {
+			t.Error("expected nil for zero piece size")
+		}
+	})
+
+	t.Run("all files deselected marks all pieces", func(t *testing.T) {
+		files := []*pb.FileInfo{
+			{Path: "a.mp3", Size: 500, Offset: 0, Selected: false},
+			{Path: "b.mp3", Size: 500, Offset: 500, Selected: false},
+		}
+		mask := deselectedPieceMask(files, 10, 100, 1000)
+		if mask == nil {
+			t.Fatal("expected non-nil mask")
+		}
+		for i, d := range mask {
+			if !d {
+				t.Errorf("piece %d should be deselected (all files deselected)", i)
+			}
+		}
+	})
+}
+
 func TestPieceMonitor_RemovalNotification_Integration(t *testing.T) {
 	logger := testLogger
 

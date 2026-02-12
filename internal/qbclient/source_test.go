@@ -226,7 +226,7 @@ func TestResolveReadDir(t *testing.T) {
 func TestReadPiece_ENOENTRetry(t *testing.T) {
 	content := []byte("piece data here!")
 	files := []*pb.FileInfo{
-		{Path: "file.bin", Size: int64(len(content)), Offset: 0},
+		{Path: "file.bin", Size: int64(len(content)), Offset: 0, Selected: true},
 	}
 	makePiece := func(hash string) *pb.Piece {
 		return &pb.Piece{TorrentHash: hash, Offset: 0, Size: int64(len(content))}
@@ -329,7 +329,7 @@ func TestReadPieceMultiFile_SingleFile(t *testing.T) {
 
 	s := &Source{}
 	files := []*pb.FileInfo{
-		{Path: "movie.mkv", Size: int64(len(content)), Offset: 0},
+		{Path: "movie.mkv", Size: int64(len(content)), Offset: 0, Selected: true},
 	}
 
 	// Read a "piece" from the middle
@@ -358,8 +358,8 @@ func TestReadPieceMultiFile_MultipleFiles(t *testing.T) {
 
 	s := &Source{}
 	files := []*pb.FileInfo{
-		{Path: "part1.bin", Size: 10, Offset: 0},
-		{Path: "part2.bin", Size: 10, Offset: 10},
+		{Path: "part1.bin", Size: 10, Offset: 0, Selected: true},
+		{Path: "part2.bin", Size: 10, Offset: 10, Selected: true},
 	}
 
 	// Read entirely from second file (offset 12, size 4)
@@ -387,11 +387,67 @@ func TestReadPieceMultiFile_PieceSpansFiles(t *testing.T) {
 
 	s := &Source{}
 	files := []*pb.FileInfo{
-		{Path: "a.bin", Size: 4, Offset: 0},
-		{Path: "b.bin", Size: 4, Offset: 4},
+		{Path: "a.bin", Size: 4, Offset: 0, Selected: true},
+		{Path: "b.bin", Size: 4, Offset: 4, Selected: true},
 	}
 
 	// Read a piece that spans both files: last 2 bytes of a.bin + first 2 bytes of b.bin
+	data, err := s.readPieceMultiFile("testhash", dir, files, 2, 4)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(data) != "AABB" {
+		t.Errorf("got %q, want %q", string(data), "AABB")
+	}
+}
+
+func TestReadPieceMultiFile_BoundaryPieceZeroFillsDeselected(t *testing.T) {
+	dir := t.TempDir()
+
+	// File A (selected): 4 bytes at offset 0
+	// File B (deselected): 4 bytes at offset 4 — NOT created on disk
+	file1 := filepath.Join(dir, "a.bin")
+	if err := os.WriteFile(file1, []byte("AAAA"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Source{}
+	files := []*pb.FileInfo{
+		{Path: "a.bin", Size: 4, Offset: 0, Selected: true},
+		{Path: "b.bin", Size: 4, Offset: 4, Selected: false},
+	}
+
+	// Read a boundary piece spanning both files: last 2 bytes of a.bin + first 2 of b.bin
+	data, err := s.readPieceMultiFile("testhash", dir, files, 2, 4)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Selected file data is correct, deselected region is zero-filled
+	want := []byte{'A', 'A', 0, 0}
+	if string(data) != string(want) {
+		t.Errorf("got %v, want %v", data, want)
+	}
+}
+
+func TestReadPieceMultiFile_AllSelectedNoZeroFill(t *testing.T) {
+	dir := t.TempDir()
+
+	file1 := filepath.Join(dir, "a.bin")
+	file2 := filepath.Join(dir, "b.bin")
+	if err := os.WriteFile(file1, []byte("AAAA"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file2, []byte("BBBB"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Source{}
+	files := []*pb.FileInfo{
+		{Path: "a.bin", Size: 4, Offset: 0, Selected: true},
+		{Path: "b.bin", Size: 4, Offset: 4, Selected: true},
+	}
+
+	// When all files are selected, normal read path (no zero-fill)
 	data, err := s.readPieceMultiFile("testhash", dir, files, 2, 4)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -589,7 +645,7 @@ func TestEvictCache_ClosesHandles(t *testing.T) {
 
 	s := &Source{}
 	s.fileCache.Store("h1", &cachedMeta{
-		files:      []*pb.FileInfo{{Path: "data.bin", Size: 4, Offset: 0}},
+		files:      []*pb.FileInfo{{Path: "data.bin", Size: 4, Offset: 0, Selected: true}},
 		contentDir: dir,
 	})
 

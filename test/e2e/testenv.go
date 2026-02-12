@@ -203,7 +203,7 @@ services:
 
 	// Configure qBittorrent save paths to match volume mounts.
 	// The home-operations image defaults to /config/Downloads, but we mount data at /downloads.
-	hotPrefs := map[string]interface{}{
+	hotPrefs := map[string]any{
 		"save_path": "/downloads",
 	}
 	if sc.hotTempPath {
@@ -211,7 +211,7 @@ services:
 		hotPrefs["temp_path"] = "/incomplete"
 	}
 	require.NoError(t, hotClient.SetPreferencesCtx(ctx, hotPrefs))
-	require.NoError(t, coldClient.SetPreferencesCtx(ctx, map[string]interface{}{
+	require.NoError(t, coldClient.SetPreferencesCtx(ctx, map[string]any{
 		"save_path": "/cold-data",
 	}))
 
@@ -568,18 +568,18 @@ func (env *TestEnv) CreateHotConfig(opts ...HotConfigOption) *config.HotConfig {
 	cfg := &config.HotConfig{
 		BaseConfig: config.BaseConfig{
 			QBURL:      env.hotURL,
-			QBUsername:  testUsername,
+			QBUsername: testUsername,
 			QBPassword: testPassword,
 			DataPath:   env.hotPath,
 			SyncedTag:  "synced",
 		},
-		MinSpaceGB:      1,
-		MinSeedingTime:  0,
-		SleepInterval:   time.Second,
+		MinSpaceGB:         1,
+		MinSeedingTime:     0,
+		SleepInterval:      time.Second,
 		MinGRPCConnections: 2,
 		MaxGRPCConnections: 8,
-		NumSenders:       4,
-		SourceRemovedTag: "source-removed",
+		NumSenders:         4,
+		SourceRemovedTag:   "source-removed",
 	}
 	for _, opt := range opts {
 		opt(cfg)
@@ -830,7 +830,11 @@ func (env *TestEnv) CleanupBothSides(ctx context.Context, hashes ...string) {
 
 // DownloadTorrentOnHot adds a torrent to hot, waits for it to appear, and waits
 // for it to finish downloading. Returns the torrent metadata.
-func (env *TestEnv) DownloadTorrentOnHot(ctx context.Context, url, hash string, downloadTimeout time.Duration) *qbittorrent.Torrent {
+func (env *TestEnv) DownloadTorrentOnHot(
+	ctx context.Context,
+	url, hash string,
+	downloadTimeout time.Duration,
+) *qbittorrent.Torrent {
 	env.t.Helper()
 	err := env.AddTorrentToHot(ctx, url, nil)
 	require.NoError(env.t, err)

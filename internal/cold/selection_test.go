@@ -10,41 +10,6 @@ import (
 	pb "github.com/arsac/qb-sync/proto"
 )
 
-// --- Helper tests ---
-
-func TestAnyProtoFileSelected(t *testing.T) {
-	t.Parallel()
-
-	t.Run("no files selected returns false", func(t *testing.T) {
-		t.Parallel()
-		files := []*pb.FileInfo{
-			{Path: "a.txt", Selected: false},
-			{Path: "b.txt", Selected: false},
-		}
-		if anyProtoFileSelected(files) {
-			t.Error("expected false when no file is selected")
-		}
-	})
-
-	t.Run("one file selected returns true", func(t *testing.T) {
-		t.Parallel()
-		files := []*pb.FileInfo{
-			{Path: "a.txt", Selected: false},
-			{Path: "b.txt", Selected: true},
-		}
-		if !anyProtoFileSelected(files) {
-			t.Error("expected true when one file is selected")
-		}
-	})
-
-	t.Run("empty list returns false", func(t *testing.T) {
-		t.Parallel()
-		if anyProtoFileSelected(nil) {
-			t.Error("expected false for nil list")
-		}
-	})
-}
-
 func TestPieceOverlapsSelectedFile(t *testing.T) {
 	t.Parallel()
 
@@ -245,8 +210,7 @@ func TestWritePieceData_SkipsUnselectedFiles(t *testing.T) {
 	}
 
 	// Verify unselected file was NOT created
-	unselectedPath := filepath.Join(tmpDir, "unselected.bin")
-	if _, statErr := os.Stat(unselectedPath); !os.IsNotExist(statErr) {
+	if _, statErr := os.Stat(state.files[1].path); !os.IsNotExist(statErr) {
 		t.Error("unselected file should not exist on disk")
 	}
 }
@@ -314,51 +278,6 @@ func TestSaveLoadSelectedFile(t *testing.T) {
 			t.Errorf("loaded = %v, want [true false false false]", loaded)
 		}
 	})
-}
-
-// --- Backward compatibility tests ---
-
-func TestInitTorrent_BackwardCompat_AllFilesSelected(t *testing.T) {
-	t.Parallel()
-	s, tmpDir := newTestColdServer(t)
-	s.inodes = NewInodeRegistry(tmpDir, testLogger(t))
-
-	// Send files without Selected field (all false = legacy hot)
-	resp, err := s.InitTorrent(context.Background(), &pb.InitTorrentRequest{
-		TorrentHash: "backcompat-test",
-		Name:        "test-torrent",
-		NumPieces:   2,
-		PieceSize:   512,
-		TotalSize:   1024,
-		Files: []*pb.FileInfo{
-			{Path: "file1.bin", Size: 512, Offset: 0},   // Selected not set (false)
-			{Path: "file2.bin", Size: 512, Offset: 512}, // Selected not set (false)
-		},
-	})
-	if err != nil {
-		t.Fatalf("InitTorrent error: %v", err)
-	}
-	if !resp.GetSuccess() {
-		t.Fatalf("InitTorrent failed: %s", resp.GetError())
-	}
-
-	// All pieces should be needed (backward compat treats all as selected)
-	if resp.GetPiecesNeededCount() != 2 {
-		t.Errorf("expected 2 pieces needed (backward compat), got %d", resp.GetPiecesNeededCount())
-	}
-
-	// Verify state files are marked selected
-	s.mu.RLock()
-	state := s.torrents["backcompat-test"]
-	s.mu.RUnlock()
-
-	state.mu.Lock()
-	for i, fi := range state.files {
-		if !fi.selected {
-			t.Errorf("file %d should be selected (backward compat)", i)
-		}
-	}
-	state.mu.Unlock()
 }
 
 // --- setupFile tests for unselected files ---
@@ -495,6 +414,15 @@ func TestFinalizeTorrent_PartialSelection(t *testing.T) {
 		t.Fatalf("FinalizeTorrent failed: %s (code: %v)", fResp.GetError(), fResp.GetErrorCode())
 	}
 
+	// Wait for the background finalization goroutine to complete before
+	// checking results and allowing TempDir cleanup.
+	state.mu.Lock()
+	done := state.finalizeDone
+	state.mu.Unlock()
+	if done != nil {
+		<-done
+	}
+
 	// Unselected file (file1.bin) should NOT exist on disk
 	if _, statErr := os.Stat(filepath.Join(tmpDir, "file1.bin")); !os.IsNotExist(statErr) {
 		t.Error("unselected file1.bin should not exist on disk")
@@ -575,6 +503,176 @@ func TestRecoverTorrentState_NoSelectedFile_DefaultsAllSelected(t *testing.T) {
 
 	if !state.files[0].selected {
 		t.Error("file should default to selected when .selected file is missing")
+	}
+}
+
+func TestRecoverTorrentState_StaleVersion_NukesDirectory(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestColdServer(t)
+
+	hash := "recover-stale-version"
+	metaDir := filepath.Join(tmpDir, metaDirName, hash)
+
+	createTestTorrentFileWithPaths(t, tmpDir, hash, []string{"file1.bin"})
+
+	// Overwrite version with a stale value
+	if err := os.WriteFile(filepath.Join(metaDir, versionFileName), []byte("0"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := s.recoverTorrentState(context.Background(), hash)
+	if err == nil {
+		t.Fatal("expected error for stale metadata")
+	}
+
+	// Directory should have been removed
+	if _, statErr := os.Stat(metaDir); !os.IsNotExist(statErr) {
+		t.Error("stale metadata directory should have been removed")
+	}
+}
+
+func TestRecoverTorrentState_MissingVersion_NukesDirectory(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestColdServer(t)
+
+	hash := "recover-no-version"
+	metaDir := filepath.Join(tmpDir, metaDirName, hash)
+
+	// Create metadata directory with torrent file but no .version
+	if err := os.MkdirAll(metaDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(metaDir, "test.torrent"), []byte("dummy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := s.recoverTorrentState(context.Background(), hash)
+	if err == nil {
+		t.Fatal("expected error for missing version")
+	}
+
+	// Directory should have been removed
+	if _, statErr := os.Stat(metaDir); !os.IsNotExist(statErr) {
+		t.Error("versionless metadata directory should have been removed")
+	}
+}
+
+func TestRecoverTorrentState_MissingStateFile(t *testing.T) {
+	t.Parallel()
+
+	t.Run("reconstructs written from final-path files", func(t *testing.T) {
+		t.Parallel()
+		s, tmpDir := newTestColdServer(t)
+
+		hash := "recover-no-state-final"
+		// Creates torrent with 10 pieces × 1024 bytes each, 2 files × 1024 bytes.
+		createTestTorrentFileWithPaths(t, tmpDir, hash, []string{"file1.bin", "file2.bin"})
+
+		// Create both files at final path (renamed from .partial → complete).
+		// No .state file exists — simulates state file loss after finalization.
+		writeTestFile(t, filepath.Join(tmpDir, "test", "file1.bin"), make([]byte, 1024))
+		writeTestFile(t, filepath.Join(tmpDir, "test", "file2.bin"), make([]byte, 1024))
+
+		state, err := s.recoverTorrentState(context.Background(), hash)
+		if err != nil {
+			t.Fatalf("recoverTorrentState: %v", err)
+		}
+
+		// 2 files × 1024 bytes = pieces 0 and 1 covered (piece size 1024).
+		// Remaining pieces 2-9 have no file data and stay unwritten.
+		if state.writtenCount != 2 {
+			t.Errorf("expected 2 pieces written (one per file), got %d", state.writtenCount)
+		}
+
+		// .state file should have been persisted for future recoveries.
+		statePath := filepath.Join(tmpDir, metaDirName, hash, ".state")
+		if _, statErr := os.Stat(statePath); os.IsNotExist(statErr) {
+			t.Error("expected .state file to be persisted after reconstruction")
+		}
+	})
+
+	t.Run("partial files treated as unwritten", func(t *testing.T) {
+		t.Parallel()
+		s, tmpDir := newTestColdServer(t)
+
+		hash := "recover-no-state-partial"
+		createTestTorrentFileWithPaths(t, tmpDir, hash, []string{"file1.bin", "file2.bin"})
+
+		// file1 at final path (complete), file2 still at .partial (incomplete).
+		writeTestFile(t, filepath.Join(tmpDir, "test", "file1.bin"), make([]byte, 1024))
+		writeTestFile(t, filepath.Join(tmpDir, "test", "file2.bin.partial"), make([]byte, 1024))
+
+		state, err := s.recoverTorrentState(context.Background(), hash)
+		if err != nil {
+			t.Fatalf("recoverTorrentState: %v", err)
+		}
+
+		// file1 covers piece 0, file2 covers piece 1. Only file1's piece should be written.
+		if state.writtenCount != 1 {
+			t.Errorf("expected 1 piece written (final-path file only), got %d", state.writtenCount)
+		}
+		if !state.written[0] {
+			t.Error("piece 0 (final-path file) should be written")
+		}
+		if state.written[1] {
+			t.Error("piece 1 (.partial file) should NOT be written")
+		}
+	})
+}
+
+// --- InitTorrent state cleaning ---
+
+func TestInitTorrent_StaleMetadata_NukedBeforeInit(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestColdServer(t)
+	s.inodes = NewInodeRegistry(tmpDir, testLogger(t))
+
+	hash := "stale-init-test"
+
+	// Pre-create a stale metadata directory with no version file and a
+	// bogus .state that claims all pieces are written.
+	metaDir := filepath.Join(tmpDir, metaDirName, hash)
+	if err := os.MkdirAll(metaDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	staleState := []byte{1, 1, 1} // 3 pieces "written"
+	if err := os.WriteFile(filepath.Join(metaDir, ".state"), staleState, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// InitTorrent should nuke the stale directory and start fresh.
+	resp, err := s.InitTorrent(context.Background(), &pb.InitTorrentRequest{
+		TorrentHash: hash,
+		Name:        "test-torrent",
+		NumPieces:   3,
+		PieceSize:   100,
+		TotalSize:   300,
+		Files: []*pb.FileInfo{
+			{Path: "file0.bin", Size: 100, Offset: 0, Selected: true},
+			{Path: "file1.bin", Size: 100, Offset: 100, Selected: true},
+			{Path: "file2.bin", Size: 100, Offset: 200, Selected: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("InitTorrent error: %v", err)
+	}
+	if !resp.GetSuccess() {
+		t.Fatalf("InitTorrent failed: %s", resp.GetError())
+	}
+
+	// Stale .state was nuked — all 3 pieces should be needed (not pre-written).
+	if resp.GetPiecesNeededCount() != 3 {
+		t.Errorf("expected 3 pieces needed (stale state nuked), got %d", resp.GetPiecesNeededCount())
+	}
+
+	// Version file should exist now.
+	versionPath := filepath.Join(metaDir, versionFileName)
+	data, readErr := os.ReadFile(versionPath)
+	if readErr != nil {
+		t.Fatalf("version file missing after init: %v", readErr)
+	}
+	if string(data) != metaVersion {
+		t.Errorf("version = %q, want %q", string(data), metaVersion)
 	}
 }
 

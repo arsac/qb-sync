@@ -285,7 +285,7 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 	pieceSize := int64(props.PieceSize)
 	numPieces := props.PiecesNum
 	if numPieces == 0 && pieceSize > 0 {
-		numPieces = int((torrent.Size + pieceSize - 1) / pieceSize)
+		numPieces = int((torrent.TotalSize + pieceSize - 1) / pieceSize)
 	}
 
 	// Validate piece count fits in int32 (protobuf field type)
@@ -308,7 +308,7 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 			TorrentHash: hash,
 			Name:        torrent.Name,
 			PieceSize:   pieceSize,
-			TotalSize:   torrent.Size,
+			TotalSize:   torrent.TotalSize,
 			NumPieces:   int32(numPieces),
 			Files:       files,
 			TorrentFile: torrentFile,
@@ -451,13 +451,66 @@ func (s *Source) readPieceMultiFile(
 	files []*pb.FileInfo,
 	offset, size int64,
 ) ([]byte, error) {
-	regions := make([]utils.FileRegion, len(files))
-	for i, f := range files {
-		regions[i] = utils.FileRegion{
-			Path:   filepath.Join(basePath, f.GetPath()),
-			Offset: f.GetOffset(),
-			Size:   f.GetSize(),
+	// Check if any deselected file overlaps this piece range.
+	pieceEnd := offset + size
+	hasDeselected := false
+	for _, f := range files {
+		if !f.GetSelected() {
+			fEnd := f.GetOffset() + f.GetSize()
+			if f.GetOffset() < pieceEnd && fEnd > offset {
+				hasDeselected = true
+				break
+			}
 		}
 	}
-	return s.readPieceFromRegions(hash, regions, offset, size)
+
+	if !hasDeselected {
+		// Fast path: all overlapping files are selected.
+		regions := make([]utils.FileRegion, len(files))
+		for i, f := range files {
+			regions[i] = utils.FileRegion{
+				Path:   filepath.Join(basePath, f.GetPath()),
+				Offset: f.GetOffset(),
+				Size:   f.GetSize(),
+			}
+		}
+		return s.readPieceFromRegions(hash, regions, offset, size)
+	}
+
+	// Boundary piece overlapping a deselected file.
+	// Zero-fill deselected regions — the file doesn't exist on disk because
+	// qBittorrent doesn't create files with priority 0.
+	// Cold's writePieceData skips deselected files, so only the selected
+	// file data (which IS correct here) gets written.
+	data := make([]byte, size) // zero-initialized
+	remaining := size
+	currentOffset := offset
+	for _, f := range files {
+		if remaining <= 0 {
+			break
+		}
+		fEnd := f.GetOffset() + f.GetSize()
+		if fEnd <= currentOffset {
+			continue
+		}
+		fileReadOffset := max(currentOffset-f.GetOffset(), 0)
+		availableInFile := f.GetSize() - fileReadOffset
+		toRead := min(remaining, availableInFile)
+
+		if f.GetSelected() {
+			path := filepath.Join(basePath, f.GetPath())
+			chunk, chunkErr := s.readChunkCached(hash, path, fileReadOffset, toRead)
+			if chunkErr != nil {
+				return nil, fmt.Errorf("reading from %s at offset %d: %w", path, fileReadOffset, chunkErr)
+			}
+			dataOffset := currentOffset - offset
+			copy(data[dataOffset:], chunk)
+		}
+		// Deselected: zeros remain in place
+
+		remaining -= toRead
+		currentOffset += toRead
+	}
+
+	return data, nil
 }

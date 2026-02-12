@@ -130,12 +130,20 @@ func (s *Server) resumeTorrent(
 }
 
 // setupMetadataDir creates the metadata directory and writes the torrent file.
+// If the directory exists with a stale or missing version, it is removed first
+// to prevent loading incompatible state files.
 // Returns metaDir, torrentPath, statePath, and error.
 func (s *Server) setupMetadataDir(
 	hash, name string,
 	torrentFile []byte,
 ) (string, string, string, error) {
 	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
+
+	// Nuke stale metadata directory before re-creating.
+	if !checkMetaVersion(metaDir) {
+		_ = os.RemoveAll(metaDir)
+	}
+
 	if err := os.MkdirAll(metaDir, serverDirPermissions); err != nil {
 		return "", "", "", fmt.Errorf("creating metadata directory: %w", err)
 	}
@@ -147,6 +155,10 @@ func (s *Server) setupMetadataDir(
 		if err := atomicWriteFile(torrentPath, torrentFile); err != nil {
 			return "", "", "", fmt.Errorf("writing .torrent file: %w", err)
 		}
+	}
+
+	if err := atomicWriteFile(filepath.Join(metaDir, versionFileName), []byte(metaVersion)); err != nil {
+		return "", "", "", fmt.Errorf("writing version file: %w", err)
 	}
 
 	return metaDir, torrentPath, statePath, nil
@@ -181,17 +193,8 @@ func (s *Server) initNewTorrent(
 		}
 	}
 
-	// Backward compatibility: if no file has Selected=true (legacy hot without
-	// the Selected field), treat all files as selected to preserve old behavior.
-	reqFiles := req.GetFiles()
-	if !anyProtoFileSelected(reqFiles) {
-		for _, f := range reqFiles {
-			f.Selected = true
-		}
-	}
-
 	// Set up files and check for hardlink opportunities
-	files, hardlinkResults, err := s.setupFiles(ctx, hash, reqFiles, saveSubPath)
+	files, hardlinkResults, err := s.setupFiles(ctx, hash, req.GetFiles(), saveSubPath)
 	if err != nil {
 		return initErrorResponse("%v", err)
 	}

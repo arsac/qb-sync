@@ -447,6 +447,16 @@ var (
 			Help:      "Files that failed read-back verification during early finalization",
 		},
 	)
+
+	// VerificationRecoveriesTotal counts torrents recovered from verification failure
+	// by marking pieces for re-streaming.
+	VerificationRecoveriesTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "verification_recoveries_total",
+			Help:      "Torrents recovered from verification failure by marking pieces for re-streaming",
+		},
+	)
 )
 
 // Gauges track values that can go up or down.

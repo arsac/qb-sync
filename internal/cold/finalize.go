@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -117,11 +118,12 @@ func (s *Server) runBackgroundFinalization(
 	defer close(done)
 
 	// storeFailure records failure metrics and stores the error for the next poll.
-	storeFailure := func(errMsg string) {
+	// errorCode is included in the result so hot can make retry decisions.
+	storeFailure := func(errMsg string, errorCode pb.FinalizeErrorCode) {
 		metrics.FinalizationDuration.WithLabelValues(metrics.ResultFailure).Observe(time.Since(startTime).Seconds())
 		metrics.FinalizationErrorsTotal.WithLabelValues(metrics.ModeCold).Inc()
 		state.mu.Lock()
-		state.finalizeResult = &finalizeResult{err: errMsg}
+		state.finalizeResult = &finalizeResult{err: errMsg, errorCode: errorCode}
 		state.mu.Unlock()
 	}
 
@@ -135,7 +137,10 @@ func (s *Server) runBackgroundFinalization(
 			"hash", hash,
 			"error", acquireErr,
 		)
-		storeFailure(fmt.Sprintf("finalization queue timeout: %v", acquireErr))
+		storeFailure(
+			fmt.Sprintf("finalization queue timeout: %v", acquireErr),
+			pb.FinalizeErrorCode_FINALIZE_ERROR_NONE,
+		)
 		return
 	}
 	waitCancel()
@@ -152,12 +157,27 @@ func (s *Server) runBackgroundFinalization(
 	defer cancel()
 
 	// Verify all pieces by reading back from finalized files.
-	if verifyErr := s.verifyFinalizedPieces(ctx, hash, state); verifyErr != nil {
+	failedPieces, verifyErr := s.verifyFinalizedPieces(ctx, hash, state)
+	if verifyErr != nil {
+		// System-level error (context cancel, idle timeout)
 		s.logger.ErrorContext(ctx, "background verification failed",
 			"hash", hash,
 			"error", verifyErr,
 		)
-		storeFailure(fmt.Sprintf("verification failed: %v", verifyErr))
+		storeFailure(
+			fmt.Sprintf("verification failed: %v", verifyErr),
+			pb.FinalizeErrorCode_FINALIZE_ERROR_NONE,
+		)
+		return
+	}
+	if len(failedPieces) > 0 {
+		// Piece corruption — recover and signal incomplete to hot.
+		s.recoverVerificationFailure(ctx, hash, state, failedPieces)
+		metrics.VerificationRecoveriesTotal.Inc()
+		storeFailure(
+			fmt.Sprintf("verification failed: %d pieces corrupted, will re-stream", len(failedPieces)),
+			pb.FinalizeErrorCode_FINALIZE_ERROR_INCOMPLETE,
+		)
 		return
 	}
 
@@ -172,7 +192,10 @@ func (s *Server) runBackgroundFinalization(
 				"hash", hash,
 				"error", qbErr,
 			)
-			storeFailure(fmt.Sprintf("qBittorrent: %v", qbErr))
+			storeFailure(
+				fmt.Sprintf("qBittorrent: %v", qbErr),
+				pb.FinalizeErrorCode_FINALIZE_ERROR_NONE,
+			)
 			return
 		}
 
@@ -523,13 +546,26 @@ func (s *Server) registerFinalizedInodes(ctx context.Context, hash string, state
 // Uses a progress-based idle timeout: as long as pieces keep being verified, it continues.
 // Only aborts if no piece is verified within verifyIdleTimeout.
 //
+// Return semantics:
+//   - (nil, nil) — all pieces verified OK
+//   - (failedPieces, nil) — piece-level corruption, recovery needed
+//   - (nil, err) — system error (context cancel, idle timeout)
+//
 //nolint:gocognit
-func (s *Server) verifyFinalizedPieces(ctx context.Context, hash string, state *serverTorrentState) error {
+func (s *Server) verifyFinalizedPieces(
+	ctx context.Context,
+	hash string,
+	state *serverTorrentState,
+) ([]int, error) {
 	if len(state.pieceHashes) == 0 {
-		return errors.New("no piece hashes available for verification — refusing to finalize without integrity check")
+		return nil, errors.New(
+			"no piece hashes available for verification — refusing to finalize without integrity check",
+		)
 	}
 	if state.pieceLength <= 0 || state.totalSize <= 0 {
-		return errors.New("missing piece size or total size metadata — refusing to finalize without integrity check")
+		return nil, errors.New(
+			"missing piece size or total size metadata — refusing to finalize without integrity check",
+		)
 	}
 
 	pieceSize := state.pieceLength
@@ -555,6 +591,10 @@ func (s *Server) verifyFinalizedPieces(ctx context.Context, hash string, state *
 	var verified atomic.Int64
 	var lastProgress atomic.Value // stores time.Time of last verified piece
 	lastProgress.Store(time.Now())
+
+	// Collect failed piece indices under a mutex (multiple goroutines may append).
+	var failedMu sync.Mutex
+	var failedPieces []int
 
 	go s.verifyIdleWatchdog(ctx, gCtx, hash, numPieces, &verified, &lastProgress, idleCancel)
 
@@ -587,17 +627,12 @@ func (s *Server) verifyFinalizedPieces(ctx context.Context, hash string, state *
 				size = totalSize - offset
 			}
 
-			// Read piece from finalized files
-			data, readErr := s.readPieceFromFinalizedFiles(state, offset, size)
-			if readErr != nil {
-				metrics.VerificationErrorsTotal.WithLabelValues(metrics.ModeCold).Inc()
-				return fmt.Errorf("reading piece %d: %w", i, readErr)
-			}
-
-			// Verify hash
-			if err := utils.VerifyPieceHash(data, expectedHash); err != nil {
-				metrics.VerificationErrorsTotal.WithLabelValues(metrics.ModeCold).Inc()
-				return fmt.Errorf("piece %d: %w", i, err)
+			// Read and verify piece hash. Failures are collected (not fail-fast)
+			// so all corrupted pieces are found in a single pass.
+			if !s.verifyOnePiece(ctx, hash, state, i, offset, size, expectedHash) {
+				failedMu.Lock()
+				failedPieces = append(failedPieces, i)
+				failedMu.Unlock()
 			}
 
 			// Record progress for idle watchdog.
@@ -616,11 +651,48 @@ func (s *Server) verifyFinalizedPieces(ctx context.Context, hash string, state *
 	}
 
 	if err := g.Wait(); err != nil {
-		return err
+		return nil, err
+	}
+
+	if len(failedPieces) > 0 {
+		s.logger.ErrorContext(ctx, "verification found corrupted pieces",
+			"hash", hash,
+			"failedCount", len(failedPieces),
+			"failedPieces", failedPieces,
+		)
+		return failedPieces, nil
 	}
 
 	s.logger.InfoContext(ctx, "all pieces verified successfully", "hash", hash, "pieces", numPieces)
-	return nil
+	return nil, nil
+}
+
+// verifyOnePiece reads a single piece from finalized files and verifies its hash.
+// Returns true if the piece is valid, false if it's corrupted or unreadable.
+func (s *Server) verifyOnePiece(
+	ctx context.Context,
+	hash string,
+	state *serverTorrentState,
+	pieceIdx int,
+	offset, size int64,
+	expectedHash string,
+) bool {
+	data, readErr := s.readPieceFromFinalizedFiles(state, offset, size)
+	if readErr != nil {
+		metrics.VerificationErrorsTotal.WithLabelValues(metrics.ModeCold).Inc()
+		s.logger.WarnContext(ctx, "piece read failed during verification",
+			"hash", hash, "piece", pieceIdx, "error", readErr,
+		)
+		return false
+	}
+	if hashErr := utils.VerifyPieceHash(data, expectedHash); hashErr != nil {
+		metrics.VerificationErrorsTotal.WithLabelValues(metrics.ModeCold).Inc()
+		s.logger.WarnContext(ctx, "piece hash mismatch during verification",
+			"hash", hash, "piece", pieceIdx, "error", hashErr,
+		)
+		return false
+	}
+	return true
 }
 
 // verifyIdleWatchdog cancels verification if no progress within verifyIdleTimeout.
@@ -653,6 +725,95 @@ func (s *Server) verifyIdleWatchdog(
 				cancel()
 				return
 			}
+		}
+	}
+}
+
+// recoverVerificationFailure marks corrupted pieces as unwritten and renames
+// affected files back to .partial so that hot can re-stream them.
+func (s *Server) recoverVerificationFailure(
+	ctx context.Context,
+	hash string,
+	state *serverTorrentState,
+	failedPieces []int,
+) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	for _, p := range failedPieces {
+		state.written[p] = false
+		state.writtenCount--
+	}
+
+	// Find and recover affected files.
+	for _, fi := range state.files {
+		s.recoverAffectedFile(ctx, hash, state, fi, failedPieces)
+	}
+
+	// Persist the recovered state.
+	state.dirty = true
+	if saveErr := s.doSaveState(state.statePath, state.written); saveErr != nil {
+		metrics.StateSaveErrorsTotal.WithLabelValues(metrics.ModeCold).Inc()
+		s.logger.ErrorContext(ctx, "failed to persist state after verification recovery",
+			"hash", hash,
+			"error", saveErr,
+		)
+	}
+
+	s.logger.InfoContext(ctx, "recovered from verification failure",
+		"hash", hash,
+		"failedPieces", len(failedPieces),
+		"writtenCount", state.writtenCount,
+	)
+}
+
+// recoverAffectedFile renames a single file back to .partial and recalculates
+// its piecesWritten if any failed piece overlaps it.
+func (s *Server) recoverAffectedFile(
+	ctx context.Context,
+	hash string,
+	state *serverTorrentState,
+	fi *serverFileInfo,
+	failedPieces []int,
+) {
+	if fi.skipForWriteData() {
+		return
+	}
+
+	// Check if any failed piece overlaps this file.
+	affected := false
+	for _, p := range failedPieces {
+		if p >= fi.firstPiece && p <= fi.lastPiece {
+			affected = true
+			break
+		}
+	}
+	if !affected {
+		return
+	}
+
+	// Rename final file back to .partial (skip if already .partial).
+	// Even if rename fails, we still clear earlyFinalized and recalculate
+	// piecesWritten so bookkeeping stays consistent with state.written.
+	if !strings.HasSuffix(fi.path, partialSuffix) {
+		partialPath := fi.path + partialSuffix
+		if renameErr := os.Rename(fi.path, partialPath); renameErr != nil {
+			s.logger.WarnContext(ctx, "failed to rename file back to partial",
+				"hash", hash,
+				"path", fi.path,
+				"error", renameErr,
+			)
+		} else {
+			fi.path = partialPath
+		}
+	}
+	fi.earlyFinalized = false
+
+	// Recalculate piecesWritten for this file.
+	fi.piecesWritten = 0
+	for p := fi.firstPiece; p <= fi.lastPiece; p++ {
+		if state.written[p] {
+			fi.piecesWritten++
 		}
 	}
 }
@@ -691,7 +852,11 @@ func (s *Server) handleExistingFinalization(
 	state.finalizeResult = nil
 	state.finalizeDone = nil
 	state.mu.Unlock()
-	return &pb.FinalizeTorrentResponse{Success: false, Error: result.err}, nil
+	return &pb.FinalizeTorrentResponse{
+		Success:   false,
+		Error:     result.err,
+		ErrorCode: result.errorCode,
+	}, nil
 }
 
 // readPieceFromFinalizedFiles reads piece data from finalized (non-.partial) files.

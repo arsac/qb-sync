@@ -492,6 +492,21 @@ func (t *PieceMonitor) startTracking(ctx context.Context, hash string, alreadyWr
 		}
 	}
 
+	// Mark pieces entirely in deselected files as already streamed.
+	// qBittorrent doesn't download files with priority 0, so these pieces
+	// can't be read from disk and must not be queued for streaming.
+	deselectedCount := 0
+	if mask := deselectedPieceMask(
+		meta.GetFiles(), meta.GetNumPieces(), meta.GetPieceSize(), meta.GetTotalSize(),
+	); mask != nil {
+		for i, d := range mask {
+			if d && i < numPieces && !state.streamed[i] {
+				state.streamed[i] = true
+				deselectedCount++
+			}
+		}
+	}
+
 	t.mu.Lock()
 	t.torrents[hash] = state
 	t.mu.Unlock()
@@ -505,6 +520,7 @@ func (t *PieceMonitor) startTracking(ctx context.Context, hash string, alreadyWr
 		"pieces", numPieces,
 		"pieceSize", meta.GetPieceSize(),
 		"resumed", resumedCount,
+		"deselected", deselectedCount,
 	)
 
 	return nil
@@ -757,4 +773,44 @@ func (t *PieceMonitor) GetTorrentMetadata(hash string) (*TorrentMetadata, bool) 
 	}
 
 	return state.meta, true
+}
+
+// deselectedPieceMask returns a boolean slice marking pieces whose byte range
+// only overlaps deselected files (Selected=false). These pieces can't be read
+// from disk — qBittorrent doesn't download files with priority 0 — and should
+// be treated as already streamed to prevent queuing and retries.
+// Returns nil if all files are selected (common case; avoids allocation).
+func deselectedPieceMask(files []*pb.FileInfo, numPieces int32, pieceSize, totalSize int64) []bool {
+	if pieceSize <= 0 || numPieces <= 0 {
+		return nil
+	}
+
+	allSelected := true
+	for _, f := range files {
+		if !f.GetSelected() {
+			allSelected = false
+			break
+		}
+	}
+	if allSelected {
+		return nil
+	}
+
+	mask := make([]bool, numPieces)
+	for pieceIdx := range numPieces {
+		pieceStart := int64(pieceIdx) * pieceSize
+		pieceEnd := min(pieceStart+pieceSize, totalSize)
+
+		// Piece is deselected if every overlapping file is deselected.
+		allDeselected := true
+		for _, f := range files {
+			fEnd := f.GetOffset() + f.GetSize()
+			if f.GetOffset() < pieceEnd && fEnd > pieceStart && f.GetSelected() {
+				allDeselected = false
+				break
+			}
+		}
+		mask[pieceIdx] = allDeselected
+	}
+	return mask
 }

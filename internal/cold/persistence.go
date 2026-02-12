@@ -19,16 +19,13 @@ func (s *Server) loadState(path string, numPieces int) ([]bool, error) {
 	}
 
 	written := make([]bool, numPieces)
-	for i, b := range data {
-		if i >= numPieces {
-			break
-		}
-		written[i] = b == 1
+	for i := range min(numPieces, len(data)) {
+		written[i] = data[i] == 1
 	}
 	return written, nil
 }
 
-// atomicWriteFile delegates to utils.AtomicWriteFile with standard server permissions.
+// atomicWriteFile writes data atomically using standard server permissions.
 func atomicWriteFile(path string, data []byte) error {
 	return utils.AtomicWriteFile(path, data, serverFilePermissions)
 }
@@ -44,7 +41,7 @@ func (s *Server) saveState(path string, written []bool) error {
 	return atomicWriteFile(path, data)
 }
 
-// doSaveState calls saveStateFunc if set (testing), otherwise saveState.
+// doSaveState persists state using saveStateFunc (injected for tests) or the default saveState.
 func (s *Server) doSaveState(path string, written []bool) error {
 	if s.saveStateFunc != nil {
 		return s.saveStateFunc(path, written)
@@ -84,19 +81,26 @@ func saveSelectedFile(metaDir string, files []*serverFileInfo) error {
 }
 
 // loadSelectedFile reads the file selection bitmap from the .selected file.
-// Returns nil if the file is missing (treat as all-selected for backward compat).
+// Returns nil if the file is missing (callers default to all-selected).
 func loadSelectedFile(metaDir string, numFiles int) []bool {
 	data, err := os.ReadFile(filepath.Join(metaDir, selectedFileName))
 	if err != nil {
 		return nil
 	}
 	selected := make([]bool, numFiles)
-	for i := range selected {
-		if i < len(data) {
-			selected[i] = data[i] == 1
-		}
+	for i := range min(numFiles, len(data)) {
+		selected[i] = data[i] == 1
 	}
 	return selected
+}
+
+// checkMetaVersion returns true if the metadata directory has the current version.
+func checkMetaVersion(metaDir string) bool {
+	data, err := os.ReadFile(filepath.Join(metaDir, versionFileName))
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(data)) == metaVersion
 }
 
 // findTorrentFile locates the .torrent file in metaDir.
@@ -119,6 +123,16 @@ func findTorrentFile(metaDir string) (string, error) {
 func (s *Server) recoverTorrentState(ctx context.Context, hash string) (*serverTorrentState, error) {
 	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
 
+	if !checkMetaVersion(metaDir) {
+		s.logger.WarnContext(ctx, "stale metadata version, nuking directory",
+			"hash", hash, "expected", metaVersion)
+		if removeErr := os.RemoveAll(metaDir); removeErr != nil {
+			s.logger.ErrorContext(ctx, "failed to remove stale metadata",
+				"hash", hash, "error", removeErr)
+		}
+		return nil, fmt.Errorf("stale metadata for %s (removed)", hash)
+	}
+
 	// Find and parse the .torrent file
 	torrentPath, findErr := findTorrentFile(metaDir)
 	if findErr != nil {
@@ -135,49 +149,25 @@ func (s *Server) recoverTorrentState(ctx context.Context, hash string) (*serverT
 		return nil, fmt.Errorf("parsing torrent file: %w", parseErr)
 	}
 
-	// Load written pieces state
 	statePath := filepath.Join(metaDir, ".state")
-	written, stateErr := s.loadState(statePath, parsed.NumPieces)
-	if stateErr != nil {
-		return nil, fmt.Errorf("loading state: %w", stateErr)
-	}
-
-	// Load save sub-path
 	saveSubPath := loadSubPathFile(metaDir)
 
-	// Reconstruct file paths from torrent metadata + saveSubPath.
-	// Use the finalized path if it exists, otherwise assume partial.
-	files := make([]*serverFileInfo, len(parsed.Files))
-	for i, f := range parsed.Files {
-		finalPath := filepath.Join(s.config.BasePath, saveSubPath, f.Path)
-		diskPath := finalPath + partialSuffix
-		if _, err := os.Stat(finalPath); err == nil {
-			diskPath = finalPath
-		}
-		files[i] = &serverFileInfo{
-			path:     diskPath,
-			size:     f.Size,
-			offset:   f.Offset,
-			selected: true, // Default; overridden below if .selected file exists
-		}
-	}
+	files := s.reconstructFiles(parsed.Files, saveSubPath)
+	restoreFileSelection(files, metaDir)
 
-	// Restore file selection from persisted .selected file.
-	selectedBitmap := loadSelectedFile(metaDir, len(files))
-	if selectedBitmap != nil {
-		for i, fi := range files {
-			fi.selected = selectedBitmap[i]
-		}
-	}
-
-	// Compute per-file piece ranges and mark files that need no streamed data as already finalized.
-	// During recovery, files at final path (not .partial) or unselected files are already done.
 	computeFilePieceRanges(files, parsed.PieceLength, parsed.TotalSize)
 	for _, fi := range files {
-		if !strings.HasSuffix(fi.path, partialSuffix) || !fi.selected {
+		alreadyRenamed := !strings.HasSuffix(fi.path, partialSuffix)
+		if alreadyRenamed || !fi.selected {
 			fi.earlyFinalized = true
 		}
 	}
+
+	written, loadErr := s.loadOrReconstructState(ctx, hash, statePath, files, parsed.NumPieces)
+	if loadErr != nil {
+		return nil, loadErr
+	}
+
 	initFilePieceCounts(files, written)
 
 	writtenCount := countWritten(written)
@@ -201,4 +191,74 @@ func (s *Server) recoverTorrentState(ctx context.Context, hash string) (*serverT
 		statePath:    statePath,
 		saveSubPath:  saveSubPath,
 	}, nil
+}
+
+// reconstructFiles builds serverFileInfo entries from torrent metadata.
+// Uses the finalized path if the file exists on disk, otherwise assumes .partial.
+func (s *Server) reconstructFiles(parsedFiles []parsedFile, saveSubPath string) []*serverFileInfo {
+	files := make([]*serverFileInfo, len(parsedFiles))
+	for i, f := range parsedFiles {
+		finalPath := filepath.Join(s.config.BasePath, saveSubPath, f.Path)
+		diskPath := finalPath + partialSuffix
+		if _, err := os.Stat(finalPath); err == nil {
+			diskPath = finalPath
+		}
+		files[i] = &serverFileInfo{
+			path:     diskPath,
+			size:     f.Size,
+			offset:   f.Offset,
+			selected: true, // Default; overridden by restoreFileSelection
+		}
+	}
+	return files
+}
+
+// restoreFileSelection applies the persisted .selected bitmap to the files.
+func restoreFileSelection(files []*serverFileInfo, metaDir string) {
+	selectedBitmap := loadSelectedFile(metaDir, len(files))
+	if selectedBitmap == nil {
+		return
+	}
+	for i, fi := range files {
+		fi.selected = selectedBitmap[i]
+	}
+}
+
+// loadOrReconstructState loads the .state file, or reconstructs the written
+// bitmap from files on disk when the state file is missing.
+// Files at final path (renamed from .partial) are assumed fully written.
+// .partial files are conservatively treated as having no written pieces.
+func (s *Server) loadOrReconstructState(
+	ctx context.Context,
+	hash, statePath string,
+	files []*serverFileInfo,
+	numPieces int,
+) ([]bool, error) {
+	written, stateErr := s.loadState(statePath, numPieces)
+	if stateErr == nil {
+		return written, nil
+	}
+	if !os.IsNotExist(stateErr) {
+		return nil, fmt.Errorf("loading state: %w", stateErr)
+	}
+
+	s.logger.WarnContext(ctx, "state file missing, reconstructing from disk", "hash", hash)
+	written = make([]bool, numPieces)
+
+	for _, fi := range files {
+		if !fi.selected || strings.HasSuffix(fi.path, partialSuffix) {
+			continue
+		}
+		for p := fi.firstPiece; p <= fi.lastPiece; p++ {
+			written[p] = true
+		}
+	}
+
+	// Persist reconstructed state to prevent repeated reconstruction.
+	if saveErr := s.doSaveState(statePath, written); saveErr != nil {
+		s.logger.WarnContext(ctx, "failed to persist reconstructed state",
+			"hash", hash, "error", saveErr)
+	}
+
+	return written, nil
 }

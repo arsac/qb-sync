@@ -30,6 +30,8 @@ type Client interface {
 	StopCtx(ctx context.Context, hashes []string) error
 	ResumeCtx(ctx context.Context, hashes []string) error
 	AddTorrentFromMemoryCtx(ctx context.Context, buf []byte, options map[string]string) error
+	SetFilePriorityCtx(ctx context.Context, hash string, ids string, priority int) error
+	RecheckCtx(ctx context.Context, hashes []string) error
 	GetFreeSpaceOnDiskCtx(ctx context.Context) (int64, error)
 }
 
@@ -268,6 +270,28 @@ func (r *ResilientClient) AddTorrentFromMemoryCtx(
 ) error {
 	return r.runVoid(ctx, "AddTorrentFromMemory", func(ctx context.Context) error {
 		return r.client.AddTorrentFromMemoryCtx(ctx, buf, options)
+	})
+}
+
+// SetFilePriorityCtx sets file priorities with retry.
+func (r *ResilientClient) SetFilePriorityCtx(
+	ctx context.Context,
+	hash string,
+	ids string,
+	priority int,
+) error {
+	return r.runVoid(ctx, "SetFilePriority", func(ctx context.Context) error {
+		return r.client.SetFilePriorityCtx(ctx, hash, ids, priority)
+	})
+}
+
+// RecheckCtx forces a hash recheck of torrents with retry.
+func (r *ResilientClient) RecheckCtx(
+	ctx context.Context,
+	hashes []string,
+) error {
+	return r.runVoid(ctx, "Recheck", func(ctx context.Context) error {
+		return r.client.RecheckCtx(ctx, hashes)
 	})
 }
 

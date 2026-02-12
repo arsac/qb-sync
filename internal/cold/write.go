@@ -177,10 +177,16 @@ func (s *Server) WritePiece(
 
 	// Verify piece hash outside lock (pieceHashes is immutable after init).
 	// This is CPU-intensive so we don't hold the lock during verification.
+	// Skip verification for boundary pieces overlapping deselected files:
+	// hot zero-fills the deselected region (file doesn't exist on disk),
+	// changing the hash. writePieceData skips deselected files, so only
+	// the selected file data is actually written.
 	writeStart := time.Now()
-	if hashErr := s.verifyPieceHash(state, pieceIndex, data, req.GetPieceHash()); hashErr != "" {
-		metrics.PieceWriteDuration.Observe(time.Since(writeStart).Seconds())
-		return writePieceError(hashErr, pb.PieceErrorCode_PIECE_ERROR_HASH_MISMATCH), nil
+	if pieceEntirelyInSelectedFiles(state.files, int(pieceIndex), state.pieceLength, state.totalSize) {
+		if hashErr := s.verifyPieceHash(state, pieceIndex, data, req.GetPieceHash()); hashErr != "" {
+			metrics.PieceWriteDuration.Observe(time.Since(writeStart).Seconds())
+			return writePieceError(hashErr, pb.PieceErrorCode_PIECE_ERROR_HASH_MISMATCH), nil
+		}
 	}
 
 	state.mu.Lock()

@@ -128,6 +128,14 @@ func (m *mockQBClient) AddTorrentFromMemoryCtx(_ context.Context, _ []byte, _ ma
 	return nil
 }
 
+func (m *mockQBClient) SetFilePriorityCtx(_ context.Context, _ string, _ string, _ int) error {
+	return nil
+}
+
+func (m *mockQBClient) RecheckCtx(_ context.Context, _ []string) error {
+	return nil
+}
+
 func (m *mockQBClient) GetFreeSpaceOnDiskCtx(_ context.Context) (int64, error) {
 	return m.freeSpaceOnDisk, m.freeSpaceErr
 }
@@ -2382,53 +2390,15 @@ func TestSelectedFingerprint(t *testing.T) {
 	})
 }
 
-func TestLoadCompletedCacheLegacy(t *testing.T) {
+func TestLoadCompletedCache(t *testing.T) {
 	logger := testLogger(t)
 
-	t.Run("loads legacy array format into map with empty fingerprints", func(t *testing.T) {
+	t.Run("loads object format with fingerprints", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		cachePath := filepath.Join(tmpDir, "cache.json")
 
-		// Write legacy format: JSON array of hashes
-		legacyData := `["hash1","hash2","hash3"]`
-		if err := os.WriteFile(cachePath, []byte(legacyData), 0o644); err != nil {
-			t.Fatal(err)
-		}
-
-		task := &QBTask{
-			cfg:                &config.HotConfig{},
-			logger:             logger,
-			completedOnCold:    make(map[string]string),
-			completedCachePath: cachePath,
-		}
-
-		task.loadCompletedCache()
-
-		task.completedMu.RLock()
-		defer task.completedMu.RUnlock()
-
-		if len(task.completedOnCold) != 3 {
-			t.Fatalf("expected 3 entries, got %d", len(task.completedOnCold))
-		}
-
-		for _, hash := range []string{"hash1", "hash2", "hash3"} {
-			fp, ok := task.completedOnCold[hash]
-			if !ok {
-				t.Errorf("expected hash %s to be loaded", hash)
-			}
-			if fp != "" {
-				t.Errorf("expected empty fingerprint for legacy hash %s, got %q", hash, fp)
-			}
-		}
-	})
-
-	t.Run("loads new object format with fingerprints", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		cachePath := filepath.Join(tmpDir, "cache.json")
-
-		// Write new format: JSON object with fingerprints
-		newData := `{"hash1":"0,1","hash2":"0,1,2","hash3":""}`
-		if err := os.WriteFile(cachePath, []byte(newData), 0o644); err != nil {
+		data := `{"hash1":"0,1","hash2":"0,1,2","hash3":""}`
+		if err := os.WriteFile(cachePath, []byte(data), 0o644); err != nil {
 			t.Fatal(err)
 		}
 
@@ -2464,14 +2434,11 @@ func TestLoadCompletedCacheLegacy(t *testing.T) {
 		}
 	})
 
-	t.Run("new format takes priority over legacy", func(t *testing.T) {
+	t.Run("corrupt file starts fresh", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		cachePath := filepath.Join(tmpDir, "cache.json")
 
-		// A JSON object is valid for both Unmarshal(map) and Unmarshal(slice) paths,
-		// but Unmarshal into map[string]string succeeds first.
-		objectData := `{"hashA":"0,1"}`
-		if err := os.WriteFile(cachePath, []byte(objectData), 0o644); err != nil {
+		if err := os.WriteFile(cachePath, []byte(`not json`), 0o644); err != nil {
 			t.Fatal(err)
 		}
 
@@ -2487,39 +2454,8 @@ func TestLoadCompletedCacheLegacy(t *testing.T) {
 		task.completedMu.RLock()
 		defer task.completedMu.RUnlock()
 
-		fp, ok := task.completedOnCold["hashA"]
-		if !ok {
-			t.Fatal("expected hashA to be loaded")
-		}
-		if fp != "0,1" {
-			t.Errorf("expected fingerprint '0,1', got %q", fp)
-		}
-	})
-
-	t.Run("empty legacy array loads empty cache", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		cachePath := filepath.Join(tmpDir, "cache.json")
-
-		if err := os.WriteFile(cachePath, []byte(`[]`), 0o644); err != nil {
-			t.Fatal(err)
-		}
-
-		task := &QBTask{
-			cfg:                &config.HotConfig{},
-			logger:             logger,
-			completedOnCold:    make(map[string]string),
-			completedCachePath: cachePath,
-		}
-
-		task.loadCompletedCache()
-
-		task.completedMu.RLock()
-		defer task.completedMu.RUnlock()
-
-		// Note: json.Unmarshal([]byte("[]"), &map[string]string{}) will actually
-		// fail, causing the fallback to the array path which yields 0 entries.
 		if len(task.completedOnCold) != 0 {
-			t.Errorf("expected 0 entries, got %d", len(task.completedOnCold))
+			t.Errorf("expected 0 entries for corrupt cache, got %d", len(task.completedOnCold))
 		}
 	})
 }

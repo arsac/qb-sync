@@ -1186,6 +1186,9 @@ func createTestTorrentFileWithPaths(t *testing.T, basePath, hash string, relPath
 	if err := os.WriteFile(torrentPath, encodeTorrent(t, bt), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(metaDir, versionFileName), []byte(metaVersion), 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func setModTime(t *testing.T, path string, modTime time.Time) {

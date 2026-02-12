@@ -67,9 +67,12 @@ func TestVerifyFinalizedPieces_ConcurrencyLimit(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := s.verifyFinalizedPieces(ctx, "testHash", state)
+	failedPieces, err := s.verifyFinalizedPieces(ctx, "testHash", state)
 	if err != nil {
 		t.Fatalf("verifyFinalizedPieces failed: %v", err)
+	}
+	if len(failedPieces) > 0 {
+		t.Fatalf("expected no failed pieces, got %v", failedPieces)
 	}
 }
 
@@ -130,9 +133,12 @@ func TestVerifyFinalizedPieces_FailsOnHashMismatch(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := s.verifyFinalizedPieces(ctx, "testHash", state)
-	if err == nil {
-		t.Fatal("expected error for hash mismatch, got nil")
+	failedPieces, err := s.verifyFinalizedPieces(ctx, "testHash", state)
+	if err != nil {
+		t.Fatalf("unexpected system error: %v", err)
+	}
+	if len(failedPieces) != 1 || failedPieces[0] != 1 {
+		t.Fatalf("expected [1] failed pieces, got %v", failedPieces)
 	}
 }
 
@@ -548,8 +554,200 @@ func TestVerifyFinalizedPieces_RequiresPieceHashes(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := s.verifyFinalizedPieces(ctx, "testHash", state)
+	_, err := s.verifyFinalizedPieces(ctx, "testHash", state)
 	if err == nil {
 		t.Fatal("expected error when piece hashes are missing")
+	}
+}
+
+func TestRecoverVerificationFailure(t *testing.T) {
+	t.Parallel()
+
+	const pieceSize int64 = 256
+	const numPieces = 3
+	const totalSize = pieceSize * numPieces
+
+	tmpDir := t.TempDir()
+	logger := testLogger(t)
+
+	// Track whether state was persisted.
+	var stateSaved atomic.Bool
+
+	s := &Server{
+		config:         ServerConfig{BasePath: tmpDir},
+		logger:         logger,
+		torrents:       make(map[string]*serverTorrentState),
+		abortingHashes: make(map[string]chan struct{}),
+		inodes:         NewInodeRegistry(tmpDir, logger),
+		memBudget:      semaphore.NewWeighted(512 * 1024 * 1024),
+		finalizeSem:    semaphore.NewWeighted(1),
+		saveStateFunc: func(_ string, _ []bool) error {
+			stateSaved.Store(true)
+			return nil
+		},
+	}
+
+	// Create two files at final paths (no .partial suffix).
+	// File 0: covers pieces 0–1 (512 bytes, offset 0)
+	// File 1: covers piece 2 (256 bytes, offset 512)
+	file0Path := filepath.Join(tmpDir, "file0.bin")
+	file1Path := filepath.Join(tmpDir, "file1.bin")
+	if err := os.WriteFile(file0Path, make([]byte, 512), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file1Path, make([]byte, 256), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	state := &serverTorrentState{
+		written:      []bool{true, true, true},
+		writtenCount: 3,
+		pieceLength:  pieceSize,
+		totalSize:    totalSize,
+		statePath:    filepath.Join(tmpDir, ".state"),
+		files: []*serverFileInfo{
+			{
+				path:           file0Path,
+				size:           512,
+				offset:         0,
+				selected:       true,
+				firstPiece:     0,
+				lastPiece:      1,
+				piecesTotal:    2,
+				piecesWritten:  2,
+				earlyFinalized: true,
+			},
+			{
+				path:           file1Path,
+				size:           256,
+				offset:         512,
+				selected:       true,
+				firstPiece:     2,
+				lastPiece:      2,
+				piecesTotal:    1,
+				piecesWritten:  1,
+				earlyFinalized: true,
+			},
+		},
+	}
+
+	// Fail piece 1 — should affect file0 (which spans pieces 0–1) but not file1.
+	s.recoverVerificationFailure(context.Background(), "test-hash", state, []int{1})
+
+	// Piece 1 should be unwritten.
+	if state.written[1] {
+		t.Error("piece 1 should be marked unwritten")
+	}
+	// Pieces 0 and 2 should still be written.
+	if !state.written[0] {
+		t.Error("piece 0 should still be written")
+	}
+	if !state.written[2] {
+		t.Error("piece 2 should still be written")
+	}
+
+	// writtenCount should be decremented.
+	if state.writtenCount != 2 {
+		t.Errorf("writtenCount = %d, want 2", state.writtenCount)
+	}
+
+	// File0 should be renamed back to .partial.
+	if !strings.HasSuffix(state.files[0].path, partialSuffix) {
+		t.Errorf("file0 should have .partial suffix, got %q", state.files[0].path)
+	}
+	if state.files[0].earlyFinalized {
+		t.Error("file0 earlyFinalized should be cleared")
+	}
+	// File0 piecesWritten should be recalculated (piece 0 written, piece 1 not).
+	if state.files[0].piecesWritten != 1 {
+		t.Errorf("file0 piecesWritten = %d, want 1", state.files[0].piecesWritten)
+	}
+
+	// File1 should be untouched — piece 2 is not in failed set.
+	if strings.HasSuffix(state.files[1].path, partialSuffix) {
+		t.Error("file1 should not be renamed to .partial")
+	}
+	if state.files[1].piecesWritten != 1 {
+		t.Errorf("file1 piecesWritten = %d, want 1", state.files[1].piecesWritten)
+	}
+
+	// State should be persisted.
+	if !stateSaved.Load() {
+		t.Error("state should have been saved after recovery")
+	}
+
+	// The .partial file should exist on disk.
+	if _, err := os.Stat(state.files[0].path); err != nil {
+		t.Errorf("partial file should exist: %v", err)
+	}
+}
+
+func TestVerifyFinalizedPieces_CollectsAllFailures(t *testing.T) {
+	t.Parallel()
+
+	const pieceSize = 256
+	const numPieces = 4
+	const totalSize = pieceSize * numPieces
+
+	tmpDir := t.TempDir()
+	logger := testLogger(t)
+
+	s := &Server{
+		config:         ServerConfig{BasePath: tmpDir},
+		logger:         logger,
+		torrents:       make(map[string]*serverTorrentState),
+		abortingHashes: make(map[string]chan struct{}),
+		inodes:         NewInodeRegistry(tmpDir, logger),
+		memBudget:      semaphore.NewWeighted(512 * 1024 * 1024),
+		finalizeSem:    semaphore.NewWeighted(1),
+	}
+
+	fileData := make([]byte, totalSize)
+	for i := range fileData {
+		fileData[i] = byte(i % 251)
+	}
+
+	// Compute correct hashes then corrupt two of them.
+	pieceHashes := make([]string, numPieces)
+	for i := range numPieces {
+		offset := i * pieceSize
+		pieceHashes[i] = utils.ComputeSHA1(fileData[offset : offset+pieceSize])
+	}
+	pieceHashes[1] = "0000000000000000000000000000000000000000"
+	pieceHashes[3] = "0000000000000000000000000000000000000000"
+
+	filePath := filepath.Join(tmpDir, "test.bin")
+	if err := os.WriteFile(filePath, fileData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	state := &serverTorrentState{
+		pieceHashes: pieceHashes,
+		pieceLength: pieceSize,
+		totalSize:   totalSize,
+		files: []*serverFileInfo{
+			{path: filePath, offset: 0, size: totalSize, selected: true},
+		},
+	}
+
+	ctx := context.Background()
+	failedPieces, err := s.verifyFinalizedPieces(ctx, "testHash", state)
+	if err != nil {
+		t.Fatalf("unexpected system error: %v", err)
+	}
+	if len(failedPieces) != 2 {
+		t.Fatalf("expected 2 failed pieces, got %d: %v", len(failedPieces), failedPieces)
+	}
+
+	// Check both corrupted pieces are reported (order may vary due to concurrency).
+	failedSet := make(map[int]struct{}, len(failedPieces))
+	for _, p := range failedPieces {
+		failedSet[p] = struct{}{}
+	}
+	if _, ok := failedSet[1]; !ok {
+		t.Error("piece 1 should be in failed set")
+	}
+	if _, ok := failedSet[3]; !ok {
+		t.Error("piece 3 should be in failed set")
 	}
 }

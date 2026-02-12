@@ -49,7 +49,7 @@ type PerfReport struct {
 // Key metrics:
 // - Sync Lag: How many pieces behind is cold compared to hot download progress
 // - Throughput: How fast are we streaming pieces to cold
-// - Window utilization: How well is the adaptive window performing
+// - Window utilization: How well is the adaptive window performing.
 func TestE2E_PerfActiveTorrent(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping perf test in short mode")
@@ -428,4 +428,3 @@ func printPerfReport(t *testing.T, report *PerfReport) {
 	}
 	t.Log("===========================")
 }
-

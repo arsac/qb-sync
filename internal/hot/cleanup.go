@@ -75,8 +75,6 @@ func (uf *unionFind) union(x, y string) {
 // maybeMoveToCold deletes torrents known to be complete on cold when space is low.
 // During a drain (t.draining is true), bypasses space and seeding checks to
 // evacuate all synced torrents.
-//
-//nolint:gocognit
 func (t *QBTask) maybeMoveToCold(ctx context.Context) error {
 	isDraining := t.draining.Load()
 
@@ -120,6 +118,13 @@ func (t *QBTask) maybeMoveToCold(ctx context.Context) error {
 	var groupsDeleted, groupsSkippedSeeding, groupsFailed, torrentsHandedOff int
 	minSeedingSeconds := int64(t.cfg.MinSeedingTime.Seconds())
 
+	// Track estimated freed bytes instead of re-querying after each deletion.
+	// qBittorrent deletes files asynchronously, so getFreeSpaceGB would still
+	// return the old value immediately after DeleteTorrentsCtx, causing the
+	// loop to over-clean. maxSize is a reasonable estimate per group since
+	// hardlinked files within a group are deduplicated by union-find.
+	var estimatedFreedBytes int64
+
 	for _, group := range sortedGroups {
 		if !isDraining && group.minSeeding < minSeedingSeconds {
 			t.logger.InfoContext(ctx, "group has not seeded long enough",
@@ -137,17 +142,16 @@ func (t *QBTask) maybeMoveToCold(ctx context.Context) error {
 			groupsFailed++
 		} else {
 			groupsDeleted++
+			estimatedFreedBytes += group.maxSize
 		}
 
-		if !isDraining {
-			currentSpaceGB, spaceErr := t.getFreeSpaceGB(ctx)
-			if spaceErr != nil {
-				return fmt.Errorf("getting free space: %w", spaceErr)
-			}
-			if currentSpaceGB >= t.cfg.MinSpaceGB {
-				t.logger.InfoContext(ctx, "reached minimum free space, stopping")
-				break
-			}
+		estimatedFreeGB := freeSpaceBefore + estimatedFreedBytes/bytesPerGB
+		if !isDraining && estimatedFreeGB >= t.cfg.MinSpaceGB {
+			t.logger.InfoContext(ctx, "estimated free space reached threshold, stopping",
+				"estimatedFreeGB", estimatedFreeGB,
+				"minGB", t.cfg.MinSpaceGB,
+			)
+			break
 		}
 	}
 

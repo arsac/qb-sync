@@ -20,11 +20,11 @@ import (
 )
 
 const (
-	// Big Buck Bunny - small, fast to download test torrent
+	// Big Buck Bunny - small, fast to download test torrent.
 	bigBuckBunnyURL  = "https://webtorrent.io/torrents/big-buck-bunny.torrent"
 	bigBuckBunnyHash = "dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c"
 
-	// Common test timeouts
+	// Common test timeouts.
 	torrentDownloadTimeout = 5 * time.Minute
 	syncCompleteTimeout    = 3 * time.Minute
 	orchestratorTimeout    = 5 * time.Minute
@@ -225,7 +225,7 @@ func TestE2E_InitTorrentOnCold(t *testing.T) {
 // 1. Download torrent on hot
 // 2. Run hot orchestrator to stream pieces to cold
 // 3. Verify torrent is finalized and added to cold qBittorrent
-// 4. Verify synced tag is added on hot
+// 4. Verify synced tag is added on hot.
 func TestE2E_FullSyncFlow(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")
@@ -485,6 +485,12 @@ func TestE2E_StopBeforeDeleteOnDiskPressure(t *testing.T) {
 	t.Log("Waiting for torrent to be synced to cold...")
 	env.WaitForTorrentCompleteOnCold(ctx, wiredCDHash, syncCompleteTimeout, "torrent should be complete on cold")
 
+	// Wait for background finalization to fully complete (including the explicit stop
+	// after addAndVerifyTorrent). The synced tag is applied after the stop, so this
+	// ensures no race between the finalization stop and the drain's StartTorrent.
+	env.WaitForSyncedTagOnCold(ctx, wiredCDHash, 30*time.Second,
+		"cold torrent should have 'synced' tag after finalization")
+
 	cancelOrchestrator()
 	<-orchestratorDone
 
@@ -500,10 +506,7 @@ func TestE2E_StopBeforeDeleteOnDiskPressure(t *testing.T) {
 		"torrent should be seeding on hot before disk pressure cleanup")
 
 	// Verify cold torrent is STOPPED before handoff (explicitly stopped during finalization).
-	// Use Eventually because the stop may still be propagating through qBittorrent.
-	require.Eventually(t, func() bool {
-		return env.IsTorrentStopped(ctx, env.ColdClient(), wiredCDHash)
-	}, 15*time.Second, time.Second,
+	require.True(t, env.IsTorrentStopped(ctx, env.ColdClient(), wiredCDHash),
 		"cold torrent should be stopped before disk pressure handoff")
 
 	// Now: drain to evacuate all synced torrents
@@ -669,7 +672,12 @@ func TestE2E_ColdServerRestart(t *testing.T) {
 	env.StartColdServer()
 
 	t.Log("Waiting for sync to complete after cold server restart...")
-	env.WaitForTorrentCompleteOnCold(ctx, wiredCDHash, syncCompleteTimeout, "torrent should be complete on cold after restart")
+	env.WaitForTorrentCompleteOnCold(
+		ctx,
+		wiredCDHash,
+		syncCompleteTimeout,
+		"torrent should be complete on cold after restart",
+	)
 
 	cancelOrchestrator()
 	<-orchestratorDone
@@ -719,7 +727,12 @@ func TestE2E_ColdQBittorrentRestart(t *testing.T) {
 	require.NoError(t, err)
 
 	t.Log("Waiting for sync to complete after cold qBittorrent restart...")
-	env.WaitForTorrentCompleteOnCold(ctx, wiredCDHash, syncCompleteTimeout, "torrent should be complete on cold after qBittorrent restart")
+	env.WaitForTorrentCompleteOnCold(
+		ctx,
+		wiredCDHash,
+		syncCompleteTimeout,
+		"torrent should be complete on cold after qBittorrent restart",
+	)
 
 	cancelOrchestrator()
 	<-orchestratorDone
@@ -729,8 +742,9 @@ func TestE2E_ColdQBittorrentRestart(t *testing.T) {
 	env.CleanupBothSides(ctx, wiredCDHash)
 }
 
-// TestE2E_HotQBittorrentRestart tests that the orchestrator can recover after hot qBittorrent restarts.
-// Scenario: Start orchestrator, stop hot qBittorrent, restart, verify sync completes.
+// TestE2E_HotQBittorrentRestart tests that syncing recovers after hot qBittorrent restarts.
+// Scenario: Start streaming, stop hot qBittorrent mid-stream, restart it, create a new
+// orchestrator (port may change after restart), verify torrent survives and sync completes.
 func TestE2E_HotQBittorrentRestart(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")
@@ -747,10 +761,8 @@ func TestE2E_HotQBittorrentRestart(t *testing.T) {
 	cfg := env.CreateHotConfig()
 	task, dest, err := env.CreateHotTask(cfg)
 	require.NoError(t, err)
-	defer dest.Close()
 
 	orchestratorCtx, cancelOrchestrator := context.WithTimeout(ctx, orchestratorTimeout)
-	defer cancelOrchestrator()
 
 	orchestratorDone := make(chan error, 1)
 	go func() {
@@ -764,6 +776,12 @@ func TestE2E_HotQBittorrentRestart(t *testing.T) {
 	err = env.StopHotQBittorrent(ctx)
 	require.NoError(t, err)
 
+	// Stop the first orchestrator — it can't recover because
+	// the container port mapping may change after restart.
+	cancelOrchestrator()
+	<-orchestratorDone
+	dest.Close()
+
 	time.Sleep(5 * time.Second)
 
 	t.Log("Restarting hot qBittorrent...")
@@ -773,11 +791,31 @@ func TestE2E_HotQBittorrentRestart(t *testing.T) {
 	torrent := env.WaitForTorrent(env.HotClient(), wiredCDHash, 30*time.Second)
 	require.NotNil(t, torrent, "torrent should still exist after hot qBittorrent restart")
 
-	t.Log("Waiting for sync to complete after hot qBittorrent restart...")
-	env.WaitForTorrentCompleteOnCold(ctx, wiredCDHash, syncCompleteTimeout, "torrent should be complete on cold after hot qBittorrent restart")
+	// Create a new orchestrator with the (potentially new) hot URL.
+	t.Log("Starting new orchestrator after hot qBittorrent restart...")
+	cfg2 := env.CreateHotConfig()
+	task2, dest2, err := env.CreateHotTask(cfg2)
+	require.NoError(t, err)
+	defer dest2.Close()
 
-	cancelOrchestrator()
-	<-orchestratorDone
+	orchestratorCtx2, cancelOrchestrator2 := context.WithTimeout(ctx, orchestratorTimeout)
+	defer cancelOrchestrator2()
+
+	orchestratorDone2 := make(chan error, 1)
+	go func() {
+		orchestratorDone2 <- task2.Run(orchestratorCtx2)
+	}()
+
+	t.Log("Waiting for sync to complete after hot qBittorrent restart...")
+	env.WaitForTorrentCompleteOnCold(
+		ctx,
+		wiredCDHash,
+		syncCompleteTimeout,
+		"torrent should be complete on cold after hot qBittorrent restart",
+	)
+
+	cancelOrchestrator2()
+	<-orchestratorDone2
 
 	env.AssertTorrentCompleteOnCold(ctx, wiredCDHash)
 
@@ -832,7 +870,12 @@ func TestE2E_OrchestratorRestart(t *testing.T) {
 	}()
 
 	t.Log("Waiting for sync to complete with second orchestrator...")
-	env.WaitForTorrentCompleteOnCold(ctx, wiredCDHash, syncCompleteTimeout, "torrent should be complete on cold after orchestrator restart")
+	env.WaitForTorrentCompleteOnCold(
+		ctx,
+		wiredCDHash,
+		syncCompleteTimeout,
+		"torrent should be complete on cold after orchestrator restart",
+	)
 
 	cancelOrchestrator2()
 	<-orchestratorDone2
@@ -1104,10 +1147,11 @@ func TestE2E_ColdHardlinkDeduplication(t *testing.T) {
 	for _, f := range hotFileInodes {
 		baseName := filepath.Base(f.path)
 		pbFiles = append(pbFiles, &pb.FileInfo{
-			Path:   "FakeTorrentB/" + baseName, // Different path, same HOT inode
-			Size:   f.size,
-			Offset: offset,
-			Inode:  f.inode, // Same HOT inode - this triggers hardlink detection!
+			Path:     "FakeTorrentB/" + baseName, // Different path, same HOT inode
+			Size:     f.size,
+			Offset:   offset,
+			Inode:    f.inode, // Same HOT inode - this triggers hardlink detection!
+			Selected: true,
 		})
 		offset += f.size
 	}
@@ -1346,7 +1390,7 @@ func TestE2E_FullSyncFlowWiredCD(t *testing.T) {
 	coldFiles, err := env.ColdClient().GetFilesInformationCtx(ctx, wiredCDHash)
 	require.NoError(t, err)
 	require.NotNil(t, coldFiles)
-	assert.Equal(t, len(*files), len(*coldFiles), "cold should have same number of files as hot")
+	assert.Len(t, *coldFiles, len(*files), "cold should have same number of files as hot")
 
 	t.Logf("Full sync flow with Wired CD (%d files) completed successfully!", len(*coldFiles))
 

@@ -77,7 +77,9 @@ func (m *mockQBClient) StopCtx(context.Context, []string) error { return nil }
 func (m *mockQBClient) AddTorrentFromMemoryCtx(context.Context, []byte, map[string]string) error {
 	return nil
 }
-func (m *mockQBClient) GetFreeSpaceOnDiskCtx(context.Context) (int64, error) { return 0, nil }
+func (m *mockQBClient) SetFilePriorityCtx(context.Context, string, string, int) error { return nil }
+func (m *mockQBClient) RecheckCtx(context.Context, []string) error                    { return nil }
+func (m *mockQBClient) GetFreeSpaceOnDiskCtx(context.Context) (int64, error)          { return 0, nil }
 
 func newTestServerWithQB(t *testing.T, mock *mockQBClient) *Server {
 	t.Helper()
