@@ -99,6 +99,7 @@ message InitTorrentRequest {
   bytes torrent_file = 7;           // Raw .torrent file for resume state and verification
   repeated string piece_hashes = 8; // SHA1 hashes per piece (hex-encoded)
   string save_sub_path = 9;         // Relative sub-path prefix for file storage (e.g., "movies" from category)
+  bool resync = 10;                 // Force re-initialization after file selection change
 }
 
 message FileInfo {
@@ -106,6 +107,7 @@ message FileInfo {
   int64 size = 2;
   int64 offset = 3;
   uint64 inode = 4;  // Source filesystem inode for hardlink detection
+  bool selected = 5; // True if file is selected for download (priority > 0)
 }
 
 // TorrentSyncStatus indicates the current state of a torrent on cold.

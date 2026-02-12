@@ -215,7 +215,7 @@ func (t *QBTask) fetchTorrentsCompletedOnCold(ctx context.Context) ([]qbittorren
 
 	var result []qbittorrent.Torrent
 	for _, torrent := range allTorrents {
-		if !t.completedOnCold[torrent.Hash] {
+		if _, ok := t.completedOnCold[torrent.Hash]; !ok {
 			continue
 		}
 		if !t.draining.Load() && t.cfg.ExcludeCleanupTag != "" &&

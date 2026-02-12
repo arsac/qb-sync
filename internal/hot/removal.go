@@ -38,7 +38,7 @@ func (t *QBTask) handleTorrentRemoval(ctx context.Context, hash string) {
 	// Read completedOnCold but don't delete yet -- only remove after
 	// StartTorrent succeeds so pruneCompletedOnCold can retry on failure.
 	t.completedMu.RLock()
-	wasCompletedOnCold := t.completedOnCold[hash]
+	_, wasCompletedOnCold := t.completedOnCold[hash]
 	t.completedMu.RUnlock()
 
 	t.clearFinalizeBackoff(hash)

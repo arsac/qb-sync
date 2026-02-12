@@ -268,9 +268,10 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 	var offset int64
 	for i, f := range sortedQBFiles {
 		files[i] = &pb.FileInfo{
-			Path:   f.Name,
-			Size:   f.Size,
-			Offset: offset,
+			Path:     f.Name,
+			Size:     f.Size,
+			Offset:   offset,
+			Selected: f.Priority > 0,
 		}
 
 		filePath := filepath.Join(contentDir, f.Name)

@@ -93,10 +93,13 @@ func (t *QBTask) finalizeCompletedStreams(ctx context.Context) error {
 // markTorrentSynced handles post-finalization bookkeeping: clears backoff, updates
 // caches and metrics, removes tracking state, and applies the synced tag.
 func (t *QBTask) markTorrentSynced(ctx context.Context, hash string, tt trackedTorrent) {
+	// Compute fingerprint before evicting source cache
+	fingerprint := t.computeSelectionFingerprint(ctx, hash)
+
 	t.clearFinalizeBackoff(hash)
 
 	metrics.TorrentSyncLatencySeconds.Observe(time.Since(tt.completionTime).Seconds())
-	t.markCompletedOnCold(hash)
+	t.markCompletedOnCold(hash, fingerprint)
 
 	t.tracker.Untrack(hash)
 	t.source.EvictCache(hash)

@@ -25,6 +25,11 @@ type mockQBClient struct {
 		hashes []string
 		tags   string
 	}
+
+	deleteCalled      bool
+	deleteHashes      []string
+	deleteDeleteFiles bool
+	deleteErr         error
 }
 
 func (m *mockQBClient) LoginCtx(context.Context) error { return m.loginErr }
@@ -62,8 +67,13 @@ func (m *mockQBClient) GetFilesInformationCtx(context.Context, string) (*qbittor
 	return nil, nil
 }
 func (m *mockQBClient) ExportTorrentCtx(context.Context, string) ([]byte, error) { return nil, nil }
-func (m *mockQBClient) DeleteTorrentsCtx(context.Context, []string, bool) error  { return nil }
-func (m *mockQBClient) StopCtx(context.Context, []string) error                  { return nil }
+func (m *mockQBClient) DeleteTorrentsCtx(_ context.Context, hashes []string, deleteFiles bool) error {
+	m.deleteCalled = true
+	m.deleteHashes = hashes
+	m.deleteDeleteFiles = deleteFiles
+	return m.deleteErr
+}
+func (m *mockQBClient) StopCtx(context.Context, []string) error { return nil }
 func (m *mockQBClient) AddTorrentFromMemoryCtx(context.Context, []byte, map[string]string) error {
 	return nil
 }

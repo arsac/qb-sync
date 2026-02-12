@@ -26,12 +26,13 @@ func (t *QBTask) FetchCompletedOnCold() []string {
 // Exported for testing only - allows tests to simulate synced state.
 func (t *QBTask) MarkCompletedOnCold(hash string) {
 	t.completedMu.Lock()
-	t.completedOnCold[hash] = true
+	t.completedOnCold[hash] = ""
 	t.completedMu.Unlock()
 }
 
 // loadCompletedCache reads the persisted completed-on-cold cache from disk.
-// Missing or corrupt file is non-fatal — starts with empty cache.
+// Supports both the new format (JSON object: hash→fingerprint) and the legacy
+// format (JSON array of hashes). Missing or corrupt file is non-fatal.
 func (t *QBTask) loadCompletedCache() {
 	data, err := os.ReadFile(t.completedCachePath)
 	if err != nil {
@@ -44,6 +45,22 @@ func (t *QBTask) loadCompletedCache() {
 		return
 	}
 
+	// Try new format first (JSON object: hash → fingerprint)
+	var fingerprints map[string]string
+	if json.Unmarshal(data, &fingerprints) == nil {
+		t.completedMu.Lock()
+		maps.Copy(t.completedOnCold, fingerprints)
+		metrics.CompletedOnColdCacheSize.Set(float64(len(t.completedOnCold)))
+		t.completedMu.Unlock()
+
+		t.logger.Info("loaded completed-on-cold cache",
+			"count", len(fingerprints),
+			"path", t.completedCachePath,
+		)
+		return
+	}
+
+	// Fall back to legacy format (JSON array of hashes)
 	var hashes []string
 	if jsonErr := json.Unmarshal(data, &hashes); jsonErr != nil {
 		t.logger.Warn("failed to parse completed cache, starting fresh",
@@ -55,12 +72,12 @@ func (t *QBTask) loadCompletedCache() {
 
 	t.completedMu.Lock()
 	for _, hash := range hashes {
-		t.completedOnCold[hash] = true
+		t.completedOnCold[hash] = "" // empty fingerprint triggers re-check
 	}
 	metrics.CompletedOnColdCacheSize.Set(float64(len(t.completedOnCold)))
 	t.completedMu.Unlock()
 
-	t.logger.Info("loaded completed-on-cold cache",
+	t.logger.Info("loaded completed-on-cold cache (legacy format, will re-check fingerprints)",
 		"count", len(hashes),
 		"path", t.completedCachePath,
 	)
@@ -70,10 +87,10 @@ func (t *QBTask) loadCompletedCache() {
 // Caller must NOT hold completedMu.
 func (t *QBTask) saveCompletedCache() {
 	t.completedMu.RLock()
-	hashes := slices.Collect(maps.Keys(t.completedOnCold))
+	snapshot := maps.Clone(t.completedOnCold)
 	t.completedMu.RUnlock()
 
-	data, err := json.Marshal(hashes)
+	data, err := json.Marshal(snapshot)
 	if err != nil {
 		t.logger.Warn("failed to marshal completed cache", "error", err)
 		return
@@ -90,11 +107,11 @@ func (t *QBTask) saveCompletedCache() {
 	}
 }
 
-// markCompletedOnCold marks a torrent as complete on cold, updates the metric,
-// and persists the cache to disk.
-func (t *QBTask) markCompletedOnCold(hash string) {
+// markCompletedOnCold marks a torrent as complete on cold with the given
+// selection fingerprint, updates the metric, and persists the cache.
+func (t *QBTask) markCompletedOnCold(hash, fingerprint string) {
 	t.completedMu.Lock()
-	t.completedOnCold[hash] = true
+	t.completedOnCold[hash] = fingerprint
 	metrics.CompletedOnColdCacheSize.Set(float64(len(t.completedOnCold)))
 	t.completedMu.Unlock()
 

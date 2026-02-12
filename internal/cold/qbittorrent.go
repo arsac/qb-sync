@@ -235,6 +235,22 @@ func (s *Server) StartTorrent(ctx context.Context, req *pb.StartTorrentRequest) 
 	return &pb.StartTorrentResponse{Success: true}, nil
 }
 
+// deleteTorrentFromQB removes a torrent from cold qBittorrent without deleting files.
+// Used during re-sync to clear a stale entry that reports 100% after partial finalization.
+func (s *Server) deleteTorrentFromQB(ctx context.Context, hash string) error {
+	if s.qbClient == nil {
+		return nil
+	}
+	if delErr := s.qbClient.DeleteTorrentsCtx(ctx, []string{hash}, false); delErr != nil {
+		s.logger.WarnContext(ctx, "failed to delete torrent from cold qBittorrent",
+			"hash", hash, "error", delErr)
+		return delErr
+	}
+	s.logger.InfoContext(ctx, "deleted stale torrent from cold qBittorrent for re-sync",
+		"hash", hash)
+	return nil
+}
+
 // isErrorState returns true if the torrent state indicates an error.
 func isErrorState(state qbittorrent.TorrentState) bool {
 	return state == qbittorrent.TorrentStateError ||

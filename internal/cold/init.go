@@ -40,10 +40,21 @@ func (s *Server) InitTorrent(
 	// Check if torrent is already complete in cold qBittorrent
 	switch s.checkTorrentInQB(ctx, hash) {
 	case qbCheckComplete:
-		return &pb.InitTorrentResponse{
-			Success: true,
-			Status:  pb.TorrentSyncStatus_SYNC_STATUS_COMPLETE,
-		}, nil
+		// If this is a re-sync (file selection changed), delete the stale
+		// qBittorrent entry so we can re-initialize with updated file selection.
+		// The torrent was added with skip_checking=true previously and may report
+		// 100% even though newly-selected files are missing.
+		if len(req.GetFiles()) > 0 && req.GetResync() {
+			if delErr := s.deleteTorrentFromQB(ctx, hash); delErr != nil {
+				return initErrorResponse("re-sync: failed to delete stale qB entry: %v", delErr), nil
+			}
+			// Fall through to check local state
+		} else {
+			return &pb.InitTorrentResponse{
+				Success: true,
+				Status:  pb.TorrentSyncStatus_SYNC_STATUS_COMPLETE,
+			}, nil
+		}
 	case qbCheckVerifying:
 		return &pb.InitTorrentResponse{
 			Success: true,
@@ -170,8 +181,17 @@ func (s *Server) initNewTorrent(
 		}
 	}
 
+	// Backward compatibility: if no file has Selected=true (legacy hot without
+	// the Selected field), treat all files as selected to preserve old behavior.
+	reqFiles := req.GetFiles()
+	if !anyProtoFileSelected(reqFiles) {
+		for _, f := range reqFiles {
+			f.Selected = true
+		}
+	}
+
 	// Set up files and check for hardlink opportunities
-	files, hardlinkResults, err := s.setupFiles(ctx, hash, req.GetFiles(), saveSubPath)
+	files, hardlinkResults, err := s.setupFiles(ctx, hash, reqFiles, saveSubPath)
 	if err != nil {
 		return initErrorResponse("%v", err)
 	}
@@ -180,31 +200,25 @@ func (s *Server) initNewTorrent(
 	pieceSize := req.GetPieceSize()
 	totalSize := req.GetTotalSize()
 
-	// Calculate which pieces are covered by hardlinks
-	piecesCovered := calculatePiecesCovered(files, numPieces, pieceSize, totalSize)
+	// Build written bitmap from persisted state + hardlink coverage.
+	written := s.buildWrittenBitmap(ctx, hash, statePath, files, numPieces, pieceSize, totalSize)
 
-	// Try to load existing state for resume, or create fresh
-	written := make([]bool, numPieces)
-	if existingState, loadErr := s.loadState(statePath, int(numPieces)); loadErr == nil {
-		written = existingState
-		_, _, haveCount := calculatePiecesNeeded(written)
-		s.logger.InfoContext(ctx, "resumed torrent state",
-			"hash", hash,
-			"written", haveCount,
-			"total", numPieces,
-		)
-	}
-
-	for i, covered := range piecesCovered {
-		if covered {
-			written[i] = true
+	// Persist initial written state so pre-existing/hardlinked piece coverage
+	// survives a crash before the first WritePiece triggers a periodic flush.
+	if initialHave := countWritten(written); initialHave > 0 {
+		if saveErr := s.doSaveState(statePath, written); saveErr != nil {
+			s.logger.WarnContext(ctx, "failed to persist initial state",
+				"hash", hash, "error", saveErr)
 		}
 	}
 
-	// Persist save sub-path for recovery after restart.
+	// Persist save sub-path and file selection for recovery after restart.
 	// The .torrent file (already written above) provides all other metadata.
 	if saveErr := saveSubPathFile(metaDir, saveSubPath); saveErr != nil {
 		return initErrorResponse("failed to save sub-path for recovery: %v", saveErr)
+	}
+	if saveErr := saveSelectedFile(metaDir, files); saveErr != nil {
+		return initErrorResponse("failed to save selection state: %v", saveErr)
 	}
 
 	// Swap sentinel for real state under s.mu
@@ -228,12 +242,14 @@ func (s *Server) initNewTorrent(
 	// Log summary
 	hardlinkedCount, pendingCount, preExistingCount := countHardlinkResults(hardlinkResults)
 	piecesNeeded, needCount, haveCount := calculatePiecesNeeded(written)
+	selectedCount := countSelectedFiles(files)
 
 	s.logger.InfoContext(ctx, "initialized torrent",
 		"hash", hash,
 		"name", name,
 		"pieces", numPieces,
 		"files", len(files),
+		"selectedFiles", selectedCount,
 		"hasHashes", len(req.GetPieceHashes()) > 0,
 		"hardlinked", hardlinkedCount,
 		"pending", pendingCount,
@@ -250,6 +266,46 @@ func (s *Server) initNewTorrent(
 		PiecesNeededCount: needCount,
 		PiecesHaveCount:   haveCount,
 	}
+}
+
+// buildWrittenBitmap constructs the written bitmap from persisted state and hardlink
+// coverage, and initializes per-file piece tracking for early finalization.
+func (s *Server) buildWrittenBitmap(
+	ctx context.Context,
+	hash, statePath string,
+	files []*serverFileInfo,
+	numPieces int32,
+	pieceSize, totalSize int64,
+) []bool {
+	piecesCovered := calculatePiecesCovered(files, numPieces, pieceSize, totalSize)
+
+	written := make([]bool, numPieces)
+	if existingState, loadErr := s.loadState(statePath, int(numPieces)); loadErr == nil {
+		written = existingState
+		_, _, haveCount := calculatePiecesNeeded(written)
+		s.logger.InfoContext(ctx, "resumed torrent state",
+			"hash", hash,
+			"written", haveCount,
+			"total", numPieces,
+		)
+	}
+
+	for i, covered := range piecesCovered {
+		if covered {
+			written[i] = true
+		}
+	}
+
+	// Compute per-file piece ranges and mark files that need no streamed data as already finalized.
+	computeFilePieceRanges(files, pieceSize, totalSize)
+	for _, fi := range files {
+		if fi.skipForWriteData() {
+			fi.earlyFinalized = true
+		}
+	}
+	initFilePieceCounts(files, written)
+
+	return written
 }
 
 // initErrorResponse creates an error response for InitTorrent.
@@ -414,6 +470,18 @@ func (s *Server) setupFile(
 	result := &pb.HardlinkResult{FileIndex: int32(fileIndex)}
 	targetPath := filepath.Join(s.config.BasePath, saveSubPath, f.GetPath())
 
+	// Unselected files: no .partial, no directory creation, no hardlink resolution.
+	// The serverFileInfo entry is still needed for offset tracking in writePieceData.
+	if !f.GetSelected() {
+		return &serverFileInfo{
+			path:        targetPath,
+			size:        f.GetSize(),
+			offset:      f.GetOffset(),
+			sourceInode: Inode(f.GetInode()),
+			selected:    false,
+		}, result, nil
+	}
+
 	// Ensure parent directory exists
 	if err := os.MkdirAll(filepath.Dir(targetPath), serverDirPermissions); err != nil {
 		return nil, nil, fmt.Errorf("creating directory for %s: %w", f.GetPath(), err)
@@ -427,17 +495,33 @@ func (s *Server) setupFile(
 			offset:      f.GetOffset(),
 			sourceInode: Inode(f.GetInode()),
 			hlState:     hlStateComplete,
+			selected:    true,
 		}
 		result.PreExisting = true
 		return fileInfo, result, nil
 	}
 
+	// Check if .partial file exists from a previous interrupted sync.
+	// Piece-level progress is recovered from .state in buildWrittenBitmap;
+	// skip hardlink resolution since the file already has data on disk.
+	partialPath := targetPath + ".partial"
+	if info, statErr := os.Stat(partialPath); statErr == nil && info.Size() == f.GetSize() {
+		return &serverFileInfo{
+			path:        partialPath,
+			size:        f.GetSize(),
+			offset:      f.GetOffset(),
+			sourceInode: Inode(f.GetInode()),
+			selected:    true,
+		}, result, nil
+	}
+
 	sourceInode := Inode(f.GetInode())
 	fileInfo := &serverFileInfo{
-		path:        targetPath + ".partial",
+		path:        partialPath,
 		size:        f.GetSize(),
 		offset:      f.GetOffset(),
 		sourceInode: sourceInode,
+		selected:    true,
 	}
 
 	// Check for hardlink opportunities if inode is provided

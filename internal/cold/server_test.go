@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/autobrr/go-qbittorrent"
+
 	pb "github.com/arsac/qb-sync/proto"
 )
 
@@ -592,7 +594,7 @@ func TestAbortTorrent_DeletesFiles(t *testing.T) {
 	}
 
 	s.torrents[hash] = &serverTorrentState{
-		files:       []*serverFileInfo{{path: partialFile, size: 4}},
+		files:       []*serverFileInfo{{path: partialFile, size: 4, selected: true}},
 		statePath:   stateFile,
 		torrentPath: torrentFile,
 	}
@@ -635,7 +637,7 @@ func TestAbortTorrent_PreservesFiles(t *testing.T) {
 	}
 
 	s.torrents[hash] = &serverTorrentState{
-		files: []*serverFileInfo{{path: partialFile, size: 4}},
+		files: []*serverFileInfo{{path: partialFile, size: 4, selected: true}},
 	}
 
 	resp, err := s.AbortTorrent(context.Background(), &pb.AbortTorrentRequest{
@@ -671,7 +673,7 @@ func TestAbortTorrent_ClosesFileHandles(t *testing.T) {
 	}
 
 	s.torrents[hash] = &serverTorrentState{
-		files: []*serverFileInfo{{path: partialFile, size: 0, file: f}},
+		files: []*serverFileInfo{{path: partialFile, size: 0, file: f, selected: true}},
 	}
 
 	resp, abortErr := s.AbortTorrent(context.Background(), &pb.AbortTorrentRequest{
@@ -742,7 +744,7 @@ func TestAbortTorrent_InitWaitsForAbort(t *testing.T) {
 	}
 
 	s.torrents[hash] = &serverTorrentState{
-		files: []*serverFileInfo{{path: partialPath, size: 9}},
+		files: []*serverFileInfo{{path: partialPath, size: 9, selected: true}},
 	}
 
 	var abortFinished, initFinished time.Time
@@ -787,7 +789,7 @@ func TestAbortTorrent_InitWaitsForAbort(t *testing.T) {
 			PieceSize:   1024,
 			TotalSize:   9,
 			Files: []*pb.FileInfo{
-				{Path: "test.mp4", Size: 9, Offset: 0},
+				{Path: "test.mp4", Size: 9, Offset: 0, Selected: true},
 			},
 		})
 		initFinished = time.Now()
@@ -839,10 +841,11 @@ func TestSetupFile_PreExisting(t *testing.T) {
 		}
 
 		fileInfo, result, err := s.setupFile(ctx, "abc123", &pb.FileInfo{
-			Path:   filePath,
-			Size:   1024,
-			Offset: 0,
-			Inode:  12345,
+			Path:     filePath,
+			Size:     1024,
+			Offset:   0,
+			Inode:    12345,
+			Selected: true,
 		}, 0, "")
 
 		if err != nil {
@@ -881,9 +884,10 @@ func TestSetupFile_PreExisting(t *testing.T) {
 		}
 
 		fileInfo, result, err := s.setupFile(ctx, "abc123", &pb.FileInfo{
-			Path:   filePath,
-			Size:   1024,
-			Offset: 0,
+			Path:     filePath,
+			Size:     1024,
+			Offset:   0,
+			Selected: true,
 		}, 0, "")
 
 		if err != nil {
@@ -909,9 +913,10 @@ func TestSetupFile_PreExisting(t *testing.T) {
 		}
 
 		fileInfo, result, err := s.setupFile(ctx, "abc123", &pb.FileInfo{
-			Path:   "data/test.mp4",
-			Size:   1024,
-			Offset: 0,
+			Path:     "data/test.mp4",
+			Size:     1024,
+			Offset:   0,
+			Selected: true,
 		}, 0, "")
 
 		if err != nil {
@@ -963,8 +968,8 @@ func TestInitTorrent_PreExistingFiles(t *testing.T) {
 			PieceSize:   512,
 			TotalSize:   1024,
 			Files: []*pb.FileInfo{
-				{Path: "data/file1.bin", Size: 512, Offset: 0},
-				{Path: "data/file2.bin", Size: 512, Offset: 512},
+				{Path: "data/file1.bin", Size: 512, Offset: 0, Selected: true},
+				{Path: "data/file2.bin", Size: 512, Offset: 512, Selected: true},
 			},
 		})
 
@@ -1015,8 +1020,8 @@ func TestInitTorrent_PreExistingFiles(t *testing.T) {
 			PieceSize:   512,
 			TotalSize:   1024,
 			Files: []*pb.FileInfo{
-				{Path: "data/file1.bin", Size: 512, Offset: 0},
-				{Path: "data/file2.bin", Size: 512, Offset: 512},
+				{Path: "data/file1.bin", Size: 512, Offset: 0, Selected: true},
+				{Path: "data/file2.bin", Size: 512, Offset: 512, Selected: true},
 			},
 		})
 
@@ -1067,7 +1072,7 @@ func TestInitTorrent_PreExistingFiles(t *testing.T) {
 			PieceSize:   1024,
 			TotalSize:   1024,
 			Files: []*pb.FileInfo{
-				{Path: "data/file1.bin", Size: 1024, Offset: 0},
+				{Path: "data/file1.bin", Size: 1024, Offset: 0, Selected: true},
 			},
 		})
 
@@ -1227,7 +1232,7 @@ func newRelocateInitRequest(hash, subPath string) *pb.InitTorrentRequest {
 		TotalSize:   512,
 		SaveSubPath: subPath,
 		Files: []*pb.FileInfo{
-			{Path: "data/file.bin", Size: 512, Offset: 0},
+			{Path: "data/file.bin", Size: 512, Offset: 0, Selected: true},
 		},
 	}
 }
@@ -1363,8 +1368,8 @@ func TestUpdateStateAfterRelocate(t *testing.T) {
 		state := &serverTorrentState{
 			saveSubPath: "",
 			files: []*serverFileInfo{
-				{path: filepath.Join(basePath, "data", "file.bin.partial"), size: 1024},
-				{path: filepath.Join(basePath, "data", "file2.bin"), size: 2048},
+				{path: filepath.Join(basePath, "data", "file.bin.partial"), size: 1024, selected: true},
+				{path: filepath.Join(basePath, "data", "file2.bin"), size: 2048, selected: true},
 			},
 		}
 
@@ -1487,11 +1492,11 @@ func TestFinalizeTorrent_RelocatesOnSubPathChange(t *testing.T) {
 		return &serverTorrentState{
 			written:      []bool{true, false},
 			writtenCount: 1,
-			pieceLength:  1024,
-			totalSize:    int64(len("file content")),
+			pieceLength:  512,
+			totalSize:    1024,
 			saveSubPath:  subPath,
 			files: []*serverFileInfo{
-				{path: filePath, size: int64(len("file content")), offset: 0},
+				{path: filePath, size: 1024, offset: 0, selected: true},
 			},
 		}
 	}
@@ -1589,5 +1594,332 @@ func TestFinalizeTorrent_RelocatesOnSubPathChange(t *testing.T) {
 		}
 
 		assertFileExists(t, filePath, "file should still exist at original path")
+	})
+}
+
+func TestInitTorrentResync(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	logger := testLogger(t)
+
+	t.Run("resync deletes qB entry and re-initializes", func(t *testing.T) {
+		t.Parallel()
+		tmpDir := t.TempDir()
+		mock := &mockQBClient{
+			torrents: []qbittorrent.Torrent{
+				{
+					Hash:     "resync1",
+					State:    "stalledUP",
+					Progress: 1.0,
+				},
+			},
+		}
+		s := &Server{
+			config:         ServerConfig{BasePath: tmpDir},
+			logger:         logger,
+			torrents:       make(map[string]*serverTorrentState),
+			abortingHashes: make(map[string]chan struct{}),
+			inodes:         NewInodeRegistry(tmpDir, logger),
+			qbClient:       mock,
+		}
+
+		resp, err := s.InitTorrent(ctx, &pb.InitTorrentRequest{
+			TorrentHash: "resync1",
+			Name:        "test-resync",
+			NumPieces:   2,
+			PieceSize:   512,
+			TotalSize:   1024,
+			Resync:      true,
+			Files: []*pb.FileInfo{
+				{Path: "data/file1.bin", Size: 512, Offset: 0, Selected: true},
+				{Path: "data/file2.bin", Size: 512, Offset: 512, Selected: true},
+			},
+		})
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !resp.GetSuccess() {
+			t.Fatalf("expected success, got error: %s", resp.GetError())
+		}
+
+		// Should have deleted the stale qB entry (deleteFiles=false)
+		if !mock.deleteCalled {
+			t.Error("DeleteTorrentsCtx should have been called for re-sync")
+		}
+		if len(mock.deleteHashes) != 1 || mock.deleteHashes[0] != "resync1" {
+			t.Errorf("expected delete hash [resync1], got %v", mock.deleteHashes)
+		}
+		if mock.deleteDeleteFiles {
+			t.Error("deleteFiles should be false for re-sync")
+		}
+
+		// Should return READY status (re-initialized), not COMPLETE
+		if resp.GetStatus() != pb.TorrentSyncStatus_SYNC_STATUS_READY {
+			t.Errorf("expected READY status after re-sync, got %v", resp.GetStatus())
+		}
+
+		// Should be tracked in server state
+		s.mu.RLock()
+		_, exists := s.torrents["resync1"]
+		s.mu.RUnlock()
+		if !exists {
+			t.Error("torrent should be tracked after re-sync init")
+		}
+	})
+
+	t.Run("without resync returns COMPLETE", func(t *testing.T) {
+		t.Parallel()
+		tmpDir := t.TempDir()
+		mock := &mockQBClient{
+			torrents: []qbittorrent.Torrent{
+				{
+					Hash:     "noresync1",
+					State:    "stalledUP",
+					Progress: 1.0,
+				},
+			},
+		}
+		s := &Server{
+			config:         ServerConfig{BasePath: tmpDir},
+			logger:         logger,
+			torrents:       make(map[string]*serverTorrentState),
+			abortingHashes: make(map[string]chan struct{}),
+			inodes:         NewInodeRegistry(tmpDir, logger),
+			qbClient:       mock,
+		}
+
+		resp, err := s.InitTorrent(ctx, &pb.InitTorrentRequest{
+			TorrentHash: "noresync1",
+			Name:        "test-no-resync",
+			NumPieces:   2,
+			PieceSize:   512,
+			TotalSize:   1024,
+			Resync:      false,
+			Files: []*pb.FileInfo{
+				{Path: "data/file1.bin", Size: 512, Offset: 0, Selected: true},
+				{Path: "data/file2.bin", Size: 512, Offset: 512, Selected: true},
+			},
+		})
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !resp.GetSuccess() {
+			t.Fatalf("expected success, got error: %s", resp.GetError())
+		}
+
+		// Should return COMPLETE without deleting
+		if resp.GetStatus() != pb.TorrentSyncStatus_SYNC_STATUS_COMPLETE {
+			t.Errorf("expected COMPLETE status, got %v", resp.GetStatus())
+		}
+		if mock.deleteCalled {
+			t.Error("DeleteTorrentsCtx should NOT have been called without resync")
+		}
+
+		// Should NOT be tracked (still complete)
+		s.mu.RLock()
+		_, exists := s.torrents["noresync1"]
+		s.mu.RUnlock()
+		if exists {
+			t.Error("torrent should NOT be tracked when returning COMPLETE")
+		}
+	})
+
+	t.Run("resync without files returns COMPLETE", func(t *testing.T) {
+		t.Parallel()
+		tmpDir := t.TempDir()
+		mock := &mockQBClient{
+			torrents: []qbittorrent.Torrent{
+				{
+					Hash:     "noresync2",
+					State:    "stalledUP",
+					Progress: 1.0,
+				},
+			},
+		}
+		s := &Server{
+			config:         ServerConfig{BasePath: tmpDir},
+			logger:         logger,
+			torrents:       make(map[string]*serverTorrentState),
+			abortingHashes: make(map[string]chan struct{}),
+			inodes:         NewInodeRegistry(tmpDir, logger),
+			qbClient:       mock,
+		}
+
+		// Resync=true but no files — the guard is `len(req.GetFiles()) > 0 && req.GetResync()`
+		resp, err := s.InitTorrent(ctx, &pb.InitTorrentRequest{
+			TorrentHash: "noresync2",
+			Name:        "test-resync-no-files",
+			NumPieces:   1,
+			PieceSize:   1024,
+			TotalSize:   1024,
+			Resync:      true,
+			// No Files — minimal request
+		})
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !resp.GetSuccess() {
+			t.Fatalf("expected success, got error: %s", resp.GetError())
+		}
+		if resp.GetStatus() != pb.TorrentSyncStatus_SYNC_STATUS_COMPLETE {
+			t.Errorf("expected COMPLETE (resync without files should be no-op), got %v", resp.GetStatus())
+		}
+		if mock.deleteCalled {
+			t.Error("DeleteTorrentsCtx should NOT be called when files are empty")
+		}
+	})
+}
+
+func TestInitTorrentResync_PartialRecovery(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	logger := testLogger(t)
+
+	t.Run("detects pre-existing partial files", func(t *testing.T) {
+		t.Parallel()
+		tmpDir := t.TempDir()
+		mock := &mockQBClient{
+			torrents: []qbittorrent.Torrent{
+				{Hash: "resyncpartial", State: "stalledUP", Progress: 1.0},
+			},
+		}
+		s := &Server{
+			config:         ServerConfig{BasePath: tmpDir},
+			logger:         logger,
+			torrents:       make(map[string]*serverTorrentState),
+			abortingHashes: make(map[string]chan struct{}),
+			inodes:         NewInodeRegistry(tmpDir, logger),
+			qbClient:       mock,
+		}
+
+		// Pre-create file1 at final path (previously synced) and
+		// file2 as .partial (interrupted previous resync attempt).
+		writeTestFile(t, filepath.Join(tmpDir, "data", "file1.bin"), make([]byte, 512))
+		// .partial pre-allocated to full size (simulates openFile + Truncate from previous attempt)
+		writeTestFile(t, filepath.Join(tmpDir, "data", "file2.bin.partial"), make([]byte, 512))
+
+		resp, err := s.InitTorrent(ctx, &pb.InitTorrentRequest{
+			TorrentHash: "resyncpartial",
+			Name:        "test-resync-partial",
+			NumPieces:   2,
+			PieceSize:   512,
+			TotalSize:   1024,
+			Resync:      true,
+			Files: []*pb.FileInfo{
+				{Path: "data/file1.bin", Size: 512, Offset: 0, Selected: true},
+				{Path: "data/file2.bin", Size: 512, Offset: 512, Selected: true},
+			},
+		})
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !resp.GetSuccess() {
+			t.Fatalf("expected success, got error: %s", resp.GetError())
+		}
+		if resp.GetStatus() != pb.TorrentSyncStatus_SYNC_STATUS_READY {
+			t.Errorf("expected READY, got %v", resp.GetStatus())
+		}
+
+		// file1 at final path → pre-existing (hlStateComplete), pieces covered
+		results := resp.GetHardlinkResults()
+		if !results[0].GetPreExisting() {
+			t.Error("file 0: expected PreExisting=true (final path)")
+		}
+		// file2 .partial detected → NOT treated as hardlinked, but no error.
+		// Its pieces are not covered (no .state file), so still needed.
+		if results[1].GetPreExisting() {
+			t.Error("file 1: .partial should NOT be marked as PreExisting")
+		}
+		if results[1].GetHardlinked() {
+			t.Error("file 1: .partial should NOT be marked as Hardlinked")
+		}
+
+		// file1 covered → 1 piece have; file2 partial → 1 piece needed
+		if resp.GetPiecesHaveCount() != 1 {
+			t.Errorf("expected 1 piece have, got %d", resp.GetPiecesHaveCount())
+		}
+		if resp.GetPiecesNeededCount() != 1 {
+			t.Errorf("expected 1 piece needed, got %d", resp.GetPiecesNeededCount())
+		}
+
+		// Verify that .partial was reused — the file should still be at the .partial path.
+		s.mu.RLock()
+		state := s.torrents["resyncpartial"]
+		s.mu.RUnlock()
+		if state == nil {
+			t.Fatal("torrent state should exist")
+		}
+		if !strings.HasSuffix(state.files[1].path, ".partial") {
+			t.Errorf("file 1 path should end with .partial, got %s", state.files[1].path)
+		}
+	})
+
+	t.Run("persists initial state for pre-existing pieces", func(t *testing.T) {
+		t.Parallel()
+		tmpDir := t.TempDir()
+		mock := &mockQBClient{
+			torrents: []qbittorrent.Torrent{
+				{Hash: "resyncstate", State: "stalledUP", Progress: 1.0},
+			},
+		}
+
+		var savedPath string
+		var savedWritten []bool
+		s := &Server{
+			config:         ServerConfig{BasePath: tmpDir},
+			logger:         logger,
+			torrents:       make(map[string]*serverTorrentState),
+			abortingHashes: make(map[string]chan struct{}),
+			inodes:         NewInodeRegistry(tmpDir, logger),
+			qbClient:       mock,
+			saveStateFunc: func(path string, written []bool) error {
+				savedPath = path
+				savedWritten = append([]bool(nil), written...)
+				return nil
+			},
+		}
+
+		// Pre-create file1 at final path (1 piece pre-existing)
+		writeTestFile(t, filepath.Join(tmpDir, "data", "file1.bin"), make([]byte, 512))
+
+		resp, err := s.InitTorrent(ctx, &pb.InitTorrentRequest{
+			TorrentHash: "resyncstate",
+			Name:        "test-resync-state",
+			NumPieces:   2,
+			PieceSize:   512,
+			TotalSize:   1024,
+			Resync:      true,
+			Files: []*pb.FileInfo{
+				{Path: "data/file1.bin", Size: 512, Offset: 0, Selected: true},
+				{Path: "data/file2.bin", Size: 512, Offset: 512, Selected: true},
+			},
+		})
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !resp.GetSuccess() {
+			t.Fatalf("expected success, got error: %s", resp.GetError())
+		}
+
+		// Initial state should have been saved immediately (pre-existing piece detected)
+		if savedPath == "" {
+			t.Fatal("doSaveState should have been called for initial state persistence")
+		}
+		if len(savedWritten) != 2 {
+			t.Fatalf("expected 2 pieces in saved state, got %d", len(savedWritten))
+		}
+		// Piece 0 (file1, pre-existing) should be marked as written
+		if !savedWritten[0] {
+			t.Error("piece 0 should be written (pre-existing file)")
+		}
+		// Piece 1 (file2, missing) should not be written
+		if savedWritten[1] {
+			t.Error("piece 1 should NOT be written (file2 not on disk)")
+		}
 	})
 }

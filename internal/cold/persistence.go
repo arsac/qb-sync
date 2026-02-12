@@ -72,6 +72,33 @@ func loadSubPathFile(metaDir string) string {
 	return strings.TrimSpace(string(data))
 }
 
+// saveSelectedFile persists the file selection bitmap to a .selected file.
+func saveSelectedFile(metaDir string, files []*serverFileInfo) error {
+	data := make([]byte, len(files))
+	for i, fi := range files {
+		if fi.selected {
+			data[i] = 1
+		}
+	}
+	return atomicWriteFile(filepath.Join(metaDir, selectedFileName), data)
+}
+
+// loadSelectedFile reads the file selection bitmap from the .selected file.
+// Returns nil if the file is missing (treat as all-selected for backward compat).
+func loadSelectedFile(metaDir string, numFiles int) []bool {
+	data, err := os.ReadFile(filepath.Join(metaDir, selectedFileName))
+	if err != nil {
+		return nil
+	}
+	selected := make([]bool, numFiles)
+	for i := range selected {
+		if i < len(data) {
+			selected[i] = data[i] == 1
+		}
+	}
+	return selected
+}
+
 // findTorrentFile locates the .torrent file in metaDir.
 func findTorrentFile(metaDir string) (string, error) {
 	entries, readErr := os.ReadDir(metaDir)
@@ -128,11 +155,30 @@ func (s *Server) recoverTorrentState(ctx context.Context, hash string) (*serverT
 			diskPath = finalPath
 		}
 		files[i] = &serverFileInfo{
-			path:   diskPath,
-			size:   f.Size,
-			offset: f.Offset,
+			path:     diskPath,
+			size:     f.Size,
+			offset:   f.Offset,
+			selected: true, // Default; overridden below if .selected file exists
 		}
 	}
+
+	// Restore file selection from persisted .selected file.
+	selectedBitmap := loadSelectedFile(metaDir, len(files))
+	if selectedBitmap != nil {
+		for i, fi := range files {
+			fi.selected = selectedBitmap[i]
+		}
+	}
+
+	// Compute per-file piece ranges and mark files that need no streamed data as already finalized.
+	// During recovery, files at final path (not .partial) or unselected files are already done.
+	computeFilePieceRanges(files, parsed.PieceLength, parsed.TotalSize)
+	for _, fi := range files {
+		if !strings.HasSuffix(fi.path, partialSuffix) || !fi.selected {
+			fi.earlyFinalized = true
+		}
+	}
+	initFilePieceCounts(files, written)
 
 	writtenCount := countWritten(written)
 

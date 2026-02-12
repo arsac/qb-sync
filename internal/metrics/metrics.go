@@ -419,6 +419,24 @@ var (
 		},
 		[]string{LabelDirection},
 	)
+
+	// FilesEarlyFinalizedTotal counts files synced, closed, and renamed before torrent finalization.
+	FilesEarlyFinalizedTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "files_early_finalized_total",
+			Help:      "Files synced, closed, and renamed before torrent finalization",
+		},
+	)
+
+	// FileSelectionResyncsTotal counts re-syncs triggered by file selection changes.
+	FileSelectionResyncsTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "file_selection_resyncs_total",
+			Help:      "Number of re-syncs triggered by file selection changes on hot",
+		},
+	)
 )
 
 // Gauges track values that can go up or down.

@@ -49,7 +49,6 @@ func (s *Server) FinalizeTorrent(
 	state.finalizing = true
 	state.finalizeDone = done
 	writtenCount := state.writtenCount
-	totalPieces := len(state.written)
 	state.mu.Unlock()
 
 	// Helper to clear finalizing state, close the done channel, record failure
@@ -76,9 +75,11 @@ func (s *Server) FinalizeTorrent(
 		}
 	}
 
-	// Verify all pieces are written.
-	if writtenCount < totalPieces {
-		msg := fmt.Sprintf("incomplete: %d/%d pieces", writtenCount, totalPieces)
+	// Verify all selected pieces are written.
+	// For partial selection, only pieces overlapping selected files must be written.
+	selectedPiecesTotal := countSelectedPiecesTotal(state)
+	if writtenCount < selectedPiecesTotal {
+		msg := fmt.Sprintf("incomplete: %d/%d selected pieces", writtenCount, selectedPiecesTotal)
 		return failureResponse(msg, pb.FinalizeErrorCode_FINALIZE_ERROR_INCOMPLETE), nil
 	}
 
@@ -480,8 +481,8 @@ func (s *Server) registerFinalizedInodes(ctx context.Context, hash string, state
 
 	var registered int
 	for _, f := range state.files {
-		// Skip files that were hardlinked (either from registration or pending) or have no inode
-		if f.hlState == hlStateComplete || f.sourceInode == 0 {
+		// Skip files that need no data (hardlinked/pending/unselected) or have no inode
+		if f.skipForWriteData() || f.sourceInode == 0 {
 			continue
 		}
 
@@ -555,35 +556,22 @@ func (s *Server) verifyFinalizedPieces(ctx context.Context, hash string, state *
 	var lastProgress atomic.Value // stores time.Time of last verified piece
 	lastProgress.Store(time.Now())
 
-	// Idle watchdog: cancel verification if no progress within verifyIdleTimeout.
-	go func() {
-		ticker := time.NewTicker(verifyIdleTimeout / verifyIdleCheckDivisor) // Check at half the timeout interval.
-		defer ticker.Stop()
-		for {
-			select {
-			case <-gCtx.Done():
-				return
-			case <-ticker.C:
-				last, ok := lastProgress.Load().(time.Time)
-				if !ok {
-					continue
-				}
-				if time.Since(last) > verifyIdleTimeout {
-					s.logger.ErrorContext(ctx, "verification stalled, aborting",
-						"hash", hash,
-						"verified", verified.Load(),
-						"total", numPieces,
-						"idleTimeout", verifyIdleTimeout,
-					)
-					idleCancel()
-					return
-				}
-			}
-		}
-	}()
+	go s.verifyIdleWatchdog(ctx, gCtx, hash, numPieces, &verified, &lastProgress, idleCancel)
 
 	for i, expectedHash := range state.pieceHashes {
 		if expectedHash == "" {
+			continue
+		}
+
+		// Skip pieces that don't overlap any selected file.
+		if !pieceOverlapsSelectedFile(state.files, i, pieceSize, totalSize) {
+			continue
+		}
+
+		// Skip boundary pieces that span both selected and unselected files —
+		// the unselected file's data doesn't exist on disk so we can't read the
+		// full piece. These pieces were hash-verified at write time.
+		if !pieceEntirelyInSelectedFiles(state.files, i, pieceSize, totalSize) {
 			continue
 		}
 
@@ -633,6 +621,40 @@ func (s *Server) verifyFinalizedPieces(ctx context.Context, hash string, state *
 
 	s.logger.InfoContext(ctx, "all pieces verified successfully", "hash", hash, "pieces", numPieces)
 	return nil
+}
+
+// verifyIdleWatchdog cancels verification if no progress within verifyIdleTimeout.
+func (s *Server) verifyIdleWatchdog(
+	ctx, gCtx context.Context,
+	hash string,
+	numPieces int,
+	verified *atomic.Int64,
+	lastProgress *atomic.Value,
+	cancel context.CancelFunc,
+) {
+	ticker := time.NewTicker(verifyIdleTimeout / verifyIdleCheckDivisor)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-gCtx.Done():
+			return
+		case <-ticker.C:
+			last, ok := lastProgress.Load().(time.Time)
+			if !ok {
+				continue
+			}
+			if time.Since(last) > verifyIdleTimeout {
+				s.logger.ErrorContext(ctx, "verification stalled, aborting",
+					"hash", hash,
+					"verified", verified.Load(),
+					"total", numPieces,
+					"idleTimeout", verifyIdleTimeout,
+				)
+				cancel()
+				return
+			}
+		}
+	}
 }
 
 // handleExistingFinalization handles a FinalizeTorrent call when background

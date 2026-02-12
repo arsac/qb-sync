@@ -62,7 +62,7 @@ func TestVerifyFinalizedPieces_ConcurrencyLimit(t *testing.T) {
 		pieceLength: pieceSize,
 		totalSize:   totalSize,
 		files: []*serverFileInfo{
-			{path: filePath, offset: 0, size: totalSize},
+			{path: filePath, offset: 0, size: totalSize, selected: true},
 		},
 	}
 
@@ -125,7 +125,7 @@ func TestVerifyFinalizedPieces_FailsOnHashMismatch(t *testing.T) {
 		pieceLength: pieceSize,
 		totalSize:   totalSize,
 		files: []*serverFileInfo{
-			{path: filePath, offset: 0, size: totalSize},
+			{path: filePath, offset: 0, size: totalSize, selected: true},
 		},
 	}
 
@@ -283,7 +283,9 @@ func TestFinalizeTorrent_PollReturnsFailedResult(t *testing.T) {
 			success: false,
 			err:     "verification failed: piece 5: hash mismatch",
 		},
-		files: []*serverFileInfo{},
+		files: []*serverFileInfo{
+			{size: 256, offset: 0, selected: true},
+		},
 	}
 
 	s.mu.Lock()
@@ -416,7 +418,7 @@ func TestRunBackgroundFinalization_SerializesViaSemaphore(t *testing.T) {
 			pieceHashes: pieceHashes,
 			pieceLength: pieceSize,
 			totalSize:   totalSize,
-			files:       []*serverFileInfo{{path: filePath, offset: 0, size: totalSize}},
+			files:       []*serverFileInfo{{path: filePath, offset: 0, size: totalSize, selected: true}},
 			torrentPath: filepath.Join(dir, metaDirName, hash, "test.torrent"),
 		}
 	}

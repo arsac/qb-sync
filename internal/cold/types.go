@@ -73,6 +73,22 @@ type serverFileInfo struct {
 	sourceInode    Inode         // Source inode for registration
 	hardlinkSource string        // Relative path to hardlink from (when ready)
 	hardlinkDoneCh chan struct{} // Wait on this before hardlinking (used when hlState == hlStatePending)
+
+	// File selection (priority > 0 on hot side)
+	selected bool // True if file is selected for download; unselected files have no .partial
+
+	// Per-file piece tracking (computed during init, not persisted)
+	firstPiece     int  // First piece index overlapping this file
+	lastPiece      int  // Last piece index overlapping this file (inclusive)
+	piecesTotal    int  // Total number of overlapping pieces
+	piecesWritten  int  // Count of overlapping pieces already written
+	earlyFinalized bool // True after sync+close+rename before torrent finalization
+}
+
+// skipForWriteData reports whether this file should be skipped during piece write.
+// True for files that are hardlinked, pending hardlink, or unselected.
+func (fi *serverFileInfo) skipForWriteData() bool {
+	return fi.hlState == hlStateComplete || fi.hlState == hlStatePending || !fi.selected
 }
 
 // finalizeResult stores the outcome of a background finalization.

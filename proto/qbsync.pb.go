@@ -412,6 +412,7 @@ type InitTorrentRequest struct {
 	TorrentFile   []byte                 `protobuf:"bytes,7,opt,name=torrent_file,json=torrentFile,proto3" json:"torrent_file,omitempty"`   // Raw .torrent file for resume state and verification
 	PieceHashes   []string               `protobuf:"bytes,8,rep,name=piece_hashes,json=pieceHashes,proto3" json:"piece_hashes,omitempty"`   // SHA1 hashes per piece (hex-encoded)
 	SaveSubPath   string                 `protobuf:"bytes,9,opt,name=save_sub_path,json=saveSubPath,proto3" json:"save_sub_path,omitempty"` // Relative sub-path prefix for file storage (e.g., "movies" from category)
+	Resync        bool                   `protobuf:"varint,10,opt,name=resync,proto3" json:"resync,omitempty"`                              // Force re-initialization after file selection change
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -509,12 +510,20 @@ func (x *InitTorrentRequest) GetSaveSubPath() string {
 	return ""
 }
 
+func (x *InitTorrentRequest) GetResync() bool {
+	if x != nil {
+		return x.Resync
+	}
+	return false
+}
+
 type FileInfo struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Path          string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
 	Size          int64                  `protobuf:"varint,2,opt,name=size,proto3" json:"size,omitempty"`
 	Offset        int64                  `protobuf:"varint,3,opt,name=offset,proto3" json:"offset,omitempty"`
-	Inode         uint64                 `protobuf:"varint,4,opt,name=inode,proto3" json:"inode,omitempty"` // Source filesystem inode for hardlink detection
+	Inode         uint64                 `protobuf:"varint,4,opt,name=inode,proto3" json:"inode,omitempty"`       // Source filesystem inode for hardlink detection
+	Selected      bool                   `protobuf:"varint,5,opt,name=selected,proto3" json:"selected,omitempty"` // True if file is selected for download (priority > 0)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -575,6 +584,13 @@ func (x *FileInfo) GetInode() uint64 {
 		return x.Inode
 	}
 	return 0
+}
+
+func (x *FileInfo) GetSelected() bool {
+	if x != nil {
+		return x.Selected
+	}
+	return false
 }
 
 type InitTorrentResponse struct {
@@ -1545,7 +1561,7 @@ const file_qbsync_proto_rawDesc = "" +
 	"\asuccess\x18\x03 \x01(\bR\asuccess\x12\x14\n" +
 	"\x05error\x18\x04 \x01(\tR\x05error\x125\n" +
 	"\n" +
-	"error_code\x18\x05 \x01(\x0e2\x16.qbsync.PieceErrorCodeR\terrorCode\"\xba\x02\n" +
+	"error_code\x18\x05 \x01(\x0e2\x16.qbsync.PieceErrorCodeR\terrorCode\"\xd2\x02\n" +
 	"\x12InitTorrentRequest\x12!\n" +
 	"\ftorrent_hash\x18\x01 \x01(\tR\vtorrentHash\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x1d\n" +
@@ -1558,12 +1574,15 @@ const file_qbsync_proto_rawDesc = "" +
 	"\x05files\x18\x06 \x03(\v2\x10.qbsync.FileInfoR\x05files\x12!\n" +
 	"\ftorrent_file\x18\a \x01(\fR\vtorrentFile\x12!\n" +
 	"\fpiece_hashes\x18\b \x03(\tR\vpieceHashes\x12\"\n" +
-	"\rsave_sub_path\x18\t \x01(\tR\vsaveSubPath\"`\n" +
+	"\rsave_sub_path\x18\t \x01(\tR\vsaveSubPath\x12\x16\n" +
+	"\x06resync\x18\n" +
+	" \x01(\bR\x06resync\"|\n" +
 	"\bFileInfo\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x12\n" +
 	"\x04size\x18\x02 \x01(\x03R\x04size\x12\x16\n" +
 	"\x06offset\x18\x03 \x01(\x03R\x06offset\x12\x14\n" +
-	"\x05inode\x18\x04 \x01(\x04R\x05inode\"\xbc\x02\n" +
+	"\x05inode\x18\x04 \x01(\x04R\x05inode\x12\x1a\n" +
+	"\bselected\x18\x05 \x01(\bR\bselected\"\xbc\x02\n" +
 	"\x13InitTorrentResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\x121\n" +

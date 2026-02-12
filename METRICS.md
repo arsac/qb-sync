@@ -59,6 +59,8 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_receive_acks_exit_total` | `reason` | receiveAcks goroutine exits by reason |
 | `qbsync_ack_channel_blocked_total` | | receiveAcks exited because ack channel was blocked too long |
 | `qbsync_connection_scale_events_total` | `direction` | TCP connection scaling events (up/down) |
+| `qbsync_files_early_finalized_total` | | Files synced, closed, and renamed before torrent finalization |
+| `qbsync_file_selection_resyncs_total` | | Re-syncs triggered by file selection changes (hot) |
 
 ## Gauges
 

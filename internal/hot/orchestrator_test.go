@@ -461,7 +461,7 @@ func TestHandleTorrentRemoval(t *testing.T) {
 			logger:           logger,
 			grpcDest:         coldDest,
 			trackedTorrents:  map[string]trackedTorrent{"abc123": {completionTime: time.Now()}},
-			completedOnCold:  map[string]bool{"abc123": true},
+			completedOnCold:  map[string]string{"abc123": ""},
 			finalizeBackoffs: make(map[string]*finalizeBackoff),
 		}
 
@@ -474,7 +474,7 @@ func TestHandleTorrentRemoval(t *testing.T) {
 		task.trackedMu.RUnlock()
 
 		task.completedMu.RLock()
-		if task.completedOnCold["abc123"] {
+		if _, ok := task.completedOnCold["abc123"]; ok {
 			t.Error("torrent should have been removed from completedOnCold")
 		}
 		task.completedMu.RUnlock()
@@ -500,7 +500,7 @@ func TestHandleTorrentRemoval(t *testing.T) {
 			logger:           logger,
 			grpcDest:         coldDest,
 			trackedTorrents:  map[string]trackedTorrent{"abc123": {completionTime: time.Now()}},
-			completedOnCold:  make(map[string]bool),
+			completedOnCold:  make(map[string]string),
 			finalizeBackoffs: make(map[string]*finalizeBackoff),
 		}
 
@@ -526,7 +526,7 @@ func TestHandleTorrentRemoval(t *testing.T) {
 			logger:           logger,
 			grpcDest:         coldDest,
 			trackedTorrents:  map[string]trackedTorrent{"abc123": {completionTime: time.Now()}},
-			completedOnCold:  map[string]bool{"abc123": true},
+			completedOnCold:  map[string]string{"abc123": ""},
 			finalizeBackoffs: make(map[string]*finalizeBackoff),
 		}
 
@@ -541,7 +541,7 @@ func TestHandleTorrentRemoval(t *testing.T) {
 
 		// completedOnCold should be preserved in dry run (no action taken)
 		task.completedMu.RLock()
-		if !task.completedOnCold["abc123"] {
+		if _, ok := task.completedOnCold["abc123"]; !ok {
 			t.Error("completedOnCold should be preserved in dry run mode")
 		}
 		task.completedMu.RUnlock()
@@ -562,7 +562,7 @@ func TestHandleTorrentRemoval(t *testing.T) {
 			logger:           logger,
 			grpcDest:         coldDest,
 			trackedTorrents:  map[string]trackedTorrent{"abc123": {completionTime: time.Now()}},
-			completedOnCold:  make(map[string]bool),
+			completedOnCold:  make(map[string]string),
 			finalizeBackoffs: make(map[string]*finalizeBackoff),
 		}
 
@@ -588,7 +588,7 @@ func TestHandleTorrentRemoval(t *testing.T) {
 			logger:           logger,
 			grpcDest:         coldDest,
 			trackedTorrents:  map[string]trackedTorrent{"abc123": {completionTime: time.Now()}},
-			completedOnCold:  map[string]bool{"abc123": true},
+			completedOnCold:  map[string]string{"abc123": ""},
 			finalizeBackoffs: make(map[string]*finalizeBackoff),
 		}
 
@@ -611,7 +611,7 @@ func TestHandleTorrentRemoval(t *testing.T) {
 			logger:           logger,
 			grpcDest:         coldDest,
 			trackedTorrents:  map[string]trackedTorrent{"abc123": {completionTime: time.Now()}},
-			completedOnCold:  map[string]bool{"abc123": true},
+			completedOnCold:  map[string]string{"abc123": ""},
 			finalizeBackoffs: make(map[string]*finalizeBackoff),
 		}
 
@@ -623,7 +623,7 @@ func TestHandleTorrentRemoval(t *testing.T) {
 
 		// completedOnCold should be preserved when StartTorrent fails
 		task.completedMu.RLock()
-		if !task.completedOnCold["abc123"] {
+		if _, ok := task.completedOnCold["abc123"]; !ok {
 			t.Error("completedOnCold should be preserved when StartTorrent fails")
 		}
 		task.completedMu.RUnlock()
@@ -641,7 +641,7 @@ func TestHandleTorrentRemoval(t *testing.T) {
 			logger:           logger,
 			grpcDest:         coldDest,
 			trackedTorrents:  make(map[string]trackedTorrent),
-			completedOnCold:  make(map[string]bool),
+			completedOnCold:  make(map[string]string),
 			finalizeBackoffs: make(map[string]*finalizeBackoff),
 		}
 
@@ -1295,7 +1295,7 @@ func TestSyncedTagApplication(t *testing.T) {
 			},
 			logger:          logger,
 			srcClient:       mockClient,
-			completedOnCold: make(map[string]bool),
+			completedOnCold: make(map[string]string),
 			trackedTorrents: make(map[string]trackedTorrent),
 		}
 
@@ -1322,7 +1322,7 @@ func TestSyncedTagApplication(t *testing.T) {
 			cfg:             &config.HotConfig{},
 			logger:          logger,
 			srcClient:       mockClient,
-			completedOnCold: make(map[string]bool),
+			completedOnCold: make(map[string]string),
 		}
 
 		// Simulate the tag application logic
@@ -1344,7 +1344,7 @@ func TestSyncedTagApplication(t *testing.T) {
 			},
 			logger:          logger,
 			srcClient:       mockClient,
-			completedOnCold: make(map[string]bool),
+			completedOnCold: make(map[string]string),
 		}
 
 		// Simulate the tag application logic
@@ -1373,7 +1373,7 @@ func TestQueryColdStatus(t *testing.T) {
 			logger:           logger,
 			grpcDest:         coldDest,
 			trackedTorrents:  make(map[string]trackedTorrent),
-			completedOnCold:  make(map[string]bool),
+			completedOnCold:  make(map[string]string),
 			finalizeBackoffs: make(map[string]*finalizeBackoff),
 			tracker:          makeTracker(),
 		}
@@ -1396,7 +1396,7 @@ func TestQueryColdStatus(t *testing.T) {
 			logger:           logger,
 			grpcDest:         coldDest,
 			trackedTorrents:  make(map[string]trackedTorrent),
-			completedOnCold:  make(map[string]bool),
+			completedOnCold:  make(map[string]string),
 			finalizeBackoffs: make(map[string]*finalizeBackoff),
 			tracker:          makeTracker(),
 		}
@@ -1423,7 +1423,7 @@ func TestQueryColdStatus(t *testing.T) {
 			logger:             logger,
 			grpcDest:           coldDest,
 			trackedTorrents:    make(map[string]trackedTorrent),
-			completedOnCold:    make(map[string]bool),
+			completedOnCold:    make(map[string]string),
 			completedCachePath: filepath.Join(tmpDir, "cache.json"),
 			finalizeBackoffs:   make(map[string]*finalizeBackoff),
 			tracker:            makeTracker(),
@@ -1439,7 +1439,7 @@ func TestQueryColdStatus(t *testing.T) {
 		}
 
 		task.completedMu.RLock()
-		if !task.completedOnCold["abc123"] {
+		if _, ok := task.completedOnCold["abc123"]; !ok {
 			t.Error("COMPLETE torrent should be cached")
 		}
 		task.completedMu.RUnlock()
@@ -1456,37 +1456,37 @@ func TestCompletedCachePersistence(t *testing.T) {
 		task := &QBTask{
 			cfg:                &config.HotConfig{},
 			logger:             logger,
-			completedOnCold:    make(map[string]bool),
+			completedOnCold:    make(map[string]string),
 			completedCachePath: cachePath,
 		}
 
 		// Mark some torrents as complete
 		task.completedMu.Lock()
-		task.completedOnCold["hash1"] = true
-		task.completedOnCold["hash2"] = true
-		task.completedOnCold["hash3"] = true
+		task.completedOnCold["hash1"] = ""
+		task.completedOnCold["hash2"] = ""
+		task.completedOnCold["hash3"] = ""
 		task.completedMu.Unlock()
 
 		task.saveCompletedCache()
 
-		// Verify file exists and is valid JSON
+		// Verify file exists and is valid JSON object (new format)
 		data, err := os.ReadFile(cachePath)
 		if err != nil {
 			t.Fatalf("cache file should exist: %v", err)
 		}
-		var hashes []string
-		if jsonErr := json.Unmarshal(data, &hashes); jsonErr != nil {
-			t.Fatalf("cache should be valid JSON: %v", jsonErr)
+		var fingerprints map[string]string
+		if jsonErr := json.Unmarshal(data, &fingerprints); jsonErr != nil {
+			t.Fatalf("cache should be valid JSON object: %v", jsonErr)
 		}
-		if len(hashes) != 3 {
-			t.Errorf("expected 3 hashes in cache, got %d", len(hashes))
+		if len(fingerprints) != 3 {
+			t.Errorf("expected 3 entries in cache, got %d", len(fingerprints))
 		}
 
 		// Load into a new task
 		task2 := &QBTask{
 			cfg:                &config.HotConfig{},
 			logger:             logger,
-			completedOnCold:    make(map[string]bool),
+			completedOnCold:    make(map[string]string),
 			completedCachePath: cachePath,
 		}
 		task2.loadCompletedCache()
@@ -1496,7 +1496,7 @@ func TestCompletedCachePersistence(t *testing.T) {
 			t.Errorf("expected 3 hashes loaded, got %d", len(task2.completedOnCold))
 		}
 		for _, h := range []string{"hash1", "hash2", "hash3"} {
-			if !task2.completedOnCold[h] {
+			if _, ok := task2.completedOnCold[h]; !ok {
 				t.Errorf("expected hash %s to be loaded", h)
 			}
 		}
@@ -1510,7 +1510,7 @@ func TestCompletedCachePersistence(t *testing.T) {
 		task := &QBTask{
 			cfg:                &config.HotConfig{},
 			logger:             logger,
-			completedOnCold:    make(map[string]bool),
+			completedOnCold:    make(map[string]string),
 			completedCachePath: cachePath,
 		}
 
@@ -1534,7 +1534,7 @@ func TestCompletedCachePersistence(t *testing.T) {
 		task := &QBTask{
 			cfg:                &config.HotConfig{},
 			logger:             logger,
-			completedOnCold:    make(map[string]bool),
+			completedOnCold:    make(map[string]string),
 			completedCachePath: cachePath,
 		}
 
@@ -1554,23 +1554,26 @@ func TestCompletedCachePersistence(t *testing.T) {
 		task := &QBTask{
 			cfg:                &config.HotConfig{},
 			logger:             logger,
-			completedOnCold:    make(map[string]bool),
+			completedOnCold:    make(map[string]string),
 			completedCachePath: cachePath,
 		}
 
-		task.markCompletedOnCold("hash_abc")
+		task.markCompletedOnCold("hash_abc", "0,1")
 
 		// Verify persisted
 		data, err := os.ReadFile(cachePath)
 		if err != nil {
 			t.Fatalf("cache file should exist after markCompletedOnCold: %v", err)
 		}
-		var hashes []string
-		if jsonErr := json.Unmarshal(data, &hashes); jsonErr != nil {
-			t.Fatalf("cache should be valid JSON: %v", jsonErr)
+		var fingerprints map[string]string
+		if jsonErr := json.Unmarshal(data, &fingerprints); jsonErr != nil {
+			t.Fatalf("cache should be valid JSON object: %v", jsonErr)
 		}
-		if len(hashes) != 1 || hashes[0] != "hash_abc" {
-			t.Errorf("expected [hash_abc], got %v", hashes)
+		if len(fingerprints) != 1 {
+			t.Errorf("expected 1 entry, got %d", len(fingerprints))
+		}
+		if fp, ok := fingerprints["hash_abc"]; !ok || fp != "0,1" {
+			t.Errorf("expected {hash_abc: 0,1}, got %v", fingerprints)
 		}
 	})
 }
@@ -1689,7 +1692,7 @@ func TestTrackNewTorrents_StateAndProgressFiltering(t *testing.T) {
 			grpcDest:           coldDest,
 			tracker:            tracker,
 			trackedTorrents:    make(map[string]trackedTorrent),
-			completedOnCold:    make(map[string]bool),
+			completedOnCold:    make(map[string]string),
 			completedCachePath: filepath.Join(tmpDir, "cache.json"),
 			finalizeBackoffs:   make(map[string]*finalizeBackoff),
 		}
@@ -1740,7 +1743,7 @@ func TestTrackNewTorrents_StateAndProgressFiltering(t *testing.T) {
 			grpcDest:           coldDest,
 			tracker:            tracker,
 			trackedTorrents:    make(map[string]trackedTorrent),
-			completedOnCold:    make(map[string]bool),
+			completedOnCold:    make(map[string]string),
 			completedCachePath: filepath.Join(tmpDir, "cache.json"),
 			finalizeBackoffs:   make(map[string]*finalizeBackoff),
 		}
@@ -1794,7 +1797,7 @@ func TestTrackNewTorrents_StateAndProgressFiltering(t *testing.T) {
 			grpcDest:           coldDest,
 			tracker:            tracker,
 			trackedTorrents:    make(map[string]trackedTorrent),
-			completedOnCold:    make(map[string]bool),
+			completedOnCold:    make(map[string]string),
 			completedCachePath: filepath.Join(tmpDir, "cache.json"),
 			finalizeBackoffs:   make(map[string]*finalizeBackoff),
 		}
@@ -1893,7 +1896,7 @@ func TestTrackNewTorrents_PrioritizesByProgress(t *testing.T) {
 			grpcDest:           coldDest,
 			tracker:            tracker,
 			trackedTorrents:    make(map[string]trackedTorrent),
-			completedOnCold:    make(map[string]bool),
+			completedOnCold:    make(map[string]string),
 			completedCachePath: filepath.Join(tmpDir, "cache.json"),
 			finalizeBackoffs:   make(map[string]*finalizeBackoff),
 		}
@@ -1945,7 +1948,7 @@ func TestTrackNewTorrents_PrioritizesByProgress(t *testing.T) {
 			grpcDest:           coldDest,
 			tracker:            tracker,
 			trackedTorrents:    make(map[string]trackedTorrent),
-			completedOnCold:    make(map[string]bool),
+			completedOnCold:    make(map[string]string),
 			completedCachePath: filepath.Join(tmpDir, "cache.json"),
 			finalizeBackoffs:   make(map[string]*finalizeBackoff),
 		}
@@ -1966,7 +1969,7 @@ func TestTrackNewTorrents_PrioritizesByProgress(t *testing.T) {
 
 		// hashX should be cached as complete
 		task.completedMu.RLock()
-		if !task.completedOnCold["hashX"] {
+		if _, ok := task.completedOnCold["hashX"]; !ok {
 			t.Error("COMPLETE torrent should be cached")
 		}
 		task.completedMu.RUnlock()
@@ -2137,7 +2140,7 @@ func TestFetchTorrentsCompletedOnCold_ExcludeCleanupTag(t *testing.T) {
 			cfg:             &config.HotConfig{ExcludeCleanupTag: "keep-on-hot"},
 			logger:          logger,
 			srcClient:       mockClient,
-			completedOnCold: map[string]bool{"hash1": true, "hash2": true, "hash3": true},
+			completedOnCold: map[string]string{"hash1": "", "hash2": "", "hash3": ""},
 		}
 
 		result, err := task.fetchTorrentsCompletedOnCold(context.Background())
@@ -2164,7 +2167,7 @@ func TestFetchTorrentsCompletedOnCold_ExcludeCleanupTag(t *testing.T) {
 			cfg:             &config.HotConfig{},
 			logger:          logger,
 			srcClient:       mockClient,
-			completedOnCold: map[string]bool{"hash1": true, "hash2": true},
+			completedOnCold: map[string]string{"hash1": "", "hash2": ""},
 		}
 
 		result, err := task.fetchTorrentsCompletedOnCold(context.Background())
@@ -2188,7 +2191,7 @@ func TestFetchTorrentsCompletedOnCold_ExcludeCleanupTag(t *testing.T) {
 			cfg:             &config.HotConfig{ExcludeCleanupTag: "keep-on-hot"},
 			logger:          logger,
 			srcClient:       mockClient,
-			completedOnCold: map[string]bool{"hash1": true, "hash2": true},
+			completedOnCold: map[string]string{"hash1": "", "hash2": ""},
 		}
 		task.draining.Store(true)
 
@@ -2210,7 +2213,7 @@ func TestFetchTorrentsCompletedOnCold_ExcludeCleanupTag(t *testing.T) {
 				{Hash: "hash1", Tags: "protected", Size: 100},
 				{Hash: "hash2", Tags: "", Size: 200},
 			},
-			completedOnCold: map[string]bool{"hash1": true, "hash2": true},
+			completedOnCold: map[string]string{"hash1": "", "hash2": ""},
 		}
 
 		result, err := task.fetchTorrentsCompletedOnCold(context.Background())
@@ -2238,7 +2241,7 @@ func TestDrain(t *testing.T) {
 			cfg:             &config.HotConfig{MinSpaceGB: 10},
 			logger:          logger,
 			srcClient:       mockClient,
-			completedOnCold: make(map[string]bool),
+			completedOnCold: make(map[string]string),
 			trackedTorrents: make(map[string]trackedTorrent),
 		}
 
@@ -2271,7 +2274,7 @@ func TestDrain(t *testing.T) {
 			srcClient:       mockClient,
 			grpcDest:        coldDest,
 			source:          qbclient.NewSource(nil, ""),
-			completedOnCold: map[string]bool{"abc123": true},
+			completedOnCold: map[string]string{"abc123": ""},
 			trackedTorrents: make(map[string]trackedTorrent),
 		}
 
@@ -2292,7 +2295,7 @@ func TestDrain(t *testing.T) {
 		task := &QBTask{
 			cfg:             &config.HotConfig{MinSpaceGB: 10},
 			logger:          logger,
-			completedOnCold: make(map[string]bool),
+			completedOnCold: make(map[string]string),
 			trackedTorrents: make(map[string]trackedTorrent),
 		}
 
@@ -2305,5 +2308,218 @@ func TestDrain(t *testing.T) {
 		}
 
 		task.draining.Store(false)
+	})
+}
+
+func TestSelectedFingerprint(t *testing.T) {
+	t.Run("all files selected returns all indices", func(t *testing.T) {
+		files := qbittorrent.TorrentFiles{
+			{Index: 0, Name: "file0.bin", Priority: 1},
+			{Index: 1, Name: "file1.bin", Priority: 6},
+			{Index: 2, Name: "file2.bin", Priority: 7},
+		}
+		got := selectedFingerprint(files)
+		if got != "0,1,2" {
+			t.Errorf("expected '0,1,2', got %q", got)
+		}
+	})
+
+	t.Run("no files selected returns empty string", func(t *testing.T) {
+		files := qbittorrent.TorrentFiles{
+			{Index: 0, Name: "file0.bin", Priority: 0},
+			{Index: 1, Name: "file1.bin", Priority: 0},
+		}
+		got := selectedFingerprint(files)
+		if got != "" {
+			t.Errorf("expected empty string, got %q", got)
+		}
+	})
+
+	t.Run("partial selection skips priority-zero files", func(t *testing.T) {
+		files := qbittorrent.TorrentFiles{
+			{Index: 0, Name: "file0.bin", Priority: 1},
+			{Index: 1, Name: "file1.bin", Priority: 0},
+			{Index: 2, Name: "file2.bin", Priority: 7},
+			{Index: 3, Name: "file3.bin", Priority: 0},
+			{Index: 4, Name: "file4.bin", Priority: 1},
+		}
+		got := selectedFingerprint(files)
+		if got != "0,2,4" {
+			t.Errorf("expected '0,2,4', got %q", got)
+		}
+	})
+
+	t.Run("single file selected", func(t *testing.T) {
+		files := qbittorrent.TorrentFiles{
+			{Index: 0, Name: "file0.bin", Priority: 0},
+			{Index: 1, Name: "file1.bin", Priority: 0},
+			{Index: 2, Name: "file2.bin", Priority: 6},
+		}
+		got := selectedFingerprint(files)
+		if got != "2" {
+			t.Errorf("expected '2', got %q", got)
+		}
+	})
+
+	t.Run("empty file list returns empty string", func(t *testing.T) {
+		files := qbittorrent.TorrentFiles{}
+		got := selectedFingerprint(files)
+		if got != "" {
+			t.Errorf("expected empty string, got %q", got)
+		}
+	})
+
+	t.Run("high index values are handled", func(t *testing.T) {
+		files := qbittorrent.TorrentFiles{
+			{Index: 100, Name: "file100.bin", Priority: 1},
+			{Index: 200, Name: "file200.bin", Priority: 0},
+			{Index: 300, Name: "file300.bin", Priority: 7},
+		}
+		got := selectedFingerprint(files)
+		if got != "100,300" {
+			t.Errorf("expected '100,300', got %q", got)
+		}
+	})
+}
+
+func TestLoadCompletedCacheLegacy(t *testing.T) {
+	logger := testLogger(t)
+
+	t.Run("loads legacy array format into map with empty fingerprints", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		cachePath := filepath.Join(tmpDir, "cache.json")
+
+		// Write legacy format: JSON array of hashes
+		legacyData := `["hash1","hash2","hash3"]`
+		if err := os.WriteFile(cachePath, []byte(legacyData), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		task := &QBTask{
+			cfg:                &config.HotConfig{},
+			logger:             logger,
+			completedOnCold:    make(map[string]string),
+			completedCachePath: cachePath,
+		}
+
+		task.loadCompletedCache()
+
+		task.completedMu.RLock()
+		defer task.completedMu.RUnlock()
+
+		if len(task.completedOnCold) != 3 {
+			t.Fatalf("expected 3 entries, got %d", len(task.completedOnCold))
+		}
+
+		for _, hash := range []string{"hash1", "hash2", "hash3"} {
+			fp, ok := task.completedOnCold[hash]
+			if !ok {
+				t.Errorf("expected hash %s to be loaded", hash)
+			}
+			if fp != "" {
+				t.Errorf("expected empty fingerprint for legacy hash %s, got %q", hash, fp)
+			}
+		}
+	})
+
+	t.Run("loads new object format with fingerprints", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		cachePath := filepath.Join(tmpDir, "cache.json")
+
+		// Write new format: JSON object with fingerprints
+		newData := `{"hash1":"0,1","hash2":"0,1,2","hash3":""}`
+		if err := os.WriteFile(cachePath, []byte(newData), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		task := &QBTask{
+			cfg:                &config.HotConfig{},
+			logger:             logger,
+			completedOnCold:    make(map[string]string),
+			completedCachePath: cachePath,
+		}
+
+		task.loadCompletedCache()
+
+		task.completedMu.RLock()
+		defer task.completedMu.RUnlock()
+
+		if len(task.completedOnCold) != 3 {
+			t.Fatalf("expected 3 entries, got %d", len(task.completedOnCold))
+		}
+
+		expected := map[string]string{
+			"hash1": "0,1",
+			"hash2": "0,1,2",
+			"hash3": "",
+		}
+		for hash, wantFP := range expected {
+			gotFP, ok := task.completedOnCold[hash]
+			if !ok {
+				t.Errorf("expected hash %s to be loaded", hash)
+			}
+			if gotFP != wantFP {
+				t.Errorf("hash %s: expected fingerprint %q, got %q", hash, wantFP, gotFP)
+			}
+		}
+	})
+
+	t.Run("new format takes priority over legacy", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		cachePath := filepath.Join(tmpDir, "cache.json")
+
+		// A JSON object is valid for both Unmarshal(map) and Unmarshal(slice) paths,
+		// but Unmarshal into map[string]string succeeds first.
+		objectData := `{"hashA":"0,1"}`
+		if err := os.WriteFile(cachePath, []byte(objectData), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		task := &QBTask{
+			cfg:                &config.HotConfig{},
+			logger:             logger,
+			completedOnCold:    make(map[string]string),
+			completedCachePath: cachePath,
+		}
+
+		task.loadCompletedCache()
+
+		task.completedMu.RLock()
+		defer task.completedMu.RUnlock()
+
+		fp, ok := task.completedOnCold["hashA"]
+		if !ok {
+			t.Fatal("expected hashA to be loaded")
+		}
+		if fp != "0,1" {
+			t.Errorf("expected fingerprint '0,1', got %q", fp)
+		}
+	})
+
+	t.Run("empty legacy array loads empty cache", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		cachePath := filepath.Join(tmpDir, "cache.json")
+
+		if err := os.WriteFile(cachePath, []byte(`[]`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		task := &QBTask{
+			cfg:                &config.HotConfig{},
+			logger:             logger,
+			completedOnCold:    make(map[string]string),
+			completedCachePath: cachePath,
+		}
+
+		task.loadCompletedCache()
+
+		task.completedMu.RLock()
+		defer task.completedMu.RUnlock()
+
+		// Note: json.Unmarshal([]byte("[]"), &map[string]string{}) will actually
+		// fail, causing the fallback to the array path which yields 0 entries.
+		if len(task.completedOnCold) != 0 {
+			t.Errorf("expected 0 entries, got %d", len(task.completedOnCold))
+		}
 	})
 }

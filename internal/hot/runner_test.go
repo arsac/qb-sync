@@ -51,7 +51,7 @@ func setupShutdownDrain(
 		srcClient:       mockClient,
 		grpcDest:        coldDest,
 		source:          qbclient.NewSource(nil, ""),
-		completedOnCold: map[string]bool{"abc123": true},
+		completedOnCold: map[string]string{"abc123": ""},
 		trackedTorrents: make(map[string]trackedTorrent),
 	}
 

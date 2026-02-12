@@ -5,11 +5,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/autobrr/go-qbittorrent"
 
+	"github.com/arsac/qb-sync/internal/metrics"
 	"github.com/arsac/qb-sync/internal/streaming"
 	pb "github.com/arsac/qb-sync/proto"
 )
@@ -70,7 +74,7 @@ func (t *QBTask) trackNewTorrents(ctx context.Context) error {
 		}
 
 		t.completedMu.RLock()
-		knownComplete := t.completedOnCold[torrent.Hash]
+		_, knownComplete := t.completedOnCold[torrent.Hash]
 		t.completedMu.RUnlock()
 		if knownComplete {
 			continue
@@ -152,7 +156,7 @@ func (t *QBTask) queryColdStatus(
 
 	switch initResp.Status {
 	case pb.TorrentSyncStatus_SYNC_STATUS_COMPLETE:
-		t.markCompletedOnCold(torrent.Hash)
+		t.markCompletedOnCold(torrent.Hash, "")
 		t.logger.InfoContext(ctx, "torrent already complete on cold",
 			"name", torrent.Name,
 			"hash", torrent.Hash,
@@ -227,4 +231,129 @@ func (t *QBTask) startTrackingReady(
 	t.trackedMu.Unlock()
 
 	return true
+}
+
+// selectedFingerprint computes a fingerprint from the selected (priority > 0) file indices.
+// The result is a sorted, comma-separated string of indices, e.g. "0,1,3".
+// Indices are sorted to produce a deterministic fingerprint regardless of API response order.
+func selectedFingerprint(files qbittorrent.TorrentFiles) string {
+	var indices []int
+	for _, f := range files {
+		if f.Priority > 0 {
+			indices = append(indices, f.Index)
+		}
+	}
+	slices.Sort(indices)
+	result := make([]string, len(indices))
+	for i, idx := range indices {
+		result[i] = strconv.Itoa(idx)
+	}
+	return strings.Join(result, ",")
+}
+
+// computeSelectionFingerprint fetches file info from qBittorrent and returns
+// the selection fingerprint. Returns "" on error (will re-check next cycle).
+func (t *QBTask) computeSelectionFingerprint(ctx context.Context, hash string) string {
+	qbFiles, err := t.srcClient.GetFilesInformationCtx(ctx, hash)
+	if err != nil {
+		return ""
+	}
+	return selectedFingerprint(*qbFiles)
+}
+
+// findTorrentByHash looks up a torrent from the per-cycle cache.
+func (t *QBTask) findTorrentByHash(hash string) *qbittorrent.Torrent {
+	for i := range t.cycleTorrents {
+		if t.cycleTorrents[i].Hash == hash {
+			return &t.cycleTorrents[i]
+		}
+	}
+	return nil
+}
+
+// recheckFileSelections compares stored fingerprints against current qBittorrent
+// file priorities. On change: evicts caches, calls InitTorrent with resync=true,
+// and starts tracking for the newly-selected pieces.
+func (t *QBTask) recheckFileSelections(ctx context.Context) {
+	t.completedMu.RLock()
+	completed := maps.Clone(t.completedOnCold)
+	t.completedMu.RUnlock()
+
+	var changed bool
+	for hash, storedFingerprint := range completed {
+		qbFiles, err := t.srcClient.GetFilesInformationCtx(ctx, hash)
+		if err != nil {
+			continue // torrent may have been removed; pruneCompletedOnCold handles that
+		}
+
+		currentFingerprint := selectedFingerprint(*qbFiles)
+		if currentFingerprint == storedFingerprint {
+			continue
+		}
+
+		t.logger.InfoContext(ctx, "file selection changed, initiating re-sync",
+			"hash", hash,
+			"oldFingerprint", storedFingerprint,
+			"newFingerprint", currentFingerprint,
+		)
+		metrics.FileSelectionResyncsTotal.Inc()
+		changed = true
+
+		t.resyncFileSelection(ctx, hash, currentFingerprint)
+	}
+
+	if changed {
+		t.saveCompletedCache()
+	}
+}
+
+// resyncFileSelection evicts caches, re-initializes the torrent on cold with
+// resync=true, and starts tracking any newly-needed pieces for streaming.
+func (t *QBTask) resyncFileSelection(ctx context.Context, hash, fingerprint string) {
+	// Evict caches so next InitTorrent gets fresh metadata
+	t.completedMu.Lock()
+	delete(t.completedOnCold, hash)
+	t.completedMu.Unlock()
+	t.source.EvictCache(hash)
+	t.grpcDest.ClearInitResult(hash)
+
+	// Get fresh metadata with updated file selection
+	meta, metaErr := t.source.GetTorrentMetadata(ctx, hash)
+	if metaErr != nil {
+		t.logger.WarnContext(ctx, "re-sync: failed to get metadata", "hash", hash, "error", metaErr)
+		return
+	}
+
+	// Call InitTorrent with resync=true to clear stale qBittorrent entry
+	meta.InitTorrentRequest.Resync = true
+	result, initErr := t.grpcDest.InitTorrent(ctx, meta.InitTorrentRequest)
+	if initErr != nil {
+		t.logger.WarnContext(ctx, "re-sync: InitTorrent failed", "hash", hash, "error", initErr)
+		return
+	}
+
+	if result.PiecesNeededCount <= 0 {
+		// All selected pieces already on cold — mark complete directly
+		t.markCompletedOnCold(hash, fingerprint)
+		return
+	}
+
+	// Start tracking for streaming
+	alreadyWritten := invertPiecesNeeded(result.PiecesNeeded)
+	if trackErr := t.tracker.TrackTorrentWithResume(ctx, hash, alreadyWritten); trackErr != nil {
+		t.logger.WarnContext(ctx, "re-sync: failed to track", "hash", hash, "error", trackErr)
+		return
+	}
+
+	tt := trackedTorrent{completionTime: time.Now(), name: hash}
+	if torrent := t.findTorrentByHash(hash); torrent != nil {
+		tt = trackedTorrent{
+			completionTime: completionTimeOrNow(torrent.CompletionOn),
+			name:           torrent.Name,
+			size:           torrent.Size,
+		}
+	}
+	t.trackedMu.Lock()
+	t.trackedTorrents[hash] = tt
+	t.trackedMu.Unlock()
 }

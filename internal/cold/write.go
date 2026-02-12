@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/arsac/qb-sync/internal/metrics"
@@ -54,7 +55,7 @@ func (s *Server) writePieceData(state *serverTorrentState, offset int64, data []
 		availableInFile := fi.size - fileWriteOffset
 		toProcess := min(int64(len(remaining)), availableInFile)
 
-		if fi.hlState == hlStateComplete || fi.hlState == hlStatePending {
+		if fi.skipForWriteData() {
 			remaining = remaining[toProcess:]
 			currentOffset += toProcess
 			continue
@@ -200,6 +201,7 @@ func (s *Server) WritePiece(
 	}
 
 	s.markPieceWritten(ctx, torrentHash, state, pieceIndex)
+	s.checkFileCompletions(ctx, torrentHash, state, pieceIndex)
 	metrics.PieceWriteDuration.Observe(time.Since(writeStart).Seconds())
 
 	metrics.PiecesReceivedTotal.Inc()
@@ -213,4 +215,47 @@ func (s *Server) WritePiece(
 	}
 
 	return &pb.WritePieceResponse{Success: true}, nil
+}
+
+// checkFileCompletions checks if the just-written piece completes any file's
+// piece coverage. If so, immediately syncs, closes, and renames that file from
+// .partial to its final path. Caller must hold state.mu.
+func (s *Server) checkFileCompletions(
+	ctx context.Context,
+	hash string,
+	state *serverTorrentState,
+	pieceIndex int32,
+) {
+	idx := int(pieceIndex)
+	for i, fi := range state.files {
+		if fi.earlyFinalized || fi.size <= 0 {
+			continue
+		}
+		if fi.hlState == hlStateComplete || fi.hlState == hlStatePending {
+			continue
+		}
+		if idx < fi.firstPiece || idx > fi.lastPiece {
+			continue
+		}
+		fi.piecesWritten++
+		if fi.piecesWritten < fi.piecesTotal {
+			continue
+		}
+		// File complete — sync, close, rename
+		if err := s.closeFileHandle(ctx, hash, fi); err != nil {
+			s.logger.WarnContext(ctx, "early finalization sync failed, deferring",
+				"hash", hash, "file", fi.path, "error", err)
+			continue // finalizeFiles() will retry
+		}
+		if err := s.renamePartialFile(ctx, hash, fi); err != nil {
+			s.logger.WarnContext(ctx, "early finalization rename failed, deferring",
+				"hash", hash, "file", fi.path, "error", err)
+			continue
+		}
+		fi.path = strings.TrimSuffix(fi.path, partialSuffix)
+		fi.earlyFinalized = true
+		metrics.FilesEarlyFinalizedTotal.Inc()
+		s.logger.InfoContext(ctx, "file early-finalized",
+			"hash", hash, "file", fi.path, "fileIndex", i)
+	}
 }

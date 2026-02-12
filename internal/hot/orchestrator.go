@@ -72,9 +72,10 @@ type QBTask struct {
 	trackedTorrents map[string]trackedTorrent
 	trackedMu       sync.RWMutex
 
-	// Torrents known to be complete on cold (persisted to disk)
-	// Cold qBittorrent is the source of truth; synced tag is for visibility only
-	completedOnCold    map[string]bool
+	// Torrents known to be complete on cold (persisted to disk).
+	// Value is the selection fingerprint (sorted selected file indices, e.g. "0,1,3").
+	// Cold qBittorrent is the source of truth; synced tag is for visibility only.
+	completedOnCold    map[string]string
 	completedMu        sync.RWMutex
 	completedCachePath string
 
@@ -147,7 +148,7 @@ func NewQBTask(
 		tracker:            tracker,
 		queue:              queue,
 		trackedTorrents:    make(map[string]trackedTorrent),
-		completedOnCold:    make(map[string]bool),
+		completedOnCold:    make(map[string]string),
 		completedCachePath: filepath.Join(cfg.DataPath, ".qb-sync", "completed_on_cold.json"),
 		finalizeBackoffs:   make(map[string]*finalizeBackoff),
 	}
@@ -250,5 +251,6 @@ func (t *QBTask) runOnce(ctx context.Context) {
 	if t.pruneCycleCount >= pruneCycleInterval {
 		t.pruneCycleCount = 0
 		t.pruneCompletedOnCold(ctx)
+		t.recheckFileSelections(ctx)
 	}
 }
