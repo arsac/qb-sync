@@ -2012,4 +2012,97 @@ func TestInitTorrentResync_ExistingState(t *testing.T) {
 			t.Error("file2 should be selected after re-sync")
 		}
 	})
+
+	// Scenario: boundary piece spans file1 (previously selected) and file2
+	// (newly selected). The old .state file has the boundary piece marked as
+	// "written", but only file1's portion was written during the first sync.
+	// Re-sync must clear the .state file so the boundary piece is re-streamed.
+	t.Run("clears persisted state so boundary pieces are re-streamed", func(t *testing.T) {
+		t.Parallel()
+		tmpDir := t.TempDir()
+		s := &Server{
+			config:         ServerConfig{BasePath: tmpDir},
+			logger:         logger,
+			torrents:       make(map[string]*serverTorrentState),
+			abortingHashes: make(map[string]chan struct{}),
+			inodes:         NewInodeRegistry(tmpDir, logger),
+		}
+
+		// 3 pieces, 1024-byte piece size, 2560 bytes total:
+		//   piece 0: bytes 0-1023     → entirely in file1 (0-1535)
+		//   piece 1: bytes 1024-2047  → boundary: file1 (0-1535) + file2 (1536-2559)
+		//   piece 2: bytes 2048-2559  → entirely in file2 (1536-2559)
+		//
+		// First sync had file2 deselected. Piece 1 was written but only file1's
+		// portion (bytes 1024-1535). File2's portion (bytes 1536-2047) was skipped.
+		metaDir := filepath.Join(tmpDir, metaDirName, "boundaryhash")
+		if err := os.MkdirAll(metaDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeTestFile(t, filepath.Join(metaDir, versionFileName), []byte(metaVersion))
+
+		// Persist old .state: all 3 pieces "written"
+		// (piece 2 was "covered" because file2 was unselected)
+		oldWritten := []bool{true, true, true}
+		stateData := make([]byte, len(oldWritten))
+		for i, w := range oldWritten {
+			if w {
+				stateData[i] = 1
+			}
+		}
+		if writeErr := os.WriteFile(filepath.Join(metaDir, ".state"), stateData, 0o644); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+
+		// Pre-existing state in memory
+		s.torrents["boundaryhash"] = &serverTorrentState{
+			info: &pb.InitTorrentRequest{
+				TorrentHash: "boundaryhash",
+				NumPieces:   3,
+				PieceSize:   1024,
+				TotalSize:   2560,
+			},
+			written:      []bool{true, true, true},
+			writtenCount: 3,
+			pieceLength:  1024,
+			totalSize:    2560,
+			files: []*serverFileInfo{
+				{path: filepath.Join(tmpDir, "data", "file1.bin"), size: 1536, offset: 0, selected: true},
+				{path: filepath.Join(tmpDir, "data", "file2.bin"), size: 1024, offset: 1536, selected: false},
+			},
+		}
+
+		// File1 at final path (previously synced)
+		writeTestFile(t, filepath.Join(tmpDir, "data", "file1.bin"), make([]byte, 1536))
+
+		resp, err := s.InitTorrent(ctx, &pb.InitTorrentRequest{
+			TorrentHash: "boundaryhash",
+			Name:        "test-boundary",
+			NumPieces:   3,
+			PieceSize:   1024,
+			TotalSize:   2560,
+			Resync:      true,
+			Files: []*pb.FileInfo{
+				{Path: "data/file1.bin", Size: 1536, Offset: 0, Selected: true},
+				{Path: "data/file2.bin", Size: 1024, Offset: 1536, Selected: true},
+			},
+		})
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !resp.GetSuccess() {
+			t.Fatalf("expected success, got error: %s", resp.GetError())
+		}
+
+		// Piece 0: entirely in file1 (pre-existing) → have
+		// Piece 1: boundary file1+file2, file2 has no data → need
+		// Piece 2: entirely in file2, no data → need
+		if resp.GetPiecesHaveCount() != 1 {
+			t.Errorf("expected 1 piece have (piece 0 in pre-existing file1), got %d", resp.GetPiecesHaveCount())
+		}
+		if resp.GetPiecesNeededCount() != 2 {
+			t.Errorf("expected 2 pieces needed (boundary + file2-only), got %d", resp.GetPiecesNeededCount())
+		}
+	})
 }

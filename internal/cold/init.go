@@ -56,6 +56,16 @@ func (s *Server) InitTorrent(
 		// which rebuilds files, coverage, and written bitmap from scratch.
 		if req.GetResync() && len(req.GetFiles()) > 0 {
 			delete(s.torrents, hash)
+
+			// Delete persisted .state so buildWrittenBitmap starts fresh.
+			// During the first sync with partial selection, boundary pieces
+			// spanning selected + unselected files were marked "written" but
+			// only the selected-file portion was actually written to disk.
+			// On re-sync those pieces must be re-streamed for the newly-
+			// selected portions.
+			stateFile := filepath.Join(s.config.BasePath, metaDirName, hash, ".state")
+			_ = os.Remove(stateFile)
+
 			s.logger.InfoContext(ctx, "re-sync: cleared existing state for re-initialization",
 				"hash", hash)
 			// Fall through to initNewTorrent below
