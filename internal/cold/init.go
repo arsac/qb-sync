@@ -37,31 +37,9 @@ func (s *Server) InitTorrent(
 		return initErrorResponse("abort in progress: %v", err), nil
 	}
 
-	// Check if torrent is already complete in cold qBittorrent
-	switch s.checkTorrentInQB(ctx, hash) {
-	case qbCheckComplete:
-		// If this is a re-sync (file selection changed), delete the stale
-		// qBittorrent entry so we can re-initialize with updated file selection.
-		// The torrent was added with skip_checking=true previously and may report
-		// 100% even though newly-selected files are missing.
-		if len(req.GetFiles()) > 0 && req.GetResync() {
-			if delErr := s.deleteTorrentFromQB(ctx, hash); delErr != nil {
-				return initErrorResponse("re-sync: failed to delete stale qB entry: %v", delErr), nil
-			}
-			// Fall through to check local state
-		} else {
-			return &pb.InitTorrentResponse{
-				Success: true,
-				Status:  pb.TorrentSyncStatus_SYNC_STATUS_COMPLETE,
-			}, nil
-		}
-	case qbCheckVerifying:
-		return &pb.InitTorrentResponse{
-			Success: true,
-			Status:  pb.TorrentSyncStatus_SYNC_STATUS_VERIFYING,
-		}, nil
-	case qbCheckNotFound:
-		// Continue to check local state
+	// Check if torrent is already complete/verifying in cold qBittorrent.
+	if resp := s.handleQBCheck(ctx, hash, req); resp != nil {
+		return resp, nil
 	}
 
 	s.mu.Lock()
@@ -72,9 +50,20 @@ func (s *Server) InitTorrent(
 			s.mu.Unlock()
 			return initErrorResponse("torrent initialization already in progress"), nil
 		}
-		s.mu.Unlock()
-		resp := s.resumeTorrent(ctx, hash, state, req)
-		return resp, nil
+
+		// Re-sync: file selection changed, so we must re-initialize with the
+		// updated selection. Delete old state and fall through to initNewTorrent
+		// which rebuilds files, coverage, and written bitmap from scratch.
+		if req.GetResync() && len(req.GetFiles()) > 0 {
+			delete(s.torrents, hash)
+			s.logger.InfoContext(ctx, "re-sync: cleared existing state for re-initialization",
+				"hash", hash)
+			// Fall through to initNewTorrent below
+		} else {
+			s.mu.Unlock()
+			resp := s.resumeTorrent(ctx, hash, state, req)
+			return resp, nil
+		}
 	}
 
 	// Don't create state for minimal requests (e.g., CheckTorrentStatus sends only hash).
@@ -330,6 +319,40 @@ func buildReadyResponse(written []bool, hardlinkResults []*pb.HardlinkResult) *p
 		PiecesNeededCount: needCount,
 		PiecesHaveCount:   haveCount,
 	}
+}
+
+// handleQBCheck checks the torrent's state in cold qBittorrent and returns
+// a response if the caller should short-circuit (complete or verifying).
+// Returns nil if InitTorrent should continue to check local state.
+func (s *Server) handleQBCheck(
+	ctx context.Context,
+	hash string,
+	req *pb.InitTorrentRequest,
+) *pb.InitTorrentResponse {
+	switch s.checkTorrentInQB(ctx, hash) {
+	case qbCheckComplete:
+		// Re-sync: file selection changed, delete stale qB entry so we can
+		// re-initialize with updated selection. The torrent was added with
+		// skip_checking=true and may report 100% even with missing files.
+		if len(req.GetFiles()) > 0 && req.GetResync() {
+			if delErr := s.deleteTorrentFromQB(ctx, hash); delErr != nil {
+				return initErrorResponse("re-sync: failed to delete stale qB entry: %v", delErr)
+			}
+			return nil // Fall through to check local state
+		}
+		return &pb.InitTorrentResponse{
+			Success: true,
+			Status:  pb.TorrentSyncStatus_SYNC_STATUS_COMPLETE,
+		}
+	case qbCheckVerifying:
+		return &pb.InitTorrentResponse{
+			Success: true,
+			Status:  pb.TorrentSyncStatus_SYNC_STATUS_VERIFYING,
+		}
+	case qbCheckNotFound:
+		return nil // Continue to check local state
+	}
+	return nil
 }
 
 // checkTorrentInQB checks if the torrent already exists in cold qBittorrent.

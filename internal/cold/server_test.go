@@ -1926,3 +1926,90 @@ func TestInitTorrentResync_PartialRecovery(t *testing.T) {
 		}
 	})
 }
+
+func TestInitTorrentResync_ExistingState(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	logger := testLogger(t)
+
+	// Scenario: torrent was initially synced with file2 deselected. Now file2 is
+	// selected, and hot sends resync=true. Cold has in-memory state with file2
+	// marked selected=false. The fix must clear old state and re-initialize so
+	// that pieces covering file2 are returned in PiecesNeeded.
+	t.Run("re-initializes with updated file selection", func(t *testing.T) {
+		t.Parallel()
+		tmpDir := t.TempDir()
+		s := &Server{
+			config:         ServerConfig{BasePath: tmpDir},
+			logger:         logger,
+			torrents:       make(map[string]*serverTorrentState),
+			abortingHashes: make(map[string]chan struct{}),
+			inodes:         NewInodeRegistry(tmpDir, logger),
+		}
+
+		// Simulate existing state: 2 files, file2 deselected, all pieces "written"
+		// (piece 1 was covered because its only overlapping file is unselected).
+		s.torrents["resyncstate"] = &serverTorrentState{
+			info: &pb.InitTorrentRequest{
+				TorrentHash: "resyncstate",
+				NumPieces:   2,
+				PieceSize:   512,
+				TotalSize:   1024,
+			},
+			written:      []bool{true, true}, // Both marked written (piece 1 "covered")
+			writtenCount: 2,
+			pieceLength:  512,
+			totalSize:    1024,
+			files: []*serverFileInfo{
+				{path: filepath.Join(tmpDir, "data", "file1.bin"), size: 512, offset: 0, selected: true},
+				{path: filepath.Join(tmpDir, "data", "file2.bin"), size: 512, offset: 512, selected: false},
+			},
+		}
+
+		// Pre-create file1 on disk (previously synced)
+		writeTestFile(t, filepath.Join(tmpDir, "data", "file1.bin"), make([]byte, 512))
+
+		// Re-sync with file2 now selected
+		resp, err := s.InitTorrent(ctx, &pb.InitTorrentRequest{
+			TorrentHash: "resyncstate",
+			Name:        "test-resync-state",
+			NumPieces:   2,
+			PieceSize:   512,
+			TotalSize:   1024,
+			Resync:      true,
+			Files: []*pb.FileInfo{
+				{Path: "data/file1.bin", Size: 512, Offset: 0, Selected: true},
+				{Path: "data/file2.bin", Size: 512, Offset: 512, Selected: true},
+			},
+		})
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !resp.GetSuccess() {
+			t.Fatalf("expected success, got error: %s", resp.GetError())
+		}
+		if resp.GetStatus() != pb.TorrentSyncStatus_SYNC_STATUS_READY {
+			t.Errorf("expected READY, got %v", resp.GetStatus())
+		}
+
+		// file1 pre-existing → 1 piece have; file2 newly selected → 1 piece needed
+		if resp.GetPiecesHaveCount() != 1 {
+			t.Errorf("expected 1 piece have (file1 pre-existing), got %d", resp.GetPiecesHaveCount())
+		}
+		if resp.GetPiecesNeededCount() != 1 {
+			t.Errorf("expected 1 piece needed (file2 newly selected), got %d", resp.GetPiecesNeededCount())
+		}
+
+		// Verify state was re-initialized with updated selection
+		s.mu.RLock()
+		state := s.torrents["resyncstate"]
+		s.mu.RUnlock()
+		if state == nil {
+			t.Fatal("torrent state should exist after re-sync")
+		}
+		if !state.files[1].selected {
+			t.Error("file2 should be selected after re-sync")
+		}
+	})
+}
