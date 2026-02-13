@@ -196,7 +196,7 @@ func TestCalculatePiecesCovered_UnselectedFiles(t *testing.T) {
 
 func TestWritePieceData_SkipsUnselectedFiles(t *testing.T) {
 	t.Parallel()
-	_, tmpDir := newTestColdServer(t)
+	_, tmpDir := newTestDestServer(t)
 
 	// File 0: selected, gets data written
 	selectedPath := filepath.Join(tmpDir, "selected.bin.partial")
@@ -364,7 +364,7 @@ func TestSetupFile_UnselectedFile(t *testing.T) {
 
 func TestFinalizeTorrent_PartialSelection(t *testing.T) {
 	t.Parallel()
-	s, tmpDir := newTestColdServer(t)
+	s, tmpDir := newTestDestServer(t)
 	s.inodes = NewInodeRegistry(tmpDir, testLogger(t))
 
 	hash := "partial-select-finalize"
@@ -469,7 +469,7 @@ func TestFinalizeTorrent_PartialSelection(t *testing.T) {
 
 func TestRecoverTorrentState_LoadsSelection(t *testing.T) {
 	t.Parallel()
-	s, tmpDir := newTestColdServer(t)
+	s, tmpDir := newTestDestServer(t)
 
 	hash := "recover-selection"
 	metaDir := filepath.Join(tmpDir, metaDirName, hash)
@@ -516,7 +516,7 @@ func TestRecoverTorrentState_LoadsSelection(t *testing.T) {
 
 func TestRecoverTorrentState_NoSelectedFile_DefaultsAllSelected(t *testing.T) {
 	t.Parallel()
-	s, tmpDir := newTestColdServer(t)
+	s, tmpDir := newTestDestServer(t)
 
 	hash := "recover-no-selection"
 	metaDir := filepath.Join(tmpDir, metaDirName, hash)
@@ -544,7 +544,7 @@ func TestRecoverTorrentState_NoSelectedFile_DefaultsAllSelected(t *testing.T) {
 
 func TestRecoverTorrentState_StaleVersion_NukesDirectory(t *testing.T) {
 	t.Parallel()
-	s, tmpDir := newTestColdServer(t)
+	s, tmpDir := newTestDestServer(t)
 
 	hash := "recover-stale-version"
 	metaDir := filepath.Join(tmpDir, metaDirName, hash)
@@ -569,7 +569,7 @@ func TestRecoverTorrentState_StaleVersion_NukesDirectory(t *testing.T) {
 
 func TestRecoverTorrentState_MissingVersion_NukesDirectory(t *testing.T) {
 	t.Parallel()
-	s, tmpDir := newTestColdServer(t)
+	s, tmpDir := newTestDestServer(t)
 
 	hash := "recover-no-version"
 	metaDir := filepath.Join(tmpDir, metaDirName, hash)
@@ -598,7 +598,7 @@ func TestRecoverTorrentState_MissingStateFile(t *testing.T) {
 
 	t.Run("reconstructs written from final-path files", func(t *testing.T) {
 		t.Parallel()
-		s, tmpDir := newTestColdServer(t)
+		s, tmpDir := newTestDestServer(t)
 
 		hash := "recover-no-state-final"
 		// Creates torrent with 10 pieces × 1024 bytes each, 2 files × 1024 bytes.
@@ -629,7 +629,7 @@ func TestRecoverTorrentState_MissingStateFile(t *testing.T) {
 
 	t.Run("partial files treated as unwritten", func(t *testing.T) {
 		t.Parallel()
-		s, tmpDir := newTestColdServer(t)
+		s, tmpDir := newTestDestServer(t)
 
 		hash := "recover-no-state-partial"
 		createTestTorrentFileWithPaths(t, tmpDir, hash, []string{"file1.bin", "file2.bin"})
@@ -660,7 +660,7 @@ func TestRecoverTorrentState_MissingStateFile(t *testing.T) {
 
 func TestInitTorrent_StaleMetadata_NukedBeforeInit(t *testing.T) {
 	t.Parallel()
-	s, tmpDir := newTestColdServer(t)
+	s, tmpDir := newTestDestServer(t)
 	s.inodes = NewInodeRegistry(tmpDir, testLogger(t))
 
 	hash := "stale-init-test"
@@ -716,7 +716,7 @@ func TestInitTorrent_StaleMetadata_NukedBeforeInit(t *testing.T) {
 
 func TestInitTorrent_PartialSelection_PiecesCovered(t *testing.T) {
 	t.Parallel()
-	s, tmpDir := newTestColdServer(t)
+	s, tmpDir := newTestDestServer(t)
 	s.inodes = NewInodeRegistry(tmpDir, testLogger(t))
 
 	// 3 files, 3 pieces. File 1 is unselected -> piece 1 should be "covered" (not needed)

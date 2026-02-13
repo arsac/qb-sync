@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -84,13 +85,13 @@ func TestServerConfig_GetSavePath(t *testing.T) {
 	}{
 		{
 			name:     "returns SavePath when set",
-			config:   ServerConfig{BasePath: "/data/cold", SavePath: "/downloads"},
+			config:   ServerConfig{BasePath: "/data/dest", SavePath: "/downloads"},
 			expected: "/downloads",
 		},
 		{
 			name:     "falls back to BasePath when SavePath empty",
-			config:   ServerConfig{BasePath: "/data/cold"},
-			expected: "/data/cold",
+			config:   ServerConfig{BasePath: "/data/dest"},
+			expected: "/data/dest",
 		},
 	}
 
@@ -413,6 +414,86 @@ func TestCleanupOrphan(t *testing.T) {
 		// identifiable by .partial suffix for manual cleanup.
 		if _, err := os.Stat(metaDir); !os.IsNotExist(err) {
 			t.Error("meta directory should be deleted even when torrent file is missing")
+		}
+	})
+	t.Run("skips cleanup when torrent exists in destination qBittorrent", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		mock := &mockQBClient{
+			torrents: []qbittorrent.Torrent{
+				{Hash: "abc123", State: qbittorrent.TorrentStateStoppedUp, Progress: 1.0},
+			},
+		}
+		s := &Server{
+			config:         ServerConfig{BasePath: tmpDir},
+			logger:         logger,
+			torrents:       make(map[string]*serverTorrentState),
+			abortingHashes: make(map[string]chan struct{}),
+			qbClient:       mock,
+		}
+
+		hash := "abc123"
+		partialFile := filepath.Join(tmpDir, "test", "data", "test.txt.partial")
+		finalFile := filepath.Join(tmpDir, "test", "data", "test.txt")
+
+		if err := os.MkdirAll(filepath.Dir(partialFile), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(partialFile, []byte("partial"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(finalFile, []byte("final"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		createTestTorrentFileWithPaths(t, tmpDir, hash, []string{"data/test.txt"})
+
+		s.cleanupOrphan(ctx, hash)
+
+		// Files should NOT be deleted — torrent exists in QB
+		if _, err := os.Stat(partialFile); os.IsNotExist(err) {
+			t.Error("partial file should not be deleted when torrent exists in QB")
+		}
+		if _, err := os.Stat(finalFile); os.IsNotExist(err) {
+			t.Error("final file should not be deleted when torrent exists in QB")
+		}
+
+		// Meta directory should also be preserved
+		metaDir := filepath.Join(tmpDir, metaDirName, hash)
+		if _, err := os.Stat(metaDir); os.IsNotExist(err) {
+			t.Error("meta directory should not be deleted when torrent exists in QB")
+		}
+	})
+
+	t.Run("skips cleanup when qBittorrent is unreachable (fail-closed)", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		mock := &mockQBClient{
+			loginErr: errors.New("connection refused"),
+		}
+		s := &Server{
+			config:         ServerConfig{BasePath: tmpDir},
+			logger:         logger,
+			torrents:       make(map[string]*serverTorrentState),
+			abortingHashes: make(map[string]chan struct{}),
+			qbClient:       mock,
+		}
+
+		hash := "abc123"
+		finalFile := filepath.Join(tmpDir, "test", "data", "test.txt")
+
+		if err := os.MkdirAll(filepath.Dir(finalFile), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(finalFile, []byte("data"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		createTestTorrentFileWithPaths(t, tmpDir, hash, []string{"data/test.txt"})
+
+		s.cleanupOrphan(ctx, hash)
+
+		// Files should NOT be deleted — QB unreachable, fail-closed
+		if _, err := os.Stat(finalFile); os.IsNotExist(err) {
+			t.Error("file should not be deleted when QB is unreachable")
 		}
 	})
 }
@@ -1367,7 +1448,7 @@ func TestUpdateStateAfterRelocate(t *testing.T) {
 
 	t.Run("updates file paths and saveSubPath", func(t *testing.T) {
 		t.Parallel()
-		basePath := "/data/cold"
+		basePath := "/data/dest"
 		state := &serverTorrentState{
 			saveSubPath: "",
 			torrentMeta: torrentMeta{files: []*serverFileInfo{

@@ -36,6 +36,23 @@ func (s *Server) getQBTorrent(ctx context.Context, hash string) (*qbittorrent.To
 	return &torrents[0], true, nil
 }
 
+// isTorrentInQB checks whether the torrent exists in destination qBittorrent.
+// Fail-closed: returns true on error (QB unreachable) to prevent accidental deletion.
+func (s *Server) isTorrentInQB(ctx context.Context, hash string) bool {
+	if s.qbClient == nil {
+		return false
+	}
+	_, found, err := s.getQBTorrent(ctx, hash)
+	if err != nil {
+		s.logger.WarnContext(ctx, "qBittorrent check failed during orphan cleanup, skipping cleanup",
+			"hash", hash,
+			"error", err,
+		)
+		return true // fail-closed
+	}
+	return found
+}
+
 // addAndVerifyTorrent adds the torrent to qBittorrent and waits for verification.
 func (s *Server) addAndVerifyTorrent(
 	ctx context.Context,

@@ -234,9 +234,14 @@ func TestFinalizeTorrent_PollReturnsCompletedResult(t *testing.T) {
 		torrentPath: filepath.Join(tmpDir, metaDirName, hash, "test.torrent"),
 	}
 
-	// Create metaDir so cleanupFinalizedTorrent doesn't fail
+	// In production, storeSuccessResult writes the .finalized marker during
+	// background finalization (before the source polls). Pre-create it here
+	// to simulate that the background work already completed.
 	metaDir := filepath.Join(tmpDir, metaDirName, hash)
 	if err := os.MkdirAll(metaDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(metaDir, finalizedFileName), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -265,9 +270,14 @@ func TestFinalizeTorrent_PollReturnsCompletedResult(t *testing.T) {
 		t.Error("torrent should be removed from tracking after successful finalize poll")
 	}
 
-	// Metadata directory should be removed
-	if _, statErr := os.Stat(metaDir); !os.IsNotExist(statErr) {
-		t.Error("metadata directory should be removed after finalization")
+	// Metadata directory should contain only the .finalized marker
+	markerPath := filepath.Join(metaDir, finalizedFileName)
+	if _, statErr := os.Stat(markerPath); statErr != nil {
+		t.Error("finalized marker should exist after finalization")
+	}
+	entries, _ := os.ReadDir(metaDir)
+	if len(entries) != 1 || entries[0].Name() != finalizedFileName {
+		t.Errorf("metadata directory should contain only .finalized marker, got %d entries", len(entries))
 	}
 }
 

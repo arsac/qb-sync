@@ -39,12 +39,24 @@ func (s *Server) InitTorrent(
 	}
 
 	// Re-sync: file selection changed, so we must re-initialize from scratch.
-	// Clean up ALL prior state (qB entry, in-memory state, persisted .state)
-	// in one place before any other checks.
+	// Clean up ALL prior state (qB entry, in-memory state, persisted .state,
+	// finalized marker) in one place before any other checks.
 	if req.GetResync() && len(req.GetFiles()) > 0 {
 		if err := s.cleanupForResync(ctx, hash); err != nil {
 			return initErrorResponse("re-sync cleanup: %v", err), nil
 		}
+	}
+
+	// Fast local check: finalized marker means we already wrote, verified,
+	// and added this torrent to destination qBittorrent. No QB query needed.
+	if s.isFinalized(hash) {
+		s.logger.InfoContext(ctx, "torrent already finalized (local marker)",
+			"hash", hash,
+		)
+		return &pb.InitTorrentResponse{
+			Success: true,
+			Status:  pb.TorrentSyncStatus_SYNC_STATUS_COMPLETE,
+		}, nil
 	}
 
 	// Check if torrent is already complete/verifying in destination qBittorrent.
@@ -293,6 +305,14 @@ func (s *Server) buildWrittenBitmap(
 	return written
 }
 
+// isFinalized checks whether a .finalized marker exists for the given torrent,
+// indicating it was previously synced, verified, and added to qBittorrent.
+func (s *Server) isFinalized(hash string) bool {
+	markerPath := filepath.Join(s.config.BasePath, metaDirName, hash, finalizedFileName)
+	_, err := os.Stat(markerPath)
+	return err == nil
+}
+
 // initErrorResponse creates an error response for InitTorrent.
 func initErrorResponse(format string, args ...any) *pb.InitTorrentResponse {
 	return &pb.InitTorrentResponse{
@@ -315,13 +335,15 @@ func (s *Server) cleanupForResync(ctx context.Context, hash string) error {
 	delete(s.torrents, hash)
 	s.mu.Unlock()
 
-	// 3. Delete persisted .state so buildWrittenBitmap starts fresh.
+	// 3. Delete persisted .state and .finalized marker so buildWrittenBitmap
+	// starts fresh and isFinalized returns false.
 	// During the first sync with partial selection, boundary pieces spanning
 	// selected + unselected files were marked "written" but only the
 	// selected-file portion was actually written to disk. On re-sync those
 	// pieces must be re-streamed for the newly-selected portions.
-	stateFile := filepath.Join(s.config.BasePath, metaDirName, hash, ".state")
-	_ = os.Remove(stateFile)
+	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
+	_ = os.Remove(filepath.Join(metaDir, ".state"))
+	_ = os.Remove(filepath.Join(metaDir, finalizedFileName))
 
 	s.logger.InfoContext(ctx, "re-sync: cleared all prior state",
 		"hash", hash)
@@ -369,12 +391,23 @@ func (s *Server) checkTorrentInQB(ctx context.Context, hash string) qbCheckResul
 		return qbCheckNotFound
 	}
 
+	// If qBittorrent is actively checking files, report verifying so the
+	// source waits — we must not write while qBittorrent reads.
 	if isCheckingState(torrent.State) {
 		return qbCheckVerifying
 	}
 
-	if torrent.Progress >= 1.0 && isReadyState(torrent.State) {
-		s.logger.InfoContext(ctx, "torrent already complete in qBittorrent",
+	// Accept 100% progress in any non-error state as complete. With partial
+	// file selection, qBittorrent may classify the torrent as a download
+	// variant (StoppedDl/PausedDl) when deselected files are absent on disk,
+	// even though all selected files are fully synced.
+	//
+	// We keep the progress >= 1.0 requirement to avoid returning COMPLETE
+	// for torrents that were added to QB but failed verification, or that
+	// qBittorrent is actively downloading (which would conflict with our
+	// piece writers).
+	if torrent.Progress >= 1.0 && !isErrorState(torrent.State) {
+		s.logger.InfoContext(ctx, "torrent already complete in destination qBittorrent",
 			"hash", hash,
 			"state", torrent.State,
 		)

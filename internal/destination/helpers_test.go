@@ -14,9 +14,9 @@ func testLogger(t *testing.T) *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 }
 
-// newTestColdServer creates a minimal Server for destination-path unit tests
+// newTestDestServer creates a minimal Server for destination-path unit tests
 // (write, finalization, early-finalize). Returns the server and its temp directory.
-func newTestColdServer(t *testing.T) (*Server, string) {
+func newTestDestServer(t *testing.T) (*Server, string) {
 	t.Helper()
 	tmpDir := t.TempDir()
 	logger := testLogger(t)

@@ -228,7 +228,8 @@ func (s *Server) runBackgroundFinalization(
 	s.storeSuccessResult(ctx, hash, state, "finalized", startTime)
 }
 
-// storeSuccessResult records success metrics and stores the result for the next poll.
+// storeSuccessResult records success metrics, writes the finalized marker,
+// and stores the result for the next poll.
 func (s *Server) storeSuccessResult(
 	ctx context.Context,
 	hash string,
@@ -237,6 +238,11 @@ func (s *Server) storeSuccessResult(
 	startTime time.Time,
 ) {
 	metrics.FinalizationDuration.WithLabelValues(metrics.ResultSuccess).Observe(time.Since(startTime).Seconds())
+
+	// Write finalized marker immediately so the torrent is recognized as
+	// complete even if the server restarts before the source polls.
+	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
+	s.markFinalized(metaDir, hash)
 
 	state.mu.Lock()
 	name := strings.TrimSuffix(filepath.Base(state.torrentPath), ".torrent")
@@ -247,21 +253,42 @@ func (s *Server) storeSuccessResult(
 	s.logger.InfoContext(ctx, "torrent finalized (background)", "hash", hash, "state", stateStr)
 }
 
-// cleanupFinalizedTorrent removes a successfully finalized torrent from tracking
-// and cleans up its metadata directory.
+// cleanupFinalizedTorrent removes a successfully finalized torrent from in-memory
+// tracking. The .finalized marker was already written by storeSuccessResult during
+// background finalization — this just cleans up the in-memory state when the source
+// polls and receives the success response.
 func (s *Server) cleanupFinalizedTorrent(hash string) {
 	s.mu.Lock()
 	delete(s.torrents, hash)
 	s.mu.Unlock()
+}
 
-	// Remove metadata directory (.qbsync/{hash}/) — no longer needed after finalization.
-	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
-	if err := os.RemoveAll(metaDir); err != nil && !os.IsNotExist(err) {
-		s.logger.Warn("failed to clean up metadata directory after finalization",
-			"hash", hash,
-			"path", metaDir,
-			"error", err,
-		)
+// markFinalized replaces the metadata directory contents with a single
+// .finalized marker file. Removes .state, .torrent, and other working
+// files but keeps the directory so the marker persists.
+func (s *Server) markFinalized(metaDir, hash string) {
+	// Remove working files but keep the directory.
+	entries, err := os.ReadDir(metaDir)
+	if err != nil {
+		// Directory may not exist (already cleaned up). Create it for the marker.
+		if mkErr := os.MkdirAll(metaDir, serverDirPermissions); mkErr != nil {
+			s.logger.Warn("failed to create metadata directory for finalized marker",
+				"hash", hash, "error", mkErr)
+			return
+		}
+	} else {
+		for _, e := range entries {
+			if e.Name() == finalizedFileName {
+				continue
+			}
+			_ = os.RemoveAll(filepath.Join(metaDir, e.Name()))
+		}
+	}
+
+	markerPath := filepath.Join(metaDir, finalizedFileName)
+	if writeErr := atomicWriteFile(markerPath, nil); writeErr != nil {
+		s.logger.Warn("failed to write finalized marker",
+			"hash", hash, "error", writeErr)
 	}
 }
 
