@@ -234,8 +234,8 @@ func (q *BidiQueue) Run(ctx context.Context) error {
 
 		// Circuit breaker: after too many consecutive failures, pause longer.
 		if consecutiveFailures >= q.config.MaxConsecutiveFailures {
-			metrics.CircuitBreakerTripsTotal.WithLabelValues(metrics.ModeHot, metrics.ComponentStreamQueue).Inc()
-			metrics.CircuitBreakerState.WithLabelValues(metrics.ModeHot, metrics.ComponentStreamQueue).
+			metrics.CircuitBreakerTripsTotal.WithLabelValues(metrics.ModeSource, metrics.ComponentStreamQueue).Inc()
+			metrics.CircuitBreakerState.WithLabelValues(metrics.ModeSource, metrics.ComponentStreamQueue).
 				Set(metrics.CircuitStateOpen)
 			q.logger.ErrorContext(ctx, "circuit breaker triggered, pausing reconnection",
 				"failures", consecutiveFailures,
@@ -246,7 +246,7 @@ func (q *BidiQueue) Run(ctx context.Context) error {
 				return ctx.Err()
 			case <-time.After(q.config.CircuitBreakerPause):
 			}
-			metrics.CircuitBreakerState.WithLabelValues(metrics.ModeHot, metrics.ComponentStreamQueue).
+			metrics.CircuitBreakerState.WithLabelValues(metrics.ModeSource, metrics.ComponentStreamQueue).
 				Set(metrics.CircuitStateClosed)
 			consecutiveFailures = 0
 			reconnectDelay = q.config.ReconnectBaseDelay
@@ -272,7 +272,7 @@ func (q *BidiQueue) Run(ctx context.Context) error {
 
 // runStream runs a single streaming session using multiple parallel streams.
 func (q *BidiQueue) runStream(ctx context.Context) error {
-	// Clear stale init cache before opening new streams. After a cold server
+	// Clear stale init cache before opening new streams. After a destination server
 	// restart the old init state is invalid — without this, ensureTorrentInitialized
 	// returns the cached result and skips InitTorrent, causing WritePiece to fail
 	// with "not initialized". Clearing here (before pool.Open) is race-free because
@@ -416,8 +416,8 @@ func (q *BidiQueue) senderWorker(ctx context.Context, pool *StreamPool, stopSend
 	}
 }
 
-// ensureTorrentInitialized initializes the torrent on cold if not already done,
-// and marks pieces already present on cold as streamed.
+// ensureTorrentInitialized initializes the torrent on destination if not already done,
+// and marks pieces already present on destination as streamed.
 func (q *BidiQueue) ensureTorrentInitialized(ctx context.Context, hash string) error {
 	if q.dest.IsInitialized(hash) {
 		return nil
@@ -436,8 +436,8 @@ func (q *BidiQueue) ensureTorrentInitialized(ctx context.Context, hash string) e
 		return nil
 	}
 
-	// Mark pieces NOT needed (already on cold) as already streamed
-	// PiecesNeeded[i] = false means piece i is already written on cold
+	// Mark pieces NOT needed (already on destination) as already streamed
+	// PiecesNeeded[i] = false means piece i is already written on destination
 	var alreadyOnCold int
 	for i, needed := range result.PiecesNeeded {
 		if !needed {
@@ -446,7 +446,7 @@ func (q *BidiQueue) ensureTorrentInitialized(ctx context.Context, hash string) e
 		}
 	}
 	if alreadyOnCold > 0 {
-		q.logger.InfoContext(ctx, "marked pieces already on cold as streamed",
+		q.logger.InfoContext(ctx, "marked pieces already on destination as streamed",
 			"hash", hash,
 			"count", alreadyOnCold,
 		)
@@ -466,7 +466,7 @@ func (q *BidiQueue) sendPiecePool(ctx context.Context, pool *StreamPool, piece *
 		return err
 	}
 
-	// Skip pieces already covered (e.g. hardlinked on cold before this piece was dequeued)
+	// Skip pieces already covered (e.g. hardlinked on destination before this piece was dequeued)
 	if q.tracker.IsPieceStreamed(hash, int(index)) {
 		q.logger.DebugContext(ctx, "skipping piece covered by hardlink",
 			"hash", hash,
@@ -691,7 +691,7 @@ func (q *BidiQueue) processAck(ctx context.Context, ack *pb.PieceAck) {
 				"error", ack.GetError(),
 			)
 
-		default: // IO, FINALIZING, NONE (old cold), unknown
+		default: // IO, FINALIZING, NONE (old destination), unknown
 			q.logger.WarnContext(ctx, "piece write failed",
 				"hash", hash,
 				"piece", index,

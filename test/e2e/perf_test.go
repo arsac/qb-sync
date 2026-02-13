@@ -10,21 +10,21 @@ import (
 	"github.com/autobrr/go-qbittorrent"
 	"github.com/stretchr/testify/require"
 
-	"github.com/arsac/qb-sync/internal/hot"
+	"github.com/arsac/qb-sync/internal/source"
 )
 
 // PerfMetrics holds performance measurements during a sync test.
 type PerfMetrics struct {
 	Timestamp       time.Time
 	Elapsed         time.Duration
-	HotPieces       int     // Completed pieces on hot (download progress)
-	ColdPieces      int     // Streamed pieces to cold
-	SyncLag         int     // HotPieces - ColdPieces
-	SyncLagPercent  float64 // Lag as percentage of hot progress
+	SourcePieces      int     // Completed pieces on source (download progress)
+	DestinationPieces int     // Streamed pieces to destination
+	SyncLag           int     // SourcePieces - DestinationPieces
+	SyncLagPercent    float64 // Lag as percentage of source progress
 	InFlight        int     // Pieces currently in flight
 	BytesSent       int64   // Total bytes sent
 	ThroughputMBps  float64 // MB/s throughput (instantaneous)
-	DownloadPercent float64 // Download progress on hot (0-1)
+	DownloadPercent float64 // Download progress on source (0-1)
 }
 
 // PerfReport summarizes the performance test results.
@@ -44,11 +44,11 @@ type PerfReport struct {
 }
 
 // TestE2E_PerfActiveTorrent measures sync performance during an active download.
-// It downloads a torrent on hot while streaming to cold and measures the lag.
+// It downloads a torrent on source while streaming to destination and measures the lag.
 //
 // Key metrics:
-// - Sync Lag: How many pieces behind is cold compared to hot download progress
-// - Throughput: How fast are we streaming pieces to cold
+// - Sync Lag: How many pieces behind is destination compared to source download progress
+// - Throughput: How fast are we streaming pieces to destination
 // - Window utilization: How well is the adaptive window performing.
 func TestE2E_PerfActiveTorrent(t *testing.T) {
 	if testing.Short() {
@@ -63,19 +63,19 @@ func TestE2E_PerfActiveTorrent(t *testing.T) {
 	torrentHash := sintelHash
 
 	// Cleanup any existing
-	env.CleanupTorrent(ctx, env.HotClient(), torrentHash)
-	env.CleanupTorrent(ctx, env.ColdClient(), torrentHash)
+	env.CleanupTorrent(ctx, env.SourceClient(), torrentHash)
+	env.CleanupTorrent(ctx, env.DestinationClient(), torrentHash)
 
-	// Add torrent to hot (will start downloading immediately)
-	t.Log("Adding torrent to hot (download will start)...")
-	err := env.AddTorrentToHot(ctx, torrentURL, nil)
+	// Add torrent to source (will start downloading immediately)
+	t.Log("Adding torrent to source (download will start)...")
+	err := env.AddTorrentToSource(ctx, torrentURL, nil)
 	require.NoError(t, err)
 
-	torrent := env.WaitForTorrent(env.HotClient(), torrentHash, 30*time.Second)
+	torrent := env.WaitForTorrent(env.SourceClient(), torrentHash, 30*time.Second)
 	require.NotNil(t, torrent)
 
 	// Get torrent properties for piece count
-	props, err := env.HotClient().GetTorrentPropertiesCtx(ctx, torrentHash)
+	props, err := env.SourceClient().GetTorrentPropertiesCtx(ctx, torrentHash)
 	require.NoError(t, err)
 
 	t.Logf("Torrent: %s (%.2f MB, %d pieces)",
@@ -85,8 +85,8 @@ func TestE2E_PerfActiveTorrent(t *testing.T) {
 	)
 
 	// Start orchestrator
-	cfg := env.CreateHotConfig()
-	task, dest, err := env.CreateHotTask(cfg)
+	cfg := env.CreateSourceConfig()
+	task, dest, err := env.CreateSourceTask(cfg)
 	require.NoError(t, err)
 	defer dest.Close()
 
@@ -111,7 +111,7 @@ func TestE2E_PerfActiveTorrent(t *testing.T) {
 	var lastBytesSent int64
 
 	t.Log("Collecting performance metrics...")
-	t.Log("Time\t\tDL%\tHot\tCold\tLag\tLag%\tInFlt\tMB/s")
+	t.Log("Time\t\tDL%\tSrc\tDest\tLag\tLag%\tInFlt\tMB/s")
 	t.Log("----\t\t---\t---\t----\t---\t----\t-----\t----")
 
 	ticker := time.NewTicker(sampleInterval)
@@ -143,8 +143,8 @@ loop:
 			t.Logf("%s\t\t%.0f%%\t%d\t%d\t%d\t%.1f%%\t%d\t%.2f",
 				metrics.Elapsed.Truncate(time.Second),
 				metrics.DownloadPercent*100,
-				metrics.HotPieces,
-				metrics.ColdPieces,
+				metrics.SourcePieces,
+				metrics.DestinationPieces,
 				metrics.SyncLag,
 				metrics.SyncLagPercent,
 				metrics.InFlight,
@@ -152,13 +152,13 @@ loop:
 			)
 
 			// Check if sync is complete
-			if metrics.HotPieces == report.TotalPieces && metrics.SyncLag == 0 {
+			if metrics.SourcePieces == report.TotalPieces && metrics.SyncLag == 0 {
 				report.SyncCompleteAt = time.Since(startTime)
 				break loop
 			}
 
-			// Check if torrent is complete on cold (streaming complete)
-			if env.IsTorrentCompleteOnCold(ctx, torrentHash) {
+			// Check if torrent is complete on destination (streaming complete)
+			if env.IsTorrentCompleteOnDestination(ctx, torrentHash) {
 				break loop
 			}
 		}
@@ -173,8 +173,8 @@ loop:
 	printPerfReport(t, report)
 
 	// Cleanup
-	env.CleanupTorrent(ctx, env.HotClient(), torrentHash)
-	env.CleanupTorrent(ctx, env.ColdClient(), torrentHash)
+	env.CleanupTorrent(ctx, env.SourceClient(), torrentHash)
+	env.CleanupTorrent(ctx, env.DestinationClient(), torrentHash)
 }
 
 // TestE2E_PerfPreDownloaded measures sync performance on an already-downloaded torrent.
@@ -190,22 +190,22 @@ func TestE2E_PerfPreDownloaded(t *testing.T) {
 	torrentHash := sintelHash
 
 	// Cleanup any existing
-	env.CleanupTorrent(ctx, env.HotClient(), torrentHash)
-	env.CleanupTorrent(ctx, env.ColdClient(), torrentHash)
+	env.CleanupTorrent(ctx, env.SourceClient(), torrentHash)
+	env.CleanupTorrent(ctx, env.DestinationClient(), torrentHash)
 
 	// Add torrent and wait for complete download
 	t.Log("Adding torrent and waiting for download to complete...")
-	err := env.AddTorrentToHot(ctx, sintelTorrentURL, nil)
+	err := env.AddTorrentToSource(ctx, sintelTorrentURL, nil)
 	require.NoError(t, err)
 
-	torrent := env.WaitForTorrent(env.HotClient(), torrentHash, 30*time.Second)
+	torrent := env.WaitForTorrent(env.SourceClient(), torrentHash, 30*time.Second)
 	require.NotNil(t, torrent)
 
-	env.WaitForTorrentComplete(env.HotClient(), torrentHash, 10*time.Minute)
+	env.WaitForTorrentComplete(env.SourceClient(), torrentHash, 10*time.Minute)
 	t.Log("Download complete, starting streaming performance test...")
 
 	// Get torrent properties for piece count
-	props, err := env.HotClient().GetTorrentPropertiesCtx(ctx, torrentHash)
+	props, err := env.SourceClient().GetTorrentPropertiesCtx(ctx, torrentHash)
 	require.NoError(t, err)
 
 	t.Logf("Torrent: %s (%.2f MB, %d pieces)",
@@ -215,8 +215,8 @@ func TestE2E_PerfPreDownloaded(t *testing.T) {
 	)
 
 	// Start orchestrator
-	cfg := env.CreateHotConfig()
-	task, dest, err := env.CreateHotTask(cfg)
+	cfg := env.CreateSourceConfig()
+	task, dest, err := env.CreateSourceTask(cfg)
 	require.NoError(t, err)
 	defer dest.Close()
 
@@ -268,17 +268,17 @@ loop:
 			lastBytesSent = bytesSent
 
 			metrics := PerfMetrics{
-				Timestamp:      time.Now(),
-				Elapsed:        elapsed,
-				HotPieces:      report.TotalPieces,
-				ColdPieces:     progress.Streamed,
-				SyncLag:        report.TotalPieces - progress.Streamed,
-				InFlight:       progress.InFlight,
-				BytesSent:      bytesSent,
-				ThroughputMBps: throughput,
+				Timestamp:         time.Now(),
+				Elapsed:           elapsed,
+				SourcePieces:      report.TotalPieces,
+				DestinationPieces: progress.Streamed,
+				SyncLag:           report.TotalPieces - progress.Streamed,
+				InFlight:          progress.InFlight,
+				BytesSent:         bytesSent,
+				ThroughputMBps:    throughput,
 			}
-			if metrics.HotPieces > 0 {
-				metrics.SyncLagPercent = float64(metrics.SyncLag) / float64(metrics.HotPieces) * 100
+			if metrics.SourcePieces > 0 {
+				metrics.SyncLagPercent = float64(metrics.SyncLag) / float64(metrics.SourcePieces) * 100
 			}
 			report.Samples = append(report.Samples, metrics)
 
@@ -290,8 +290,8 @@ loop:
 				throughput,
 			)
 
-			// Check if torrent is complete on cold (streaming complete)
-			if env.IsTorrentCompleteOnCold(ctx, torrentHash) {
+			// Check if torrent is complete on destination (streaming complete)
+			if env.IsTorrentCompleteOnDestination(ctx, torrentHash) {
 				report.SyncCompleteAt = elapsed
 				break loop
 			}
@@ -306,40 +306,40 @@ loop:
 	printPerfReport(t, report)
 
 	// Cleanup
-	env.CleanupTorrent(ctx, env.HotClient(), torrentHash)
-	env.CleanupTorrent(ctx, env.ColdClient(), torrentHash)
+	env.CleanupTorrent(ctx, env.SourceClient(), torrentHash)
+	env.CleanupTorrent(ctx, env.DestinationClient(), torrentHash)
 }
 
 func collectPerfMetrics(
 	ctx context.Context,
 	env *TestEnv,
-	task *hot.QBTask,
+	task *source.QBTask,
 	hash string,
 	totalPieces int,
 	startTime time.Time,
 	lastBytes int64,
 	interval time.Duration,
 ) *PerfMetrics {
-	// Get hot progress (download)
-	torrents, err := env.HotClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+	// Get source progress (download)
+	torrents, err := env.SourceClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
 		Hashes: []string{hash},
 	})
 	if err != nil || len(torrents) == 0 {
 		return nil
 	}
-	hotTorrent := torrents[0]
+	sourceTorrent := torrents[0]
 
-	// Calculate hot pieces from progress
-	hotPieces := int(float64(totalPieces) * hotTorrent.Progress)
+	// Calculate source pieces from progress
+	sourcePieces := int(float64(totalPieces) * sourceTorrent.Progress)
 
-	// Get cold progress (streamed)
-	var coldPieces int
+	// Get destination progress (streamed)
+	var destPieces int
 	var inFlight int
 	var bytesSent int64
 
 	progress, err := task.Progress(ctx, hash)
 	if err == nil {
-		coldPieces = progress.Streamed
+		destPieces = progress.Streamed
 		inFlight = progress.InFlight
 		bytesSent = progress.BytesSent
 	}
@@ -347,18 +347,18 @@ func collectPerfMetrics(
 	elapsed := time.Since(startTime)
 
 	metrics := &PerfMetrics{
-		Timestamp:       time.Now(),
-		Elapsed:         elapsed,
-		HotPieces:       hotPieces,
-		ColdPieces:      coldPieces,
-		SyncLag:         hotPieces - coldPieces,
-		InFlight:        inFlight,
-		BytesSent:       bytesSent,
-		DownloadPercent: hotTorrent.Progress,
+		Timestamp:         time.Now(),
+		Elapsed:           elapsed,
+		SourcePieces:      sourcePieces,
+		DestinationPieces: destPieces,
+		SyncLag:           sourcePieces - destPieces,
+		InFlight:          inFlight,
+		BytesSent:         bytesSent,
+		DownloadPercent:   sourceTorrent.Progress,
 	}
 
-	if hotPieces > 0 {
-		metrics.SyncLagPercent = float64(metrics.SyncLag) / float64(hotPieces) * 100
+	if sourcePieces > 0 {
+		metrics.SyncLagPercent = float64(metrics.SyncLag) / float64(sourcePieces) * 100
 	}
 
 	// Calculate throughput

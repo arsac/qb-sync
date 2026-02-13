@@ -688,7 +688,7 @@ func TestPieceMonitor_ResyncStreamed(t *testing.T) {
 		}
 	}
 
-	t.Run("resets streamed pieces missing on cold", func(t *testing.T) {
+	t.Run("resets streamed pieces missing on destination", func(t *testing.T) {
 		monitor := newMonitor()
 		hash := "abc123"
 		numPieces := 10
@@ -697,13 +697,13 @@ func TestPieceMonitor_ResyncStreamed(t *testing.T) {
 			failed:   make([]bool, numPieces),
 		}
 
-		// Simulate: hot thinks all 10 are streamed
+		// Simulate: source thinks all 10 are streamed
 		state := monitor.torrents[hash]
 		for i := range state.streamed {
 			state.streamed[i] = true
 		}
 
-		// Cold only has 7 pieces (0-6)
+		// Destination only has 7 pieces (0-6)
 		writtenOnCold := make([]bool, numPieces)
 		for i := range 7 {
 			writtenOnCold[i] = true
@@ -725,7 +725,7 @@ func TestPieceMonitor_ResyncStreamed(t *testing.T) {
 		}
 	})
 
-	t.Run("clears failed flag for pieces cold has", func(t *testing.T) {
+	t.Run("clears failed flag for pieces destination has", func(t *testing.T) {
 		monitor := newMonitor()
 		hash := "abc123"
 		numPieces := 5
@@ -739,19 +739,19 @@ func TestPieceMonitor_ResyncStreamed(t *testing.T) {
 		state.failed[2] = true
 		state.failed[3] = true
 
-		// Cold has piece 2 but not 3
+		// Destination has piece 2 but not 3
 		writtenOnCold := []bool{false, false, true, false, false}
 		monitor.ResyncStreamed(hash, writtenOnCold)
 
 		state.mu.RLock()
 		defer state.mu.RUnlock()
 		if state.failed[2] {
-			t.Error("piece 2 should have failed cleared (cold has it)")
+			t.Error("piece 2 should have failed cleared (destination has it)")
 		}
 		if state.streamed[2] != true {
 			t.Error("piece 2 should be marked streamed")
 		}
-		// Piece 3: cold doesn't have it, so failed stays as-is (not touched by resync)
+		// Piece 3: destination doesn't have it, so failed stays as-is (not touched by resync)
 	})
 
 	t.Run("no-op when already in sync", func(t *testing.T) {
@@ -789,11 +789,11 @@ func TestPieceMonitor_ResyncStreamed(t *testing.T) {
 			state.streamed[i] = true
 		}
 
-		// Cold reports fewer pieces than tracker has
+		// Destination reports fewer pieces than tracker has
 		writtenOnCold := []bool{true, true, true}
 		reset := monitor.ResyncStreamed(hash, writtenOnCold)
 
-		// Pieces 3 and 4 should be reset (out of range = cold doesn't have)
+		// Pieces 3 and 4 should be reset (out of range = destination doesn't have)
 		if reset != 2 {
 			t.Errorf("expected 2 pieces reset, got %d", reset)
 		}

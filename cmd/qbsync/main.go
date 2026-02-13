@@ -12,11 +12,11 @@ import (
 	"github.com/spf13/viper"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/arsac/qb-sync/internal/cold"
 	"github.com/arsac/qb-sync/internal/config"
+	"github.com/arsac/qb-sync/internal/destination"
 	"github.com/arsac/qb-sync/internal/health"
-	"github.com/arsac/qb-sync/internal/hot"
 	"github.com/arsac/qb-sync/internal/logger"
+	"github.com/arsac/qb-sync/internal/source"
 )
 
 const bytesPerMB = 1024 * 1024
@@ -32,30 +32,30 @@ func run() error {
 	rootCmd := &cobra.Command{
 		Use:   "qbsync",
 		Short: "Sync torrents between qBittorrent instances",
-		Long: `qbsync synchronizes torrents between hot (source) and cold (destination) servers.
+		Long: `qbsync synchronizes torrents between source and destination servers.
 
-Run as hot server to stream pieces from source qBittorrent to cold server.
-Run as cold server to receive pieces and manage destination qBittorrent.`,
+Run as source server to stream pieces from source qBittorrent to destination server.
+Run as destination server to receive pieces and manage destination qBittorrent.`,
 	}
 
-	hotCmd := &cobra.Command{
-		Use:   "hot",
-		Short: "Run as hot (source) server",
-		Long:  "Stream pieces from local qBittorrent to cold server.",
-		RunE:  runHot,
+	sourceCmd := &cobra.Command{
+		Use:   "source",
+		Short: "Run as source server",
+		Long:  "Stream pieces from local qBittorrent to destination server.",
+		RunE:  runSource,
 	}
 
-	coldCmd := &cobra.Command{
-		Use:   "cold",
-		Short: "Run as cold (destination) server",
+	destinationCmd := &cobra.Command{
+		Use:   "destination",
+		Short: "Run as destination server",
 		Long:  "Receive pieces via gRPC, write to disk, add verified torrents to qBittorrent.",
-		RunE:  runCold,
+		RunE:  runDestination,
 	}
 
-	config.SetupHotFlags(hotCmd)
-	config.SetupColdFlags(coldCmd)
+	config.SetupSourceFlags(sourceCmd)
+	config.SetupDestinationFlags(destinationCmd)
 
-	rootCmd.AddCommand(hotCmd, coldCmd)
+	rootCmd.AddCommand(sourceCmd, destinationCmd)
 
 	return rootCmd.Execute()
 }
@@ -87,22 +87,22 @@ func startHealthServer(
 	return hs
 }
 
-func runHot(cmd *cobra.Command, _ []string) error {
+func runSource(cmd *cobra.Command, _ []string) error {
 	v := viper.New()
-	if err := config.BindHotFlags(cmd, v); err != nil {
+	if err := config.BindSourceFlags(cmd, v); err != nil {
 		return err
 	}
 
-	cfg, err := config.LoadHot(v)
+	cfg, err := config.LoadSource(v)
 	if err != nil {
 		return err
 	}
 
-	log := logger.New("hot", logger.ParseLevel(cfg.LogLevel))
-	log.Info("starting hot server",
+	log := logger.New("source", logger.ParseLevel(cfg.LogLevel))
+	log.Info("starting source server",
 		"data", cfg.DataPath,
 		"qbURL", cfg.QBURL,
-		"coldAddr", cfg.ColdAddr,
+		"destinationAddr", cfg.DestinationAddr,
 		"healthAddr", cfg.HealthAddr,
 		"dryRun", cfg.DryRun,
 	)
@@ -114,7 +114,7 @@ func runHot(cmd *cobra.Command, _ []string) error {
 	healthServer := startHealthServer(ctx, g, cfg.HealthAddr, log)
 
 	g.Go(func() error {
-		runner := hot.NewRunner(cfg, log)
+		runner := source.NewRunner(cfg, log)
 		if healthServer != nil {
 			runner.SetHealthServer(healthServer)
 		}
@@ -124,19 +124,19 @@ func runHot(cmd *cobra.Command, _ []string) error {
 	return g.Wait()
 }
 
-func runCold(cmd *cobra.Command, _ []string) error {
+func runDestination(cmd *cobra.Command, _ []string) error {
 	v := viper.New()
-	if err := config.BindColdFlags(cmd, v); err != nil {
+	if err := config.BindDestinationFlags(cmd, v); err != nil {
 		return err
 	}
 
-	cfg, err := config.LoadCold(v)
+	cfg, err := config.LoadDestination(v)
 	if err != nil {
 		return err
 	}
 
-	log := logger.New("cold", logger.ParseLevel(cfg.LogLevel))
-	log.Info("starting cold server",
+	log := logger.New("destination", logger.ParseLevel(cfg.LogLevel))
+	log.Info("starting destination server",
 		"listen", cfg.ListenAddr,
 		"data", cfg.DataPath,
 		"savePath", cfg.SavePath,
@@ -150,7 +150,7 @@ func runCold(cmd *cobra.Command, _ []string) error {
 	ctx, cancel := signalContext(log)
 	defer cancel()
 
-	serverCfg := cold.ServerConfig{
+	serverCfg := destination.ServerConfig{
 		ListenAddr:           cfg.ListenAddr,
 		BasePath:             cfg.DataPath,
 		SavePath:             cfg.SavePath,
@@ -161,7 +161,7 @@ func runCold(cmd *cobra.Command, _ []string) error {
 	}
 
 	if cfg.QBURL != "" {
-		serverCfg.ColdQB = &cold.QBConfig{
+		serverCfg.QB = &destination.QBConfig{
 			URL:          cfg.QBURL,
 			Username:     cfg.QBUsername,
 			Password:     cfg.QBPassword,
@@ -174,7 +174,7 @@ func runCold(cmd *cobra.Command, _ []string) error {
 	healthServer := startHealthServer(ctx, g, cfg.HealthAddr, log)
 
 	g.Go(func() error {
-		server := cold.NewServer(serverCfg, log)
+		server := destination.NewServer(serverCfg, log)
 		if healthServer != nil {
 			server.SetHealthServer(healthServer)
 		}

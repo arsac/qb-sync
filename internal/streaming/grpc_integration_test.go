@@ -163,7 +163,7 @@ func TestIntegration_SendRecvAckRoundtrip(t *testing.T) {
 }
 
 // TestIntegration_SendTimeoutOnStallServer verifies that when the server stops
-// reading from the stream (simulating cold going silent), HTTP/2 flow control
+// reading from the stream (simulating destination going silent), HTTP/2 flow control
 // fills up and the client's Send timeout fires, cancelling the stream.
 //
 // This is the core deadlock scenario: without the send timeout, Send blocks
@@ -409,7 +409,7 @@ func TestIntegration_PoolErrorPropagation(t *testing.T) {
 }
 
 // TestIntegration_SendTimeoutErrorReachesPool verifies the full deadlock
-// detection chain end-to-end: cold stops consuming → HTTP/2 flow control fills
+// detection chain end-to-end: destination stops consuming → HTTP/2 flow control fills
 // → Send timeout fires → stream context cancelled → receiveAcks exits →
 // forwardAcks detects stream death via Done() → synthetic error reaches pool.
 //

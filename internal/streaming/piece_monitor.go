@@ -75,7 +75,7 @@ type PieceMonitor struct {
 	completed chan *pb.Piece
 
 	// Channel to signal torrents removed from qBittorrent
-	// This allows the orchestrator to clean up partial data on cold
+	// This allows the orchestrator to clean up partial data on destination
 	removed chan string
 
 	closed    atomic.Bool // Prevents sends after channel close
@@ -114,7 +114,7 @@ func (t *PieceMonitor) Completed() <-chan *pb.Piece {
 }
 
 // Removed returns the channel of torrent hashes that have been removed from qBittorrent.
-// The orchestrator should listen to this channel and call AbortTorrent on cold to clean up.
+// The orchestrator should listen to this channel and call AbortTorrent on destination to clean up.
 func (t *PieceMonitor) Removed() <-chan string {
 	return t.removed
 }
@@ -125,7 +125,7 @@ func (t *PieceMonitor) TrackTorrent(ctx context.Context, hash string) error {
 }
 
 // TrackTorrentWithResume adds a torrent to track, marking pieces in alreadyWritten
-// as already streamed. This prevents re-queuing pieces that cold already has.
+// as already streamed. This prevents re-queuing pieces that destination already has.
 func (t *PieceMonitor) TrackTorrentWithResume(ctx context.Context, hash string, alreadyWritten []bool) error {
 	return t.startTracking(ctx, hash, alreadyWritten)
 }
@@ -154,7 +154,7 @@ func (t *PieceMonitor) MarkStreamed(hash string, pieceIndex int) {
 }
 
 // MarkStreamedBatch marks multiple pieces as already streamed.
-// Used to resume after restart - pieces already written to cold don't need re-streaming.
+// Used to resume after restart - pieces already written to destination don't need re-streaming.
 func (t *PieceMonitor) MarkStreamedBatch(hash string, written []bool) int {
 	t.mu.RLock()
 	state, ok := t.torrents[hash]
@@ -179,8 +179,8 @@ func (t *PieceMonitor) MarkStreamedBatch(hash string, written []bool) int {
 	return count
 }
 
-// ResyncStreamed resets the streamed state for a torrent to match cold's actual
-// written state. Pieces that cold has are marked streamed; pieces cold is missing
+// ResyncStreamed resets the streamed state for a torrent to match destination's actual
+// written state. Pieces that destination has are marked streamed; pieces destination is missing
 // are unmarked so they get re-queued by the next poll cycle.
 // Returns the number of pieces that were reset (streamed→unstreamed).
 func (t *PieceMonitor) ResyncStreamed(hash string, writtenOnCold []bool) int {
@@ -202,7 +202,7 @@ func (t *PieceMonitor) ResyncStreamed(hash string, writtenOnCold []bool) int {
 			state.streamed[i] = true
 			state.failed[i] = false
 		} else if state.streamed[i] {
-			// Was marked streamed but cold doesn't have it — un-mark for re-streaming
+			// Was marked streamed but destination doesn't have it — un-mark for re-streaming
 			state.streamed[i] = false
 			reset++
 		}
@@ -267,7 +267,7 @@ func (t *PieceMonitor) Run(ctx context.Context) error {
 
 	// Initial full sync
 	if err := t.pollMainData(ctx); err != nil {
-		metrics.StreamOpenErrorsTotal.WithLabelValues(metrics.ModeHot).Inc()
+		metrics.StreamOpenErrorsTotal.WithLabelValues(metrics.ModeSource).Inc()
 		t.logger.WarnContext(ctx, "initial maindata poll failed", "error", err)
 	}
 
@@ -278,7 +278,7 @@ func (t *PieceMonitor) Run(ctx context.Context) error {
 			return ctx.Err()
 		case <-ticker.C:
 			if err := t.poll(ctx); err != nil {
-				metrics.StreamOpenErrorsTotal.WithLabelValues(metrics.ModeHot).Inc()
+				metrics.StreamOpenErrorsTotal.WithLabelValues(metrics.ModeSource).Inc()
 				t.logger.WarnContext(ctx, "poll cycle failed", "error", err)
 			}
 		}
@@ -377,7 +377,7 @@ func (t *PieceMonitor) pollMainData(ctx context.Context) error {
 		}
 		t.mu.Unlock()
 
-		// Notify orchestrator about the removal so it can clean up cold
+		// Notify orchestrator about the removal so it can clean up destination
 		if wasTracked {
 			if t.trySendRemoved(ctx, hash) {
 				t.logger.InfoContext(ctx, "notified orchestrator of torrent removal", "hash", hash)
@@ -455,7 +455,7 @@ func (t *PieceMonitor) isDownloadingState(state qbittorrent.TorrentState) bool {
 
 // startTracking begins tracking a torrent's piece completion.
 // If alreadyWritten is provided, those pieces are marked as streamed before
-// queuing, preventing re-transfer of data that cold already has.
+// queuing, preventing re-transfer of data that destination already has.
 func (t *PieceMonitor) startTracking(ctx context.Context, hash string, alreadyWritten []bool) error {
 	meta, err := t.source.GetTorrentMetadata(ctx, hash)
 	if err != nil {
@@ -483,7 +483,7 @@ func (t *PieceMonitor) startTracking(ctx context.Context, hash string, alreadyWr
 	}
 
 	// Apply already-written pieces BEFORE adding to map and queuing.
-	// This prevents queueCompletedPieces from sending pieces that cold already has.
+	// This prevents queueCompletedPieces from sending pieces that destination already has.
 	resumedCount := 0
 	for i, written := range alreadyWritten {
 		if written && i < numPieces {
@@ -586,7 +586,7 @@ func (t *PieceMonitor) handleTorrentNotFound(ctx context.Context, hash string) {
 	}
 	t.mu.Unlock()
 
-	// Notify orchestrator about the removal so it can clean up cold
+	// Notify orchestrator about the removal so it can clean up destination
 	if wasTracked {
 		if t.trySendRemoved(ctx, hash) {
 			t.logger.InfoContext(ctx, "notified orchestrator of torrent removal (via 404)", "hash", hash)

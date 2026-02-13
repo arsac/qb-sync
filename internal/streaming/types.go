@@ -1,5 +1,5 @@
 // Package streaming provides the core streaming infrastructure for transferring
-// torrent pieces from hot (source) to cold (destination). It includes piece
+// torrent pieces from source to destination. It includes piece
 // monitoring, gRPC client/server communication, adaptive congestion control,
 // and connection pooling for high-throughput bidirectional streaming.
 package streaming

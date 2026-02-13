@@ -7,14 +7,14 @@ Use **Go modules**: `go mod tidy`, `go build ./...`
 ## Module
 
 - Module path: `github.com/arsac/qb-sync`
-- Go project: torrent sync system (hot -> cold) using gRPC streaming
+- Go project: torrent sync system (source -> destination) using gRPC streaming
 
 ## Architecture
 
-- `internal/hot` — Hot orchestrator: streams pieces from source qBittorrent to cold, handles drain/handoff
-- `internal/cold` — Cold gRPC server: receives pieces, verifies, finalizes torrents
+- `internal/source` — Source orchestrator: streams pieces from source qBittorrent to destination, handles drain/handoff
+- `internal/destination` — Destination gRPC server: receives pieces, verifies, finalizes torrents
 - `internal/streaming` — BidiQueue, PieceMonitor, GRPCDestination, congestion control
-- `internal/config` — `BaseConfig` embedded in `HotConfig` and `ColdConfig`
+- `internal/config` — `BaseConfig` embedded in `SourceConfig` and `DestinationConfig`
 - `internal/metrics` — Prometheus metrics with `qbsync_` namespace
 - `internal/health` — HTTP health/metrics server
 - `internal/qbclient` — Resilient qBittorrent API wrapper with circuit breaker
@@ -30,7 +30,7 @@ Use **Go modules**: `go mod tidy`, `go build ./...`
 
 - Error variables: `fooErr` naming (not `errFoo`)
 - `int32`/`int` conversions at proto boundaries are intentional
-- Cold server lock ordering: `s.mu` -> `state.mu` -> `inodes.registeredMu` -> `inodes.inProgressMu`
+- Destination server lock ordering: `s.mu` -> `state.mu` -> `inodes.registeredMu` -> `inodes.inProgressMu`
 - `InodeRegistry` is self-contained with internal locking
 - `collectTorrents()` pattern: acquire `s.mu`, snapshot refs, release `s.mu`, then process under individual `state.mu`
 - Injectable function fields on structs for testability (e.g., `checkAnnotation` on `Runner`)
@@ -70,10 +70,10 @@ Use **Go modules**: `go mod tidy`, `go build ./...`
 
 ## CLI
 
-| Command       | Description                   |
-| ------------- | ----------------------------- |
-| `qbsync hot`  | Run hot server (source)       |
-| `qbsync cold` | Run cold server (destination) |
+| Command              | Description              |
+| -------------------- | ------------------------ |
+| `qbsync source`      | Run source server        |
+| `qbsync destination` | Run destination server   |
 
 - Flags bound via Cobra/Viper
-- Env prefix: `QBSYNC_HOT_` / `QBSYNC_COLD_`
+- Env prefix: `QBSYNC_SOURCE_` / `QBSYNC_DESTINATION_`

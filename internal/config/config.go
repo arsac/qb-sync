@@ -31,7 +31,7 @@ const (
 	defaultMaxStreamBufferMB    = 512
 )
 
-// BaseConfig contains configuration shared between hot and cold servers.
+// BaseConfig contains configuration shared between source and destination servers.
 type BaseConfig struct {
 	// qBittorrent connection
 	QBURL      string
@@ -53,12 +53,12 @@ type BaseConfig struct {
 	DryRun bool
 }
 
-// HotConfig contains configuration for the hot (source) server.
-type HotConfig struct {
+// SourceConfig contains configuration for the source server.
+type SourceConfig struct {
 	BaseConfig
 
 	// Streaming destination
-	ColdAddr string // gRPC address of cold server
+	DestinationAddr string // gRPC address of destination server
 
 	// Migration settings
 	MinSpaceGB     int64
@@ -76,13 +76,13 @@ type HotConfig struct {
 	MaxBytesPerSec     int64
 	ReconnectMaxDelay  time.Duration // Max reconnect backoff delay (default: 30s)
 	NumSenders         int           // Concurrent sender workers for streaming (default: 4)
-	MinGRPCConnections int           // Minimum TCP connections to cold server (default: 2)
-	MaxGRPCConnections int           // Maximum TCP connections to cold server (default: 8)
-	SourceRemovedTag   string        // Tag applied on cold when torrent is removed from hot (empty to disable)
-	ExcludeCleanupTag  string        // Tag that prevents torrents from being cleaned up from hot (empty to disable)
+	MinGRPCConnections int           // Minimum TCP connections to destination server (default: 2)
+	MaxGRPCConnections int           // Maximum TCP connections to destination server (default: 8)
+	SourceRemovedTag   string        // Tag applied on destination when torrent is removed from source (empty to disable)
+	ExcludeCleanupTag  string        // Tag that prevents torrents from being cleaned up from source (empty to disable)
 }
 
-// Validate validates the base configuration shared by hot and cold.
+// Validate validates the base configuration shared by source and destination.
 func (c *BaseConfig) Validate() error {
 	if c.DataPath == "" {
 		return errors.New("data path is required")
@@ -90,16 +90,16 @@ func (c *BaseConfig) Validate() error {
 	return nil
 }
 
-// Validate validates the hot configuration.
-func (c *HotConfig) Validate() error {
+// Validate validates the source configuration.
+func (c *SourceConfig) Validate() error {
 	if err := c.BaseConfig.Validate(); err != nil {
 		return err
 	}
 	if c.QBURL == "" {
 		return errors.New("qBittorrent URL is required")
 	}
-	if c.ColdAddr == "" {
-		return errors.New("cold server address is required")
+	if c.DestinationAddr == "" {
+		return errors.New("destination server address is required")
 	}
 	if c.MinSpaceGB < 0 {
 		return errors.New("minimum space cannot be negative")
@@ -128,14 +128,14 @@ func (c *HotConfig) Validate() error {
 	return nil
 }
 
-// ColdConfig contains configuration for the cold (destination) server.
-type ColdConfig struct {
+// DestinationConfig contains configuration for the destination server.
+type DestinationConfig struct {
 	BaseConfig
 
 	// gRPC server
 	ListenAddr string
 
-	// SavePath is the path as cold qBittorrent sees it (container mount point).
+	// SavePath is the path as destination qBittorrent sees it (container mount point).
 	// Defaults to DataPath when empty.
 	SavePath string
 
@@ -148,8 +148,8 @@ type ColdConfig struct {
 	MaxStreamBufferMB int // Global memory budget in MB for buffered piece data (default: 512)
 }
 
-// Validate validates the cold configuration.
-func (c *ColdConfig) Validate() error {
+// Validate validates the destination configuration.
+func (c *DestinationConfig) Validate() error {
 	if err := c.BaseConfig.Validate(); err != nil {
 		return err
 	}
@@ -171,15 +171,15 @@ func (c *ColdConfig) Validate() error {
 	return nil
 }
 
-// SetupHotFlags sets up flags for the hot command.
-func SetupHotFlags(cmd *cobra.Command) {
+// SetupSourceFlags sets up flags for the source command.
+func SetupSourceFlags(cmd *cobra.Command) {
 	flags := cmd.Flags()
 
 	flags.String("data", "", "Data directory path where torrent content is stored")
 	flags.String("qb-url", "", "qBittorrent WebUI URL")
 	flags.String("qb-username", "", "qBittorrent username")
 	flags.String("qb-password", "", "qBittorrent password")
-	flags.String("cold-addr", "", "Cold server gRPC address (e.g., 192.168.1.100:50051)")
+	flags.String("destination-addr", "", "Destination server gRPC address (e.g., 192.168.1.100:50051)")
 	flags.Int64("min-space", defaultMinSpaceGB, "Minimum free space in GB before moving torrents")
 	flags.Int("min-seeding-time", defaultMinSeedingTimeSec, "Minimum seeding time in seconds before moving")
 	flags.Int("sleep", defaultSleepIntervalSec, "Sleep interval between checks in seconds")
@@ -218,12 +218,12 @@ func SetupHotFlags(cmd *cobra.Command) {
 	flags.String(
 		"source-removed-tag",
 		defaultSourceRemovedTag,
-		"Tag to apply on cold torrent when source is removed from hot (empty to disable)",
+		"Tag to apply on destination torrent when removed from source (empty to disable)",
 	)
 	flags.String(
 		"exclude-cleanup-tag",
 		"",
-		"Tag that prevents torrents from being cleaned up from hot (empty to disable)",
+		"Tag that prevents torrents from being cleaned up from source (empty to disable)",
 	)
 	flags.String("health-addr", defaultHealthAddr, "HTTP health endpoint address (empty to disable)")
 	flags.String("synced-tag", defaultSyncedTag, "Tag to apply to synced torrents (empty to disable)")
@@ -231,13 +231,13 @@ func SetupHotFlags(cmd *cobra.Command) {
 	flags.String("log-level", "info", "Log level: debug, info, warn, error")
 }
 
-// SetupColdFlags sets up flags for the cold command.
-func SetupColdFlags(cmd *cobra.Command) {
+// SetupDestinationFlags sets up flags for the destination command.
+func SetupDestinationFlags(cmd *cobra.Command) {
 	flags := cmd.Flags()
 
 	flags.String("listen", defaultListenAddr, "gRPC listen address")
 	flags.String("data", "", "Data directory path where torrent content will be written")
-	flags.String("save-path", "", "Save path as cold qBittorrent sees it (defaults to --data)")
+	flags.String("save-path", "", "Save path as destination qBittorrent sees it (defaults to --data)")
 	flags.String("qb-url", "", "qBittorrent WebUI URL (for adding verified torrents)")
 	flags.String("qb-username", "", "qBittorrent username")
 	flags.String("qb-password", "", "qBittorrent password")
@@ -270,11 +270,11 @@ func bindFlags(cmd *cobra.Command, v *viper.Viper, envPrefix string, flags []str
 	return nil
 }
 
-// BindHotFlags binds hot command flags to viper.
-func BindHotFlags(cmd *cobra.Command, v *viper.Viper) error {
-	return bindFlags(cmd, v, "QBSYNC_HOT", []string{
+// BindSourceFlags binds source command flags to viper.
+func BindSourceFlags(cmd *cobra.Command, v *viper.Viper) error {
+	return bindFlags(cmd, v, "QBSYNC_SOURCE", []string{
 		"data", "qb-url", "qb-username", "qb-password",
-		"cold-addr", "min-space", "min-seeding-time", "sleep",
+		"destination-addr", "min-space", "min-seeding-time", "sleep",
 		"rate-limit", "piece-timeout", "reconnect-max-delay",
 		"num-senders", "min-connections", "max-connections",
 		"source-removed-tag", "exclude-cleanup-tag", "health-addr", "synced-tag",
@@ -282,9 +282,9 @@ func BindHotFlags(cmd *cobra.Command, v *viper.Viper) error {
 	})
 }
 
-// BindColdFlags binds cold command flags to viper.
-func BindColdFlags(cmd *cobra.Command, v *viper.Viper) error {
-	return bindFlags(cmd, v, "QBSYNC_COLD", []string{
+// BindDestinationFlags binds destination command flags to viper.
+func BindDestinationFlags(cmd *cobra.Command, v *viper.Viper) error {
+	return bindFlags(cmd, v, "QBSYNC_DESTINATION", []string{
 		"listen", "data", "save-path", "qb-url", "qb-username", "qb-password",
 		"poll-interval", "poll-timeout", "stream-workers", "max-stream-buffer",
 		"health-addr", "synced-tag", "dry-run", "log-level",
@@ -296,7 +296,7 @@ func seconds(v *viper.Viper, key string) time.Duration {
 	return time.Duration(v.GetInt(key)) * time.Second
 }
 
-// loadBase loads the base configuration shared by hot and cold.
+// loadBase loads the base configuration shared by source and destination.
 func loadBase(v *viper.Viper) BaseConfig {
 	return BaseConfig{
 		QBURL:      v.GetString("qb-url"),
@@ -310,11 +310,11 @@ func loadBase(v *viper.Viper) BaseConfig {
 	}
 }
 
-// LoadHot loads the hot server configuration from viper.
-func LoadHot(v *viper.Viper) (*HotConfig, error) {
-	cfg := &HotConfig{
+// LoadSource loads the source server configuration from viper.
+func LoadSource(v *viper.Viper) (*SourceConfig, error) {
+	cfg := &SourceConfig{
 		BaseConfig:         loadBase(v),
-		ColdAddr:           v.GetString("cold-addr"),
+		DestinationAddr:    v.GetString("destination-addr"),
 		MinSpaceGB:         v.GetInt64("min-space"),
 		MinSeedingTime:     seconds(v, "min-seeding-time"),
 		SleepInterval:      seconds(v, "sleep"),
@@ -342,9 +342,9 @@ func LoadHot(v *viper.Viper) (*HotConfig, error) {
 	return cfg, nil
 }
 
-// LoadCold loads the cold server configuration from viper.
-func LoadCold(v *viper.Viper) (*ColdConfig, error) {
-	cfg := &ColdConfig{
+// LoadDestination loads the destination server configuration from viper.
+func LoadDestination(v *viper.Viper) (*DestinationConfig, error) {
+	cfg := &DestinationConfig{
 		BaseConfig:        loadBase(v),
 		ListenAddr:        v.GetString("listen"),
 		SavePath:          v.GetString("save-path"),

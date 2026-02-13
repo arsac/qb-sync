@@ -21,9 +21,9 @@ import (
 //
 // Strategy: Wired CD has 18 audio files. During streaming, small files complete
 // before larger ones. Early finalization renames these to their final paths while
-// the torrent is still syncing (before FinalizeTorrent adds it to cold qBittorrent).
-// We poll the cold filesystem for non-.partial files and verify at least one appears
-// before the torrent is complete on cold qBittorrent.
+// the torrent is still syncing (before FinalizeTorrent adds it to destination qBittorrent).
+// We poll the destination filesystem for non-.partial files and verify at least one appears
+// before the torrent is complete on destination qBittorrent.
 func TestE2E_PerFileEarlyFinalization(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")
@@ -34,26 +34,26 @@ func TestE2E_PerFileEarlyFinalization(t *testing.T) {
 
 	env.CleanupBothSides(ctx, wiredCDHash)
 
-	t.Log("Adding Wired CD torrent to hot (18 files)...")
-	env.DownloadTorrentOnHot(ctx, testTorrentURL, wiredCDHash, torrentDownloadTimeout)
+	t.Log("Adding Wired CD torrent to source (18 files)...")
+	env.DownloadTorrentOnSource(ctx, testTorrentURL, wiredCDHash, torrentDownloadTimeout)
 
-	// Get file list from hot to know what paths to look for on cold.
-	files, err := env.HotClient().GetFilesInformationCtx(ctx, wiredCDHash)
+	// Get file list from source to know what paths to look for on destination.
+	files, err := env.SourceClient().GetFilesInformationCtx(ctx, wiredCDHash)
 	require.NoError(t, err)
 	require.NotNil(t, files)
 	require.GreaterOrEqual(t, len(*files), 10, "Wired CD should have multiple files")
 	t.Logf("Torrent has %d files", len(*files))
 
-	// Collect expected final paths on cold filesystem.
-	// Files are stored at coldPath/<torrentName>/<fileName> (no saveSubPath without category).
+	// Collect expected final paths on destination filesystem.
+	// Files are stored at destinationPath/<torrentName>/<fileName> (no saveSubPath without category).
 	finalPaths := make([]string, len(*files))
 	for i, f := range *files {
-		finalPaths[i] = filepath.Join(env.ColdPath(), f.Name)
+		finalPaths[i] = filepath.Join(env.DestinationPath(), f.Name)
 	}
 
 	// Start orchestrator.
-	cfg := env.CreateHotConfig()
-	task, dest, err := env.CreateHotTask(cfg)
+	cfg := env.CreateSourceConfig()
+	task, dest, err := env.CreateSourceTask(cfg)
 	require.NoError(t, err)
 	defer dest.Close()
 
@@ -66,7 +66,7 @@ func TestE2E_PerFileEarlyFinalization(t *testing.T) {
 	}()
 
 	// Poll for early-finalized files: look for files at their final path
-	// (no .partial suffix) while the torrent is NOT yet complete on cold qBittorrent.
+	// (no .partial suffix) while the torrent is NOT yet complete on destination qBittorrent.
 	var earlyFinalizedCount atomic.Int32
 	var observedBeforeComplete atomic.Bool
 
@@ -99,10 +99,10 @@ func TestE2E_PerFileEarlyFinalization(t *testing.T) {
 
 			earlyFinalizedCount.Store(count)
 
-			// Check if torrent is NOT yet complete on cold qBittorrent.
+			// Check if torrent is NOT yet complete on destination qBittorrent.
 			// If we see finalized files before torrent completion, that's
 			// proof of per-file early finalization.
-			if !env.IsTorrentCompleteOnCold(ctx, wiredCDHash) {
+			if !env.IsTorrentCompleteOnDestination(ctx, wiredCDHash) {
 				if observedBeforeComplete.CompareAndSwap(false, true) {
 					t.Logf("Early finalization observed: %d files at final path before torrent completion", count)
 				}
@@ -111,9 +111,9 @@ func TestE2E_PerFileEarlyFinalization(t *testing.T) {
 	}()
 
 	// Wait for full sync.
-	t.Log("Waiting for torrent to sync to cold...")
-	env.WaitForTorrentCompleteOnCold(ctx, wiredCDHash, syncCompleteTimeout,
-		"torrent should be complete on cold")
+	t.Log("Waiting for torrent to sync to destination...")
+	env.WaitForTorrentCompleteOnDestination(ctx, wiredCDHash, syncCompleteTimeout,
+		"torrent should be complete on destination")
 
 	// Stop poller.
 	earlyFinalizeCancel()
@@ -121,7 +121,7 @@ func TestE2E_PerFileEarlyFinalization(t *testing.T) {
 
 	// Assert that we observed early-finalized files before torrent completion.
 	assert.True(t, observedBeforeComplete.Load(),
-		"should observe at least one file at final path before torrent completion on cold qBittorrent")
+		"should observe at least one file at final path before torrent completion on destination qBittorrent")
 	t.Logf("Final early-finalized file count observed during streaming: %d", earlyFinalizedCount.Load())
 
 	// Stop orchestrator.
@@ -139,9 +139,9 @@ func TestE2E_PerFileEarlyFinalization(t *testing.T) {
 			".partial file should not exist after sync: %s", partialPath)
 	}
 
-	// Verify no .partial files remain anywhere under the cold path for this torrent.
+	// Verify no .partial files remain anywhere under the destination path for this torrent.
 	var leftoverPartials []string
-	_ = filepath.WalkDir(env.ColdPath(), func(path string, _ os.DirEntry, walkErr error) error {
+	_ = filepath.WalkDir(env.DestinationPath(), func(path string, _ os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -152,7 +152,7 @@ func TestE2E_PerFileEarlyFinalization(t *testing.T) {
 	})
 	assert.Empty(t, leftoverPartials, "no .partial files should remain after sync")
 
-	env.AssertTorrentCompleteOnCold(ctx, wiredCDHash)
+	env.AssertTorrentCompleteOnDestination(ctx, wiredCDHash)
 
 	t.Log("Per-file early finalization E2E test completed successfully!")
 

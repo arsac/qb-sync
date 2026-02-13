@@ -6,7 +6,7 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 
 | Label | Values | Description |
 |-------|--------|-------------|
-| `mode` | `hot`, `cold` | Which side emits the metric |
+| `mode` | `source`, `destination` | Which side emits the metric |
 | `result` | `success`, `failure`, `skipped_seeding`, `hit`, `miss` | Outcome of an operation |
 | `operation` | `GetTorrents`, `Login`, ... | qBittorrent API operation name |
 | `component` | `qb_client`, `stream_queue` | Internal component |
@@ -21,25 +21,25 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | Metric | Labels | Description |
 |--------|--------|-------------|
 | `qbsync_torrents_synced_total` | `mode`, `hash`, `name` | Torrents successfully synced |
-| `qbsync_torrent_bytes_synced_total` | `hash`, `name` | Bytes synced per torrent (hot only, for completed-transfers table) |
+| `qbsync_torrent_bytes_synced_total` | `hash`, `name` | Bytes synced per torrent (source only, for completed-transfers table) |
 | `qbsync_finalization_errors_total` | `mode` | Finalization failures |
 | `qbsync_torrent_stop_errors_total` | `mode` | Failures stopping torrents before handoff |
 | `qbsync_torrent_resume_errors_total` | `mode` | Failures resuming torrents after handoff rollback |
-| `qbsync_orphan_cleanups_total` | | Orphan torrents cleaned up on cold |
-| `qbsync_pieces_sent_total` | `connection` | Pieces sent from hot |
-| `qbsync_pieces_acked_total` | | Pieces acknowledged by cold |
+| `qbsync_orphan_cleanups_total` | | Orphan torrents cleaned up on destination |
+| `qbsync_pieces_sent_total` | `connection` | Pieces sent from source |
+| `qbsync_pieces_acked_total` | | Pieces acknowledged by destination |
 | `qbsync_pieces_failed_total` | | Piece transfer failures |
-| `qbsync_pieces_received_total` | | Pieces received on cold |
-| `qbsync_bytes_sent_total` | `connection` | Bytes sent from hot |
-| `qbsync_bytes_received_total` | | Bytes received on cold (aggregate) |
+| `qbsync_pieces_received_total` | | Pieces received on destination |
+| `qbsync_bytes_sent_total` | `connection` | Bytes sent from source |
+| `qbsync_bytes_received_total` | | Bytes received on destination (aggregate) |
 | `qbsync_qb_client_retries_total` | | qBittorrent API retries |
 | `qbsync_qb_api_calls_total` | `mode`, `operation` | qBittorrent API calls by operation |
 | `qbsync_circuit_breaker_trips_total` | `mode`, `component` | Circuit breaker trips |
 | `qbsync_stream_reconnects_total` | | gRPC stream reconnections |
 | `qbsync_stale_pieces_total` | | Pieces that timed out in-flight |
 | `qbsync_drain_timeout_pieces_lost_total` | | Pieces lost due to drain timeout at shutdown |
-| `qbsync_hardlinks_created_total` | | Hardlinks created on cold |
-| `qbsync_piece_hash_mismatch_total` | | Pieces rejected on cold due to hash mismatch (retried automatically) |
+| `qbsync_hardlinks_created_total` | | Hardlinks created on destination |
+| `qbsync_piece_hash_mismatch_total` | | Pieces rejected on destination due to hash mismatch (retried automatically) |
 | `qbsync_tag_application_errors_total` | `mode` | Failures applying tags in qBittorrent |
 | `qbsync_piece_write_errors_total` | `mode` | Piece write failures (file open/truncate/write) |
 | `qbsync_state_save_errors_total` | `mode` | Failures saving torrent state to disk |
@@ -47,12 +47,12 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_verification_errors_total` | `mode` | Piece verification failures during finalization |
 | `qbsync_hardlink_errors_total` | `mode` | Hardlink creation failures |
 | `qbsync_stream_open_errors_total` | `mode` | Stream open or poll failures |
-| `qbsync_hot_cleanup_groups_total` | `result` | Hardlink groups processed during hot cleanup |
-| `qbsync_hot_cleanup_torrents_handed_off_total` | | Torrents handed off from hot to cold |
+| `qbsync_hot_cleanup_groups_total` | `result` | Hardlink groups processed during source cleanup |
+| `qbsync_hot_cleanup_torrents_handed_off_total` | | Torrents handed off from source to destination |
 | `qbsync_idle_poll_skips_total` | | Piece poll skips due to idle torrent detection |
 | `qbsync_cycle_cache_hits_total` | | Per-cycle completed-torrents cache reuses |
 | `qbsync_health_check_cache_total` | `result` | Health check cache hits/misses |
-| `qbsync_file_handle_cache_total` | `result` | File handle cache lookups (hit/miss) on hot |
+| `qbsync_file_handle_cache_total` | `result` | File handle cache lookups (hit/miss) on source |
 | `qbsync_file_handle_evictions_total` | | File handle evictions (stale retry, fallback, or full evict) |
 | `qbsync_window_full_total` | | Sender blocked waiting for congestion window capacity |
 | `qbsync_send_timeout_total` | | Send() timed out on HTTP/2 flow control backpressure |
@@ -60,9 +60,9 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_ack_channel_blocked_total` | | receiveAcks exited because ack channel was blocked too long |
 | `qbsync_connection_scale_events_total` | `direction` | TCP connection scaling events (up/down) |
 | `qbsync_files_early_finalized_total` | | Files synced, closed, and renamed before torrent finalization |
-| `qbsync_file_selection_resyncs_total` | | Re-syncs triggered by file selection changes (hot) |
-| `qbsync_early_finalize_verify_failures_total` | | Files that failed read-back verification during early finalization (cold) |
-| `qbsync_verification_recoveries_total` | | Torrents recovered from verification failure by marking pieces for re-streaming (cold) |
+| `qbsync_file_selection_resyncs_total` | | Re-syncs triggered by file selection changes (source) |
+| `qbsync_early_finalize_verify_failures_total` | | Files that failed read-back verification during early finalization (destination) |
+| `qbsync_verification_recoveries_total` | | Torrents recovered from verification failure by marking pieces for re-streaming (destination) |
 
 ## Gauges
 
@@ -76,33 +76,33 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_circuit_breaker_state` | `mode`, `component` | Circuit breaker state: 0=closed, 1=open, 2=half-open |
 | `qbsync_stream_pool_scaling_paused` | | Pool scaling paused: 1=paused, 0=active |
 | `qbsync_transfer_throughput_bytes_per_second` | | Current transfer throughput |
-| `qbsync_torrents_with_dirty_state` | | Torrents with state not yet flushed to disk (cold) |
-| `qbsync_active_finalization_backoffs` | | Torrents in finalization backoff (hot) |
+| `qbsync_torrents_with_dirty_state` | | Torrents with state not yet flushed to disk (destination) |
+| `qbsync_active_finalization_backoffs` | | Torrents in finalization backoff (source) |
 | `qbsync_oldest_pending_sync_seconds` | `hash`, `name` | Age of each torrent waiting to sync |
 | `qbsync_torrent_pieces` | `hash`, `name` | Total pieces per tracked torrent |
-| `qbsync_torrent_pieces_streamed` | `hash`, `name` | Pieces synced to cold per tracked torrent |
+| `qbsync_torrent_pieces_streamed` | `hash`, `name` | Pieces synced to destination per tracked torrent |
 | `qbsync_torrent_size_bytes` | `hash`, `name` | Total size in bytes per tracked torrent |
-| `qbsync_completed_on_cold_cache_size` | | Torrents cached as complete on cold (hot) |
-| `qbsync_inode_registry_size` | | Registered inodes for hardlink deduplication (cold) |
-| `qbsync_cold_worker_queue_depth` | | Pieces queued waiting for a cold write worker |
-| `qbsync_cold_workers_busy` | | Cold write workers currently processing |
-| `qbsync_grpc_connections_configured` | | Maximum TCP connections configured for gRPC streaming (hot) |
-| `qbsync_grpc_connections_active` | | Current active TCP connections to cold server (hot) |
-| `qbsync_sender_workers_configured` | | Concurrent sender workers configured (hot) |
-| `qbsync_draining` | | Shutdown drain in progress: 1=draining, 0=normal (hot) |
+| `qbsync_completed_on_cold_cache_size` | | Torrents cached as complete on destination (source) |
+| `qbsync_inode_registry_size` | | Registered inodes for hardlink deduplication (destination) |
+| `qbsync_cold_worker_queue_depth` | | Pieces queued waiting for a destination write worker |
+| `qbsync_cold_workers_busy` | | Destination write workers currently processing |
+| `qbsync_grpc_connections_configured` | | Maximum TCP connections configured for gRPC streaming (source) |
+| `qbsync_grpc_connections_active` | | Current active TCP connections to destination server (source) |
+| `qbsync_sender_workers_configured` | | Concurrent sender workers configured (source) |
+| `qbsync_draining` | | Shutdown drain in progress: 1=draining, 0=normal (source) |
 
 ## Histograms
 
 | Metric | Labels | Buckets | Description |
 |--------|--------|---------|-------------|
-| `qbsync_piece_read_duration_seconds` | | 1ms .. 5s | Time to read a piece from disk on hot |
-| `qbsync_piece_send_duration_seconds` | `connection` | 10ms .. 10s | Time to send a piece from hot |
-| `qbsync_piece_write_duration_seconds` | | 1ms .. 5s | Time to verify and write a piece on cold |
+| `qbsync_piece_read_duration_seconds` | | 1ms .. 5s | Time to read a piece from disk on source |
+| `qbsync_piece_send_duration_seconds` | `connection` | 10ms .. 10s | Time to send a piece from source |
+| `qbsync_piece_write_duration_seconds` | | 1ms .. 5s | Time to verify and write a piece on destination |
 | `qbsync_piece_rtt_seconds` | | 10ms .. 5s | Round-trip time for piece acknowledgment |
-| `qbsync_finalization_duration_seconds` | `result` | 100ms .. 120s | Time to finalize a torrent on cold |
+| `qbsync_finalization_duration_seconds` | `result` | 100ms .. 120s | Time to finalize a torrent on destination |
 | `qbsync_qb_api_call_duration_seconds` | `mode`, `operation` | 10ms .. 10s | qBittorrent API call latency (including retries) |
-| `qbsync_state_flush_duration_seconds` | | 1ms .. 2.5s | Time to flush dirty torrent state to disk (cold) |
-| `qbsync_torrent_sync_latency_seconds` | | 10s .. 7200s | End-to-end sync duration from download completion to cold finalization |
+| `qbsync_state_flush_duration_seconds` | | 1ms .. 2.5s | Time to flush dirty torrent state to disk (destination) |
+| `qbsync_torrent_sync_latency_seconds` | | 10s .. 7200s | End-to-end sync duration from download completion to destination finalization |
 
 ## Grafana Tips
 
@@ -112,7 +112,7 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 |--------|--------|
 | Name | `qbsync_torrent_bytes_synced_total` label `name` |
 | Bytes | `qbsync_torrent_bytes_synced_total` |
-| Synced at | `timestamp(qbsync_torrents_synced_total{mode="hot"})` |
+| Synced at | `timestamp(qbsync_torrents_synced_total{mode="source"})` |
 
 **Live per-torrent progress** (download list view):
 

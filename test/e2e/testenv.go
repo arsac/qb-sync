@@ -19,9 +19,9 @@ import (
 	"github.com/testcontainers/testcontainers-go/modules/compose"
 	"github.com/testcontainers/testcontainers-go/wait"
 
-	"github.com/arsac/qb-sync/internal/cold"
 	"github.com/arsac/qb-sync/internal/config"
-	"github.com/arsac/qb-sync/internal/hot"
+	"github.com/arsac/qb-sync/internal/destination"
+	"github.com/arsac/qb-sync/internal/source"
 	"github.com/arsac/qb-sync/internal/streaming"
 )
 
@@ -43,42 +43,42 @@ const (
 	progressTolerance    = 0.001 // For float comparisons
 )
 
-// TestEnv holds the complete test environment for hot/cold e2e tests.
+// TestEnv holds the complete test environment for source/destination e2e tests.
 type TestEnv struct {
-	compose    compose.ComposeStack
-	hotURL     string
-	coldURL    string
-	hotPath    string
-	coldPath   string
-	hotClient  *qbittorrent.Client
-	coldClient *qbittorrent.Client
-	coldServer *cold.Server
-	grpcAddr   string
-	t          *testing.T
-	logger     *slog.Logger
+	compose          compose.ComposeStack
+	sourceURL        string
+	destinationURL   string
+	sourcePath       string
+	destinationPath  string
+	sourceClient     *qbittorrent.Client
+	destinationClient *qbittorrent.Client
+	destinationServer *destination.Server
+	grpcAddr          string
+	t                 *testing.T
+	logger            *slog.Logger
 
-	// Cancellation for cold server
-	coldCancel    context.CancelFunc
-	coldDone      chan error
-	coldServerCtx context.Context
+	// Cancellation for destination server
+	destinationCancel    context.CancelFunc
+	destinationDone      chan error
+	destinationServerCtx context.Context
 
-	// Cold server config for restart
-	coldServerConfig cold.ServerConfig
+	// Destination server config for restart
+	destinationServerConfig destination.ServerConfig
 }
 
 // SetupOption configures the test environment.
 type SetupOption func(*setupConfig)
 
 type setupConfig struct {
-	hotTempPath bool
+	sourceTempPath bool
 }
 
-// WithHotTempPath enables temp_path on the hot qBittorrent instance.
+// WithSourceTempPath enables temp_path on the source qBittorrent instance.
 // This mounts the same host directory at an additional container path (/incomplete)
 // and configures qBittorrent to use it as the temp/incomplete download directory.
-func WithHotTempPath() SetupOption {
+func WithSourceTempPath() SetupOption {
 	return func(cfg *setupConfig) {
-		cfg.hotTempPath = true
+		cfg.sourceTempPath = true
 	}
 }
 
@@ -95,36 +95,36 @@ func SetupTestEnv(t *testing.T, opts ...SetupOption) *TestEnv {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	// Create temp directories for test data.
-	// Hot directory names match the container mount points (/downloads, /incomplete)
+	// Source directory names match the container mount points (/downloads, /incomplete)
 	// so the orchestrator's relative-path computation (Rel(save_path, temp_path)
 	// applied to dataPath) resolves to the correct host directory.
 	tmpDir := t.TempDir()
-	hotPath := filepath.Join(tmpDir, "downloads")
-	hotIncompletePath := filepath.Join(tmpDir, "incomplete")
-	coldPath := filepath.Join(tmpDir, "cold")
-	hotConfig := filepath.Join(tmpDir, "qb-hot")
-	coldConfig := filepath.Join(tmpDir, "qb-cold")
+	sourcePath := filepath.Join(tmpDir, "downloads")
+	sourceIncompletePath := filepath.Join(tmpDir, "incomplete")
+	destinationPath := filepath.Join(tmpDir, "destination")
+	sourceConfig := filepath.Join(tmpDir, "qb-source")
+	destinationConfig := filepath.Join(tmpDir, "qb-destination")
 
-	require.NoError(t, os.MkdirAll(hotPath, 0o755))
-	require.NoError(t, os.MkdirAll(hotIncompletePath, 0o755))
-	require.NoError(t, os.MkdirAll(coldPath, 0o755))
-	require.NoError(t, os.MkdirAll(hotConfig, 0o755))
-	require.NoError(t, os.MkdirAll(coldConfig, 0o755))
+	require.NoError(t, os.MkdirAll(sourcePath, 0o755))
+	require.NoError(t, os.MkdirAll(sourceIncompletePath, 0o755))
+	require.NoError(t, os.MkdirAll(destinationPath, 0o755))
+	require.NoError(t, os.MkdirAll(sourceConfig, 0o755))
+	require.NoError(t, os.MkdirAll(destinationConfig, 0o755))
 
-	hotExtraVolumes := ""
-	if sc.hotTempPath {
+	sourceExtraVolumes := ""
+	if sc.sourceTempPath {
 		// Mount a separate host dir at /incomplete inside the container.
 		// The orchestrator's resolveQBDir computes a local tempDataPath from
 		// the relative offset between save_path and temp_path, so host paths
 		// must mirror the container layout (separate directories).
-		hotExtraVolumes = fmt.Sprintf("\n      - %s:/incomplete", hotIncompletePath)
+		sourceExtraVolumes = fmt.Sprintf("\n      - %s:/incomplete", sourceIncompletePath)
 	}
 
 	// Let Docker assign host ports dynamically to avoid TOCTOU port conflicts.
 	// Ports stay stable across container stop/start (same container instance).
 	composeContent := fmt.Sprintf(`
 services:
-  qb-hot:
+  qb-source:
     image: ghcr.io/home-operations/qbittorrent:5.1.4
     volumes:
       - %s:/downloads
@@ -138,10 +138,10 @@ services:
       retries: 30
       start_period: 10s
 
-  qb-cold:
+  qb-destination:
     image: ghcr.io/home-operations/qbittorrent:5.1.4
     volumes:
-      - %s:/cold-data
+      - %s:/destination-data
       - %s:/config
     ports:
       - "8080"
@@ -151,7 +151,7 @@ services:
       timeout: 5s
       retries: 30
       start_period: 10s
-`, hotPath, hotConfig, hotExtraVolumes, coldPath, coldConfig)
+`, sourcePath, sourceConfig, sourceExtraVolumes, destinationPath, destinationConfig)
 
 	// Create compose stack
 	identifier := fmt.Sprintf("qbsync-e2e-%d", time.Now().UnixNano())
@@ -163,80 +163,80 @@ services:
 
 	// Start the stack and wait for services to be ready
 	err = stack.
-		WaitForService("qb-hot", wait.ForHTTP("/api/v2/app/version").
+		WaitForService("qb-source", wait.ForHTTP("/api/v2/app/version").
 			WithPort("8080/tcp").
 			WithStartupTimeout(120*time.Second)).
-		WaitForService("qb-cold", wait.ForHTTP("/api/v2/app/version").
+		WaitForService("qb-destination", wait.ForHTTP("/api/v2/app/version").
 			WithPort("8080/tcp").
 			WithStartupTimeout(120*time.Second)).
 		Up(ctx, compose.Wait(true))
 	require.NoError(t, err)
 
 	// Query the actual mapped ports from the running containers.
-	hotURL := serviceURL(t, ctx, stack, "qb-hot")
-	coldURL := serviceURL(t, ctx, stack, "qb-cold")
+	sourceURL := serviceURL(t, ctx, stack, "qb-source")
+	destinationURL := serviceURL(t, ctx, stack, "qb-destination")
 
-	t.Logf("Hot qBittorrent: %s", hotURL)
-	t.Logf("Cold qBittorrent: %s", coldURL)
+	t.Logf("Source qBittorrent: %s", sourceURL)
+	t.Logf("Destination qBittorrent: %s", destinationURL)
 
 	// Create qBittorrent clients
-	hotClient := qbittorrent.NewClient(qbittorrent.Config{
-		Host:     hotURL,
+	sourceClient := qbittorrent.NewClient(qbittorrent.Config{
+		Host:     sourceURL,
 		Username: testUsername,
 		Password: testPassword,
 	})
 
-	coldClient := qbittorrent.NewClient(qbittorrent.Config{
-		Host:     coldURL,
+	destinationClient := qbittorrent.NewClient(qbittorrent.Config{
+		Host:     destinationURL,
 		Username: testUsername,
 		Password: testPassword,
 	})
 
 	// Wait for clients to be ready and login
 	require.Eventually(t, func() bool {
-		return hotClient.LoginCtx(ctx) == nil
-	}, 60*time.Second, 2*time.Second, "hot qBittorrent should be ready")
+		return sourceClient.LoginCtx(ctx) == nil
+	}, 60*time.Second, 2*time.Second, "source qBittorrent should be ready")
 
 	require.Eventually(t, func() bool {
-		return coldClient.LoginCtx(ctx) == nil
-	}, 60*time.Second, 2*time.Second, "cold qBittorrent should be ready")
+		return destinationClient.LoginCtx(ctx) == nil
+	}, 60*time.Second, 2*time.Second, "destination qBittorrent should be ready")
 
 	// Configure qBittorrent save paths to match volume mounts.
 	// The home-operations image defaults to /config/Downloads, but we mount data at /downloads.
-	hotPrefs := map[string]any{
+	sourcePrefs := map[string]any{
 		"save_path": "/downloads",
 	}
-	if sc.hotTempPath {
-		hotPrefs["temp_path_enabled"] = true
-		hotPrefs["temp_path"] = "/incomplete"
+	if sc.sourceTempPath {
+		sourcePrefs["temp_path_enabled"] = true
+		sourcePrefs["temp_path"] = "/incomplete"
 	}
-	require.NoError(t, hotClient.SetPreferencesCtx(ctx, hotPrefs))
-	require.NoError(t, coldClient.SetPreferencesCtx(ctx, map[string]any{
-		"save_path": "/cold-data",
+	require.NoError(t, sourceClient.SetPreferencesCtx(ctx, sourcePrefs))
+	require.NoError(t, destinationClient.SetPreferencesCtx(ctx, map[string]any{
+		"save_path": "/destination-data",
 	}))
 
 	// Find a free port for gRPC server
 	grpcAddr := findFreePort(t)
 
-	// Start cold gRPC server
-	coldServerConfig := cold.ServerConfig{
+	// Start destination gRPC server
+	destinationServerConfig := destination.ServerConfig{
 		ListenAddr: grpcAddr,
-		BasePath:   coldPath,
-		SavePath:   "/cold-data",
+		BasePath:   destinationPath,
+		SavePath:   "/destination-data",
 		SyncedTag:  "synced",
-		ColdQB: &cold.QBConfig{
-			URL:      coldURL,
+		QB: &destination.QBConfig{
+			URL:      destinationURL,
 			Username: testUsername,
 			Password: testPassword,
 		},
 	}
-	coldServer := cold.NewServer(coldServerConfig, logger)
+	destinationServer := destination.NewServer(destinationServerConfig, logger)
 
-	// Start cold server in background
-	coldServerCtx, coldServerCancel := context.WithCancel(context.Background())
-	coldServerDone := make(chan error, 1)
+	// Start destination server in background
+	destinationServerCtx, destinationServerCancel := context.WithCancel(context.Background())
+	destinationServerDone := make(chan error, 1)
 	go func() {
-		coldServerDone <- coldServer.Run(coldServerCtx)
+		destinationServerDone <- destinationServer.Run(destinationServerCtx)
 	}()
 
 	// Wait for gRPC server to be ready
@@ -250,21 +250,21 @@ services:
 	}, 10*time.Second, 100*time.Millisecond, "gRPC server should be ready")
 
 	env := &TestEnv{
-		compose:          stack,
-		hotURL:           hotURL,
-		coldURL:          coldURL,
-		hotPath:          hotPath,
-		coldPath:         coldPath,
-		hotClient:        hotClient,
-		coldClient:       coldClient,
-		coldServer:       coldServer,
-		grpcAddr:         grpcAddr,
-		t:                t,
-		logger:           logger,
-		coldCancel:       coldServerCancel,
-		coldDone:         coldServerDone,
-		coldServerCtx:    coldServerCtx,
-		coldServerConfig: coldServerConfig,
+		compose:                 stack,
+		sourceURL:               sourceURL,
+		destinationURL:          destinationURL,
+		sourcePath:              sourcePath,
+		destinationPath:         destinationPath,
+		sourceClient:            sourceClient,
+		destinationClient:       destinationClient,
+		destinationServer:       destinationServer,
+		grpcAddr:                grpcAddr,
+		t:                       t,
+		logger:                  logger,
+		destinationCancel:       destinationServerCancel,
+		destinationDone:         destinationServerDone,
+		destinationServerCtx:    destinationServerCtx,
+		destinationServerConfig: destinationServerConfig,
 	}
 
 	t.Cleanup(env.Cleanup)
@@ -274,8 +274,8 @@ services:
 
 // Cleanup tears down the test environment.
 func (env *TestEnv) Cleanup() {
-	env.coldCancel()
-	<-env.coldDone
+	env.destinationCancel()
+	<-env.destinationDone
 	_ = env.compose.Down(context.Background(),
 		compose.RemoveOrphans(true),
 		compose.RemoveVolumes(true),
@@ -302,37 +302,37 @@ func serviceURL(t *testing.T, ctx context.Context, stack compose.ComposeStack, s
 	return fmt.Sprintf("http://localhost:%s", mappedPort.Port())
 }
 
-// HotURL returns the hot qBittorrent URL.
-func (env *TestEnv) HotURL() string {
-	return env.hotURL
+// SourceURL returns the source qBittorrent URL.
+func (env *TestEnv) SourceURL() string {
+	return env.sourceURL
 }
 
-// ColdURL returns the cold qBittorrent URL.
-func (env *TestEnv) ColdURL() string {
-	return env.coldURL
+// DestinationURL returns the destination qBittorrent URL.
+func (env *TestEnv) DestinationURL() string {
+	return env.destinationURL
 }
 
-// HotPath returns the hot data path.
-func (env *TestEnv) HotPath() string {
-	return env.hotPath
+// SourcePath returns the source data path.
+func (env *TestEnv) SourcePath() string {
+	return env.sourcePath
 }
 
-// ColdPath returns the cold data path.
-func (env *TestEnv) ColdPath() string {
-	return env.coldPath
+// DestinationPath returns the destination data path.
+func (env *TestEnv) DestinationPath() string {
+	return env.destinationPath
 }
 
-// HotClient returns the hot qBittorrent client.
-func (env *TestEnv) HotClient() *qbittorrent.Client {
-	return env.hotClient
+// SourceClient returns the source qBittorrent client.
+func (env *TestEnv) SourceClient() *qbittorrent.Client {
+	return env.sourceClient
 }
 
-// ColdClient returns the cold qBittorrent client.
-func (env *TestEnv) ColdClient() *qbittorrent.Client {
-	return env.coldClient
+// DestinationClient returns the destination qBittorrent client.
+func (env *TestEnv) DestinationClient() *qbittorrent.Client {
+	return env.destinationClient
 }
 
-// GRPCAddr returns the cold gRPC server address.
+// GRPCAddr returns the destination gRPC server address.
 func (env *TestEnv) GRPCAddr() string {
 	return env.grpcAddr
 }
@@ -345,7 +345,7 @@ func (env *TestEnv) Logger() *slog.Logger {
 // CreateTestFile creates a test file with deterministic content.
 func (env *TestEnv) CreateTestFile(relativePath string, size int) string {
 	env.t.Helper()
-	fullPath := filepath.Join(env.hotPath, relativePath)
+	fullPath := filepath.Join(env.sourcePath, relativePath)
 	dir := filepath.Dir(fullPath)
 	require.NoError(env.t, os.MkdirAll(dir, 0o755))
 
@@ -357,20 +357,20 @@ func (env *TestEnv) CreateTestFile(relativePath string, size int) string {
 	return fullPath
 }
 
-// AddTorrentToHot adds a test torrent to hot qBittorrent from URL.
-func (env *TestEnv) AddTorrentToHot(ctx context.Context, url string, opts map[string]string) error {
-	return env.addTorrent(ctx, env.hotClient, url, opts)
+// AddTorrentToSource adds a test torrent to source qBittorrent from URL.
+func (env *TestEnv) AddTorrentToSource(ctx context.Context, url string, opts map[string]string) error {
+	return env.addTorrent(ctx, env.sourceClient, url, opts)
 }
 
-// AddTorrentToCold adds a test torrent to cold qBittorrent from URL.
-func (env *TestEnv) AddTorrentToCold(ctx context.Context, url string, opts map[string]string) error {
+// AddTorrentToDestination adds a test torrent to destination qBittorrent from URL.
+func (env *TestEnv) AddTorrentToDestination(ctx context.Context, url string, opts map[string]string) error {
 	if opts == nil {
 		opts = make(map[string]string)
 	}
 	if _, ok := opts["savepath"]; !ok {
-		opts["savepath"] = "/cold-data"
+		opts["savepath"] = "/destination-data"
 	}
-	return env.coldClient.AddTorrentFromUrlCtx(ctx, url, opts)
+	return env.destinationClient.AddTorrentFromUrlCtx(ctx, url, opts)
 }
 
 func (env *TestEnv) addTorrent(
@@ -496,11 +496,11 @@ func (env *TestEnv) isTorrentComplete(state qbittorrent.TorrentState) bool {
 	}
 }
 
-// IsTorrentCompleteOnCold checks if a torrent is complete on cold qBittorrent.
-// This is the new way to verify sync completion - checking cold qB status
+// IsTorrentCompleteOnDestination checks if a torrent is complete on destination qBittorrent.
+// This is the new way to verify sync completion - checking destination qB status
 // instead of the old "synced" tag approach.
-func (env *TestEnv) IsTorrentCompleteOnCold(ctx context.Context, hash string) bool {
-	torrents, err := env.coldClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+func (env *TestEnv) IsTorrentCompleteOnDestination(ctx context.Context, hash string) bool {
+	torrents, err := env.destinationClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
 		Hashes: []string{hash},
 	})
 	if err != nil || len(torrents) == 0 {
@@ -510,8 +510,8 @@ func (env *TestEnv) IsTorrentCompleteOnCold(ctx context.Context, hash string) bo
 	return torrent.Progress >= 1.0 || env.isTorrentComplete(torrent.State)
 }
 
-// WaitForTorrentCompleteOnCold waits for a torrent to be complete on cold qBittorrent.
-func (env *TestEnv) WaitForTorrentCompleteOnCold(
+// WaitForTorrentCompleteOnDestination waits for a torrent to be complete on destination qBittorrent.
+func (env *TestEnv) WaitForTorrentCompleteOnDestination(
 	ctx context.Context,
 	hash string,
 	timeout time.Duration,
@@ -519,16 +519,16 @@ func (env *TestEnv) WaitForTorrentCompleteOnCold(
 ) {
 	env.t.Helper()
 	require.Eventually(env.t, func() bool {
-		return env.IsTorrentCompleteOnCold(ctx, hash)
+		return env.IsTorrentCompleteOnDestination(ctx, hash)
 	}, timeout, 2*time.Second, msg)
 }
 
-// WaitForSyncedTagOnCold waits for the synced tag to appear on a cold torrent.
+// WaitForSyncedTagOnDestination waits for the synced tag to appear on a destination torrent.
 // The synced tag is applied in background finalization after addAndVerifyTorrent completes.
-func (env *TestEnv) WaitForSyncedTagOnCold(ctx context.Context, hash string, timeout time.Duration, msg string) {
+func (env *TestEnv) WaitForSyncedTagOnDestination(ctx context.Context, hash string, timeout time.Duration, msg string) {
 	env.t.Helper()
 	require.Eventually(env.t, func() bool {
-		torrents, err := env.coldClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+		torrents, err := env.destinationClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
 			Hashes: []string{hash},
 		})
 		if err != nil || len(torrents) == 0 {
@@ -538,7 +538,7 @@ func (env *TestEnv) WaitForSyncedTagOnCold(ctx context.Context, hash string, tim
 	}, timeout, time.Second, msg)
 }
 
-// IsTorrentStopped checks if a torrent on hot qBittorrent is in a stopped/paused state.
+// IsTorrentStopped checks if a torrent is in a stopped/paused state.
 func (env *TestEnv) IsTorrentStopped(ctx context.Context, client *qbittorrent.Client, hash string) bool {
 	torrents, err := client.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
 		Hashes: []string{hash},
@@ -563,14 +563,14 @@ func (env *TestEnv) CreateGRPCDestination() (*streaming.GRPCDestination, error) 
 	return streaming.NewGRPCDestination(env.grpcAddr, 2, 8)
 }
 
-// CreateHotConfig creates a hot config for testing.
-func (env *TestEnv) CreateHotConfig(opts ...HotConfigOption) *config.HotConfig {
-	cfg := &config.HotConfig{
+// CreateSourceConfig creates a source config for testing.
+func (env *TestEnv) CreateSourceConfig(opts ...SourceConfigOption) *config.SourceConfig {
+	cfg := &config.SourceConfig{
 		BaseConfig: config.BaseConfig{
-			QBURL:      env.hotURL,
+			QBURL:      env.sourceURL,
 			QBUsername: testUsername,
 			QBPassword: testPassword,
-			DataPath:   env.hotPath,
+			DataPath:   env.sourcePath,
 			SyncedTag:  "synced",
 		},
 		MinSpaceGB:         1,
@@ -587,82 +587,82 @@ func (env *TestEnv) CreateHotConfig(opts ...HotConfigOption) *config.HotConfig {
 	return cfg
 }
 
-// HotConfigOption is a functional option for hot config.
-type HotConfigOption func(*config.HotConfig)
+// SourceConfigOption is a functional option for source config.
+type SourceConfigOption func(*config.SourceConfig)
 
 // WithDryRun sets dry run mode.
-func WithDryRun(dryRun bool) HotConfigOption {
-	return func(cfg *config.HotConfig) {
+func WithDryRun(dryRun bool) SourceConfigOption {
+	return func(cfg *config.SourceConfig) {
 		cfg.DryRun = dryRun
 	}
 }
 
 // WithMinSeedingTime sets minimum seeding time.
-func WithMinSeedingTime(d time.Duration) HotConfigOption {
-	return func(cfg *config.HotConfig) {
+func WithMinSeedingTime(d time.Duration) SourceConfigOption {
+	return func(cfg *config.SourceConfig) {
 		cfg.MinSeedingTime = d
 	}
 }
 
 // WithGRPCConnections sets the min and max gRPC connections.
-func WithGRPCConnections(min, max int) HotConfigOption {
-	return func(cfg *config.HotConfig) {
+func WithGRPCConnections(min, max int) SourceConfigOption {
+	return func(cfg *config.SourceConfig) {
 		cfg.MinGRPCConnections = min
 		cfg.MaxGRPCConnections = max
 	}
 }
 
 // WithNumSenders sets the number of sender goroutines.
-func WithNumSenders(n int) HotConfigOption {
-	return func(cfg *config.HotConfig) {
+func WithNumSenders(n int) SourceConfigOption {
+	return func(cfg *config.SourceConfig) {
 		cfg.NumSenders = n
 	}
 }
 
-// WithSourceRemovedTag sets the tag applied on cold when torrent is removed from hot.
-func WithSourceRemovedTag(tag string) HotConfigOption {
-	return func(cfg *config.HotConfig) {
+// WithSourceRemovedTag sets the tag applied on destination when torrent is removed from source.
+func WithSourceRemovedTag(tag string) SourceConfigOption {
+	return func(cfg *config.SourceConfig) {
 		cfg.SourceRemovedTag = tag
 	}
 }
 
-// CreateHotTask creates a QBTask for testing.
-func (env *TestEnv) CreateHotTask(cfg *config.HotConfig) (*hot.QBTask, *streaming.GRPCDestination, error) {
+// CreateSourceTask creates a QBTask for testing.
+func (env *TestEnv) CreateSourceTask(cfg *config.SourceConfig) (*source.QBTask, *streaming.GRPCDestination, error) {
 	dest, err := env.CreateGRPCDestination()
 	if err != nil {
 		return nil, nil, fmt.Errorf("creating gRPC destination: %w", err)
 	}
 
-	task, err := hot.NewQBTask(cfg, dest, env.logger)
+	task, err := source.NewQBTask(cfg, dest, env.logger)
 	if err != nil {
 		dest.Close()
-		return nil, nil, fmt.Errorf("creating hot task: %w", err)
+		return nil, nil, fmt.Errorf("creating source task: %w", err)
 	}
 
 	return task, dest, nil
 }
 
-// StopColdServer stops the cold gRPC server.
-func (env *TestEnv) StopColdServer() {
+// StopDestinationServer stops the destination gRPC server.
+func (env *TestEnv) StopDestinationServer() {
 	env.t.Helper()
-	env.coldCancel()
-	<-env.coldDone
-	env.t.Log("Cold gRPC server stopped")
+	env.destinationCancel()
+	<-env.destinationDone
+	env.t.Log("Destination gRPC server stopped")
 }
 
-// StartColdServer starts (or restarts) the cold gRPC server.
-func (env *TestEnv) StartColdServer() {
+// StartDestinationServer starts (or restarts) the destination gRPC server.
+func (env *TestEnv) StartDestinationServer() {
 	env.t.Helper()
 	ctx := context.Background()
 
 	// Create new server with same config
-	env.coldServer = cold.NewServer(env.coldServerConfig, env.logger)
+	env.destinationServer = destination.NewServer(env.destinationServerConfig, env.logger)
 
 	// Start in background
-	env.coldServerCtx, env.coldCancel = context.WithCancel(context.Background())
-	env.coldDone = make(chan error, 1)
+	env.destinationServerCtx, env.destinationCancel = context.WithCancel(context.Background())
+	env.destinationDone = make(chan error, 1)
 	go func() {
-		env.coldDone <- env.coldServer.Run(env.coldServerCtx)
+		env.destinationDone <- env.destinationServer.Run(env.destinationServerCtx)
 	}()
 
 	// Wait for gRPC server to be ready
@@ -675,68 +675,68 @@ func (env *TestEnv) StartColdServer() {
 		return true
 	}, 10*time.Second, 100*time.Millisecond, "gRPC server should be ready after restart")
 
-	// Re-login to cold qBittorrent
+	// Re-login to destination qBittorrent
 	require.Eventually(env.t, func() bool {
-		return env.coldClient.LoginCtx(ctx) == nil
-	}, 30*time.Second, time.Second, "cold qBittorrent should be accessible after cold server restart")
+		return env.destinationClient.LoginCtx(ctx) == nil
+	}, 30*time.Second, time.Second, "destination qBittorrent should be accessible after destination server restart")
 
-	env.t.Log("Cold gRPC server started")
+	env.t.Log("Destination gRPC server started")
 }
 
-// StopHotQBittorrent stops the hot qBittorrent container.
-func (env *TestEnv) StopHotQBittorrent(ctx context.Context) error {
+// StopSourceQBittorrent stops the source qBittorrent container.
+func (env *TestEnv) StopSourceQBittorrent(ctx context.Context) error {
 	env.t.Helper()
-	return env.stopContainer(ctx, "qb-hot", "Hot")
+	return env.stopContainer(ctx, "qb-source", "Source")
 }
 
-// StartHotQBittorrent starts the hot qBittorrent container.
-func (env *TestEnv) StartHotQBittorrent(ctx context.Context) error {
+// StartSourceQBittorrent starts the source qBittorrent container.
+func (env *TestEnv) StartSourceQBittorrent(ctx context.Context) error {
 	env.t.Helper()
-	newURL, err := env.startContainer(ctx, "qb-hot", "Hot")
+	newURL, err := env.startContainer(ctx, "qb-source", "Source")
 	if err != nil {
 		return err
 	}
 
-	env.hotURL = newURL
-	env.hotClient = qbittorrent.NewClient(qbittorrent.Config{
+	env.sourceURL = newURL
+	env.sourceClient = qbittorrent.NewClient(qbittorrent.Config{
 		Host:     newURL,
 		Username: testUsername,
 		Password: testPassword,
 	})
-	env.waitForClientReady(ctx, env.hotClient, "hot")
+	env.waitForClientReady(ctx, env.sourceClient, "source")
 
-	env.t.Log("Hot qBittorrent container started and healthy")
+	env.t.Log("Source qBittorrent container started and healthy")
 	return nil
 }
 
-// StopColdQBittorrent stops the cold qBittorrent container.
-func (env *TestEnv) StopColdQBittorrent(ctx context.Context) error {
+// StopDestinationQBittorrent stops the destination qBittorrent container.
+func (env *TestEnv) StopDestinationQBittorrent(ctx context.Context) error {
 	env.t.Helper()
-	return env.stopContainer(ctx, "qb-cold", "Cold")
+	return env.stopContainer(ctx, "qb-destination", "Destination")
 }
 
-// StartColdQBittorrent starts the cold qBittorrent container.
-func (env *TestEnv) StartColdQBittorrent(ctx context.Context) error {
+// StartDestinationQBittorrent starts the destination qBittorrent container.
+func (env *TestEnv) StartDestinationQBittorrent(ctx context.Context) error {
 	env.t.Helper()
-	newURL, err := env.startContainer(ctx, "qb-cold", "Cold")
+	newURL, err := env.startContainer(ctx, "qb-destination", "Destination")
 	if err != nil {
 		return err
 	}
 
-	env.coldURL = newURL
-	env.coldClient = qbittorrent.NewClient(qbittorrent.Config{
+	env.destinationURL = newURL
+	env.destinationClient = qbittorrent.NewClient(qbittorrent.Config{
 		Host:     newURL,
 		Username: testUsername,
 		Password: testPassword,
 	})
-	env.waitForClientReady(ctx, env.coldClient, "cold")
+	env.waitForClientReady(ctx, env.destinationClient, "destination")
 
-	// Update the cold server config with the new URL and restart.
-	env.coldServerConfig.ColdQB.URL = newURL
-	env.StopColdServer()
-	env.StartColdServer()
+	// Update the destination server config with the new URL and restart.
+	env.destinationServerConfig.QB.URL = newURL
+	env.StopDestinationServer()
+	env.StartDestinationServer()
 
-	env.t.Log("Cold qBittorrent container started and healthy")
+	env.t.Log("Destination qBittorrent container started and healthy")
 	return nil
 }
 
@@ -794,70 +794,70 @@ func (env *TestEnv) waitForClientReady(ctx context.Context, client *qbittorrent.
 	}, 30*time.Second, time.Second, "%s qBittorrent API should be ready after restart", name)
 }
 
-// RestartHotQBittorrent restarts the hot qBittorrent container.
-func (env *TestEnv) RestartHotQBittorrent(ctx context.Context) error {
+// RestartSourceQBittorrent restarts the source qBittorrent container.
+func (env *TestEnv) RestartSourceQBittorrent(ctx context.Context) error {
 	env.t.Helper()
-	if err := env.StopHotQBittorrent(ctx); err != nil {
+	if err := env.StopSourceQBittorrent(ctx); err != nil {
 		return err
 	}
-	return env.StartHotQBittorrent(ctx)
+	return env.StartSourceQBittorrent(ctx)
 }
 
-// RestartColdQBittorrent restarts the cold qBittorrent container.
-func (env *TestEnv) RestartColdQBittorrent(ctx context.Context) error {
+// RestartDestinationQBittorrent restarts the destination qBittorrent container.
+func (env *TestEnv) RestartDestinationQBittorrent(ctx context.Context) error {
 	env.t.Helper()
-	if err := env.StopColdQBittorrent(ctx); err != nil {
+	if err := env.StopDestinationQBittorrent(ctx); err != nil {
 		return err
 	}
-	return env.StartColdQBittorrent(ctx)
+	return env.StartDestinationQBittorrent(ctx)
 }
 
-// RestartColdServer restarts the cold gRPC server.
-func (env *TestEnv) RestartColdServer() {
+// RestartDestinationServer restarts the destination gRPC server.
+func (env *TestEnv) RestartDestinationServer() {
 	env.t.Helper()
-	env.StopColdServer()
-	env.StartColdServer()
+	env.StopDestinationServer()
+	env.StartDestinationServer()
 }
 
-// CleanupBothSides removes torrents from both hot and cold qBittorrent instances.
+// CleanupBothSides removes torrents from both source and destination qBittorrent instances.
 func (env *TestEnv) CleanupBothSides(ctx context.Context, hashes ...string) {
 	env.t.Helper()
 	for _, hash := range hashes {
-		env.CleanupTorrent(ctx, env.hotClient, hash)
-		env.CleanupTorrent(ctx, env.coldClient, hash)
+		env.CleanupTorrent(ctx, env.sourceClient, hash)
+		env.CleanupTorrent(ctx, env.destinationClient, hash)
 	}
 }
 
-// DownloadTorrentOnHot adds a torrent to hot, waits for it to appear, and waits
+// DownloadTorrentOnSource adds a torrent to source, waits for it to appear, and waits
 // for it to finish downloading. Returns the torrent metadata.
-func (env *TestEnv) DownloadTorrentOnHot(
+func (env *TestEnv) DownloadTorrentOnSource(
 	ctx context.Context,
 	url, hash string,
 	downloadTimeout time.Duration,
 ) *qbittorrent.Torrent {
 	env.t.Helper()
-	err := env.AddTorrentToHot(ctx, url, nil)
+	err := env.AddTorrentToSource(ctx, url, nil)
 	require.NoError(env.t, err)
 
-	torrent := env.WaitForTorrent(env.hotClient, hash, torrentAppearTimeout)
+	torrent := env.WaitForTorrent(env.sourceClient, hash, torrentAppearTimeout)
 	require.NotNil(env.t, torrent)
 
 	env.t.Logf("Torrent added: %s, waiting for download...", torrent.Name)
-	env.WaitForTorrentComplete(env.hotClient, hash, downloadTimeout)
+	env.WaitForTorrentComplete(env.sourceClient, hash, downloadTimeout)
 	env.t.Log("Torrent download complete")
 
 	return torrent
 }
 
-// AssertTorrentCompleteOnCold verifies the torrent exists on cold qBittorrent
+// AssertTorrentCompleteOnDestination verifies the torrent exists on destination qBittorrent
 // and is 100% complete.
-func (env *TestEnv) AssertTorrentCompleteOnCold(ctx context.Context, hash string) {
+func (env *TestEnv) AssertTorrentCompleteOnDestination(ctx context.Context, hash string) {
 	env.t.Helper()
-	coldTorrents, err := env.coldClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+	destTorrents, err := env.destinationClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
 		Hashes: []string{hash},
 	})
 	require.NoError(env.t, err)
-	require.Len(env.t, coldTorrents, 1, "torrent should exist on cold qBittorrent")
-	assert.InDelta(env.t, 1.0, coldTorrents[0].Progress, progressTolerance,
-		"torrent should be 100% complete on cold")
+	require.Len(env.t, destTorrents, 1, "torrent should exist on destination qBittorrent")
+	assert.InDelta(env.t, 1.0, destTorrents[0].Progress, progressTolerance,
+		"torrent should be 100% complete on destination")
 }

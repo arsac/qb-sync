@@ -544,7 +544,7 @@ func (p *StreamPool) applyScalingDecision(currentThroughput float64) {
 // tryScaleUp attempts to add a stream. Must hold p.mu.
 func (p *StreamPool) tryScaleUp() {
 	if err := p.addStreamLocked(); err != nil {
-		metrics.StreamOpenErrorsTotal.WithLabelValues(metrics.ModeHot).Inc()
+		metrics.StreamOpenErrorsTotal.WithLabelValues(metrics.ModeSource).Inc()
 		p.logger.WarnContext(p.ctx, "failed to add stream", "error", err)
 		return
 	}

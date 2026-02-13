@@ -9,68 +9,68 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestHotConfig_Validate(t *testing.T) {
+func TestSourceConfig_Validate(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name    string
-		cfg     HotConfig
+		cfg     SourceConfig
 		wantErr string
 	}{
 		{
 			name: "valid config",
-			cfg: HotConfig{
-				BaseConfig: BaseConfig{DataPath: "/data", QBURL: "http://qb:8080"},
-				ColdAddr:   "cold:50051",
+			cfg: SourceConfig{
+				BaseConfig:      BaseConfig{DataPath: "/data", QBURL: "http://qb:8080"},
+				DestinationAddr: "cold:50051",
 			},
 			wantErr: "",
 		},
 		{
 			name: "missing data path",
-			cfg: HotConfig{
-				BaseConfig: BaseConfig{QBURL: "http://qb:8080"},
-				ColdAddr:   "cold:50051",
+			cfg: SourceConfig{
+				BaseConfig:      BaseConfig{QBURL: "http://qb:8080"},
+				DestinationAddr: "cold:50051",
 			},
 			wantErr: "data path is required",
 		},
 		{
 			name: "missing qb URL",
-			cfg: HotConfig{
-				BaseConfig: BaseConfig{DataPath: "/data"},
-				ColdAddr:   "cold:50051",
+			cfg: SourceConfig{
+				BaseConfig:      BaseConfig{DataPath: "/data"},
+				DestinationAddr: "cold:50051",
 			},
 			wantErr: "qBittorrent URL is required",
 		},
 		{
-			name: "missing cold addr",
-			cfg: HotConfig{
+			name: "missing destination addr",
+			cfg: SourceConfig{
 				BaseConfig: BaseConfig{DataPath: "/data", QBURL: "http://qb:8080"},
 			},
-			wantErr: "cold server address is required",
+			wantErr: "destination server address is required",
 		},
 		{
 			name: "negative min connections",
-			cfg: HotConfig{
+			cfg: SourceConfig{
 				BaseConfig:         BaseConfig{DataPath: "/data", QBURL: "http://qb:8080"},
-				ColdAddr:           "cold:50051",
+				DestinationAddr:    "cold:50051",
 				MinGRPCConnections: -1,
 			},
 			wantErr: "min connections cannot be negative",
 		},
 		{
 			name: "negative max connections",
-			cfg: HotConfig{
+			cfg: SourceConfig{
 				BaseConfig:         BaseConfig{DataPath: "/data", QBURL: "http://qb:8080"},
-				ColdAddr:           "cold:50051",
+				DestinationAddr:    "cold:50051",
 				MaxGRPCConnections: -1,
 			},
 			wantErr: "max connections cannot be negative",
 		},
 		{
 			name: "min exceeds max",
-			cfg: HotConfig{
+			cfg: SourceConfig{
 				BaseConfig:         BaseConfig{DataPath: "/data", QBURL: "http://qb:8080"},
-				ColdAddr:           "cold:50051",
+				DestinationAddr:    "cold:50051",
 				MinGRPCConnections: 5,
 				MaxGRPCConnections: 2,
 			},
@@ -91,17 +91,17 @@ func TestHotConfig_Validate(t *testing.T) {
 	}
 }
 
-func TestColdConfig_Validate(t *testing.T) {
+func TestDestinationConfig_Validate(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name    string
-		cfg     ColdConfig
+		cfg     DestinationConfig
 		wantErr string
 	}{
 		{
 			name: "valid config",
-			cfg: ColdConfig{
+			cfg: DestinationConfig{
 				BaseConfig: BaseConfig{DataPath: "/data"},
 				ListenAddr: ":50051",
 			},
@@ -109,21 +109,21 @@ func TestColdConfig_Validate(t *testing.T) {
 		},
 		{
 			name: "missing data path",
-			cfg: ColdConfig{
+			cfg: DestinationConfig{
 				ListenAddr: ":50051",
 			},
 			wantErr: "data path is required",
 		},
 		{
 			name: "missing listen addr",
-			cfg: ColdConfig{
+			cfg: DestinationConfig{
 				BaseConfig: BaseConfig{DataPath: "/data"},
 			},
 			wantErr: "listen address is required",
 		},
 		{
 			name: "negative max stream buffer",
-			cfg: ColdConfig{
+			cfg: DestinationConfig{
 				BaseConfig:        BaseConfig{DataPath: "/data"},
 				ListenAddr:        ":50051",
 				MaxStreamBufferMB: -1,
@@ -132,7 +132,7 @@ func TestColdConfig_Validate(t *testing.T) {
 		},
 		{
 			name: "zero max stream buffer uses default",
-			cfg: ColdConfig{
+			cfg: DestinationConfig{
 				BaseConfig: BaseConfig{DataPath: "/data"},
 				ListenAddr: ":50051",
 			},
@@ -140,7 +140,7 @@ func TestColdConfig_Validate(t *testing.T) {
 		},
 		{
 			name: "positive max stream buffer",
-			cfg: ColdConfig{
+			cfg: DestinationConfig{
 				BaseConfig:        BaseConfig{DataPath: "/data"},
 				ListenAddr:        ":50051",
 				MaxStreamBufferMB: 256,
@@ -162,7 +162,7 @@ func TestColdConfig_Validate(t *testing.T) {
 	}
 }
 
-func TestLoadHot(t *testing.T) {
+func TestLoadSource(t *testing.T) {
 	t.Parallel()
 
 	t.Run("loads config from viper", func(t *testing.T) {
@@ -172,7 +172,7 @@ func TestLoadHot(t *testing.T) {
 		v.Set("qb-url", "http://qb:8080")
 		v.Set("qb-username", "admin")
 		v.Set("qb-password", "secret")
-		v.Set("cold-addr", "cold:50051")
+		v.Set("destination-addr", "cold:50051")
 		v.Set("min-space", 100)
 		v.Set("min-seeding-time", 7200)
 		v.Set("dry-run", true)
@@ -186,14 +186,14 @@ func TestLoadHot(t *testing.T) {
 		v.Set("drain-annotation", "my/drain")
 		v.Set("drain-timeout", 480)
 
-		cfg, err := LoadHot(v)
+		cfg, err := LoadSource(v)
 		require.NoError(t, err)
 
 		assert.Equal(t, "/data/path", cfg.DataPath)
 		assert.Equal(t, "http://qb:8080", cfg.QBURL)
 		assert.Equal(t, "admin", cfg.QBUsername)
 		assert.Equal(t, "secret", cfg.QBPassword)
-		assert.Equal(t, "cold:50051", cfg.ColdAddr)
+		assert.Equal(t, "cold:50051", cfg.DestinationAddr)
 		assert.Equal(t, int64(100), cfg.MinSpaceGB)
 		assert.Equal(t, 7200, int(cfg.MinSeedingTime.Seconds()))
 		assert.True(t, cfg.DryRun)
@@ -213,11 +213,11 @@ func TestLoadHot(t *testing.T) {
 		v := viper.New()
 		v.Set("data", "/data/path")
 		v.Set("qb-url", "http://qb:8080")
-		v.Set("cold-addr", "cold:50051")
+		v.Set("destination-addr", "cold:50051")
 		// Default "source-removed" is applied at flag level, not viper level.
-		// LoadHot without the flag binding sees empty string.
+		// LoadSource without the flag binding sees empty string.
 
-		cfg, err := LoadHot(v)
+		cfg, err := LoadSource(v)
 		require.NoError(t, err)
 		assert.Empty(t, cfg.SourceRemovedTag)
 	})
@@ -227,10 +227,10 @@ func TestLoadHot(t *testing.T) {
 		v := viper.New()
 		v.Set("data", "/data/path")
 		v.Set("qb-url", "http://qb:8080")
-		v.Set("cold-addr", "cold:50051")
+		v.Set("destination-addr", "cold:50051")
 		v.Set("source-removed-tag", "")
 
-		cfg, err := LoadHot(v)
+		cfg, err := LoadSource(v)
 		require.NoError(t, err)
 		assert.Empty(t, cfg.SourceRemovedTag)
 	})
@@ -240,16 +240,16 @@ func TestLoadHot(t *testing.T) {
 		v := viper.New()
 		v.Set("data", "/data/path")
 		v.Set("qb-url", "http://qb:8080")
-		v.Set("cold-addr", "cold:50051")
+		v.Set("destination-addr", "cold:50051")
 		v.Set("synced-tag", "")
 
-		cfg, err := LoadHot(v)
+		cfg, err := LoadSource(v)
 		require.NoError(t, err)
 		assert.Empty(t, cfg.SyncedTag)
 	})
 }
 
-func TestLoadCold(t *testing.T) {
+func TestLoadDestination(t *testing.T) {
 	t.Parallel()
 
 	t.Run("loads config from viper", func(t *testing.T) {
@@ -267,7 +267,7 @@ func TestLoadCold(t *testing.T) {
 		v.Set("max-stream-buffer", 256)
 		v.Set("dry-run", true)
 
-		cfg, err := LoadCold(v)
+		cfg, err := LoadDestination(v)
 		require.NoError(t, err)
 
 		assert.Equal(t, ":50051", cfg.ListenAddr)
@@ -289,7 +289,7 @@ func TestLoadCold(t *testing.T) {
 		v.Set("listen", ":50051")
 		v.Set("data", "/data/path")
 
-		cfg, err := LoadCold(v)
+		cfg, err := LoadDestination(v)
 		require.NoError(t, err)
 		assert.Empty(t, cfg.SavePath, "SavePath should be empty when not explicitly set")
 	})
@@ -301,21 +301,21 @@ func TestLoadCold(t *testing.T) {
 		v.Set("data", "/data/path")
 		v.Set("synced-tag", "")
 
-		cfg, err := LoadCold(v)
+		cfg, err := LoadDestination(v)
 		require.NoError(t, err)
 		assert.Empty(t, cfg.SyncedTag)
 	})
 }
 
-func TestSetupHotFlags(t *testing.T) {
+func TestSetupSourceFlags(t *testing.T) {
 	t.Parallel()
 
 	cmd := &cobra.Command{Use: "test"}
-	SetupHotFlags(cmd)
+	SetupSourceFlags(cmd)
 
 	flags := []string{
 		"data", "qb-url", "qb-username", "qb-password",
-		"cold-addr", "min-space", "min-seeding-time",
+		"destination-addr", "min-space", "min-seeding-time",
 		"dry-run", "sleep", "rate-limit", "synced-tag",
 		"min-connections", "max-connections", "num-senders", "source-removed-tag",
 		"drain-annotation", "drain-timeout",
@@ -346,11 +346,11 @@ func TestSetupHotFlags(t *testing.T) {
 	assert.Equal(t, "source-removed", sourceRemovedTagFlag.DefValue)
 }
 
-func TestSetupColdFlags(t *testing.T) {
+func TestSetupDestinationFlags(t *testing.T) {
 	t.Parallel()
 
 	cmd := &cobra.Command{Use: "test"}
-	SetupColdFlags(cmd)
+	SetupDestinationFlags(cmd)
 
 	flags := []string{
 		"listen", "data", "save-path", "qb-url", "qb-username", "qb-password",
@@ -429,7 +429,7 @@ func TestGetEnvWithFallbacks(t *testing.T) {
 	}
 }
 
-func TestLoadCold_EnvFallbacks(t *testing.T) {
+func TestLoadDestination_EnvFallbacks(t *testing.T) {
 	t.Run("uses GRPC_PORT for listen address", func(t *testing.T) {
 		t.Setenv("GRPC_PORT", "50052")
 
@@ -437,7 +437,7 @@ func TestLoadCold_EnvFallbacks(t *testing.T) {
 		v.Set("listen", defaultListenAddr) // default value
 		v.Set("data", "/data")
 
-		cfg, err := LoadCold(v)
+		cfg, err := LoadDestination(v)
 		require.NoError(t, err)
 		assert.Equal(t, ":50052", cfg.ListenAddr)
 	})
@@ -450,7 +450,7 @@ func TestLoadCold_EnvFallbacks(t *testing.T) {
 		v.Set("data", "/data")
 		v.Set("health-addr", defaultHealthAddr) // default value
 
-		cfg, err := LoadCold(v)
+		cfg, err := LoadDestination(v)
 		require.NoError(t, err)
 		assert.Equal(t, ":9090", cfg.HealthAddr)
 	})
@@ -462,23 +462,23 @@ func TestLoadCold_EnvFallbacks(t *testing.T) {
 		v.Set("listen", ":60000") // explicit non-default value
 		v.Set("data", "/data")
 
-		cfg, err := LoadCold(v)
+		cfg, err := LoadDestination(v)
 		require.NoError(t, err)
 		assert.Equal(t, ":60000", cfg.ListenAddr) // flag wins over env
 	})
 }
 
-func TestLoadHot_EnvFallbacks(t *testing.T) {
+func TestLoadSource_EnvFallbacks(t *testing.T) {
 	t.Run("uses HTTP_PORT for health address", func(t *testing.T) {
 		t.Setenv("HTTP_PORT", "9090")
 
 		v := viper.New()
 		v.Set("data", "/data")
 		v.Set("qb-url", "http://qb:8080")
-		v.Set("cold-addr", "cold:50051")
+		v.Set("destination-addr", "cold:50051")
 		v.Set("health-addr", defaultHealthAddr) // default value
 
-		cfg, err := LoadHot(v)
+		cfg, err := LoadSource(v)
 		require.NoError(t, err)
 		assert.Equal(t, ":9090", cfg.HealthAddr)
 	})
