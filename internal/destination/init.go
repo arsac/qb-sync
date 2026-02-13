@@ -499,11 +499,11 @@ func (s *Server) setupFile(
 	// The serverFileInfo entry is still needed for offset tracking in writePieceData.
 	if !f.GetSelected() {
 		return &serverFileInfo{
-			path:        targetPath,
-			size:        f.GetSize(),
-			offset:      f.GetOffset(),
-			sourceInode: Inode(f.GetInode()),
-			selected:    false,
+			path:     targetPath,
+			size:     f.GetSize(),
+			offset:   f.GetOffset(),
+			hl:       hardlinkInfo{sourceInode: Inode(f.GetInode())},
+			selected: false,
 		}, result, nil
 	}
 
@@ -515,12 +515,11 @@ func (s *Server) setupFile(
 	// Check if file already exists with correct size (pre-existing data)
 	if info, statErr := os.Stat(targetPath); statErr == nil && info.Size() == f.GetSize() {
 		fileInfo := &serverFileInfo{
-			path:        targetPath,
-			size:        f.GetSize(),
-			offset:      f.GetOffset(),
-			sourceInode: Inode(f.GetInode()),
-			hlState:     hlStateComplete,
-			selected:    true,
+			path:     targetPath,
+			size:     f.GetSize(),
+			offset:   f.GetOffset(),
+			hl:       hardlinkInfo{sourceInode: Inode(f.GetInode()), state: hlStateComplete},
+			selected: true,
 		}
 		result.PreExisting = true
 		return fileInfo, result, nil
@@ -532,21 +531,21 @@ func (s *Server) setupFile(
 	partialPath := targetPath + ".partial"
 	if info, statErr := os.Stat(partialPath); statErr == nil && info.Size() == f.GetSize() {
 		return &serverFileInfo{
-			path:        partialPath,
-			size:        f.GetSize(),
-			offset:      f.GetOffset(),
-			sourceInode: Inode(f.GetInode()),
-			selected:    true,
+			path:     partialPath,
+			size:     f.GetSize(),
+			offset:   f.GetOffset(),
+			hl:       hardlinkInfo{sourceInode: Inode(f.GetInode())},
+			selected: true,
 		}, result, nil
 	}
 
 	sourceInode := Inode(f.GetInode())
 	fileInfo := &serverFileInfo{
-		path:        partialPath,
-		size:        f.GetSize(),
-		offset:      f.GetOffset(),
-		sourceInode: sourceInode,
-		selected:    true,
+		path:     partialPath,
+		size:     f.GetSize(),
+		offset:   f.GetOffset(),
+		hl:       hardlinkInfo{sourceInode: sourceInode},
+		selected: true,
 	}
 
 	// Check for hardlink opportunities if inode is provided
@@ -586,7 +585,7 @@ func (s *Server) applyHardlinkOutcome(
 	targetPath string,
 	outcome hardlinkOutcome,
 ) {
-	fileInfo.hlState = outcome.state
+	fileInfo.hl.state = outcome.state
 
 	switch outcome.state {
 	case hlStateComplete:
@@ -596,8 +595,8 @@ func (s *Server) applyHardlinkOutcome(
 	case hlStatePending:
 		result.Pending = true
 		result.SourcePath = outcome.sourcePath
-		fileInfo.hardlinkSource = outcome.sourcePath
-		fileInfo.hardlinkDoneCh = outcome.doneCh
+		fileInfo.hl.sourcePath = outcome.sourcePath
+		fileInfo.hl.doneCh = outcome.doneCh
 		fileInfo.path = targetPath
 	case hlStateInProgress, hlStateNone:
 		// Keep default values

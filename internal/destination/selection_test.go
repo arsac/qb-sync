@@ -127,9 +127,9 @@ func TestCalculatePiecesCovered_UnselectedFiles(t *testing.T) {
 		// File 1: unselected             -> piece 1 covered
 		// File 2: selected, hlStateNone  -> piece 2 NOT covered
 		files := []*serverFileInfo{
-			{offset: 0, size: 100, selected: true, hlState: hlStateNone},
+			{offset: 0, size: 100, selected: true, hl: hardlinkInfo{state: hlStateNone}},
 			{offset: 100, size: 100, selected: false},
-			{offset: 200, size: 100, selected: true, hlState: hlStateNone},
+			{offset: 200, size: 100, selected: true, hl: hardlinkInfo{state: hlStateNone}},
 		}
 		covered := calculatePiecesCovered(files, 3, 100, 300)
 		if covered[0] {
@@ -149,7 +149,7 @@ func TestCalculatePiecesCovered_UnselectedFiles(t *testing.T) {
 		// File 0: offset=0,  size=50, hlStateComplete, selected=true   -> piece 0
 		// File 1: offset=50, size=150, unselected                      -> pieces 0..1
 		files := []*serverFileInfo{
-			{offset: 0, size: 50, hlState: hlStateComplete, selected: true},
+			{offset: 0, size: 50, hl: hardlinkInfo{state: hlStateComplete}, selected: true},
 			{offset: 50, size: 150, selected: false},
 		}
 		covered := calculatePiecesCovered(files, 2, 100, 200)
@@ -168,7 +168,7 @@ func TestCalculatePiecesCovered_UnselectedFiles(t *testing.T) {
 		// File 1: offset=50, size=150, selected, none   -> pieces 0..1
 		files := []*serverFileInfo{
 			{offset: 0, size: 50, selected: false},
-			{offset: 50, size: 150, selected: true, hlState: hlStateNone},
+			{offset: 50, size: 150, selected: true, hl: hardlinkInfo{state: hlStateNone}},
 		}
 		covered := calculatePiecesCovered(files, 2, 100, 200)
 		if covered[0] {
@@ -441,7 +441,7 @@ func TestFinalizeTorrent_PartialSelection(t *testing.T) {
 	// Wait for the background finalization goroutine to complete before
 	// checking results and allowing TempDir cleanup.
 	state.mu.Lock()
-	done := state.finalizeDone
+	done := state.finalization.done
 	state.mu.Unlock()
 	if done != nil {
 		<-done

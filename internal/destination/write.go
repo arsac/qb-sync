@@ -87,7 +87,7 @@ func (s *Server) writePiece(ctx context.Context, req *pb.WritePieceRequest) writ
 	// This is NOT the correctness check - see double-check below after hash verification.
 	state.mu.Lock()
 	alreadyWritten := int(pieceIndex) < len(state.written) && state.written[pieceIndex]
-	isFinalizing := state.finalizing
+	isFinalizing := state.finalization.active
 	state.mu.Unlock()
 
 	if alreadyWritten {
@@ -118,7 +118,7 @@ func (s *Server) writePiece(ctx context.Context, req *pb.WritePieceRequest) writ
 
 	// CORRECTNESS CHECK: Re-verify finalizing flag under lock.
 	// Even if finalization started between the early check and now, this prevents the write.
-	if state.finalizing {
+	if state.finalization.active {
 		return writePieceError("torrent is being finalized", pb.PieceErrorCode_PIECE_ERROR_FINALIZING)
 	}
 
@@ -210,7 +210,7 @@ func (s *Server) checkFileCompletions(
 		if fi.earlyFinalized || fi.size <= 0 {
 			continue
 		}
-		if fi.hlState == hlStateComplete || fi.hlState == hlStatePending {
+		if fi.hl.state == hlStateComplete || fi.hl.state == hlStatePending {
 			continue
 		}
 		if !fi.overlaps(idx) {
@@ -258,7 +258,7 @@ func (s *Server) earlyFinalizeFile(
 	// Background verification (verifyFinalizedPieces) will catch any corruption,
 	// and modifying state.written here could double-decrement with
 	// recoverVerificationFailure which doesn't guard against already-false entries.
-	if state.finalizing {
+	if state.finalization.active {
 		s.logger.InfoContext(ctx, "finalization started during early finalize I/O, deferring",
 			"hash", hash, "file", fi.path)
 		return

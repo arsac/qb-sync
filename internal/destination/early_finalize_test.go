@@ -300,7 +300,7 @@ func TestCheckFileCompletions(t *testing.T) {
 		fi := &serverFileInfo{
 			size: 100, offset: 0,
 			firstPiece: 0, lastPiece: 0, piecesTotal: 1,
-			hlState: hlStateComplete, selected: true,
+			hl: hardlinkInfo{state: hlStateComplete}, selected: true,
 		}
 		state := &serverTorrentState{torrentMeta: torrentMeta{files: []*serverFileInfo{fi}}}
 

@@ -41,13 +41,13 @@ func (s *Server) FinalizeTorrent(
 
 	// Check if finalization is already in progress or completed.
 	state.mu.Lock()
-	if state.finalizing {
-		result, done := state.finalizeResult, state.finalizeDone
+	if state.finalization.active {
+		result, done := state.finalization.result, state.finalization.done
 		state.mu.Unlock()
 		return s.handleExistingFinalization(hash, state, result, done)
 	}
 	// Create finalizeDone immediately so concurrent polls always see it.
-	done := state.startFinalization()
+	done := state.finalization.start()
 	writtenCount := state.writtenCount
 	state.mu.Unlock()
 
@@ -57,7 +57,7 @@ func (s *Server) FinalizeTorrent(
 	failureResponse := func(errMsg string, code pb.FinalizeErrorCode) *pb.FinalizeTorrentResponse {
 		close(done)
 		state.mu.Lock()
-		state.resetFinalization()
+		state.finalization.reset()
 		state.mu.Unlock()
 		metrics.FinalizationDuration.WithLabelValues(metrics.ResultFailure).Observe(time.Since(startTime).Seconds())
 		metrics.FinalizationErrorsTotal.WithLabelValues(metrics.ModeDestination).Inc()
@@ -115,7 +115,7 @@ func (s *Server) FinalizeTorrent(
 
 // runBackgroundFinalization runs piece verification and post-verification steps
 // (inode registration, qBittorrent integration) independently of the RPC context.
-// On completion, it stores the result in state.finalizeResult and closes done.
+// On completion, it stores the result in state.finalization and closes done.
 func (s *Server) runBackgroundFinalization(
 	hash string,
 	state *serverTorrentState,
@@ -131,7 +131,7 @@ func (s *Server) runBackgroundFinalization(
 		metrics.FinalizationDuration.WithLabelValues(metrics.ResultFailure).Observe(time.Since(startTime).Seconds())
 		metrics.FinalizationErrorsTotal.WithLabelValues(metrics.ModeDestination).Inc()
 		state.mu.Lock()
-		state.finalizeResult = &finalizeResult{err: errMsg, errorCode: errorCode}
+		state.finalization.storeResult(&finalizeResult{err: errMsg, errorCode: errorCode})
 		state.mu.Unlock()
 	}
 
@@ -240,7 +240,7 @@ func (s *Server) storeSuccessResult(
 
 	state.mu.Lock()
 	name := strings.TrimSuffix(filepath.Base(state.torrentPath), ".torrent")
-	state.finalizeResult = &finalizeResult{success: true, state: stateStr}
+	state.finalization.storeResult(&finalizeResult{success: true, state: stateStr})
 	state.mu.Unlock()
 
 	metrics.TorrentsSyncedTotal.WithLabelValues(metrics.ModeDestination, hash, name).Inc()
@@ -351,14 +351,14 @@ func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTo
 	// and holding the lock would block all WritePiece calls for that duration.
 	// Safe because: files slice is immutable after init, and finalizing=true prevents writes.
 	for _, fi := range state.files {
-		if fi.hlState != hlStatePending {
+		if fi.hl.state != hlStatePending {
 			continue
 		}
 
 		s.logger.DebugContext(ctx, "waiting for pending hardlink source",
 			"hash", hash,
 			"target", fi.path,
-			"source", fi.hardlinkSource,
+			"source", fi.hl.sourcePath,
 		)
 
 		select {
@@ -366,12 +366,12 @@ func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTo
 			return ctx.Err()
 		case <-time.After(defaultHardlinkWaitTimeout):
 			return fmt.Errorf("timeout waiting for pending hardlink source %s (waited %v)",
-				fi.hardlinkSource, defaultHardlinkWaitTimeout)
-		case <-fi.hardlinkDoneCh:
+				fi.hl.sourcePath, defaultHardlinkWaitTimeout)
+		case <-fi.hl.doneCh:
 			// Source is ready
 		}
 
-		sourcePath := filepath.Join(s.config.BasePath, fi.hardlinkSource)
+		sourcePath := filepath.Join(s.config.BasePath, fi.hl.sourcePath)
 		if linkErr := os.Link(sourcePath, fi.path); linkErr != nil {
 			if os.IsExist(linkErr) {
 				s.logger.DebugContext(ctx, "pending hardlink target already exists",
@@ -391,7 +391,7 @@ func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTo
 			)
 		}
 
-		fi.hlState = hlStateComplete
+		fi.hl.state = hlStateComplete
 	}
 
 	// Phase 2: Sync, close, and rename under lock.
@@ -402,7 +402,7 @@ func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTo
 	// Fail early if any file can't be flushed — renaming unflushed files
 	// risks data loss, especially on NFS where sync is less reliable.
 	for _, fi := range state.files {
-		if fi.hlState != hlStateComplete {
+		if fi.hl.state != hlStateComplete {
 			if err := s.closeFileHandle(ctx, hash, fi); err != nil {
 				return fmt.Errorf("flushing before rename: %w", err)
 			}
@@ -411,7 +411,7 @@ func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTo
 
 	// Then rename partial files
 	for _, fi := range state.files {
-		if fi.hlState == hlStateComplete {
+		if fi.hl.state == hlStateComplete {
 			continue
 		}
 		if err := s.renamePartialFile(ctx, hash, fi); err != nil {
@@ -518,7 +518,7 @@ func (s *Server) registerFinalizedInodes(ctx context.Context, hash string, state
 	var registered int
 	for _, f := range state.files {
 		// Skip files that need no data (hardlinked/pending/unselected) or have no inode
-		if f.skipForWriteData() || f.sourceInode == 0 {
+		if f.skipForWriteData() || f.hl.sourceInode == 0 {
 			continue
 		}
 
@@ -537,8 +537,8 @@ func (s *Server) registerFinalizedInodes(ctx context.Context, hash string, state
 		}
 
 		// Register in persistent map and signal waiters
-		s.inodes.Register(f.sourceInode, relPath)
-		s.inodes.CompleteInProgress(f.sourceInode, hash)
+		s.inodes.Register(f.hl.sourceInode, relPath)
+		s.inodes.CompleteInProgress(f.hl.sourceInode, hash)
 		registered++
 	}
 
@@ -844,7 +844,7 @@ func (s *Server) handleExistingFinalization(
 	// before clearing state, preventing concurrent background goroutines.
 	<-done
 	state.mu.Lock()
-	state.resetFinalization()
+	state.finalization.reset()
 	state.mu.Unlock()
 	return &pb.FinalizeTorrentResponse{
 		Success:   false,

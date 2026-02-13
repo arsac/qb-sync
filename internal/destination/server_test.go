@@ -851,8 +851,8 @@ func TestSetupFile_PreExisting(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if fileInfo.hlState != hlStateComplete {
-			t.Errorf("expected hlStateComplete, got %v", fileInfo.hlState)
+		if fileInfo.hl.state != hlStateComplete {
+			t.Errorf("expected hlStateComplete, got %v", fileInfo.hl.state)
 		}
 		if fileInfo.path != targetPath {
 			t.Errorf("expected path %q, got %q", targetPath, fileInfo.path)
@@ -893,7 +893,7 @@ func TestSetupFile_PreExisting(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if fileInfo.hlState == hlStateComplete {
+		if fileInfo.hl.state == hlStateComplete {
 			t.Error("should not be hlStateComplete when size doesn't match")
 		}
 		if result.GetPreExisting() {
@@ -922,7 +922,7 @@ func TestSetupFile_PreExisting(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if fileInfo.hlState == hlStateComplete {
+		if fileInfo.hl.state == hlStateComplete {
 			t.Error("should not be hlStateComplete when file doesn't exist")
 		}
 		if result.GetPreExisting() {

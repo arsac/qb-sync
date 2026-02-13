@@ -172,8 +172,10 @@ func TestFinalizeTorrent_PollReturnsVerifying(t *testing.T) {
 		},
 		written:      []bool{true, true},
 		writtenCount: 2,
-		finalizing:   true,
-		finalizeDone: done,
+		finalization: finalizationState{
+			active: true,
+			done:   done,
+		},
 	}
 
 	s.mu.Lock()
@@ -221,11 +223,13 @@ func TestFinalizeTorrent_PollReturnsCompletedResult(t *testing.T) {
 		},
 		written:      []bool{true},
 		writtenCount: 1,
-		finalizing:   true,
-		finalizeDone: done,
-		finalizeResult: &finalizeResult{
-			success: true,
-			state:   "uploading",
+		finalization: finalizationState{
+			active: true,
+			done:   done,
+			result: &finalizeResult{
+				success: true,
+				state:   "uploading",
+			},
 		},
 		torrentPath: filepath.Join(tmpDir, metaDirName, hash, "test.torrent"),
 	}
@@ -296,11 +300,13 @@ func TestFinalizeTorrent_PollReturnsFailedResult(t *testing.T) {
 		},
 		written:      []bool{true},
 		writtenCount: 1,
-		finalizing:   true,
-		finalizeDone: done,
-		finalizeResult: &finalizeResult{
-			success: false,
-			err:     "verification failed: piece 5: hash mismatch",
+		finalization: finalizationState{
+			active: true,
+			done:   done,
+			result: &finalizeResult{
+				success: false,
+				err:     "verification failed: piece 5: hash mismatch",
+			},
 		},
 	}
 
@@ -324,7 +330,7 @@ func TestFinalizeTorrent_PollReturnsFailedResult(t *testing.T) {
 
 	// After failure, finalizing should be cleared to allow retry
 	state.mu.Lock()
-	stillFinalizing := state.finalizing
+	stillFinalizing := state.finalization.active
 	state.mu.Unlock()
 	if stillFinalizing {
 		t.Error("finalizing flag should be cleared after returning failed result")
@@ -381,8 +387,10 @@ func TestFinalizeTorrent_ConcurrentPollDuringSetup(t *testing.T) {
 		},
 		written:      []bool{true},
 		writtenCount: 1,
-		finalizing:   true,
-		finalizeDone: done,
+		finalization: finalizationState{
+			active: true,
+			done:   done,
+		},
 	}
 
 	s.mu.Lock()

@@ -42,9 +42,17 @@ func (i *inProgressInode) close() {
 // Safe to read without holding state.mu.
 //
 // Note: the files slice reference is immutable (never appended/removed), but individual
-// serverFileInfo fields (file, path, earlyFinalized, piecesWritten) are mutable and
-// require state.mu. The immutable per-file fields are: offset, size, selected,
-// sourceInode, firstPiece, lastPiece, piecesTotal.
+// serverFileInfo fields have varying mutability:
+//
+// Immutable per-file (set during init, never modified):
+//
+//	offset, size, selected, firstPiece, lastPiece, piecesTotal,
+//	hl.sourceInode, hl.sourcePath, hl.doneCh
+//
+// Mutable per-file (require state.mu):
+//
+//	file, path, earlyFinalized, piecesWritten,
+//	hl.state (transitions through hardlink state machine during finalization)
 type torrentMeta struct {
 	pieceHashes []string          // SHA1 hashes per piece for verification
 	pieceLength int64             // Size of each piece (last piece may be smaller)
@@ -56,23 +64,78 @@ type torrentMeta struct {
 type serverTorrentState struct {
 	torrentMeta // Immutable metadata (safe to read without mu)
 
-	info             *pb.InitTorrentRequest
+	// Immutable after init (set once during initNewTorrent or recoverTorrentState):
+	info      *pb.InitTorrentRequest // Original init request; nil when recovered from disk
+	statePath string                 // Path to written pieces state file
+
+	// Mutable state (require state.mu):
+	torrentPath      string // Path to stored .torrent file; may be set late during resumeTorrent
+	saveSubPath      string // Relative sub-path prefix; may change if category relocates at finalize
 	written          []bool
-	writtenCount     int             // Number of true entries in written (maintained for O(1) checks)
-	torrentPath      string          // Path to stored .torrent file
-	statePath        string          // Path to written pieces state file
-	saveSubPath      string          // Relative sub-path prefix (e.g., "movies" from category)
-	dirty            bool            // Whether state needs to be flushed
-	piecesSinceFlush int             // Pieces written since last flush (for count-based trigger)
-	flushGen         uint64          // Monotonic counter incremented on every successful state flush
-	finalizing       bool            // True during FinalizeTorrent to prevent concurrent writes
-	finalizeDone     chan struct{}   // Closed when background finalization completes
-	finalizeResult   *finalizeResult // Result of background finalization (nil = not started)
-	initializing     bool            // True while disk I/O is in progress during InitTorrent
+	writtenCount     int    // Number of true entries in written (maintained for O(1) checks)
+	dirty            bool   // Whether state needs to be flushed
+	piecesSinceFlush int    // Pieces written since last flush (for count-based trigger)
+	flushGen         uint64 // Monotonic counter incremented on every successful state flush
+	initializing     bool   // True while disk I/O is in progress during InitTorrent
 	mu               sync.Mutex
+
+	// Finalization lifecycle (state machine: inactive -> active -> result stored).
+	// Require state.mu. Use start()/reset()/storeResult() methods.
+	finalization finalizationState
 
 	// Cached for re-initialization (hardlink info for logging)
 	hardlinkResults []*pb.HardlinkResult
+}
+
+// finalizationState tracks the background finalization lifecycle.
+// States: inactive (active=false) -> active (active=true, done open) -> complete (result set, done closed).
+type finalizationState struct {
+	active bool            // True during FinalizeTorrent to prevent concurrent writes
+	done   chan struct{}   // Closed when background finalization completes
+	result *finalizeResult // Result of background finalization (nil = not started)
+}
+
+// start marks finalization as active and returns the done channel.
+// Caller must hold state.mu.
+func (f *finalizationState) start() chan struct{} {
+	done := make(chan struct{})
+	f.active = true
+	f.done = done
+	return done
+}
+
+// reset clears all finalization state back to inactive.
+// Caller must hold state.mu.
+func (f *finalizationState) reset() {
+	f.active = false
+	f.result = nil
+	f.done = nil
+}
+
+// storeResult records the outcome of background finalization.
+// Caller must hold state.mu.
+func (f *finalizationState) storeResult(r *finalizeResult) {
+	f.result = r
+}
+
+// finalizeResult stores the outcome of a background finalization.
+type finalizeResult struct {
+	success   bool
+	state     string               // qBittorrent state on success
+	err       string               // Error message on failure
+	errorCode pb.FinalizeErrorCode // Structured error code for retry decisions
+}
+
+// hardlinkInfo tracks the hardlink resolution state for a single file.
+// State machine: None -> InProgress (first writer) or Pending (wait for another) -> Complete.
+//
+// sourceInode, sourcePath, and doneCh are immutable after init.
+// state is mutable and requires the parent serverTorrentState.mu.
+type hardlinkInfo struct {
+	state       hardlinkState // Current state in the hardlink state machine
+	sourceInode Inode         // Source inode for registration (immutable after init)
+	sourcePath  string        // Relative path to hardlink from (immutable after init)
+	doneCh      chan struct{} // Wait on this before hardlinking (immutable after init)
 }
 
 // serverFileInfo holds information about a file in a torrent.
@@ -82,11 +145,8 @@ type serverFileInfo struct {
 	offset int64    // Offset within torrent's total data
 	file   *os.File // Open file handle (lazy opened)
 
-	// Hardlink tracking
-	hlState        hardlinkState // Current state in the hardlink state machine
-	sourceInode    Inode         // Source inode for registration
-	hardlinkSource string        // Relative path to hardlink from (when ready)
-	hardlinkDoneCh chan struct{} // Wait on this before hardlinking (used when hlState == hlStatePending)
+	// Hardlink tracking (state machine for cross-torrent file dedup)
+	hl hardlinkInfo
 
 	// File selection (priority > 0 on source side)
 	selected bool // True if file is selected for download; unselected files have no .partial
@@ -102,7 +162,7 @@ type serverFileInfo struct {
 // skipForWriteData reports whether this file should be skipped during piece write.
 // True for files that are hardlinked, pending hardlink, or unselected.
 func (fi *serverFileInfo) skipForWriteData() bool {
-	return fi.hlState == hlStateComplete || fi.hlState == hlStatePending || !fi.selected
+	return fi.hl.state == hlStateComplete || fi.hl.state == hlStatePending || !fi.selected
 }
 
 // overlaps reports whether the given piece index falls within this file's piece range.
@@ -118,31 +178,6 @@ func (fi *serverFileInfo) recalcPiecesWritten(written []bool) {
 			fi.piecesWritten++
 		}
 	}
-}
-
-// startFinalization marks the torrent as finalizing and returns the done channel.
-// Caller must hold state.mu.
-func (s *serverTorrentState) startFinalization() chan struct{} {
-	done := make(chan struct{})
-	s.finalizing = true
-	s.finalizeDone = done
-	return done
-}
-
-// resetFinalization clears all finalization state.
-// Caller must hold state.mu.
-func (s *serverTorrentState) resetFinalization() {
-	s.finalizing = false
-	s.finalizeResult = nil
-	s.finalizeDone = nil
-}
-
-// finalizeResult stores the outcome of a background finalization.
-type finalizeResult struct {
-	success   bool
-	state     string               // qBittorrent state on success
-	err       string               // Error message on failure
-	errorCode pb.FinalizeErrorCode // Structured error code for retry decisions
 }
 
 // torrentRef is a reference to a torrent state for safe iteration.
