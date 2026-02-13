@@ -155,7 +155,13 @@ func (s *Server) recoverTorrentState(ctx context.Context, hash string) (*serverT
 	files := s.reconstructFiles(parsed.Files, saveSubPath)
 	restoreFileSelection(files, metaDir)
 
-	computeFilePieceRanges(files, parsed.PieceLength, parsed.TotalSize)
+	meta := torrentMeta{
+		pieceHashes: parsed.PieceHashes,
+		pieceLength: parsed.PieceLength,
+		totalSize:   parsed.TotalSize,
+		files:       files,
+	}
+	meta.computeFilePieceRanges()
 	for _, fi := range files {
 		alreadyRenamed := !strings.HasSuffix(fi.path, partialSuffix)
 		if alreadyRenamed || !fi.selected {
@@ -168,7 +174,7 @@ func (s *Server) recoverTorrentState(ctx context.Context, hash string) (*serverT
 		return nil, loadErr
 	}
 
-	initFilePieceCounts(files, written)
+	meta.initFilePieceCounts(written)
 
 	writtenCount := countWritten(written)
 
@@ -180,12 +186,7 @@ func (s *Server) recoverTorrentState(ctx context.Context, hash string) (*serverT
 	)
 
 	return &serverTorrentState{
-		torrentMeta: torrentMeta{
-			pieceHashes: parsed.PieceHashes,
-			pieceLength: parsed.PieceLength,
-			totalSize:   parsed.TotalSize,
-			files:       files,
-		},
+		torrentMeta:  meta,
 		written:      written,
 		writtenCount: writtenCount,
 		torrentPath:  torrentPath,

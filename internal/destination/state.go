@@ -9,29 +9,28 @@ import (
 )
 
 // openForWrite lazily opens the file for writing, creating and pre-allocating it if needed.
-func (fi *serverFileInfo) openForWrite() (*os.File, error) {
-	if fi.file != nil {
-		return fi.file, nil
+func (f *serverFileInfo) openForWrite() (*os.File, error) {
+	if f.file != nil {
+		return f.file, nil
 	}
 
-	file, err := os.OpenFile(fi.path, os.O_RDWR|os.O_CREATE, serverFilePermissions)
+	file, err := os.OpenFile(f.path, os.O_RDWR|os.O_CREATE, serverFilePermissions)
 	if err != nil {
 		return nil, err
 	}
 
 	// Pre-allocate to expected size
-	if truncErr := file.Truncate(fi.size); truncErr != nil {
+	if truncErr := file.Truncate(f.size); truncErr != nil {
 		_ = file.Close()
 		return nil, truncErr
 	}
 
-	fi.file = file
+	f.file = file
 	return file, nil
 }
 
 // verifyPieceHash checks the piece data against expected hash.
 // Returns empty string if valid, error message if invalid.
-// Safe to call without state.mu — only accesses immutable pieceHashes.
 func (m *torrentMeta) verifyPieceHash(pieceIndex int32, data []byte, reqHash string) string {
 	// Prefer pre-stored hash from InitTorrent, fall back to request hash
 	expectedHash := reqHash
@@ -106,7 +105,6 @@ func (s *serverTorrentState) buildReadyResponse() *pb.InitTorrentResponse {
 }
 
 // countSelectedFiles returns the number of selected files.
-// Safe to call without state.mu — only accesses immutable file selection flags.
 func (m *torrentMeta) countSelectedFiles() int {
 	count := 0
 	for _, f := range m.files {
@@ -118,7 +116,6 @@ func (m *torrentMeta) countSelectedFiles() int {
 }
 
 // countSelectedPiecesTotal returns the number of pieces that overlap at least one selected file.
-// Uses len(written) for iteration bound and classifyPiece (immutable torrentMeta).
 func (s *serverTorrentState) countSelectedPiecesTotal() int {
 	count := 0
 	for i := range s.written {
@@ -143,7 +140,6 @@ const (
 
 // classifyPiece determines a piece's relationship to the file selection in a single
 // pass with early exit on boundary detection.
-// Safe to call without state.mu — only accesses immutable geometry and selection flags.
 func (m *torrentMeta) classifyPiece(pieceIdx int) pieceClass {
 	pieceStart := int64(pieceIdx) * m.pieceLength
 	pieceEnd := min(pieceStart+m.pieceLength, m.totalSize)
@@ -151,11 +147,11 @@ func (m *torrentMeta) classifyPiece(pieceIdx int) pieceClass {
 	hasSelected := false
 	hasUnselected := false
 
-	for _, fi := range m.files {
-		if fi.offset >= pieceEnd || fi.offset+fi.size <= pieceStart {
+	for _, f := range m.files {
+		if f.offset >= pieceEnd || f.offset+f.size <= pieceStart {
 			continue
 		}
-		if fi.selected {
+		if f.selected {
 			hasSelected = true
 		} else {
 			hasUnselected = true
@@ -187,27 +183,6 @@ func calculatePiecesNeeded(written []bool) ([]bool, int32, int32) {
 	return piecesNeeded, needCount, haveCount
 }
 
-// calculatePiecesCovered determines which pieces are fully covered by hardlinked, pending,
-// or unselected files (none of these need data streamed from source).
-func calculatePiecesCovered(files []*serverFileInfo, numPieces int32, pieceSize, totalSize int64) []bool {
-	piecesCovered := make([]bool, numPieces)
-	for pieceIdx := range numPieces {
-		pieceStart := int64(pieceIdx) * pieceSize
-		pieceEnd := min(pieceStart+pieceSize, totalSize)
-
-		// Piece is covered if every overlapping file is hardlinked, pending, or unselected
-		covered := true
-		for _, f := range files {
-			if f.offset < pieceEnd && f.offset+f.size > pieceStart && !f.skipForWriteData() {
-				covered = false
-				break
-			}
-		}
-		piecesCovered[pieceIdx] = covered
-	}
-	return piecesCovered
-}
-
 // countHardlinkResults counts hardlinked, pending, and pre-existing files from results.
 func countHardlinkResults(results []*pb.HardlinkResult) (int, int, int) {
 	hardlinked, pending, preExisting := 0, 0, 0
@@ -233,31 +208,4 @@ func countWritten(written []bool) int {
 		}
 	}
 	return count
-}
-
-// computeFilePieceRanges sets firstPiece, lastPiece, and piecesTotal on each file
-// based on its offset/size and the torrent's piece geometry.
-func computeFilePieceRanges(files []*serverFileInfo, pieceLength, totalSize int64) {
-	if pieceLength <= 0 {
-		return
-	}
-	maxPiece := int((totalSize - 1) / pieceLength)
-	for _, fi := range files {
-		if fi.size <= 0 {
-			continue
-		}
-		fi.firstPiece = int(fi.offset / pieceLength)
-		fi.lastPiece = min(int((fi.offset+fi.size-1)/pieceLength), maxPiece)
-		fi.piecesTotal = fi.lastPiece - fi.firstPiece + 1
-	}
-}
-
-// initFilePieceCounts initializes piecesWritten on each file from the existing written bitmap.
-func initFilePieceCounts(files []*serverFileInfo, written []bool) {
-	for _, fi := range files {
-		if fi.earlyFinalized || fi.size <= 0 {
-			continue
-		}
-		fi.recalcPiecesWritten(written)
-	}
 }

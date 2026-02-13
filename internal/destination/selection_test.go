@@ -126,12 +126,16 @@ func TestCalculatePiecesCovered_UnselectedFiles(t *testing.T) {
 		// File 0: selected, hlStateNone  -> piece 0 NOT covered
 		// File 1: unselected             -> piece 1 covered
 		// File 2: selected, hlStateNone  -> piece 2 NOT covered
-		files := []*serverFileInfo{
-			{offset: 0, size: 100, selected: true, hl: hardlinkInfo{state: hlStateNone}},
-			{offset: 100, size: 100, selected: false},
-			{offset: 200, size: 100, selected: true, hl: hardlinkInfo{state: hlStateNone}},
+		meta := torrentMeta{
+			pieceLength: 100,
+			totalSize:   300,
+			files: []*serverFileInfo{
+				{offset: 0, size: 100, selected: true, hardlink: hardlinkInfo{state: hlStateNone}},
+				{offset: 100, size: 100, selected: false},
+				{offset: 200, size: 100, selected: true, hardlink: hardlinkInfo{state: hlStateNone}},
+			},
 		}
-		covered := calculatePiecesCovered(files, 3, 100, 300)
+		covered := meta.calculatePiecesCovered()
 		if covered[0] {
 			t.Error("piece 0 should NOT be covered (selected, hlStateNone)")
 		}
@@ -148,11 +152,15 @@ func TestCalculatePiecesCovered_UnselectedFiles(t *testing.T) {
 		// pieceLength=100, totalSize=200
 		// File 0: offset=0,  size=50, hlStateComplete, selected=true   -> piece 0
 		// File 1: offset=50, size=150, unselected                      -> pieces 0..1
-		files := []*serverFileInfo{
-			{offset: 0, size: 50, hl: hardlinkInfo{state: hlStateComplete}, selected: true},
-			{offset: 50, size: 150, selected: false},
+		meta := torrentMeta{
+			pieceLength: 100,
+			totalSize:   200,
+			files: []*serverFileInfo{
+				{offset: 0, size: 50, hardlink: hardlinkInfo{state: hlStateComplete}, selected: true},
+				{offset: 50, size: 150, selected: false},
+			},
 		}
-		covered := calculatePiecesCovered(files, 2, 100, 200)
+		covered := meta.calculatePiecesCovered()
 		if !covered[0] {
 			t.Error("piece 0 should be covered (hlStateComplete + unselected)")
 		}
@@ -166,11 +174,15 @@ func TestCalculatePiecesCovered_UnselectedFiles(t *testing.T) {
 		// pieceLength=100, totalSize=200
 		// File 0: offset=0,  size=50, unselected        -> piece 0
 		// File 1: offset=50, size=150, selected, none   -> pieces 0..1
-		files := []*serverFileInfo{
-			{offset: 0, size: 50, selected: false},
-			{offset: 50, size: 150, selected: true, hl: hardlinkInfo{state: hlStateNone}},
+		meta := torrentMeta{
+			pieceLength: 100,
+			totalSize:   200,
+			files: []*serverFileInfo{
+				{offset: 0, size: 50, selected: false},
+				{offset: 50, size: 150, selected: true, hardlink: hardlinkInfo{state: hlStateNone}},
+			},
 		}
-		covered := calculatePiecesCovered(files, 2, 100, 200)
+		covered := meta.calculatePiecesCovered()
 		if covered[0] {
 			t.Error("piece 0 should NOT be covered (selected file 1 overlaps)")
 		}

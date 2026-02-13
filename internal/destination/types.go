@@ -47,17 +47,74 @@ func (i *inProgressInode) close() {
 // Immutable per-file (set during init, never modified):
 //
 //	offset, size, selected, firstPiece, lastPiece, piecesTotal,
-//	hl.sourceInode, hl.sourcePath, hl.doneCh
+//	hardlink.sourceInode, hardlink.sourcePath, hardlink.doneCh
 //
 // Mutable per-file (require state.mu):
 //
 //	file, path, earlyFinalized, piecesWritten,
-//	hl.state (transitions through hardlink state machine during finalization)
+//	hardlink.state (transitions through hardlink state machine during finalization)
 type torrentMeta struct {
 	pieceHashes []string          // SHA1 hashes per piece for verification
 	pieceLength int64             // Size of each piece (last piece may be smaller)
 	totalSize   int64             // Total size of all files combined
 	files       []*serverFileInfo // Files in this torrent (slice immutable, elements partly mutable)
+}
+
+// numPieces returns the number of pieces derived from piece geometry.
+func (m *torrentMeta) numPieces() int32 {
+	if m.pieceLength <= 0 {
+		return 0
+	}
+	return int32((m.totalSize + m.pieceLength - 1) / m.pieceLength)
+}
+
+// computeFilePieceRanges sets firstPiece, lastPiece, and piecesTotal on each file
+// based on its offset/size and the torrent's piece geometry.
+func (m *torrentMeta) computeFilePieceRanges() {
+	if m.pieceLength <= 0 {
+		return
+	}
+	maxPiece := int((m.totalSize - 1) / m.pieceLength)
+	for _, f := range m.files {
+		if f.size <= 0 {
+			continue
+		}
+		f.firstPiece = int(f.offset / m.pieceLength)
+		f.lastPiece = min(int((f.offset+f.size-1)/m.pieceLength), maxPiece)
+		f.piecesTotal = f.lastPiece - f.firstPiece + 1
+	}
+}
+
+// initFilePieceCounts initializes piecesWritten on each file from the existing written bitmap.
+func (m *torrentMeta) initFilePieceCounts(written []bool) {
+	for _, f := range m.files {
+		if f.earlyFinalized || f.size <= 0 {
+			continue
+		}
+		f.recalcPiecesWritten(written)
+	}
+}
+
+// calculatePiecesCovered determines which pieces are fully covered by hardlinked, pending,
+// or unselected files (none of these need data streamed from source).
+func (m *torrentMeta) calculatePiecesCovered() []bool {
+	numPieces := m.numPieces()
+	piecesCovered := make([]bool, numPieces)
+	for pieceIdx := range numPieces {
+		pieceStart := int64(pieceIdx) * m.pieceLength
+		pieceEnd := min(pieceStart+m.pieceLength, m.totalSize)
+
+		// Piece is covered if every overlapping file is hardlinked, pending, or unselected.
+		covered := true
+		for _, f := range m.files {
+			if f.offset < pieceEnd && f.offset+f.size > pieceStart && !f.skipForWriteData() {
+				covered = false
+				break
+			}
+		}
+		piecesCovered[pieceIdx] = covered
+	}
+	return piecesCovered
 }
 
 // serverTorrentState holds the state for a torrent being received.
@@ -80,7 +137,8 @@ type serverTorrentState struct {
 	mu               sync.Mutex
 
 	// Finalization lifecycle (state machine: inactive -> active -> result stored).
-	// Require state.mu. Use start()/reset()/storeResult() methods.
+	// All fields are mutable and require state.mu.
+	// Use start()/reset()/storeResult() methods for transitions.
 	finalization finalizationState
 
 	// Cached for re-initialization (hardlink info for logging)
@@ -88,7 +146,10 @@ type serverTorrentState struct {
 }
 
 // finalizationState tracks the background finalization lifecycle.
-// States: inactive (active=false) -> active (active=true, done open) -> complete (result set, done closed).
+// All fields are mutable and require the parent serverTorrentState.mu:
+//   - active: set during FinalizeTorrent, cleared on completion or failure
+//   - done: created when active becomes true, closed when background work ends
+//   - result: nil until background goroutine stores success or failure
 type finalizationState struct {
 	active bool            // True during FinalizeTorrent to prevent concurrent writes
 	done   chan struct{}   // Closed when background finalization completes
@@ -131,6 +192,7 @@ type finalizeResult struct {
 //
 // sourceInode, sourcePath, and doneCh are immutable after init.
 // state is mutable and requires the parent serverTorrentState.mu.
+// Use applyOutcome() during init and markComplete() during finalization.
 type hardlinkInfo struct {
 	state       hardlinkState // Current state in the hardlink state machine
 	sourceInode Inode         // Source inode for registration (immutable after init)
@@ -138,15 +200,41 @@ type hardlinkInfo struct {
 	doneCh      chan struct{} // Wait on this before hardlinking (immutable after init)
 }
 
+// applyOutcome sets the hardlink state from an init-time resolution outcome.
+// Called during setupFiles when a file's hardlink is resolved.
+func (h *hardlinkInfo) applyOutcome(outcome hardlinkOutcome) {
+	h.state = outcome.state
+	if outcome.state == hlStatePending {
+		h.sourcePath = outcome.sourcePath
+		h.doneCh = outcome.doneCh
+	}
+}
+
+// markComplete transitions the hardlink state to Complete.
+// Called during finalization after a pending hardlink is resolved.
+// Caller must hold state.mu.
+func (h *hardlinkInfo) markComplete() {
+	h.state = hlStateComplete
+}
+
 // serverFileInfo holds information about a file in a torrent.
+//
+// Immutable fields (set during init, safe to read without state.mu):
+//
+//	offset, size, selected, firstPiece, lastPiece, piecesTotal,
+//	hardlink.sourceInode, hardlink.sourcePath, hardlink.doneCh
+//
+// Mutable fields (require state.mu):
+//
+//	path, file, earlyFinalized, piecesWritten, hardlink.state
 type serverFileInfo struct {
-	path   string   // Full path on disk
+	path   string   // Full path on disk (mutable: renamed during early finalize)
 	size   int64    // File size
 	offset int64    // Offset within torrent's total data
-	file   *os.File // Open file handle (lazy opened)
+	file   *os.File // Open file handle (lazy opened, mutable)
 
 	// Hardlink tracking (state machine for cross-torrent file dedup)
-	hl hardlinkInfo
+	hardlink hardlinkInfo
 
 	// File selection (priority > 0 on source side)
 	selected bool // True if file is selected for download; unselected files have no .partial
@@ -160,22 +248,22 @@ type serverFileInfo struct {
 }
 
 // skipForWriteData reports whether this file should be skipped during piece write.
-// True for files that are hardlinked, pending hardlink, or unselected.
-func (fi *serverFileInfo) skipForWriteData() bool {
-	return fi.hl.state == hlStateComplete || fi.hl.state == hlStatePending || !fi.selected
+// True for unselected files, or files that are hardlinked/pending hardlink.
+func (f *serverFileInfo) skipForWriteData() bool {
+	return !f.selected || f.hardlink.state == hlStateComplete || f.hardlink.state == hlStatePending
 }
 
 // overlaps reports whether the given piece index falls within this file's piece range.
-func (fi *serverFileInfo) overlaps(pieceIdx int) bool {
-	return pieceIdx >= fi.firstPiece && pieceIdx <= fi.lastPiece
+func (f *serverFileInfo) overlaps(pieceIdx int) bool {
+	return pieceIdx >= f.firstPiece && pieceIdx <= f.lastPiece
 }
 
 // recalcPiecesWritten recomputes piecesWritten from the torrent's written bitmap.
-func (fi *serverFileInfo) recalcPiecesWritten(written []bool) {
-	fi.piecesWritten = 0
-	for p := fi.firstPiece; p <= fi.lastPiece; p++ {
+func (f *serverFileInfo) recalcPiecesWritten(written []bool) {
+	f.piecesWritten = 0
+	for p := f.firstPiece; p <= f.lastPiece; p++ {
 		if written[p] {
-			fi.piecesWritten++
+			f.piecesWritten++
 		}
 	}
 }

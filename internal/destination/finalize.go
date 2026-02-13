@@ -351,14 +351,14 @@ func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTo
 	// and holding the lock would block all WritePiece calls for that duration.
 	// Safe because: files slice is immutable after init, and finalizing=true prevents writes.
 	for _, fi := range state.files {
-		if fi.hl.state != hlStatePending {
+		if fi.hardlink.state != hlStatePending {
 			continue
 		}
 
 		s.logger.DebugContext(ctx, "waiting for pending hardlink source",
 			"hash", hash,
 			"target", fi.path,
-			"source", fi.hl.sourcePath,
+			"source", fi.hardlink.sourcePath,
 		)
 
 		select {
@@ -366,12 +366,12 @@ func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTo
 			return ctx.Err()
 		case <-time.After(defaultHardlinkWaitTimeout):
 			return fmt.Errorf("timeout waiting for pending hardlink source %s (waited %v)",
-				fi.hl.sourcePath, defaultHardlinkWaitTimeout)
-		case <-fi.hl.doneCh:
+				fi.hardlink.sourcePath, defaultHardlinkWaitTimeout)
+		case <-fi.hardlink.doneCh:
 			// Source is ready
 		}
 
-		sourcePath := filepath.Join(s.config.BasePath, fi.hl.sourcePath)
+		sourcePath := filepath.Join(s.config.BasePath, fi.hardlink.sourcePath)
 		if linkErr := os.Link(sourcePath, fi.path); linkErr != nil {
 			if os.IsExist(linkErr) {
 				s.logger.DebugContext(ctx, "pending hardlink target already exists",
@@ -391,7 +391,7 @@ func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTo
 			)
 		}
 
-		fi.hl.state = hlStateComplete
+		fi.hardlink.markComplete()
 	}
 
 	// Phase 2: Sync, close, and rename under lock.
@@ -402,7 +402,7 @@ func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTo
 	// Fail early if any file can't be flushed — renaming unflushed files
 	// risks data loss, especially on NFS where sync is less reliable.
 	for _, fi := range state.files {
-		if fi.hl.state != hlStateComplete {
+		if fi.hardlink.state != hlStateComplete {
 			if err := s.closeFileHandle(ctx, hash, fi); err != nil {
 				return fmt.Errorf("flushing before rename: %w", err)
 			}
@@ -411,7 +411,7 @@ func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTo
 
 	// Then rename partial files
 	for _, fi := range state.files {
-		if fi.hl.state == hlStateComplete {
+		if fi.hardlink.state == hlStateComplete {
 			continue
 		}
 		if err := s.renamePartialFile(ctx, hash, fi); err != nil {
@@ -516,14 +516,14 @@ func (s *Server) registerFinalizedInodes(ctx context.Context, hash string, state
 	defer state.mu.Unlock()
 
 	var registered int
-	for _, f := range state.files {
+	for _, fi := range state.files {
 		// Skip files that need no data (hardlinked/pending/unselected) or have no inode
-		if f.skipForWriteData() || f.hl.sourceInode == 0 {
+		if fi.skipForWriteData() || fi.hardlink.sourceInode == 0 {
 			continue
 		}
 
 		// Get final path (remove .partial suffix if present)
-		finalPath, _ := strings.CutSuffix(f.path, partialSuffix)
+		finalPath, _ := strings.CutSuffix(fi.path, partialSuffix)
 
 		// Get relative path for storage
 		relPath, relErr := filepath.Rel(s.config.BasePath, finalPath)
@@ -537,8 +537,8 @@ func (s *Server) registerFinalizedInodes(ctx context.Context, hash string, state
 		}
 
 		// Register in persistent map and signal waiters
-		s.inodes.Register(f.hl.sourceInode, relPath)
-		s.inodes.CompleteInProgress(f.hl.sourceInode, hash)
+		s.inodes.Register(fi.hardlink.sourceInode, relPath)
+		s.inodes.CompleteInProgress(fi.hardlink.sourceInode, hash)
 		registered++
 	}
 

@@ -186,16 +186,24 @@ func (s *Server) initNewTorrent(
 		return initErrorResponse("%v", err)
 	}
 
-	numPieces := req.GetNumPieces()
 	pieceSize := req.GetPieceSize()
 	totalSize := req.GetTotalSize()
 
+	// Create torrentMeta early so buildWrittenBitmap can use its methods.
+	meta := torrentMeta{
+		pieceHashes: req.GetPieceHashes(),
+		pieceLength: pieceSize,
+		totalSize:   totalSize,
+		files:       files,
+	}
+
 	// Build written bitmap from persisted state + hardlink coverage.
-	written := s.buildWrittenBitmap(ctx, hash, statePath, files, numPieces, pieceSize, totalSize)
+	written := s.buildWrittenBitmap(ctx, hash, statePath, &meta)
+	writtenCount := countWritten(written)
 
 	// Persist initial written state so pre-existing/hardlinked piece coverage
 	// survives a crash before the first WritePiece triggers a periodic flush.
-	if initialHave := countWritten(written); initialHave > 0 {
+	if writtenCount > 0 {
 		if saveErr := s.doSaveState(statePath, written); saveErr != nil {
 			s.logger.WarnContext(ctx, "failed to persist initial state",
 				"hash", hash, "error", saveErr)
@@ -213,15 +221,10 @@ func (s *Server) initNewTorrent(
 
 	// Swap sentinel for real state under s.mu
 	state := &serverTorrentState{
-		torrentMeta: torrentMeta{
-			pieceHashes: req.GetPieceHashes(),
-			pieceLength: pieceSize,
-			totalSize:   totalSize,
-			files:       files,
-		},
+		torrentMeta:     meta,
 		info:            req,
 		written:         written,
-		writtenCount:    countWritten(written),
+		writtenCount:    writtenCount,
 		torrentPath:     torrentPath,
 		statePath:       statePath,
 		saveSubPath:     saveSubPath,
@@ -239,7 +242,7 @@ func (s *Server) initNewTorrent(
 	s.logger.InfoContext(ctx, "initialized torrent",
 		"hash", hash,
 		"name", name,
-		"pieces", numPieces,
+		"pieces", meta.numPieces(),
 		"files", len(files),
 		"selectedFiles", selectedCount,
 		"hasHashes", len(req.GetPieceHashes()) > 0,
@@ -258,11 +261,10 @@ func (s *Server) initNewTorrent(
 func (s *Server) buildWrittenBitmap(
 	ctx context.Context,
 	hash, statePath string,
-	files []*serverFileInfo,
-	numPieces int32,
-	pieceSize, totalSize int64,
+	meta *torrentMeta,
 ) []bool {
-	piecesCovered := calculatePiecesCovered(files, numPieces, pieceSize, totalSize)
+	numPieces := meta.numPieces()
+	piecesCovered := meta.calculatePiecesCovered()
 
 	written := make([]bool, numPieces)
 	if existingState, loadErr := s.loadState(statePath, int(numPieces)); loadErr == nil {
@@ -276,19 +278,17 @@ func (s *Server) buildWrittenBitmap(
 	}
 
 	for i, covered := range piecesCovered {
-		if covered {
-			written[i] = true
-		}
+		written[i] = written[i] || covered
 	}
 
 	// Compute per-file piece ranges and mark files that need no streamed data as already finalized.
-	computeFilePieceRanges(files, pieceSize, totalSize)
-	for _, fi := range files {
+	meta.computeFilePieceRanges()
+	for _, fi := range meta.files {
 		if fi.skipForWriteData() {
 			fi.earlyFinalized = true
 		}
 	}
-	initFilePieceCounts(files, written)
+	meta.initFilePieceCounts(written)
 
 	return written
 }
@@ -502,7 +502,7 @@ func (s *Server) setupFile(
 			path:     targetPath,
 			size:     f.GetSize(),
 			offset:   f.GetOffset(),
-			hl:       hardlinkInfo{sourceInode: Inode(f.GetInode())},
+			hardlink: hardlinkInfo{sourceInode: Inode(f.GetInode())},
 			selected: false,
 		}, result, nil
 	}
@@ -518,7 +518,7 @@ func (s *Server) setupFile(
 			path:     targetPath,
 			size:     f.GetSize(),
 			offset:   f.GetOffset(),
-			hl:       hardlinkInfo{sourceInode: Inode(f.GetInode()), state: hlStateComplete},
+			hardlink: hardlinkInfo{sourceInode: Inode(f.GetInode()), state: hlStateComplete},
 			selected: true,
 		}
 		result.PreExisting = true
@@ -534,7 +534,7 @@ func (s *Server) setupFile(
 			path:     partialPath,
 			size:     f.GetSize(),
 			offset:   f.GetOffset(),
-			hl:       hardlinkInfo{sourceInode: Inode(f.GetInode())},
+			hardlink: hardlinkInfo{sourceInode: Inode(f.GetInode())},
 			selected: true,
 		}, result, nil
 	}
@@ -544,7 +544,7 @@ func (s *Server) setupFile(
 		path:     partialPath,
 		size:     f.GetSize(),
 		offset:   f.GetOffset(),
-		hl:       hardlinkInfo{sourceInode: sourceInode},
+		hardlink: hardlinkInfo{sourceInode: sourceInode},
 		selected: true,
 	}
 
@@ -585,7 +585,7 @@ func (s *Server) applyHardlinkOutcome(
 	targetPath string,
 	outcome hardlinkOutcome,
 ) {
-	fileInfo.hl.state = outcome.state
+	fileInfo.hardlink.applyOutcome(outcome)
 
 	switch outcome.state {
 	case hlStateComplete:
@@ -595,8 +595,6 @@ func (s *Server) applyHardlinkOutcome(
 	case hlStatePending:
 		result.Pending = true
 		result.SourcePath = outcome.sourcePath
-		fileInfo.hl.sourcePath = outcome.sourcePath
-		fileInfo.hl.doneCh = outcome.doneCh
 		fileInfo.path = targetPath
 	case hlStateInProgress, hlStateNone:
 		// Keep default values

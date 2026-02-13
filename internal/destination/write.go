@@ -207,10 +207,7 @@ func (s *Server) checkFileCompletions(
 ) {
 	idx := int(pieceIndex)
 	for i, fi := range state.files {
-		if fi.earlyFinalized || fi.size <= 0 {
-			continue
-		}
-		if fi.hl.state == hlStateComplete || fi.hl.state == hlStatePending {
+		if fi.earlyFinalized || fi.size <= 0 || fi.skipForWriteData() {
 			continue
 		}
 		if !fi.overlaps(idx) {

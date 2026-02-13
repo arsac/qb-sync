@@ -25,7 +25,8 @@ func TestComputeFilePieceRanges(t *testing.T) {
 			{offset: 80, size: 120, selected: true},
 			{offset: 200, size: 50, selected: true},
 		}
-		computeFilePieceRanges(files, 100, 250)
+		meta := torrentMeta{pieceLength: 100, totalSize: 250, files: files}
+		meta.computeFilePieceRanges()
 
 		assertFileRange(t, files[0], 0, 0, 1)
 		assertFileRange(t, files[1], 0, 1, 2)
@@ -39,7 +40,8 @@ func TestComputeFilePieceRanges(t *testing.T) {
 			{offset: 100, size: 0, selected: true},
 			{offset: 100, size: 50, selected: true},
 		}
-		computeFilePieceRanges(files, 100, 150)
+		meta := torrentMeta{pieceLength: 100, totalSize: 150, files: files}
+		meta.computeFilePieceRanges()
 
 		assertFileRange(t, files[0], 0, 0, 1)
 		if files[1].piecesTotal != 0 {
@@ -53,7 +55,8 @@ func TestComputeFilePieceRanges(t *testing.T) {
 		files := []*serverFileInfo{
 			{offset: 0, size: 50, selected: true},
 		}
-		computeFilePieceRanges(files, 100, 50)
+		meta := torrentMeta{pieceLength: 100, totalSize: 50, files: files}
+		meta.computeFilePieceRanges()
 
 		assertFileRange(t, files[0], 0, 0, 1)
 	})
@@ -67,7 +70,8 @@ func TestComputeFilePieceRanges(t *testing.T) {
 			{offset: 0, size: 50, selected: true},
 			{offset: 50, size: 150, selected: true},
 		}
-		computeFilePieceRanges(files, 100, 200)
+		meta := torrentMeta{pieceLength: 100, totalSize: 200, files: files}
+		meta.computeFilePieceRanges()
 
 		assertFileRange(t, files[0], 0, 0, 1)
 		assertFileRange(t, files[1], 0, 1, 2)
@@ -80,7 +84,8 @@ func TestComputeFilePieceRanges(t *testing.T) {
 		files := []*serverFileInfo{
 			{offset: 0, size: 150, selected: true},
 		}
-		computeFilePieceRanges(files, 100, 150)
+		meta := torrentMeta{pieceLength: 100, totalSize: 150, files: files}
+		meta.computeFilePieceRanges()
 
 		assertFileRange(t, files[0], 0, 1, 2)
 	})
@@ -90,7 +95,8 @@ func TestComputeFilePieceRanges(t *testing.T) {
 		files := []*serverFileInfo{
 			{offset: 0, size: 100, selected: true},
 		}
-		computeFilePieceRanges(files, 0, 100)
+		meta := torrentMeta{pieceLength: 0, totalSize: 100, files: files}
+		meta.computeFilePieceRanges()
 
 		if files[0].piecesTotal != 0 {
 			t.Errorf("piecesTotal = %d, want 0 for zero pieceLength", files[0].piecesTotal)
@@ -112,7 +118,8 @@ func TestInitFilePieceCounts(t *testing.T) {
 			{offset: 150, size: 150, firstPiece: 1, lastPiece: 2, piecesTotal: 2, selected: true},
 		}
 		written := []bool{true, false, true}
-		initFilePieceCounts(files, written)
+		meta := torrentMeta{files: files}
+		meta.initFilePieceCounts(written)
 
 		if files[0].piecesWritten != 1 {
 			t.Errorf("file 0: piecesWritten = %d, want 1", files[0].piecesWritten)
@@ -128,7 +135,8 @@ func TestInitFilePieceCounts(t *testing.T) {
 			{offset: 0, size: 200, firstPiece: 0, lastPiece: 1, piecesTotal: 2, selected: true},
 		}
 		written := []bool{true, true}
-		initFilePieceCounts(files, written)
+		meta := torrentMeta{files: files}
+		meta.initFilePieceCounts(written)
 
 		if files[0].piecesWritten != 2 {
 			t.Errorf("piecesWritten = %d, want 2", files[0].piecesWritten)
@@ -142,7 +150,8 @@ func TestInitFilePieceCounts(t *testing.T) {
 			{offset: 100, size: 100, firstPiece: 1, lastPiece: 1, piecesTotal: 1, selected: true},
 		}
 		written := []bool{true, true}
-		initFilePieceCounts(files, written)
+		meta := torrentMeta{files: files}
+		meta.initFilePieceCounts(written)
 
 		if files[0].piecesWritten != 0 {
 			t.Errorf("early-finalized file: piecesWritten = %d, want 0", files[0].piecesWritten)
@@ -159,7 +168,8 @@ func TestInitFilePieceCounts(t *testing.T) {
 			{offset: 0, size: 100, firstPiece: 0, lastPiece: 0, piecesTotal: 1, selected: true},
 		}
 		written := []bool{true}
-		initFilePieceCounts(files, written)
+		meta := torrentMeta{files: files}
+		meta.initFilePieceCounts(written)
 
 		if files[0].piecesWritten != 0 {
 			t.Errorf("zero-size file: piecesWritten = %d, want 0", files[0].piecesWritten)
@@ -300,7 +310,7 @@ func TestCheckFileCompletions(t *testing.T) {
 		fi := &serverFileInfo{
 			size: 100, offset: 0,
 			firstPiece: 0, lastPiece: 0, piecesTotal: 1,
-			hl: hardlinkInfo{state: hlStateComplete}, selected: true,
+			hardlink: hardlinkInfo{state: hlStateComplete}, selected: true,
 		}
 		state := &serverTorrentState{torrentMeta: torrentMeta{files: []*serverFileInfo{fi}}}
 
