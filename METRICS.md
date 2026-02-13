@@ -47,8 +47,8 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_verification_errors_total` | `mode` | Piece verification failures during finalization |
 | `qbsync_hardlink_errors_total` | `mode` | Hardlink creation failures |
 | `qbsync_stream_open_errors_total` | `mode` | Stream open or poll failures |
-| `qbsync_hot_cleanup_groups_total` | `result` | Hardlink groups processed during source cleanup |
-| `qbsync_hot_cleanup_torrents_handed_off_total` | | Torrents handed off from source to destination |
+| `qbsync_cleanup_groups_total` | `result` | Hardlink groups processed during source cleanup |
+| `qbsync_cleanup_torrents_handed_off_total` | | Torrents handed off from source to destination |
 | `qbsync_idle_poll_skips_total` | | Piece poll skips due to idle torrent detection |
 | `qbsync_cycle_cache_hits_total` | | Per-cycle completed-torrents cache reuses |
 | `qbsync_health_check_cache_total` | `result` | Health check cache hits/misses |
@@ -82,10 +82,10 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_torrent_pieces` | `hash`, `name` | Total pieces per tracked torrent |
 | `qbsync_torrent_pieces_streamed` | `hash`, `name` | Pieces synced to destination per tracked torrent |
 | `qbsync_torrent_size_bytes` | `hash`, `name` | Total size in bytes per tracked torrent |
-| `qbsync_completed_on_cold_cache_size` | | Torrents cached as complete on destination (source) |
+| `qbsync_completed_on_dest_cache_size` | | Torrents cached as complete on destination (source) |
 | `qbsync_inode_registry_size` | | Registered inodes for hardlink deduplication (destination) |
-| `qbsync_cold_worker_queue_depth` | | Pieces queued waiting for a destination write worker |
-| `qbsync_cold_workers_busy` | | Destination write workers currently processing |
+| `qbsync_write_worker_queue_depth` | | Pieces queued waiting for a destination write worker |
+| `qbsync_write_workers_busy` | | Destination write workers currently processing |
 | `qbsync_grpc_connections_configured` | | Maximum TCP connections configured for gRPC streaming (source) |
 | `qbsync_grpc_connections_active` | | Current active TCP connections to destination server (source) |
 | `qbsync_sender_workers_configured` | | Concurrent sender workers configured (source) |

@@ -288,7 +288,7 @@ var (
 	SourceCleanupGroupsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: namespace,
-			Name:      "hot_cleanup_groups_total",
+			Name:      "cleanup_groups_total",
 			Help:      "Total groups processed during source cleanup cycles",
 		},
 		[]string{LabelResult},
@@ -298,7 +298,7 @@ var (
 	SourceCleanupTorrentsHandedOffTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: namespace,
-			Name:      "hot_cleanup_torrents_handed_off_total",
+			Name:      "cleanup_torrents_handed_off_total",
 			Help:      "Total torrents handed off from source to destination",
 		},
 	)
@@ -597,7 +597,7 @@ var (
 	CompletedOnDestCacheSize = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: namespace,
-			Name:      "completed_on_cold_cache_size",
+			Name:      "completed_on_dest_cache_size",
 			Help:      "Number of torrents cached as complete on destination",
 		},
 	)
@@ -615,7 +615,7 @@ var (
 	DestWorkerQueueDepth = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: namespace,
-			Name:      "cold_worker_queue_depth",
+			Name:      "write_worker_queue_depth",
 			Help:      "Pieces queued waiting for a destination server write worker",
 		},
 	)
@@ -624,7 +624,7 @@ var (
 	DestWorkersBusy = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: namespace,
-			Name:      "cold_workers_busy",
+			Name:      "write_workers_busy",
 			Help:      "Number of destination server write workers currently processing a piece",
 		},
 	)
