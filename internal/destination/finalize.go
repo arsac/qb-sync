@@ -419,7 +419,7 @@ func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTo
 		}
 	}
 
-	s.saveStatePath(ctx, hash, state)
+	s.flushWrittenState(ctx, hash, state)
 	return nil
 }
 
@@ -493,8 +493,8 @@ func (s *Server) renamePartialFile(ctx context.Context, hash string, fi *serverF
 	return nil
 }
 
-// saveStatePath saves the torrent state to disk.
-func (s *Server) saveStatePath(ctx context.Context, hash string, state *serverTorrentState) {
+// flushWrittenState persists the written bitmap to disk.
+func (s *Server) flushWrittenState(ctx context.Context, hash string, state *serverTorrentState) {
 	if state.statePath == "" {
 		return
 	}

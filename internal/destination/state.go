@@ -8,8 +8,6 @@ import (
 	pb "github.com/arsac/qb-sync/proto"
 )
 
-// --- serverFileInfo domain methods ---
-
 // openForWrite lazily opens the file for writing, creating and pre-allocating it if needed.
 func (fi *serverFileInfo) openForWrite() (*os.File, error) {
 	if fi.file != nil {
@@ -30,8 +28,6 @@ func (fi *serverFileInfo) openForWrite() (*os.File, error) {
 	fi.file = file
 	return file, nil
 }
-
-// --- serverTorrentState domain methods ---
 
 // verifyPieceHash checks the piece data against expected hash.
 // Returns empty string if valid, error message if invalid.
@@ -122,7 +118,7 @@ func (m *torrentMeta) countSelectedFiles() int {
 }
 
 // countSelectedPiecesTotal returns the number of pieces that overlap at least one selected file.
-// Caller must hold state.mu.
+// Uses len(written) for iteration bound and classifyPiece (immutable torrentMeta).
 func (s *serverTorrentState) countSelectedPiecesTotal() int {
 	count := 0
 	for i := range s.written {
@@ -174,8 +170,6 @@ func (m *torrentMeta) classifyPiece(pieceIdx int) pieceClass {
 	}
 	return pieceFullySelected
 }
-
-// --- Free functions (operate on domain types before state construction) ---
 
 // calculatePiecesNeeded converts written state to pieces_needed (inverse).
 // pieces_needed[i] = true means the piece needs to be streamed.
