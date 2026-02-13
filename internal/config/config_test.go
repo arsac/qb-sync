@@ -21,7 +21,7 @@ func TestSourceConfig_Validate(t *testing.T) {
 			name: "valid config",
 			cfg: SourceConfig{
 				BaseConfig:      BaseConfig{DataPath: "/data", QBURL: "http://qb:8080"},
-				DestinationAddr: "cold:50051",
+				DestinationAddr: "destination:50051",
 			},
 			wantErr: "",
 		},
@@ -29,7 +29,7 @@ func TestSourceConfig_Validate(t *testing.T) {
 			name: "missing data path",
 			cfg: SourceConfig{
 				BaseConfig:      BaseConfig{QBURL: "http://qb:8080"},
-				DestinationAddr: "cold:50051",
+				DestinationAddr: "destination:50051",
 			},
 			wantErr: "data path is required",
 		},
@@ -37,7 +37,7 @@ func TestSourceConfig_Validate(t *testing.T) {
 			name: "missing qb URL",
 			cfg: SourceConfig{
 				BaseConfig:      BaseConfig{DataPath: "/data"},
-				DestinationAddr: "cold:50051",
+				DestinationAddr: "destination:50051",
 			},
 			wantErr: "qBittorrent URL is required",
 		},
@@ -52,7 +52,7 @@ func TestSourceConfig_Validate(t *testing.T) {
 			name: "negative min connections",
 			cfg: SourceConfig{
 				BaseConfig:         BaseConfig{DataPath: "/data", QBURL: "http://qb:8080"},
-				DestinationAddr:    "cold:50051",
+				DestinationAddr:    "destination:50051",
 				MinGRPCConnections: -1,
 			},
 			wantErr: "min connections cannot be negative",
@@ -61,7 +61,7 @@ func TestSourceConfig_Validate(t *testing.T) {
 			name: "negative max connections",
 			cfg: SourceConfig{
 				BaseConfig:         BaseConfig{DataPath: "/data", QBURL: "http://qb:8080"},
-				DestinationAddr:    "cold:50051",
+				DestinationAddr:    "destination:50051",
 				MaxGRPCConnections: -1,
 			},
 			wantErr: "max connections cannot be negative",
@@ -70,7 +70,7 @@ func TestSourceConfig_Validate(t *testing.T) {
 			name: "min exceeds max",
 			cfg: SourceConfig{
 				BaseConfig:         BaseConfig{DataPath: "/data", QBURL: "http://qb:8080"},
-				DestinationAddr:    "cold:50051",
+				DestinationAddr:    "destination:50051",
 				MinGRPCConnections: 5,
 				MaxGRPCConnections: 2,
 			},
@@ -172,7 +172,7 @@ func TestLoadSource(t *testing.T) {
 		v.Set("qb-url", "http://qb:8080")
 		v.Set("qb-username", "admin")
 		v.Set("qb-password", "secret")
-		v.Set("destination-addr", "cold:50051")
+		v.Set("destination-addr", "destination:50051")
 		v.Set("min-space", 100)
 		v.Set("min-seeding-time", 7200)
 		v.Set("dry-run", true)
@@ -193,7 +193,7 @@ func TestLoadSource(t *testing.T) {
 		assert.Equal(t, "http://qb:8080", cfg.QBURL)
 		assert.Equal(t, "admin", cfg.QBUsername)
 		assert.Equal(t, "secret", cfg.QBPassword)
-		assert.Equal(t, "cold:50051", cfg.DestinationAddr)
+		assert.Equal(t, "destination:50051", cfg.DestinationAddr)
 		assert.Equal(t, int64(100), cfg.MinSpaceGB)
 		assert.Equal(t, 7200, int(cfg.MinSeedingTime.Seconds()))
 		assert.True(t, cfg.DryRun)
@@ -213,7 +213,7 @@ func TestLoadSource(t *testing.T) {
 		v := viper.New()
 		v.Set("data", "/data/path")
 		v.Set("qb-url", "http://qb:8080")
-		v.Set("destination-addr", "cold:50051")
+		v.Set("destination-addr", "destination:50051")
 		// Default "source-removed" is applied at flag level, not viper level.
 		// LoadSource without the flag binding sees empty string.
 
@@ -227,7 +227,7 @@ func TestLoadSource(t *testing.T) {
 		v := viper.New()
 		v.Set("data", "/data/path")
 		v.Set("qb-url", "http://qb:8080")
-		v.Set("destination-addr", "cold:50051")
+		v.Set("destination-addr", "destination:50051")
 		v.Set("source-removed-tag", "")
 
 		cfg, err := LoadSource(v)
@@ -240,7 +240,7 @@ func TestLoadSource(t *testing.T) {
 		v := viper.New()
 		v.Set("data", "/data/path")
 		v.Set("qb-url", "http://qb:8080")
-		v.Set("destination-addr", "cold:50051")
+		v.Set("destination-addr", "destination:50051")
 		v.Set("synced-tag", "")
 
 		cfg, err := LoadSource(v)
@@ -263,7 +263,7 @@ func TestLoadDestination(t *testing.T) {
 		v.Set("qb-password", "secret")
 		v.Set("poll-interval", 5)
 		v.Set("poll-timeout", 600)
-		v.Set("synced-tag", "cold-synced")
+		v.Set("synced-tag", "dest-synced")
 		v.Set("max-stream-buffer", 256)
 		v.Set("dry-run", true)
 
@@ -279,7 +279,7 @@ func TestLoadDestination(t *testing.T) {
 		assert.Equal(t, 5, int(cfg.PollInterval.Seconds()))
 		assert.Equal(t, 600, int(cfg.PollTimeout.Seconds()))
 		assert.Equal(t, 256, cfg.MaxStreamBufferMB)
-		assert.Equal(t, "cold-synced", cfg.SyncedTag)
+		assert.Equal(t, "dest-synced", cfg.SyncedTag)
 		assert.True(t, cfg.DryRun)
 	})
 
@@ -475,7 +475,7 @@ func TestLoadSource_EnvFallbacks(t *testing.T) {
 		v := viper.New()
 		v.Set("data", "/data")
 		v.Set("qb-url", "http://qb:8080")
-		v.Set("destination-addr", "cold:50051")
+		v.Set("destination-addr", "destination:50051")
 		v.Set("health-addr", defaultHealthAddr) // default value
 
 		cfg, err := LoadSource(v)

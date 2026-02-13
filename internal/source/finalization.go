@@ -56,16 +56,8 @@ func (t *QBTask) finalizeCompletedStreams(ctx context.Context) error {
 				continue
 			}
 
-			// Destination says pieces are missing — source's streamed state diverged from
-			// destination's written state (e.g., destination restarted with stale flush).
-			// Re-sync: clear init cache, re-init to get actual PiecesNeeded,
-			// and reset tracker so missing pieces get re-streamed.
 			if errors.Is(finalizeErr, streaming.ErrFinalizeIncomplete) {
-				t.logger.WarnContext(ctx, "destination reports incomplete, re-syncing streamed state",
-					"hash", hash,
-					"error", finalizeErr,
-				)
-				t.resyncWithDest(ctx, hash)
+				t.handleIncompleteFinalization(ctx, hash)
 				continue
 			}
 
@@ -174,7 +166,8 @@ func (t *QBTask) shouldAttemptFinalize(hash string) bool {
 }
 
 // recordFinalizeFailure records a finalization failure for backoff tracking.
-func (t *QBTask) recordFinalizeFailure(hash string) {
+// Returns the total number of consecutive failures for this hash.
+func (t *QBTask) recordFinalizeFailure(hash string) int {
 	t.backoffMu.Lock()
 	defer t.backoffMu.Unlock()
 
@@ -187,6 +180,57 @@ func (t *QBTask) recordFinalizeFailure(hash string) {
 	backoff.failures++
 	backoff.lastAttempt = time.Now()
 	metrics.ActiveFinalizationBackoffs.Set(float64(len(t.finalizeBackoffs)))
+	return backoff.failures
+}
+
+// handleIncompleteFinalization handles a FINALIZE_ERROR_INCOMPLETE response from
+// the destination. Tracks consecutive failures to prevent infinite verify→re-stream
+// loops. After maxVerificationRetries, tags the torrent as sync-failed so the user
+// can investigate. Removing the tag re-enables sync.
+func (t *QBTask) handleIncompleteFinalization(ctx context.Context, hash string) {
+	failures := t.recordFinalizeFailure(hash)
+	if failures >= maxVerificationRetries {
+		t.logger.ErrorContext(ctx, "verification failed repeatedly, marking torrent as sync-failed",
+			"hash", hash,
+			"failures", failures,
+			"maxRetries", maxVerificationRetries,
+		)
+		t.markSyncFailed(ctx, hash)
+		return
+	}
+	t.logger.WarnContext(ctx, "destination reports incomplete, re-syncing streamed state",
+		"hash", hash,
+		"attempt", failures,
+		"maxRetries", maxVerificationRetries,
+	)
+	t.resyncWithDest(ctx, hash)
+}
+
+// markSyncFailed tags the torrent as sync-failed on source qBittorrent and stops
+// tracking it. The user can remove the tag to re-enable sync.
+func (t *QBTask) markSyncFailed(ctx context.Context, hash string) {
+	if tag := t.cfg.SyncFailedTag; tag != "" && !t.cfg.DryRun {
+		if tagErr := t.srcClient.AddTagsCtx(ctx, []string{hash}, tag); tagErr != nil {
+			metrics.TagApplicationErrorsTotal.WithLabelValues(metrics.ModeSource).Inc()
+			t.logger.ErrorContext(ctx, "failed to apply sync-failed tag",
+				"hash", hash,
+				"tag", tag,
+				"error", tagErr,
+			)
+		}
+	}
+
+	// Stop tracking so the torrent is not re-streamed.
+	// It will be picked up again if the user removes the tag.
+	t.tracker.Untrack(hash)
+	t.source.EvictCache(hash)
+	t.grpcDest.ClearInitResult(hash)
+	t.trackedMu.Lock()
+	delete(t.trackedTorrents, hash)
+	t.trackedMu.Unlock()
+	t.clearFinalizeBackoff(hash)
+
+	metrics.SyncFailedTotal.Inc()
 }
 
 // clearFinalizeBackoff removes backoff tracking for a successfully finalized torrent.

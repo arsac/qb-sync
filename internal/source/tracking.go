@@ -65,25 +65,7 @@ func (t *QBTask) trackNewTorrents(ctx context.Context) error {
 
 	var candidates []candidateTorrent
 	for _, torrent := range torrents {
-		if !isSyncableState(torrent.State) {
-			continue
-		}
-
-		if torrent.Progress <= 0 {
-			continue
-		}
-
-		t.completedMu.RLock()
-		_, knownComplete := t.completedOnDest[torrent.Hash]
-		t.completedMu.RUnlock()
-		if knownComplete {
-			continue
-		}
-
-		t.trackedMu.RLock()
-		_, alreadyTracked := t.trackedTorrents[torrent.Hash]
-		t.trackedMu.RUnlock()
-		if alreadyTracked {
+		if t.isExcludedFromTracking(torrent) {
 			continue
 		}
 
@@ -115,6 +97,30 @@ func (t *QBTask) trackNewTorrents(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// isExcludedFromTracking returns true if the torrent should be skipped during tracking:
+// non-syncable state, zero progress, sync-failed tag, already complete, or already tracked.
+func (t *QBTask) isExcludedFromTracking(torrent qbittorrent.Torrent) bool {
+	if !isSyncableState(torrent.State) || torrent.Progress <= 0 {
+		return true
+	}
+
+	if t.cfg.SyncFailedTag != "" && hasTag(torrent.Tags, t.cfg.SyncFailedTag) {
+		return true
+	}
+
+	t.completedMu.RLock()
+	_, knownComplete := t.completedOnDest[torrent.Hash]
+	t.completedMu.RUnlock()
+	if knownComplete {
+		return true
+	}
+
+	t.trackedMu.RLock()
+	_, alreadyTracked := t.trackedTorrents[torrent.Hash]
+	t.trackedMu.RUnlock()
+	return alreadyTracked
 }
 
 // queryDestStatus checks a torrent's status on destination without starting tracking.

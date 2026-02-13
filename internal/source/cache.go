@@ -110,15 +110,15 @@ func (t *QBTask) pruneCompletedOnDest(ctx context.Context) {
 		return
 	}
 
-	hotHashes := make(map[string]struct{}, len(torrents))
+	sourceHashes := make(map[string]struct{}, len(torrents))
 	for _, torrent := range torrents {
-		hotHashes[torrent.Hash] = struct{}{}
+		sourceHashes[torrent.Hash] = struct{}{}
 	}
 
 	t.completedMu.Lock()
 	var pruned int
 	for hash := range t.completedOnDest {
-		if _, exists := hotHashes[hash]; !exists {
+		if _, exists := sourceHashes[hash]; !exists {
 			delete(t.completedOnDest, hash)
 			pruned++
 		}

@@ -37,6 +37,10 @@ const (
 	minFinalizeBackoff = 2 * time.Second
 	maxFinalizeBackoff = 30 * time.Second
 
+	// maxVerificationRetries is the number of consecutive verification failures
+	// before the torrent is tagged as sync-failed and excluded from future syncs.
+	maxVerificationRetries = 3
+
 	// Timeout for unary RPCs to destination server during removal/handoff.
 	destRPCTimeout = 30 * time.Second
 

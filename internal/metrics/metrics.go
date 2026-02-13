@@ -457,6 +457,16 @@ var (
 			Help:      "Torrents recovered from verification failure by marking pieces for re-streaming",
 		},
 	)
+
+	// SyncFailedTotal counts torrents that exhausted verification retries
+	// and were tagged as sync-failed on source.
+	SyncFailedTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "sync_failed_total",
+			Help:      "Torrents that failed verification repeatedly and were tagged as sync-failed",
+		},
+	)
 )
 
 // Gauges track values that can go up or down.
