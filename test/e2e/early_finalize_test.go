@@ -29,6 +29,8 @@ func TestE2E_PerFileEarlyFinalization(t *testing.T) {
 		t.Skip("skipping e2e test in short mode")
 	}
 
+	t.Parallel()
+
 	env := SetupTestEnv(t)
 	ctx := context.Background()
 

@@ -153,8 +153,9 @@ services:
       start_period: 10s
 `, sourcePath, sourceConfig, sourceExtraVolumes, destinationPath, destinationConfig)
 
-	// Create compose stack
-	identifier := fmt.Sprintf("qbsync-e2e-%d", time.Now().UnixNano())
+	// Create compose stack — use test name for a deterministic, unique identifier
+	// that won't collide when tests run in parallel.
+	identifier := sanitizeComposeIdentifier(t.Name())
 	stack, err := compose.NewDockerComposeWith(
 		compose.StackIdentifier(identifier),
 		compose.WithStackReaders(strings.NewReader(composeContent)),
@@ -280,6 +281,24 @@ func (env *TestEnv) Cleanup() {
 		compose.RemoveOrphans(true),
 		compose.RemoveVolumes(true),
 	)
+}
+
+// sanitizeComposeIdentifier converts a Go test name into a valid Docker Compose
+// project name (lowercase alphanumeric + hyphens, max 63 chars).
+func sanitizeComposeIdentifier(name string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(name) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('-')
+		}
+	}
+	s := b.String()
+	if len(s) > 63 {
+		s = s[:63]
+	}
+	return s
 }
 
 // findFreePort finds an available TCP port and returns the address string.

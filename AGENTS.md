@@ -38,13 +38,14 @@ Use **Go modules**: `go mod tidy`, `go build ./...`
 
 ## Testing
 
-| Command                                  | Description                 |
-| ---------------------------------------- | --------------------------- |
-| `go test ./internal/... -short -count=1` | Unit tests                  |
-| `go test -tags=e2e ./test/e2e/...`       | E2E tests (requires Docker) |
-| `go vet -tags=e2e ./test/e2e/...`        | Vet E2E code                |
+| Command                                                                    | Description                 |
+| -------------------------------------------------------------------------- | --------------------------- |
+| `go test ./internal/... -short -count=1`                                   | Unit tests                  |
+| `go test -tags=e2e -parallel 4 -timeout 30m ./test/e2e/...`               | E2E tests (requires Docker) |
+| `go vet -tags=e2e ./test/e2e/...`                                          | Vet E2E code                |
 
 - E2E tests use `//go:build e2e` tag and testcontainers (docker-compose)
+- E2E tests run in parallel (`t.Parallel()`); `-parallel 4` limits to 4 concurrent docker stacks
 - E2E test helpers in `testenv.go` with functional options (`WithDryRun`, `WithForce`, etc.)
 
 ## Linting

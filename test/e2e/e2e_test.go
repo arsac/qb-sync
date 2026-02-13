@@ -37,6 +37,8 @@ func TestE2E_QBitTorrentConnectivity(t *testing.T) {
 		t.Skip("skipping e2e test in short mode")
 	}
 
+	t.Parallel()
+
 	env := SetupTestEnv(t)
 	ctx := context.Background()
 
@@ -56,6 +58,8 @@ func TestE2E_GRPCConnectivity(t *testing.T) {
 		t.Skip("skipping e2e test in short mode")
 	}
 
+	t.Parallel()
+
 	env := SetupTestEnv(t)
 	ctx := context.Background()
 
@@ -73,6 +77,8 @@ func TestE2E_AddTorrentToSource(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")
 	}
+
+	t.Parallel()
 
 	env := SetupTestEnv(t)
 	ctx := context.Background()
@@ -98,6 +104,8 @@ func TestE2E_SourceTaskCreation(t *testing.T) {
 		t.Skip("skipping e2e test in short mode")
 	}
 
+	t.Parallel()
+
 	env := SetupTestEnv(t)
 
 	cfg := env.CreateSourceConfig(WithDryRun(true))
@@ -113,6 +121,8 @@ func TestE2E_DryRunDoesNotDelete(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")
 	}
+
+	t.Parallel()
 
 	env := SetupTestEnv(t)
 	ctx := context.Background()
@@ -160,6 +170,8 @@ func TestE2E_InitTorrentOnDestination(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")
 	}
+
+	t.Parallel()
 
 	env := SetupTestEnv(t)
 	ctx := context.Background()
@@ -230,6 +242,8 @@ func TestE2E_FullSyncFlow(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")
 	}
+
+	t.Parallel()
 
 	env := SetupTestEnv(t)
 	ctx := context.Background()
@@ -312,6 +326,8 @@ func TestE2E_TempPathSync(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")
 	}
+
+	t.Parallel()
 
 	env := SetupTestEnv(t, WithSourceTempPath())
 	ctx := context.Background()
@@ -400,6 +416,8 @@ func TestE2E_TorrentSeedsOnSourceAfterSync(t *testing.T) {
 		t.Skip("skipping e2e test in short mode")
 	}
 
+	t.Parallel()
+
 	env := SetupTestEnv(t)
 	ctx := context.Background()
 
@@ -459,6 +477,8 @@ func TestE2E_StopBeforeDeleteOnDiskPressure(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")
 	}
+
+	t.Parallel()
 
 	env := SetupTestEnv(t)
 	ctx := context.Background()
@@ -549,6 +569,8 @@ func TestE2E_SourceRemovedTagOnDiskPressure(t *testing.T) {
 		t.Skip("skipping e2e test in short mode")
 	}
 
+	t.Parallel()
+
 	env := SetupTestEnv(t)
 	ctx := context.Background()
 
@@ -633,6 +655,8 @@ func TestE2E_DestinationServerRestart(t *testing.T) {
 		t.Skip("skipping e2e test in short mode")
 	}
 
+	t.Parallel()
+
 	env := SetupTestEnv(t)
 	ctx := context.Background()
 
@@ -694,6 +718,8 @@ func TestE2E_DestinationQBittorrentRestart(t *testing.T) {
 		t.Skip("skipping e2e test in short mode")
 	}
 
+	t.Parallel()
+
 	env := SetupTestEnv(t)
 	ctx := context.Background()
 
@@ -749,6 +775,8 @@ func TestE2E_SourceQBittorrentRestart(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")
 	}
+
+	t.Parallel()
 
 	env := SetupTestEnv(t)
 	ctx := context.Background()
@@ -829,6 +857,8 @@ func TestE2E_OrchestratorRestart(t *testing.T) {
 		t.Skip("skipping e2e test in short mode")
 	}
 
+	t.Parallel()
+
 	env := SetupTestEnv(t)
 	ctx := context.Background()
 
@@ -892,6 +922,8 @@ func TestE2E_HardlinkDetection(t *testing.T) {
 		t.Skip("skipping e2e test in short mode")
 	}
 
+	t.Parallel()
+
 	env := SetupTestEnv(t)
 
 	// Create original file
@@ -933,6 +965,8 @@ func TestE2E_HardlinkGroupDeletion(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")
 	}
+
+	t.Parallel()
 
 	env := SetupTestEnv(t)
 	ctx := context.Background()
@@ -1074,6 +1108,8 @@ func TestE2E_DestinationHardlinkDeduplication(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")
 	}
+
+	t.Parallel()
 
 	env := SetupTestEnv(t)
 	ctx := context.Background()
@@ -1244,6 +1280,8 @@ func TestE2E_NonHardlinkedDeletedIndependently(t *testing.T) {
 		t.Skip("skipping e2e test in short mode")
 	}
 
+	t.Parallel()
+
 	env := SetupTestEnv(t)
 	ctx := context.Background()
 
@@ -1334,6 +1372,8 @@ func TestE2E_FullSyncFlowWiredCD(t *testing.T) {
 		t.Skip("skipping e2e test in short mode")
 	}
 
+	t.Parallel()
+
 	env := SetupTestEnv(t)
 	ctx := context.Background()
 
@@ -1404,6 +1444,8 @@ func TestE2E_OrphanCleanupOnTorrentRemoval(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")
 	}
+
+	t.Parallel()
 
 	env := SetupTestEnv(t)
 	ctx := context.Background()
@@ -1509,6 +1551,8 @@ func TestE2E_CategoryWithATM(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")
 	}
+
+	t.Parallel()
 
 	env := SetupTestEnv(t)
 	ctx := context.Background()

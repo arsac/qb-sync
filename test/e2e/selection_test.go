@@ -30,6 +30,8 @@ func TestE2E_PartialFileSelection(t *testing.T) {
 		t.Skip("skipping e2e test in short mode")
 	}
 
+	t.Parallel()
+
 	env := SetupTestEnv(t)
 	ctx := context.Background()
 

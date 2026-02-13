@@ -55,6 +55,8 @@ func TestE2E_PerfActiveTorrent(t *testing.T) {
 		t.Skip("skipping perf test in short mode")
 	}
 
+	t.Parallel()
+
 	env := SetupTestEnv(t)
 	ctx := context.Background()
 
@@ -183,6 +185,8 @@ func TestE2E_PerfPreDownloaded(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping perf test in short mode")
 	}
+
+	t.Parallel()
 
 	env := SetupTestEnv(t)
 	ctx := context.Background()
