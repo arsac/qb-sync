@@ -19,7 +19,6 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	QBSyncService_WritePiece_FullMethodName       = "/qbsync.QBSyncService/WritePiece"
 	QBSyncService_StreamPiecesBidi_FullMethodName = "/qbsync.QBSyncService/StreamPiecesBidi"
 	QBSyncService_InitTorrent_FullMethodName      = "/qbsync.QBSyncService/InitTorrent"
 	QBSyncService_CreateHardlink_FullMethodName   = "/qbsync.QBSyncService/CreateHardlink"
@@ -38,8 +37,6 @@ const (
 // Cold qBittorrent is the single source of truth for sync status.
 // InitTorrent determines what needs syncing by checking qB, active syncs, and filesystem.
 type QBSyncServiceClient interface {
-	// WritePiece sends a single piece to the receiver (for simple cases).
-	WritePiece(ctx context.Context, in *WritePieceRequest, opts ...grpc.CallOption) (*WritePieceResponse, error)
 	// StreamPiecesBidi provides full-duplex streaming for maximum throughput.
 	// Client streams pieces, server streams back acknowledgments as pieces are written.
 	// This allows immediate retry on failure without waiting for batch completion.
@@ -78,16 +75,6 @@ type qBSyncServiceClient struct {
 
 func NewQBSyncServiceClient(cc grpc.ClientConnInterface) QBSyncServiceClient {
 	return &qBSyncServiceClient{cc}
-}
-
-func (c *qBSyncServiceClient) WritePiece(ctx context.Context, in *WritePieceRequest, opts ...grpc.CallOption) (*WritePieceResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(WritePieceResponse)
-	err := c.cc.Invoke(ctx, QBSyncService_WritePiece_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
 }
 
 func (c *qBSyncServiceClient) StreamPiecesBidi(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[WritePieceRequest, PieceAck], error) {
@@ -181,8 +168,6 @@ func (c *qBSyncServiceClient) StartTorrent(ctx context.Context, in *StartTorrent
 // Cold qBittorrent is the single source of truth for sync status.
 // InitTorrent determines what needs syncing by checking qB, active syncs, and filesystem.
 type QBSyncServiceServer interface {
-	// WritePiece sends a single piece to the receiver (for simple cases).
-	WritePiece(context.Context, *WritePieceRequest) (*WritePieceResponse, error)
 	// StreamPiecesBidi provides full-duplex streaming for maximum throughput.
 	// Client streams pieces, server streams back acknowledgments as pieces are written.
 	// This allows immediate retry on failure without waiting for batch completion.
@@ -223,9 +208,6 @@ type QBSyncServiceServer interface {
 // pointer dereference when methods are called.
 type UnimplementedQBSyncServiceServer struct{}
 
-func (UnimplementedQBSyncServiceServer) WritePiece(context.Context, *WritePieceRequest) (*WritePieceResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method WritePiece not implemented")
-}
 func (UnimplementedQBSyncServiceServer) StreamPiecesBidi(grpc.BidiStreamingServer[WritePieceRequest, PieceAck]) error {
 	return status.Error(codes.Unimplemented, "method StreamPiecesBidi not implemented")
 }
@@ -269,24 +251,6 @@ func RegisterQBSyncServiceServer(s grpc.ServiceRegistrar, srv QBSyncServiceServe
 		t.testEmbeddedByValue()
 	}
 	s.RegisterService(&QBSyncService_ServiceDesc, srv)
-}
-
-func _QBSyncService_WritePiece_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(WritePieceRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(QBSyncServiceServer).WritePiece(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: QBSyncService_WritePiece_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(QBSyncServiceServer).WritePiece(ctx, req.(*WritePieceRequest))
-	}
-	return interceptor(ctx, in, info, handler)
 }
 
 func _QBSyncService_StreamPiecesBidi_Handler(srv interface{}, stream grpc.ServerStream) error {
@@ -429,10 +393,6 @@ var QBSyncService_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "qbsync.QBSyncService",
 	HandlerType: (*QBSyncServiceServer)(nil),
 	Methods: []grpc.MethodDesc{
-		{
-			MethodName: "WritePiece",
-			Handler:    _QBSyncService_WritePiece_Handler,
-		},
 		{
 			MethodName: "InitTorrent",
 			Handler:    _QBSyncService_InitTorrent_Handler,

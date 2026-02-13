@@ -3,7 +3,6 @@ package cold
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -12,98 +11,24 @@ import (
 	pb "github.com/arsac/qb-sync/proto"
 )
 
-// openFile lazily opens a file for writing, creating and pre-allocating it if needed.
-func (s *Server) openFile(fi *serverFileInfo) (*os.File, error) {
-	if fi.file != nil {
-		return fi.file, nil
-	}
-
-	file, err := os.OpenFile(fi.path, os.O_RDWR|os.O_CREATE, serverFilePermissions)
-	if err != nil {
-		return nil, err
-	}
-
-	// Pre-allocate to expected size
-	if truncErr := file.Truncate(fi.size); truncErr != nil {
-		_ = file.Close()
-		return nil, truncErr
-	}
-
-	fi.file = file
-	return file, nil
+// writeResult captures the outcome of writing a single piece.
+type writeResult struct {
+	success   bool
+	errMsg    string
+	errorCode pb.PieceErrorCode
 }
 
-// writePieceData writes piece data to the correct file(s) based on offset.
-// A piece may span multiple files in a multi-file torrent.
-// Skips files that are hardlinked or pending hardlink.
-func (s *Server) writePieceData(state *serverTorrentState, offset int64, data []byte) error {
-	remaining := data
-	currentOffset := offset
-
-	for _, fi := range state.files {
-		if len(remaining) == 0 {
-			break
-		}
-
-		fileEnd := fi.offset + fi.size
-
-		if fileEnd <= currentOffset {
-			continue
-		}
-
-		fileWriteOffset := max(currentOffset-fi.offset, 0)
-		availableInFile := fi.size - fileWriteOffset
-		toProcess := min(int64(len(remaining)), availableInFile)
-
-		if fi.skipForWriteData() {
-			remaining = remaining[toProcess:]
-			currentOffset += toProcess
-			continue
-		}
-
-		file, openErr := s.openFile(fi)
-		if openErr != nil {
-			return fmt.Errorf("opening %s: %w", fi.path, openErr)
-		}
-		// No per-piece fsync: data integrity is guaranteed by verifyFilePieces
-		// (early finalization) and verifyFinalizedPieces (full finalization),
-		// which read back and SHA1-verify pieces before rename.
-		// Per-piece fsync would severely degrade write throughput on NFS/spinning disks.
-		if _, writeErr := file.WriteAt(remaining[:toProcess], fileWriteOffset); writeErr != nil {
-			return fmt.Errorf("writing to %s: %w", fi.path, writeErr)
-		}
-
-		remaining = remaining[toProcess:]
-		currentOffset += toProcess
-	}
-
-	return nil
+// writePieceOK builds a success result.
+func writePieceOK() writeResult {
+	return writeResult{success: true}
 }
 
-// writePieceError builds a failure response with the given message and error code.
-func writePieceError(msg string, code pb.PieceErrorCode) *pb.WritePieceResponse {
-	return &pb.WritePieceResponse{
-		Success:   false,
-		Error:     msg,
-		ErrorCode: code,
+// writePieceError builds a failure result with the given message and error code.
+func writePieceError(msg string, code pb.PieceErrorCode) writeResult {
+	return writeResult{
+		errMsg:    msg,
+		errorCode: code,
 	}
-}
-
-// verifyPieceHash checks the piece data against expected hash.
-// Returns empty string if valid, error message if invalid.
-func (s *Server) verifyPieceHash(state *serverTorrentState, pieceIndex int32, data []byte, reqHash string) string {
-	// Prefer pre-stored hash from InitTorrent, fall back to request hash
-	var expectedHash string
-	if int(pieceIndex) < len(state.pieceHashes) && state.pieceHashes[pieceIndex] != "" {
-		expectedHash = state.pieceHashes[pieceIndex]
-	} else {
-		expectedHash = reqHash
-	}
-
-	if err := utils.VerifyPieceHash(data, expectedHash); err != nil {
-		return err.Error()
-	}
-	return ""
 }
 
 // markPieceWritten updates state tracking after a piece is written.
@@ -136,13 +61,10 @@ func (s *Server) markPieceWritten(ctx context.Context, hash string, state *serve
 	}
 }
 
-// WritePiece receives and writes a single piece.
-func (s *Server) WritePiece(
-	ctx context.Context,
-	req *pb.WritePieceRequest,
-) (*pb.WritePieceResponse, error) {
+// writePiece receives and writes a single piece.
+func (s *Server) writePiece(ctx context.Context, req *pb.WritePieceRequest) writeResult {
 	if s.config.DryRun {
-		return &pb.WritePieceResponse{Success: true}, nil
+		return writePieceOK()
 	}
 
 	torrentHash := req.GetTorrentHash()
@@ -153,7 +75,7 @@ func (s *Server) WritePiece(
 	s.mu.RUnlock()
 
 	if !exists || initializing {
-		return writePieceError("torrent not initialized", pb.PieceErrorCode_PIECE_ERROR_NOT_INITIALIZED), nil
+		return writePieceError("torrent not initialized", pb.PieceErrorCode_PIECE_ERROR_NOT_INITIALIZED)
 	}
 
 	pieceIndex := req.GetPieceIndex()
@@ -167,12 +89,12 @@ func (s *Server) WritePiece(
 	state.mu.Unlock()
 
 	if alreadyWritten {
-		return &pb.WritePieceResponse{Success: true}, nil
+		return writePieceOK()
 	}
 
 	// Early rejection during finalization (optimization to skip expensive hash verification)
 	if isFinalizing {
-		return writePieceError("torrent is being finalized", pb.PieceErrorCode_PIECE_ERROR_FINALIZING), nil
+		return writePieceError("torrent is being finalized", pb.PieceErrorCode_PIECE_ERROR_FINALIZING)
 	}
 
 	// Verify piece hash outside lock (pieceHashes is immutable after init).
@@ -182,10 +104,10 @@ func (s *Server) WritePiece(
 	// changing the hash. writePieceData skips deselected files, so only
 	// the selected file data is actually written.
 	writeStart := time.Now()
-	if pieceEntirelyInSelectedFiles(state.files, int(pieceIndex), state.pieceLength, state.totalSize) {
-		if hashErr := s.verifyPieceHash(state, pieceIndex, data, req.GetPieceHash()); hashErr != "" {
+	if state.classifyPiece(int(pieceIndex)) == pieceFullySelected {
+		if hashErr := state.verifyPieceHash(pieceIndex, data, req.GetPieceHash()); hashErr != "" {
 			metrics.PieceWriteDuration.Observe(time.Since(writeStart).Seconds())
-			return writePieceError(hashErr, pb.PieceErrorCode_PIECE_ERROR_HASH_MISMATCH), nil
+			return writePieceError(hashErr, pb.PieceErrorCode_PIECE_ERROR_HASH_MISMATCH)
 		}
 	}
 
@@ -195,16 +117,16 @@ func (s *Server) WritePiece(
 	// CORRECTNESS CHECK: Re-verify finalizing flag under lock.
 	// Even if finalization started between the early check and now, this prevents the write.
 	if state.finalizing {
-		return writePieceError("torrent is being finalized", pb.PieceErrorCode_PIECE_ERROR_FINALIZING), nil
+		return writePieceError("torrent is being finalized", pb.PieceErrorCode_PIECE_ERROR_FINALIZING)
 	}
 
 	if int(pieceIndex) < len(state.written) && state.written[pieceIndex] {
-		return &pb.WritePieceResponse{Success: true}, nil
+		return writePieceOK()
 	}
 
-	if writeErr := s.writePieceData(state, req.GetOffset(), data); writeErr != nil {
+	if writeErr := state.writePieceData(req.GetOffset(), data); writeErr != nil {
 		metrics.PieceWriteErrorsTotal.WithLabelValues(metrics.ModeCold).Inc()
-		return writePieceError(fmt.Sprintf("write failed: %v", writeErr), pb.PieceErrorCode_PIECE_ERROR_IO), nil
+		return writePieceError(fmt.Sprintf("write failed: %v", writeErr), pb.PieceErrorCode_PIECE_ERROR_IO)
 	}
 
 	s.markPieceWritten(ctx, torrentHash, state, pieceIndex)
@@ -221,7 +143,7 @@ func (s *Server) WritePiece(
 		)
 	}
 
-	return &pb.WritePieceResponse{Success: true}, nil
+	return writePieceOK()
 }
 
 // verifyFilePieces reads back interior pieces from a synced .partial file and
@@ -285,7 +207,7 @@ func (s *Server) checkFileCompletions(
 		if fi.hlState == hlStateComplete || fi.hlState == hlStatePending {
 			continue
 		}
-		if idx < fi.firstPiece || idx > fi.lastPiece {
+		if !fi.overlaps(idx) {
 			continue
 		}
 		fi.piecesWritten++

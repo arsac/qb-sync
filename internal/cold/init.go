@@ -23,9 +23,10 @@ const (
 // This is the primary entry point that determines what pieces need to be streamed.
 //
 // Decision flow:
-// 1. Check cold qBittorrent - if complete, return SYNC_STATUS_COMPLETE.
-// 2. Check active sync state - return remaining pieces_needed.
-// 3. Fresh torrent - initialize tracking and return all pieces_needed.
+// 1. If re-sync, clean up all prior state first (qB, memory, disk).
+// 2. Check cold qBittorrent - if complete, return SYNC_STATUS_COMPLETE.
+// 3. Check active sync state - return remaining pieces_needed.
+// 4. Fresh torrent - initialize tracking and return all pieces_needed.
 func (s *Server) InitTorrent(
 	ctx context.Context,
 	req *pb.InitTorrentRequest,
@@ -37,43 +38,30 @@ func (s *Server) InitTorrent(
 		return initErrorResponse("abort in progress: %v", err), nil
 	}
 
+	// Re-sync: file selection changed, so we must re-initialize from scratch.
+	// Clean up ALL prior state (qB entry, in-memory state, persisted .state)
+	// in one place before any other checks.
+	if req.GetResync() && len(req.GetFiles()) > 0 {
+		if err := s.cleanupForResync(ctx, hash); err != nil {
+			return initErrorResponse("re-sync cleanup: %v", err), nil
+		}
+	}
+
 	// Check if torrent is already complete/verifying in cold qBittorrent.
-	if resp := s.handleQBCheck(ctx, hash, req); resp != nil {
+	if resp := s.checkQBCompletion(ctx, hash); resp != nil {
 		return resp, nil
 	}
 
 	s.mu.Lock()
 
-	// Check for existing state (resume case)
+	// Check for existing state (resume case).
 	if state, exists := s.torrents[hash]; exists {
 		if state.initializing {
 			s.mu.Unlock()
 			return initErrorResponse("torrent initialization already in progress"), nil
 		}
-
-		// Re-sync: file selection changed, so we must re-initialize with the
-		// updated selection. Delete old state and fall through to initNewTorrent
-		// which rebuilds files, coverage, and written bitmap from scratch.
-		if req.GetResync() && len(req.GetFiles()) > 0 {
-			delete(s.torrents, hash)
-
-			// Delete persisted .state so buildWrittenBitmap starts fresh.
-			// During the first sync with partial selection, boundary pieces
-			// spanning selected + unselected files were marked "written" but
-			// only the selected-file portion was actually written to disk.
-			// On re-sync those pieces must be re-streamed for the newly-
-			// selected portions.
-			stateFile := filepath.Join(s.config.BasePath, metaDirName, hash, ".state")
-			_ = os.Remove(stateFile)
-
-			s.logger.InfoContext(ctx, "re-sync: cleared existing state for re-initialization",
-				"hash", hash)
-			// Fall through to initNewTorrent below
-		} else {
-			s.mu.Unlock()
-			resp := s.resumeTorrent(ctx, hash, state, req)
-			return resp, nil
-		}
+		s.mu.Unlock()
+		return s.resumeTorrent(ctx, hash, state, req), nil
 	}
 
 	// Don't create state for minimal requests (e.g., CheckTorrentStatus sends only hash).
@@ -123,7 +111,7 @@ func (s *Server) resumeTorrent(
 	// Acquire state.mu to read written/hardlinkResults safely — a concurrent
 	// WritePiece may be modifying state.written under this lock.
 	state.mu.Lock()
-	resp := buildReadyResponse(state.written, state.hardlinkResults)
+	resp := state.buildReadyResponse()
 	state.mu.Unlock()
 	return resp
 }
@@ -243,8 +231,8 @@ func (s *Server) initNewTorrent(
 
 	// Log summary
 	hardlinkedCount, pendingCount, preExistingCount := countHardlinkResults(hardlinkResults)
-	piecesNeeded, needCount, haveCount := calculatePiecesNeeded(written)
-	selectedCount := countSelectedFiles(files)
+	_, needCount, haveCount := calculatePiecesNeeded(written)
+	selectedCount := state.countSelectedFiles()
 
 	s.logger.InfoContext(ctx, "initialized torrent",
 		"hash", hash,
@@ -260,14 +248,7 @@ func (s *Server) initNewTorrent(
 		"piecesHave", haveCount,
 	)
 
-	return &pb.InitTorrentResponse{
-		Success:           true,
-		Status:            pb.TorrentSyncStatus_SYNC_STATUS_READY,
-		PiecesNeeded:      piecesNeeded,
-		HardlinkResults:   hardlinkResults,
-		PiecesNeededCount: needCount,
-		PiecesHaveCount:   haveCount,
-	}
+	return state.buildReadyResponse()
 }
 
 // buildWrittenBitmap constructs the written bitmap from persisted state and hardlink
@@ -318,38 +299,40 @@ func initErrorResponse(format string, args ...any) *pb.InitTorrentResponse {
 	}
 }
 
-// buildReadyResponse creates a successful READY response with piece information.
-func buildReadyResponse(written []bool, hardlinkResults []*pb.HardlinkResult) *pb.InitTorrentResponse {
-	piecesNeeded, needCount, haveCount := calculatePiecesNeeded(written)
-	return &pb.InitTorrentResponse{
-		Success:           true,
-		Status:            pb.TorrentSyncStatus_SYNC_STATUS_READY,
-		PiecesNeeded:      piecesNeeded,
-		HardlinkResults:   hardlinkResults,
-		PiecesNeededCount: needCount,
-		PiecesHaveCount:   haveCount,
+// cleanupForResync removes all prior state for a torrent so it appears as
+// "never initialized" to subsequent steps. Called at the top of InitTorrent
+// when resync is requested.
+func (s *Server) cleanupForResync(ctx context.Context, hash string) error {
+	// 1. Delete from qBittorrent (any state — complete or verifying).
+	if delErr := s.deleteTorrentFromQB(ctx, hash); delErr != nil {
+		return fmt.Errorf("failed to delete stale qB entry: %w", delErr)
 	}
+
+	// 2. Delete in-memory state.
+	s.mu.Lock()
+	delete(s.torrents, hash)
+	s.mu.Unlock()
+
+	// 3. Delete persisted .state so buildWrittenBitmap starts fresh.
+	// During the first sync with partial selection, boundary pieces spanning
+	// selected + unselected files were marked "written" but only the
+	// selected-file portion was actually written to disk. On re-sync those
+	// pieces must be re-streamed for the newly-selected portions.
+	stateFile := filepath.Join(s.config.BasePath, metaDirName, hash, ".state")
+	_ = os.Remove(stateFile)
+
+	s.logger.InfoContext(ctx, "re-sync: cleared all prior state",
+		"hash", hash)
+	return nil
 }
 
-// handleQBCheck checks the torrent's state in cold qBittorrent and returns
+// checkQBCompletion checks the torrent's state in cold qBittorrent and returns
 // a response if the caller should short-circuit (complete or verifying).
 // Returns nil if InitTorrent should continue to check local state.
-func (s *Server) handleQBCheck(
-	ctx context.Context,
-	hash string,
-	req *pb.InitTorrentRequest,
-) *pb.InitTorrentResponse {
+// This is a pure check with no mutations.
+func (s *Server) checkQBCompletion(ctx context.Context, hash string) *pb.InitTorrentResponse {
 	switch s.checkTorrentInQB(ctx, hash) {
 	case qbCheckComplete:
-		// Re-sync: file selection changed, delete stale qB entry so we can
-		// re-initialize with updated selection. The torrent was added with
-		// skip_checking=true and may report 100% even with missing files.
-		if len(req.GetFiles()) > 0 && req.GetResync() {
-			if delErr := s.deleteTorrentFromQB(ctx, hash); delErr != nil {
-				return initErrorResponse("re-sync: failed to delete stale qB entry: %v", delErr)
-			}
-			return nil // Fall through to check local state
-		}
 		return &pb.InitTorrentResponse{
 			Success: true,
 			Status:  pb.TorrentSyncStatus_SYNC_STATUS_COMPLETE,
@@ -360,7 +343,7 @@ func (s *Server) handleQBCheck(
 			Status:  pb.TorrentSyncStatus_SYNC_STATUS_VERIFYING,
 		}
 	case qbCheckNotFound:
-		return nil // Continue to check local state
+		return nil
 	}
 	return nil
 }

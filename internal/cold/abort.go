@@ -37,7 +37,7 @@ func tryRemoveWithLog(
 // AbortTorrent aborts an in-progress torrent transfer and optionally cleans up partial files.
 // This is called when a torrent is removed from hot before streaming completes.
 //
-//nolint:gocognit,funlen // Complex cleanup with proper lock ordering is clearer as single function
+//nolint:funlen // Complex cleanup with proper lock ordering is clearer as single function
 func (s *Server) AbortTorrent(
 	ctx context.Context,
 	req *pb.AbortTorrentRequest,
@@ -104,19 +104,14 @@ func (s *Server) AbortTorrent(
 
 	// Clean up in-progress inode entries for this torrent's files.
 	// Signal waiters so they can handle the abort (their hardlink attempt will fail).
+	// AbortInProgress is idempotent: no-ops for zero inodes, completed, or pending files.
 	for _, fi := range state.files {
-		if fi.sourceInode == 0 || fi.hlState == hlStateComplete || fi.hlState == hlStatePending {
-			continue
-		}
 		s.inodes.AbortInProgress(ctx, fi.sourceInode, hash)
 	}
 
 	for _, fi := range state.files {
-		if fi.file != nil {
-			_ = fi.file.Sync()
-			_ = fi.file.Close()
-			fi.file = nil
-		}
+		// closeFileHandle is idempotent (no-op if fi.file is nil).
+		_ = s.closeFileHandle(ctx, hash, fi)
 
 		if deleteFiles {
 			if tryRemoveWithLog(ctx, s.logger, fi.path, "partial file", hash, &deleteErrors) {

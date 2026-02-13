@@ -49,22 +49,14 @@ func (s *Server) addAndVerifyTorrent(
 	}
 
 	if found {
-		// If it's in error state, return error
 		if isErrorState(existingTorrent.State) {
 			return existingTorrent.State, fmt.Errorf("torrent in error state: %s", existingTorrent.State)
 		}
-
-		// If already verified (100% progress and ready), return success
 		if existingTorrent.Progress >= 1.0 && isReadyState(existingTorrent.State) {
 			return existingTorrent.State, nil
 		}
-
-		// If checking, wait for completion
-		if isCheckingState(existingTorrent.State) || existingTorrent.Progress < 1.0 {
-			return s.waitForTorrentReady(ctx, hash)
-		}
-
-		return existingTorrent.State, nil
+		// Not yet ready (checking, incomplete, moving, etc.) — poll until ready.
+		return s.waitForTorrentReady(ctx, hash)
 	}
 
 	// Torrent doesn't exist - add it

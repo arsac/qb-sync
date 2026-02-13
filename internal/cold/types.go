@@ -91,6 +91,38 @@ func (fi *serverFileInfo) skipForWriteData() bool {
 	return fi.hlState == hlStateComplete || fi.hlState == hlStatePending || !fi.selected
 }
 
+// overlaps reports whether the given piece index falls within this file's piece range.
+func (fi *serverFileInfo) overlaps(pieceIdx int) bool {
+	return pieceIdx >= fi.firstPiece && pieceIdx <= fi.lastPiece
+}
+
+// recalcPiecesWritten recomputes piecesWritten from the torrent's written bitmap.
+func (fi *serverFileInfo) recalcPiecesWritten(written []bool) {
+	fi.piecesWritten = 0
+	for p := fi.firstPiece; p <= fi.lastPiece; p++ {
+		if written[p] {
+			fi.piecesWritten++
+		}
+	}
+}
+
+// startFinalization marks the torrent as finalizing and returns the done channel.
+// Caller must hold state.mu.
+func (s *serverTorrentState) startFinalization() chan struct{} {
+	done := make(chan struct{})
+	s.finalizing = true
+	s.finalizeDone = done
+	return done
+}
+
+// resetFinalization clears all finalization state.
+// Caller must hold state.mu.
+func (s *serverTorrentState) resetFinalization() {
+	s.finalizing = false
+	s.finalizeResult = nil
+	s.finalizeDone = nil
+}
+
 // finalizeResult stores the outcome of a background finalization.
 type finalizeResult struct {
 	success   bool

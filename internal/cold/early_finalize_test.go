@@ -475,18 +475,15 @@ func TestWritePiece_EarlyFinalizesCompletedFile(t *testing.T) {
 	s.mu.Unlock()
 
 	ctx := context.Background()
-	resp, err := s.WritePiece(ctx, &pb.WritePieceRequest{
+	result := s.writePiece(ctx, &pb.WritePieceRequest{
 		TorrentHash: hash,
 		PieceIndex:  0,
 		Offset:      0,
 		Data:        pieceData,
 		PieceHash:   pieceHash,
 	})
-	if err != nil {
-		t.Fatalf("WritePiece error: %v", err)
-	}
-	if !resp.GetSuccess() {
-		t.Fatalf("WritePiece failed: %s", resp.GetError())
+	if !result.success {
+		t.Fatalf("writePiece failed: %s", result.errMsg)
 	}
 
 	// Verify the file was early-finalized

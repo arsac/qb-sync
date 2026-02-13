@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -46,9 +47,7 @@ func (s *Server) FinalizeTorrent(
 		return s.handleExistingFinalization(hash, state, result, done)
 	}
 	// Create finalizeDone immediately so concurrent polls always see it.
-	done := make(chan struct{})
-	state.finalizing = true
-	state.finalizeDone = done
+	done := state.startFinalization()
 	writtenCount := state.writtenCount
 	state.mu.Unlock()
 
@@ -58,9 +57,7 @@ func (s *Server) FinalizeTorrent(
 	failureResponse := func(errMsg string, code pb.FinalizeErrorCode) *pb.FinalizeTorrentResponse {
 		close(done)
 		state.mu.Lock()
-		state.finalizing = false
-		state.finalizeResult = nil
-		state.finalizeDone = nil
+		state.resetFinalization()
 		state.mu.Unlock()
 		metrics.FinalizationDuration.WithLabelValues(metrics.ResultFailure).Observe(time.Since(startTime).Seconds())
 		metrics.FinalizationErrorsTotal.WithLabelValues(metrics.ModeCold).Inc()
@@ -78,7 +75,7 @@ func (s *Server) FinalizeTorrent(
 
 	// Verify all selected pieces are written.
 	// For partial selection, only pieces overlapping selected files must be written.
-	selectedPiecesTotal := countSelectedPiecesTotal(state)
+	selectedPiecesTotal := state.countSelectedPiecesTotal()
 	if writtenCount < selectedPiecesTotal {
 		msg := fmt.Sprintf("incomplete: %d/%d selected pieces", writtenCount, selectedPiecesTotal)
 		return failureResponse(msg, pb.FinalizeErrorCode_FINALIZE_ERROR_INCOMPLETE), nil
@@ -603,15 +600,11 @@ func (s *Server) verifyFinalizedPieces(
 			continue
 		}
 
-		// Skip pieces that don't overlap any selected file.
-		if !pieceOverlapsSelectedFile(state.files, i, pieceSize, totalSize) {
-			continue
-		}
-
-		// Skip boundary pieces that span both selected and unselected files —
-		// the unselected file's data doesn't exist on disk so we can't read the
-		// full piece. These pieces were hash-verified at write time.
-		if !pieceEntirelyInSelectedFiles(state.files, i, pieceSize, totalSize) {
+		// Skip pieces not fully covered by selected files — boundary pieces
+		// (spanning selected + unselected) can't be read back because the
+		// unselected file's data doesn't exist on disk. Those were hash-verified
+		// at write time.
+		if state.classifyPiece(i) != pieceFullySelected {
 			continue
 		}
 
@@ -781,13 +774,7 @@ func (s *Server) recoverAffectedFile(
 	}
 
 	// Check if any failed piece overlaps this file.
-	affected := false
-	for _, p := range failedPieces {
-		if p >= fi.firstPiece && p <= fi.lastPiece {
-			affected = true
-			break
-		}
-	}
+	affected := slices.ContainsFunc(failedPieces, fi.overlaps)
 	if !affected {
 		return
 	}
@@ -808,14 +795,7 @@ func (s *Server) recoverAffectedFile(
 		}
 	}
 	fi.earlyFinalized = false
-
-	// Recalculate piecesWritten for this file.
-	fi.piecesWritten = 0
-	for p := fi.firstPiece; p <= fi.lastPiece; p++ {
-		if state.written[p] {
-			fi.piecesWritten++
-		}
-	}
+	fi.recalcPiecesWritten(state.written)
 }
 
 // handleExistingFinalization handles a FinalizeTorrent call when background
@@ -844,13 +824,9 @@ func (s *Server) handleExistingFinalization(
 
 	// Background finalization failed — wait for the goroutine to fully exit
 	// before clearing state, preventing concurrent background goroutines.
-	if done != nil {
-		<-done
-	}
+	<-done
 	state.mu.Lock()
-	state.finalizing = false
-	state.finalizeResult = nil
-	state.finalizeDone = nil
+	state.resetFinalization()
 	state.mu.Unlock()
 	return &pb.FinalizeTorrentResponse{
 		Success:   false,

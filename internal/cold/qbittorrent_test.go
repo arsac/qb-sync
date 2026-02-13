@@ -71,7 +71,22 @@ func (m *mockQBClient) DeleteTorrentsCtx(_ context.Context, hashes []string, del
 	m.deleteCalled = true
 	m.deleteHashes = hashes
 	m.deleteDeleteFiles = deleteFiles
-	return m.deleteErr
+	if m.deleteErr != nil {
+		return m.deleteErr
+	}
+	// Actually remove deleted hashes so subsequent GetTorrentsCtx reflects the deletion.
+	deleteSet := make(map[string]struct{}, len(hashes))
+	for _, h := range hashes {
+		deleteSet[h] = struct{}{}
+	}
+	filtered := m.torrents[:0]
+	for _, t := range m.torrents {
+		if _, ok := deleteSet[t.Hash]; !ok {
+			filtered = append(filtered, t)
+		}
+	}
+	m.torrents = filtered
+	return nil
 }
 func (m *mockQBClient) StopCtx(context.Context, []string) error { return nil }
 func (m *mockQBClient) AddTorrentFromMemoryCtx(context.Context, []byte, map[string]string) error {

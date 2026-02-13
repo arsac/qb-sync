@@ -255,15 +255,7 @@ func (s *Server) cleanup() {
 			}
 		}
 		for _, fi := range t.state.files {
-			if fi.file != nil {
-				if closeErr := fi.file.Close(); closeErr != nil {
-					s.logger.Warn("failed to close file on cleanup",
-						"hash", t.hash,
-						"path", fi.path,
-						"error", closeErr,
-					)
-				}
-			}
+			_ = s.closeFileHandle(context.Background(), t.hash, fi)
 		}
 		t.state.mu.Unlock()
 	}

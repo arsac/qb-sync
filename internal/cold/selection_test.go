@@ -10,65 +10,77 @@ import (
 	pb "github.com/arsac/qb-sync/proto"
 )
 
-func TestPieceOverlapsSelectedFile(t *testing.T) {
+func TestClassifyPiece(t *testing.T) {
 	t.Parallel()
 
-	// Layout: pieceLength=100, totalSize=300
-	// File 0: offset=0,   size=100 (selected)   -> piece 0
-	// File 1: offset=100, size=100 (unselected)  -> piece 1
-	// File 2: offset=200, size=100 (selected)    -> piece 2
-	files := []*serverFileInfo{
-		{offset: 0, size: 100, selected: true},
-		{offset: 100, size: 100, selected: false},
-		{offset: 200, size: 100, selected: true},
-	}
-
-	tests := []struct {
-		pieceIdx int
-		want     bool
-	}{
-		{0, true},  // overlaps selected file 0
-		{1, false}, // overlaps only unselected file 1
-		{2, true},  // overlaps selected file 2
-	}
-
-	for _, tt := range tests {
-		got := pieceOverlapsSelectedFile(files, tt.pieceIdx, 100, 300)
-		if got != tt.want {
-			t.Errorf("piece %d: got %v, want %v", tt.pieceIdx, got, tt.want)
+	t.Run("aligned files", func(t *testing.T) {
+		t.Parallel()
+		// pieceLength=100, totalSize=300
+		// File 0: offset=0,   size=100 (selected)   -> piece 0
+		// File 1: offset=100, size=100 (unselected)  -> piece 1
+		// File 2: offset=200, size=100 (selected)    -> piece 2
+		state := &serverTorrentState{
+			pieceLength: 100,
+			totalSize:   300,
+			files: []*serverFileInfo{
+				{offset: 0, size: 100, selected: true},
+				{offset: 100, size: 100, selected: false},
+				{offset: 200, size: 100, selected: true},
+			},
 		}
-	}
-}
 
-func TestPieceEntirelyInSelectedFiles(t *testing.T) {
-	t.Parallel()
+		tests := []struct {
+			pieceIdx int
+			want     pieceClass
+		}{
+			{0, pieceFullySelected},
+			{1, pieceNoSelectedOverlap},
+			{2, pieceFullySelected},
+		}
+		for _, tt := range tests {
+			got := state.classifyPiece(tt.pieceIdx)
+			if got != tt.want {
+				t.Errorf("piece %d: got %d, want %d", tt.pieceIdx, got, tt.want)
+			}
+		}
+	})
 
-	// pieceLength=100, totalSize=200
-	// File 0: offset=0,  size=80  (selected)   -> piece 0 only
-	// File 1: offset=80, size=120 (unselected) -> pieces 0..1
-	files := []*serverFileInfo{
-		{offset: 0, size: 80, selected: true},
-		{offset: 80, size: 120, selected: false},
-	}
+	t.Run("boundary piece spanning selected and unselected", func(t *testing.T) {
+		t.Parallel()
+		// pieceLength=100, totalSize=200
+		// File 0: offset=0,  size=80  (selected)   -> piece 0
+		// File 1: offset=80, size=120 (unselected)  -> pieces 0..1
+		state := &serverTorrentState{
+			pieceLength: 100,
+			totalSize:   200,
+			files: []*serverFileInfo{
+				{offset: 0, size: 80, selected: true},
+				{offset: 80, size: 120, selected: false},
+			},
+		}
 
-	// Piece 0 spans file 0 (selected) and file 1 (unselected) -> boundary
-	if pieceEntirelyInSelectedFiles(files, 0, 100, 200) {
-		t.Error("piece 0 should NOT be entirely in selected files (boundary)")
-	}
+		if got := state.classifyPiece(0); got != pieceBoundary {
+			t.Errorf("piece 0: got %d, want pieceBoundary (%d)", got, pieceBoundary)
+		}
+		if got := state.classifyPiece(1); got != pieceNoSelectedOverlap {
+			t.Errorf("piece 1: got %d, want pieceNoSelectedOverlap (%d)", got, pieceNoSelectedOverlap)
+		}
+	})
 
-	// Piece 1 only overlaps file 1 (unselected) -> not entirely selected
-	if pieceEntirelyInSelectedFiles(files, 1, 100, 200) {
-		t.Error("piece 1 should NOT be entirely in selected files")
-	}
-
-	// All-selected case
-	allSelected := []*serverFileInfo{
-		{offset: 0, size: 100, selected: true},
-		{offset: 100, size: 100, selected: true},
-	}
-	if !pieceEntirelyInSelectedFiles(allSelected, 0, 100, 200) {
-		t.Error("piece 0 should be entirely in selected files when all selected")
-	}
+	t.Run("all selected", func(t *testing.T) {
+		t.Parallel()
+		state := &serverTorrentState{
+			pieceLength: 100,
+			totalSize:   200,
+			files: []*serverFileInfo{
+				{offset: 0, size: 100, selected: true},
+				{offset: 100, size: 100, selected: true},
+			},
+		}
+		if got := state.classifyPiece(0); got != pieceFullySelected {
+			t.Errorf("piece 0: got %d, want pieceFullySelected (%d)", got, pieceFullySelected)
+		}
+	})
 }
 
 func TestCountSelectedPiecesTotal(t *testing.T) {
@@ -89,7 +101,7 @@ func TestCountSelectedPiecesTotal(t *testing.T) {
 		},
 	}
 
-	got := countSelectedPiecesTotal(state)
+	got := state.countSelectedPiecesTotal()
 	if got != 2 {
 		t.Errorf("countSelectedPiecesTotal = %d, want 2", got)
 	}
@@ -164,7 +176,7 @@ func TestCalculatePiecesCovered_UnselectedFiles(t *testing.T) {
 
 func TestWritePieceData_SkipsUnselectedFiles(t *testing.T) {
 	t.Parallel()
-	s, tmpDir := newTestColdServer(t)
+	_, tmpDir := newTestColdServer(t)
 
 	// File 0: selected, gets data written
 	selectedPath := filepath.Join(tmpDir, "selected.bin.partial")
@@ -190,7 +202,7 @@ func TestWritePieceData_SkipsUnselectedFiles(t *testing.T) {
 		data[i] = byte(i % 256)
 	}
 
-	if err := s.writePieceData(state, 0, data); err != nil {
+	if err := state.writePieceData(0, data); err != nil {
 		t.Fatalf("writePieceData error: %v", err)
 	}
 
@@ -370,7 +382,7 @@ func TestFinalizeTorrent_PartialSelection(t *testing.T) {
 	ctx := context.Background()
 
 	// Write piece 0
-	resp, err := s.WritePiece(ctx, &pb.WritePieceRequest{
+	result := s.writePiece(ctx, &pb.WritePieceRequest{
 		TorrentHash: hash,
 		PieceIndex:  0,
 		Offset:      0,
@@ -378,12 +390,12 @@ func TestFinalizeTorrent_PartialSelection(t *testing.T) {
 		Data:        pieceData0,
 		PieceHash:   pieceHash0,
 	})
-	if err != nil || !resp.GetSuccess() {
-		t.Fatalf("WritePiece 0 failed: err=%v resp=%v", err, resp)
+	if !result.success {
+		t.Fatalf("writePiece 0 failed: %s", result.errMsg)
 	}
 
 	// Write piece 2
-	resp, err = s.WritePiece(ctx, &pb.WritePieceRequest{
+	result = s.writePiece(ctx, &pb.WritePieceRequest{
 		TorrentHash: hash,
 		PieceIndex:  2,
 		Offset:      32,
@@ -391,8 +403,8 @@ func TestFinalizeTorrent_PartialSelection(t *testing.T) {
 		Data:        pieceData2,
 		PieceHash:   pieceHash2,
 	})
-	if err != nil || !resp.GetSuccess() {
-		t.Fatalf("WritePiece 2 failed: err=%v resp=%v", err, resp)
+	if !result.success {
+		t.Fatalf("writePiece 2 failed: %s", result.errMsg)
 	}
 
 	// Verify written count is 2 (not 3)

@@ -123,7 +123,7 @@ func (s *Server) streamWorker(
 ) {
 	for req := range workCh {
 		metrics.ColdWorkersBusy.Inc()
-		resp, writeErr := s.WritePiece(ctx, req)
+		result := s.writePiece(ctx, req)
 		metrics.ColdWorkersBusy.Dec()
 
 		// Release memory budget now that piece data has been written to disk.
@@ -134,19 +134,9 @@ func (s *Server) streamWorker(
 		ack := &pb.PieceAck{
 			TorrentHash: req.GetTorrentHash(),
 			PieceIndex:  req.GetPieceIndex(),
-		}
-
-		switch {
-		case writeErr != nil:
-			ack.Success = false
-			ack.Error = writeErr.Error()
-			ack.ErrorCode = pb.PieceErrorCode_PIECE_ERROR_IO
-		case !resp.GetSuccess():
-			ack.Success = false
-			ack.Error = resp.GetError()
-			ack.ErrorCode = resp.GetErrorCode()
-		default:
-			ack.Success = true
+			Success:     result.success,
+			Error:       result.errMsg,
+			ErrorCode:   result.errorCode,
 		}
 
 		select {

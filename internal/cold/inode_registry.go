@@ -109,7 +109,11 @@ func (r *InodeRegistry) CompleteInProgress(inode Inode, expectedHash string) boo
 
 // AbortInProgress aborts an in-progress inode, signaling waiters.
 // Only aborts if the inode belongs to the specified torrent.
+// Safe to call with nil receiver or zero inode (no-op).
 func (r *InodeRegistry) AbortInProgress(ctx context.Context, inode Inode, torrentHash string) {
+	if r == nil || inode == 0 {
+		return
+	}
 	r.inProgressMu.Lock()
 	defer r.inProgressMu.Unlock()
 

@@ -89,10 +89,7 @@ func checkRPCResponse(resp successResponse, operation string) error {
 	return nil
 }
 
-var (
-	_ PieceDestination    = (*GRPCDestination)(nil)
-	_ HardlinkDestination = (*GRPCDestination)(nil)
-)
+var _ HardlinkDestination = (*GRPCDestination)(nil)
 
 // GRPCDestination sends pieces to a remote gRPC server.
 // It provides PieceDestination-like functionality plus additional features
@@ -323,15 +320,6 @@ func (d *GRPCDestination) CheckTorrentStatus(ctx context.Context, hash string) (
 
 	// Return result WITHOUT caching - BidiQueue should still do full InitTorrent
 	return initTorrentResultFromProto(resp), nil
-}
-
-// WritePiece sends a piece to the remote server (unary, for simple cases).
-func (d *GRPCDestination) WritePiece(ctx context.Context, req *pb.WritePieceRequest) error {
-	resp, err := d.client().WritePiece(ctx, req)
-	if err != nil {
-		return fmt.Errorf("write piece RPC failed: %w", err)
-	}
-	return checkRPCResponse(resp, "write piece")
 }
 
 // OpenStream opens a bidirectional stream for high-throughput piece transfer.

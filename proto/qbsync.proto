@@ -8,9 +8,6 @@ option go_package = "github.com/arsac/qb-sync/proto";
 // Cold qBittorrent is the single source of truth for sync status.
 // InitTorrent determines what needs syncing by checking qB, active syncs, and filesystem.
 service QBSyncService {
-  // WritePiece sends a single piece to the receiver (for simple cases).
-  rpc WritePiece(WritePieceRequest) returns (WritePieceResponse);
-
   // StreamPiecesBidi provides full-duplex streaming for maximum throughput.
   // Client streams pieces, server streams back acknowledgments as pieces are written.
   // This allows immediate retry on failure without waiting for batch completion.
@@ -72,12 +69,6 @@ message WritePieceRequest {
   int64 size = 4;
   string piece_hash = 5;  // SHA1 hash for verification
   bytes data = 6;
-}
-
-message WritePieceResponse {
-  bool success = 1;
-  string error = 2;
-  PieceErrorCode error_code = 3;
 }
 
 // PieceAck is sent by the receiver for each piece in bidirectional streaming.
