@@ -92,7 +92,18 @@ func (s *Server) FinalizeTorrent(
 	// This decouples from the RPC context so verification survives source-side
 	// deadline cancellation. The finalizing flag and finalizeDone channel were
 	// set upfront (under lock) so concurrent polls see "verifying" immediately.
-	go s.runBackgroundFinalization(hash, state, req, startTime, done)
+	// Tracked via bgWg so shutdown waits for completion before cleanup.
+	//
+	// Check bgCtx before launching: during the shutdown window between
+	// GracefulStop returning and bgCancel() being called, a goroutine launched
+	// here would immediately fail with a cancelled context. Fail fast instead.
+	if s.bgCtx.Err() != nil {
+		//nolint:nilerr // bgCtx.Err is a context error, not the function's error; we return a structured gRPC failure.
+		return failureResponse("server shutting down", pb.FinalizeErrorCode_FINALIZE_ERROR_NONE), nil
+	}
+	s.bgWg.Go(func() {
+		s.runBackgroundFinalization(hash, state, req, startTime, done)
+	})
 
 	// Return "verifying" to the source side. Source should poll via subsequent
 	// FinalizeTorrent calls until it gets the final result.
@@ -127,10 +138,11 @@ func (s *Server) runBackgroundFinalization(
 	// Serialize background finalizations to prevent disk I/O and qBittorrent
 	// API saturation when many torrents complete around the same time.
 	// Use a generous wait context — queue time doesn't count against actual work.
-	waitCtx, waitCancel := context.WithTimeout(context.Background(), finalizeQueueTimeout)
+	// Derived from s.bgCtx so server shutdown cancels queued goroutines.
+	waitCtx, waitCancel := context.WithTimeout(s.bgCtx, finalizeQueueTimeout)
 	if acquireErr := s.finalizeSem.Acquire(waitCtx, 1); acquireErr != nil {
 		waitCancel()
-		s.logger.WarnContext(context.Background(), "finalization queue timeout",
+		s.logger.WarnContext(s.bgCtx, "finalization queue timeout",
 			"hash", hash,
 			"error", acquireErr,
 		)
@@ -143,14 +155,15 @@ func (s *Server) runBackgroundFinalization(
 	waitCancel()
 	defer s.finalizeSem.Release(1)
 
-	s.logger.InfoContext(context.Background(), "acquired finalization slot",
+	s.logger.InfoContext(s.bgCtx, "acquired finalization slot",
 		"hash", hash,
 		"queueWait", time.Since(startTime).Round(time.Millisecond),
 	)
 
 	// Work timeout starts after acquiring the semaphore — queue wait doesn't
 	// eat into the time budget for verification and qBittorrent operations.
-	ctx, cancel := context.WithTimeout(context.Background(), backgroundFinalizeTimeout)
+	// Derived from s.bgCtx so server shutdown cancels in-flight work.
+	ctx, cancel := context.WithTimeout(s.bgCtx, backgroundFinalizeTimeout)
 	defer cancel()
 
 	// Verify all pieces by reading back from finalized files.
@@ -224,13 +237,14 @@ func (s *Server) storeSuccessResult(
 	startTime time.Time,
 ) {
 	metrics.FinalizationDuration.WithLabelValues(metrics.ResultSuccess).Observe(time.Since(startTime).Seconds())
-	name := strings.TrimSuffix(filepath.Base(state.torrentPath), ".torrent")
-	metrics.TorrentsSyncedTotal.WithLabelValues(metrics.ModeDestination, hash, name).Inc()
-	s.logger.InfoContext(ctx, "torrent finalized (background)", "hash", hash, "state", stateStr)
 
 	state.mu.Lock()
+	name := strings.TrimSuffix(filepath.Base(state.torrentPath), ".torrent")
 	state.finalizeResult = &finalizeResult{success: true, state: stateStr}
 	state.mu.Unlock()
+
+	metrics.TorrentsSyncedTotal.WithLabelValues(metrics.ModeDestination, hash, name).Inc()
+	s.logger.InfoContext(ctx, "torrent finalized (background)", "hash", hash, "state", stateStr)
 }
 
 // cleanupFinalizedTorrent removes a successfully finalized torrent from tracking
@@ -490,6 +504,8 @@ func (s *Server) saveStatePath(ctx context.Context, hash string, state *serverTo
 			"hash", hash,
 			"error", saveErr,
 		)
+	} else {
+		state.flushGen++
 	}
 }
 
@@ -751,6 +767,8 @@ func (s *Server) recoverVerificationFailure(
 			"hash", hash,
 			"error", saveErr,
 		)
+	} else {
+		state.flushGen++
 	}
 
 	s.logger.InfoContext(ctx, "recovered from verification failure",

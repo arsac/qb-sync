@@ -1,6 +1,7 @@
 package destination
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"testing"
@@ -19,6 +20,7 @@ func newTestColdServer(t *testing.T) (*Server, string) {
 	t.Helper()
 	tmpDir := t.TempDir()
 	logger := testLogger(t)
+	bgCtx, bgCancel := context.WithCancel(context.Background())
 	s := &Server{
 		config:         ServerConfig{BasePath: tmpDir},
 		logger:         logger,
@@ -27,6 +29,12 @@ func newTestColdServer(t *testing.T) (*Server, string) {
 		inodes:         NewInodeRegistry(tmpDir, logger),
 		memBudget:      semaphore.NewWeighted(512 * 1024 * 1024),
 		finalizeSem:    semaphore.NewWeighted(1),
+		bgCtx:          bgCtx,
+		bgCancel:       bgCancel,
 	}
+	t.Cleanup(func() {
+		bgCancel()
+		s.bgWg.Wait()
+	})
 	return s, tmpDir
 }

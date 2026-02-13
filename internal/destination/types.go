@@ -37,24 +37,38 @@ func (i *inProgressInode) close() {
 	})
 }
 
+// torrentMeta holds piece geometry and hash data that is immutable after initialization.
+// All fields are set once during initNewTorrent (or recoverTorrentState) and never modified.
+// Safe to read without holding state.mu.
+//
+// Note: the files slice reference is immutable (never appended/removed), but individual
+// serverFileInfo fields (file, path, earlyFinalized, piecesWritten) are mutable and
+// require state.mu. The immutable per-file fields are: offset, size, selected,
+// sourceInode, firstPiece, lastPiece, piecesTotal.
+type torrentMeta struct {
+	pieceHashes []string          // SHA1 hashes per piece for verification
+	pieceLength int64             // Size of each piece (last piece may be smaller)
+	totalSize   int64             // Total size of all files combined
+	files       []*serverFileInfo // Files in this torrent (slice immutable, elements partly mutable)
+}
+
 // serverTorrentState holds the state for a torrent being received.
 type serverTorrentState struct {
+	torrentMeta // Immutable metadata (safe to read without mu)
+
 	info             *pb.InitTorrentRequest
 	written          []bool
-	writtenCount     int               // Number of true entries in written (maintained for O(1) checks)
-	pieceHashes      []string          // SHA1 hashes per piece for verification
-	pieceLength      int64             // Size of each piece (last piece may be smaller)
-	totalSize        int64             // Total size of all files combined
-	files            []*serverFileInfo // Files in this torrent
-	torrentPath      string            // Path to stored .torrent file
-	statePath        string            // Path to written pieces state file
-	saveSubPath      string            // Relative sub-path prefix (e.g., "movies" from category)
-	dirty            bool              // Whether state needs to be flushed
-	piecesSinceFlush int               // Pieces written since last flush (for count-based trigger)
-	finalizing       bool              // True during FinalizeTorrent to prevent concurrent writes
-	finalizeDone     chan struct{}     // Closed when background finalization completes
-	finalizeResult   *finalizeResult   // Result of background finalization (nil = not started)
-	initializing     bool              // True while disk I/O is in progress during InitTorrent
+	writtenCount     int             // Number of true entries in written (maintained for O(1) checks)
+	torrentPath      string          // Path to stored .torrent file
+	statePath        string          // Path to written pieces state file
+	saveSubPath      string          // Relative sub-path prefix (e.g., "movies" from category)
+	dirty            bool            // Whether state needs to be flushed
+	piecesSinceFlush int             // Pieces written since last flush (for count-based trigger)
+	flushGen         uint64          // Monotonic counter incremented on every successful state flush
+	finalizing       bool            // True during FinalizeTorrent to prevent concurrent writes
+	finalizeDone     chan struct{}   // Closed when background finalization completes
+	finalizeResult   *finalizeResult // Result of background finalization (nil = not started)
+	initializing     bool            // True while disk I/O is in progress during InitTorrent
 	mu               sync.Mutex
 
 	// Cached for re-initialization (hardlink info for logging)

@@ -564,8 +564,13 @@ func (d *GRPCDestination) MaxConnections() int {
 // Close closes all gRPC connections. Safe for repeated calls.
 func (d *GRPCDestination) Close() error {
 	d.closeOnce.Do(func() {
+		d.mu.Lock()
+		conns := make([]*grpc.ClientConn, len(d.conns))
+		copy(conns, d.conns)
+		d.mu.Unlock()
+
 		var errs []error
-		for _, conn := range d.conns {
+		for _, conn := range conns {
 			if err := conn.Close(); err != nil {
 				errs = append(errs, err)
 			}

@@ -58,11 +58,13 @@ func TestVerifyFinalizedPieces_ConcurrencyLimit(t *testing.T) {
 	}
 
 	state := &serverTorrentState{
-		pieceHashes: pieceHashes,
-		pieceLength: pieceSize,
-		totalSize:   totalSize,
-		files: []*serverFileInfo{
-			{path: filePath, offset: 0, size: totalSize, selected: true},
+		torrentMeta: torrentMeta{
+			pieceHashes: pieceHashes,
+			pieceLength: pieceSize,
+			totalSize:   totalSize,
+			files: []*serverFileInfo{
+				{path: filePath, offset: 0, size: totalSize, selected: true},
+			},
 		},
 	}
 
@@ -124,11 +126,13 @@ func TestVerifyFinalizedPieces_FailsOnHashMismatch(t *testing.T) {
 	}
 
 	state := &serverTorrentState{
-		pieceHashes: pieceHashes,
-		pieceLength: pieceSize,
-		totalSize:   totalSize,
-		files: []*serverFileInfo{
-			{path: filePath, offset: 0, size: totalSize, selected: true},
+		torrentMeta: torrentMeta{
+			pieceHashes: pieceHashes,
+			pieceLength: pieceSize,
+			totalSize:   totalSize,
+			files: []*serverFileInfo{
+				{path: filePath, offset: 0, size: totalSize, selected: true},
+			},
 		},
 	}
 
@@ -161,13 +165,15 @@ func TestFinalizeTorrent_PollReturnsVerifying(t *testing.T) {
 	hash := "poll-verify-test"
 	done := make(chan struct{}) // not closed yet — simulates in-progress verification
 	state := &serverTorrentState{
+		torrentMeta: torrentMeta{
+			pieceLength: 256,
+			totalSize:   512,
+			files:       []*serverFileInfo{},
+		},
 		written:      []bool{true, true},
 		writtenCount: 2,
-		pieceLength:  256,
-		totalSize:    512,
 		finalizing:   true,
 		finalizeDone: done,
-		files:        []*serverFileInfo{},
 	}
 
 	s.mu.Lock()
@@ -208,10 +214,13 @@ func TestFinalizeTorrent_PollReturnsCompletedResult(t *testing.T) {
 	done := make(chan struct{})
 	close(done)
 	state := &serverTorrentState{
+		torrentMeta: torrentMeta{
+			pieceLength: 256,
+			totalSize:   256,
+			files:       []*serverFileInfo{},
+		},
 		written:      []bool{true},
 		writtenCount: 1,
-		pieceLength:  256,
-		totalSize:    256,
 		finalizing:   true,
 		finalizeDone: done,
 		finalizeResult: &finalizeResult{
@@ -219,7 +228,6 @@ func TestFinalizeTorrent_PollReturnsCompletedResult(t *testing.T) {
 			state:   "uploading",
 		},
 		torrentPath: filepath.Join(tmpDir, metaDirName, hash, "test.torrent"),
-		files:       []*serverFileInfo{},
 	}
 
 	// Create metaDir so cleanupFinalizedTorrent doesn't fail
@@ -279,18 +287,20 @@ func TestFinalizeTorrent_PollReturnsFailedResult(t *testing.T) {
 	done := make(chan struct{})
 	close(done)
 	state := &serverTorrentState{
+		torrentMeta: torrentMeta{
+			pieceLength: 256,
+			totalSize:   256,
+			files: []*serverFileInfo{
+				{size: 256, offset: 0, selected: true},
+			},
+		},
 		written:      []bool{true},
 		writtenCount: 1,
-		pieceLength:  256,
-		totalSize:    256,
 		finalizing:   true,
 		finalizeDone: done,
 		finalizeResult: &finalizeResult{
 			success: false,
 			err:     "verification failed: piece 5: hash mismatch",
-		},
-		files: []*serverFileInfo{
-			{size: 256, offset: 0, selected: true},
 		},
 	}
 
@@ -364,13 +374,15 @@ func TestFinalizeTorrent_ConcurrentPollDuringSetup(t *testing.T) {
 	// finalizeDone is set upfront (same as production code) so concurrent
 	// polls always see "verifying" instead of a spurious error.
 	state := &serverTorrentState{
+		torrentMeta: torrentMeta{
+			pieceLength: 256,
+			totalSize:   256,
+			files:       []*serverFileInfo{},
+		},
 		written:      []bool{true},
 		writtenCount: 1,
-		pieceLength:  256,
-		totalSize:    256,
 		finalizing:   true,
 		finalizeDone: done,
-		files:        []*serverFileInfo{},
 	}
 
 	s.mu.Lock()
@@ -421,16 +433,19 @@ func TestRunBackgroundFinalization_SerializesViaSemaphore(t *testing.T) {
 		}
 
 		return &serverTorrentState{
-			pieceHashes: pieceHashes,
-			pieceLength: pieceSize,
-			totalSize:   totalSize,
-			files:       []*serverFileInfo{{path: filePath, offset: 0, size: totalSize, selected: true}},
+			torrentMeta: torrentMeta{
+				pieceHashes: pieceHashes,
+				pieceLength: pieceSize,
+				totalSize:   totalSize,
+				files:       []*serverFileInfo{{path: filePath, offset: 0, size: totalSize, selected: true}},
+			},
 			torrentPath: filepath.Join(dir, metaDirName, hash, "test.torrent"),
 		}
 	}
 
 	newServer := func() *Server {
-		return &Server{
+		bgCtx, bgCancel := context.WithCancel(context.Background())
+		s := &Server{
 			config:         ServerConfig{BasePath: tmpDir},
 			logger:         logger,
 			torrents:       make(map[string]*serverTorrentState),
@@ -438,7 +453,14 @@ func TestRunBackgroundFinalization_SerializesViaSemaphore(t *testing.T) {
 			inodes:         NewInodeRegistry(tmpDir, logger),
 			memBudget:      semaphore.NewWeighted(512 * 1024 * 1024),
 			finalizeSem:    semaphore.NewWeighted(1),
+			bgCtx:          bgCtx,
+			bgCancel:       bgCancel,
 		}
+		t.Cleanup(func() {
+			bgCancel()
+			s.bgWg.Wait()
+		})
+		return s
 	}
 
 	t.Run("blocks when semaphore is held", func(t *testing.T) {
@@ -548,9 +570,11 @@ func TestVerifyFinalizedPieces_RequiresPieceHashes(t *testing.T) {
 	}
 
 	state := &serverTorrentState{
-		pieceHashes: nil, // No hashes
-		pieceLength: 1024,
-		totalSize:   1024,
+		torrentMeta: torrentMeta{
+			pieceHashes: nil, // No hashes
+			pieceLength: 1024,
+			totalSize:   1024,
+		},
 	}
 
 	ctx := context.Background()
@@ -600,35 +624,37 @@ func TestRecoverVerificationFailure(t *testing.T) {
 	}
 
 	state := &serverTorrentState{
-		written:      []bool{true, true, true},
-		writtenCount: 3,
-		pieceLength:  pieceSize,
-		totalSize:    totalSize,
-		statePath:    filepath.Join(tmpDir, ".state"),
-		files: []*serverFileInfo{
-			{
-				path:           file0Path,
-				size:           512,
-				offset:         0,
-				selected:       true,
-				firstPiece:     0,
-				lastPiece:      1,
-				piecesTotal:    2,
-				piecesWritten:  2,
-				earlyFinalized: true,
-			},
-			{
-				path:           file1Path,
-				size:           256,
-				offset:         512,
-				selected:       true,
-				firstPiece:     2,
-				lastPiece:      2,
-				piecesTotal:    1,
-				piecesWritten:  1,
-				earlyFinalized: true,
+		torrentMeta: torrentMeta{
+			pieceLength: pieceSize,
+			totalSize:   totalSize,
+			files: []*serverFileInfo{
+				{
+					path:           file0Path,
+					size:           512,
+					offset:         0,
+					selected:       true,
+					firstPiece:     0,
+					lastPiece:      1,
+					piecesTotal:    2,
+					piecesWritten:  2,
+					earlyFinalized: true,
+				},
+				{
+					path:           file1Path,
+					size:           256,
+					offset:         512,
+					selected:       true,
+					firstPiece:     2,
+					lastPiece:      2,
+					piecesTotal:    1,
+					piecesWritten:  1,
+					earlyFinalized: true,
+				},
 			},
 		},
+		written:      []bool{true, true, true},
+		writtenCount: 3,
+		statePath:    filepath.Join(tmpDir, ".state"),
 	}
 
 	// Fail piece 1 — should affect file0 (which spans pieces 0–1) but not file1.
@@ -722,11 +748,13 @@ func TestVerifyFinalizedPieces_CollectsAllFailures(t *testing.T) {
 	}
 
 	state := &serverTorrentState{
-		pieceHashes: pieceHashes,
-		pieceLength: pieceSize,
-		totalSize:   totalSize,
-		files: []*serverFileInfo{
-			{path: filePath, offset: 0, size: totalSize, selected: true},
+		torrentMeta: torrentMeta{
+			pieceHashes: pieceHashes,
+			pieceLength: pieceSize,
+			totalSize:   totalSize,
+			files: []*serverFileInfo{
+				{path: filePath, offset: 0, size: totalSize, selected: true},
+			},
 		},
 	}
 

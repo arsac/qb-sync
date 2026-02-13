@@ -3,6 +3,7 @@ package destination
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -57,6 +58,7 @@ func (s *Server) markPieceWritten(ctx context.Context, hash string, state *serve
 		} else {
 			state.dirty = false
 			state.piecesSinceFlush = 0
+			state.flushGen++
 		}
 	}
 }
@@ -149,7 +151,10 @@ func (s *Server) writePiece(ctx context.Context, req *pb.WritePieceRequest) writ
 // verifyFilePieces reads back interior pieces from a synced .partial file and
 // verifies their hashes. Returns indices of pieces that failed verification.
 // Boundary pieces (spanning adjacent files) are skipped — they are deferred to
-// verifyFinalizedPieces. Caller must hold state.mu.
+// verifyFinalizedPieces.
+//
+// Safe to call without state.mu: all accessed fields (pieceHashes, pieceLength,
+// totalSize, fi geometry) are immutable after initialization.
 func (s *Server) verifyFilePieces(
 	state *serverTorrentState,
 	fi *serverFileInfo,
@@ -193,6 +198,7 @@ func (s *Server) verifyFilePieces(
 // checkFileCompletions checks if the just-written piece completes any file's
 // piece coverage. If so, immediately syncs, closes, verifies interior pieces,
 // and renames that file from .partial to its final path. Caller must hold state.mu.
+// Note: earlyFinalizeFile temporarily releases state.mu during I/O operations.
 func (s *Server) checkFileCompletions(
 	ctx context.Context,
 	hash string,
@@ -220,7 +226,11 @@ func (s *Server) checkFileCompletions(
 
 // earlyFinalizeFile syncs, verifies, and renames a completed .partial file.
 // On verification failure, marks failed pieces as unwritten for re-streaming.
-// Caller must hold state.mu.
+//
+// Caller must hold state.mu. This method temporarily releases state.mu during
+// fsync, close, and piece verification to avoid blocking concurrent WritePiece
+// calls. It is safe because all pieces overlapping this file are already marked
+// written, so no concurrent WritePiece will access fi.file.
 func (s *Server) earlyFinalizeFile(
 	ctx context.Context,
 	hash string,
@@ -228,13 +238,41 @@ func (s *Server) earlyFinalizeFile(
 	fi *serverFileInfo,
 	fileIndex int,
 ) {
-	if err := s.closeFileHandle(ctx, hash, fi); err != nil {
+	// Snapshot the file handle and prevent concurrent access.
+	fh := fi.file
+	fi.file = nil
+	fi.earlyFinalized = true // Block re-entry from concurrent checkFileCompletions
+
+	// Release lock for I/O: fsync, close, and piece verification.
+	state.mu.Unlock()
+
+	syncCloseErr := s.syncAndCloseHandle(ctx, hash, fi.path, fh)
+	var failedPieces []int
+	if syncCloseErr == nil {
+		failedPieces = s.verifyFilePieces(state, fi)
+	}
+
+	state.mu.Lock()
+
+	// If FinalizeTorrent started while we released the lock, bail out.
+	// Background verification (verifyFinalizedPieces) will catch any corruption,
+	// and modifying state.written here could double-decrement with
+	// recoverVerificationFailure which doesn't guard against already-false entries.
+	if state.finalizing {
+		s.logger.InfoContext(ctx, "finalization started during early finalize I/O, deferring",
+			"hash", hash, "file", fi.path)
+		return
+	}
+
+	if syncCloseErr != nil {
+		fi.earlyFinalized = false
 		s.logger.WarnContext(ctx, "early finalization sync failed, deferring",
-			"hash", hash, "file", fi.path, "error", err)
+			"hash", hash, "file", fi.path, "error", syncCloseErr)
 		return // finalizeFiles() will retry
 	}
-	// Verify interior pieces by reading back from disk after sync.
-	if failedPieces := s.verifyFilePieces(state, fi); len(failedPieces) > 0 {
+
+	if len(failedPieces) > 0 {
+		fi.earlyFinalized = false
 		for _, p := range failedPieces {
 			state.written[p] = false
 			state.writtenCount--
@@ -248,6 +286,7 @@ func (s *Server) earlyFinalizeFile(
 					"hash", hash, "file", fi.path, "error", saveErr)
 			} else {
 				state.dirty = false
+				state.flushGen++
 			}
 		}
 		metrics.EarlyFinalizeVerifyFailuresTotal.Inc()
@@ -255,14 +294,43 @@ func (s *Server) earlyFinalizeFile(
 			"hash", hash, "file", fi.path, "failedPieces", len(failedPieces))
 		return // File stays as .partial
 	}
+
 	if err := s.renamePartialFile(ctx, hash, fi); err != nil {
+		fi.earlyFinalized = false
 		s.logger.WarnContext(ctx, "early finalization rename failed, deferring",
 			"hash", hash, "file", fi.path, "error", err)
 		return
 	}
+
 	fi.path = strings.TrimSuffix(fi.path, partialSuffix)
-	fi.earlyFinalized = true
 	metrics.FilesEarlyFinalizedTotal.Inc()
 	s.logger.InfoContext(ctx, "file early-finalized",
 		"hash", hash, "file", fi.path, "fileIndex", fileIndex)
+}
+
+// syncAndCloseHandle syncs and closes a snapshotted file handle outside the state lock.
+// Always attempts close even on sync error. Returns the first error encountered.
+func (s *Server) syncAndCloseHandle(ctx context.Context, hash, path string, fh *os.File) error {
+	if fh == nil {
+		return nil
+	}
+
+	var firstErr error
+	if syncErr := fh.Sync(); syncErr != nil {
+		metrics.FileSyncErrorsTotal.WithLabelValues(metrics.ModeDestination).Inc()
+		s.logger.WarnContext(ctx, "failed to sync file",
+			"hash", hash, "path", path, "error", syncErr)
+		firstErr = fmt.Errorf("syncing %s: %w", path, syncErr)
+	}
+
+	if closeErr := fh.Close(); closeErr != nil {
+		metrics.FileSyncErrorsTotal.WithLabelValues(metrics.ModeDestination).Inc()
+		s.logger.WarnContext(ctx, "failed to close file",
+			"hash", hash, "path", path, "error", closeErr)
+		if firstErr == nil {
+			firstErr = fmt.Errorf("closing %s: %w", path, closeErr)
+		}
+	}
+
+	return firstErr
 }

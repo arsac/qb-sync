@@ -180,13 +180,14 @@ func (s *Server) recoverTorrentState(ctx context.Context, hash string) (*serverT
 	)
 
 	return &serverTorrentState{
-		info:         nil, // Not needed for finalization
+		torrentMeta: torrentMeta{
+			pieceHashes: parsed.PieceHashes,
+			pieceLength: parsed.PieceLength,
+			totalSize:   parsed.TotalSize,
+			files:       files,
+		},
 		written:      written,
 		writtenCount: writtenCount,
-		pieceHashes:  parsed.PieceHashes,
-		pieceLength:  parsed.PieceLength,
-		totalSize:    parsed.TotalSize,
-		files:        files,
 		torrentPath:  torrentPath,
 		statePath:    statePath,
 		saveSubPath:  saveSubPath,

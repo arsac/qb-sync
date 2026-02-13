@@ -302,10 +302,15 @@ linters:
       # BitTorrent protocol mandates SHA1 for piece verification - not a security issue.
       # G115 int overflow is bounded by math.MaxInt32 check before conversion.
       - text: 'G401|G505|G115'
-        path: 'internal/(streaming|cold|hot|qbclient)/'
+        path: 'internal/(streaming|destination|source|qbclient)/'
         linters:
           - gosec
       # Prometheus metrics use package-level variables by convention.
       - path: 'internal/metrics/'
         linters:
           - gochecknoglobals
+      # "metrics" package name conflicts with runtime/metrics but is the standard Prometheus convention.
+      - text: 'var-naming.*package'
+        path: 'internal/metrics/'
+        linters:
+          - revive

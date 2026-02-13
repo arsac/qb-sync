@@ -213,13 +213,15 @@ func (s *Server) initNewTorrent(
 
 	// Swap sentinel for real state under s.mu
 	state := &serverTorrentState{
+		torrentMeta: torrentMeta{
+			pieceHashes: req.GetPieceHashes(),
+			pieceLength: pieceSize,
+			totalSize:   totalSize,
+			files:       files,
+		},
 		info:            req,
 		written:         written,
 		writtenCount:    countWritten(written),
-		pieceHashes:     req.GetPieceHashes(),
-		pieceLength:     pieceSize,
-		totalSize:       totalSize,
-		files:           files,
 		torrentPath:     torrentPath,
 		statePath:       statePath,
 		saveSubPath:     saveSubPath,
@@ -416,8 +418,12 @@ func (s *Server) ensureTorrentFileWritten(
 		return nil
 	}
 
-	// Use existing path if valid, otherwise construct from request
+	// Use existing path if valid, otherwise construct from request.
+	// Read under state.mu: torrentPath can be written concurrently by another
+	// resumeTorrent call for the same hash.
+	state.mu.Lock()
 	torrentPath := state.torrentPath
+	state.mu.Unlock()
 	if torrentPath == "" {
 		name := req.GetName()
 		if name == "" {
@@ -486,7 +492,7 @@ func (s *Server) setupFile(
 	fileIndex int,
 	saveSubPath string,
 ) (*serverFileInfo, *pb.HardlinkResult, error) {
-	result := &pb.HardlinkResult{FileIndex: int32(fileIndex)} //nolint:gosec // bounded by proto file count
+	result := &pb.HardlinkResult{FileIndex: int32(fileIndex)}
 	targetPath := filepath.Join(s.config.BasePath, saveSubPath, f.GetPath())
 
 	// Unselected files: no .partial, no directory creation, no hardlink resolution.

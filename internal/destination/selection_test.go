@@ -20,12 +20,14 @@ func TestClassifyPiece(t *testing.T) {
 		// File 1: offset=100, size=100 (unselected)  -> piece 1
 		// File 2: offset=200, size=100 (selected)    -> piece 2
 		state := &serverTorrentState{
-			pieceLength: 100,
-			totalSize:   300,
-			files: []*serverFileInfo{
-				{offset: 0, size: 100, selected: true},
-				{offset: 100, size: 100, selected: false},
-				{offset: 200, size: 100, selected: true},
+			torrentMeta: torrentMeta{
+				pieceLength: 100,
+				totalSize:   300,
+				files: []*serverFileInfo{
+					{offset: 0, size: 100, selected: true},
+					{offset: 100, size: 100, selected: false},
+					{offset: 200, size: 100, selected: true},
+				},
 			},
 		}
 
@@ -51,11 +53,13 @@ func TestClassifyPiece(t *testing.T) {
 		// File 0: offset=0,  size=80  (selected)   -> piece 0
 		// File 1: offset=80, size=120 (unselected)  -> pieces 0..1
 		state := &serverTorrentState{
-			pieceLength: 100,
-			totalSize:   200,
-			files: []*serverFileInfo{
-				{offset: 0, size: 80, selected: true},
-				{offset: 80, size: 120, selected: false},
+			torrentMeta: torrentMeta{
+				pieceLength: 100,
+				totalSize:   200,
+				files: []*serverFileInfo{
+					{offset: 0, size: 80, selected: true},
+					{offset: 80, size: 120, selected: false},
+				},
 			},
 		}
 
@@ -70,11 +74,13 @@ func TestClassifyPiece(t *testing.T) {
 	t.Run("all selected", func(t *testing.T) {
 		t.Parallel()
 		state := &serverTorrentState{
-			pieceLength: 100,
-			totalSize:   200,
-			files: []*serverFileInfo{
-				{offset: 0, size: 100, selected: true},
-				{offset: 100, size: 100, selected: true},
+			torrentMeta: torrentMeta{
+				pieceLength: 100,
+				totalSize:   200,
+				files: []*serverFileInfo{
+					{offset: 0, size: 100, selected: true},
+					{offset: 100, size: 100, selected: true},
+				},
 			},
 		}
 		if got := state.classifyPiece(0); got != pieceFullySelected {
@@ -91,14 +97,16 @@ func TestCountSelectedPiecesTotal(t *testing.T) {
 	// File 1: offset=100, size=100 (unselected)  -> piece 1
 	// File 2: offset=200, size=100 (selected)    -> piece 2
 	state := &serverTorrentState{
-		written:     []bool{false, false, false},
-		pieceLength: 100,
-		totalSize:   300,
-		files: []*serverFileInfo{
-			{offset: 0, size: 100, selected: true},
-			{offset: 100, size: 100, selected: false},
-			{offset: 200, size: 100, selected: true},
+		torrentMeta: torrentMeta{
+			pieceLength: 100,
+			totalSize:   300,
+			files: []*serverFileInfo{
+				{offset: 0, size: 100, selected: true},
+				{offset: 100, size: 100, selected: false},
+				{offset: 200, size: 100, selected: true},
+			},
 		},
+		written: []bool{false, false, false},
 	}
 
 	got := state.countSelectedPiecesTotal()
@@ -183,11 +191,13 @@ func TestWritePieceData_SkipsUnselectedFiles(t *testing.T) {
 	// File 1: unselected, skipped (no .partial file)
 
 	state := &serverTorrentState{
-		pieceLength: 200,
-		totalSize:   200,
-		files: []*serverFileInfo{
-			{path: selectedPath, size: 100, offset: 0, selected: true},
-			{path: filepath.Join(tmpDir, "unselected.bin"), size: 100, offset: 100, selected: false},
+		torrentMeta: torrentMeta{
+			pieceLength: 200,
+			totalSize:   200,
+			files: []*serverFileInfo{
+				{path: selectedPath, size: 100, offset: 0, selected: true},
+				{path: filepath.Join(tmpDir, "unselected.bin"), size: 100, offset: 100, selected: false},
+			},
 		},
 	}
 
@@ -361,17 +371,19 @@ func TestFinalizeTorrent_PartialSelection(t *testing.T) {
 	partialFile2 := filepath.Join(tmpDir, "file2.bin.partial")
 
 	state := &serverTorrentState{
+		torrentMeta: torrentMeta{
+			pieceHashes: []string{pieceHash0, "", pieceHash2},
+			pieceLength: pieceLength,
+			totalSize:   totalSize,
+			files: []*serverFileInfo{
+				{path: partialFile0, size: 16, offset: 0, selected: true},
+				{path: filepath.Join(tmpDir, "file1.bin"), size: 16, offset: 16, selected: false, earlyFinalized: true},
+				{path: partialFile2, size: 16, offset: 32, selected: true},
+			},
+		},
 		written:      []bool{false, false, false},
 		writtenCount: 0,
-		pieceHashes:  []string{pieceHash0, "", pieceHash2},
-		pieceLength:  pieceLength,
-		totalSize:    totalSize,
-		files: []*serverFileInfo{
-			{path: partialFile0, size: 16, offset: 0, selected: true},
-			{path: filepath.Join(tmpDir, "file1.bin"), size: 16, offset: 16, selected: false, earlyFinalized: true},
-			{path: partialFile2, size: 16, offset: 32, selected: true},
-		},
-		statePath: filepath.Join(tmpDir, ".state"),
+		statePath:    filepath.Join(tmpDir, ".state"),
 	}
 
 	// Register state

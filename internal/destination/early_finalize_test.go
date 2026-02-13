@@ -195,7 +195,7 @@ func TestCheckFileCompletions(t *testing.T) {
 			piecesWritten: 0,
 		}
 		state := &serverTorrentState{
-			files: []*serverFileInfo{fi},
+			torrentMeta: torrentMeta{files: []*serverFileInfo{fi}},
 		}
 
 		ctx := context.Background()
@@ -250,7 +250,7 @@ func TestCheckFileCompletions(t *testing.T) {
 				firstPiece: 0, lastPiece: 1, piecesTotal: 2, piecesWritten: 1, selected: true,
 			},
 		}
-		state := &serverTorrentState{files: files}
+		state := &serverTorrentState{torrentMeta: torrentMeta{files: files}}
 
 		ctx := context.Background()
 		state.mu.Lock()
@@ -278,7 +278,7 @@ func TestCheckFileCompletions(t *testing.T) {
 			path: partialPath, size: 4, offset: 0,
 			firstPiece: 0, lastPiece: 1, piecesTotal: 2, piecesWritten: 0, selected: true,
 		}
-		state := &serverTorrentState{files: []*serverFileInfo{fi}}
+		state := &serverTorrentState{torrentMeta: torrentMeta{files: []*serverFileInfo{fi}}}
 
 		ctx := context.Background()
 		state.mu.Lock()
@@ -302,7 +302,7 @@ func TestCheckFileCompletions(t *testing.T) {
 			firstPiece: 0, lastPiece: 0, piecesTotal: 1,
 			hlState: hlStateComplete, selected: true,
 		}
-		state := &serverTorrentState{files: []*serverFileInfo{fi}}
+		state := &serverTorrentState{torrentMeta: torrentMeta{files: []*serverFileInfo{fi}}}
 
 		ctx := context.Background()
 		state.mu.Lock()
@@ -323,7 +323,7 @@ func TestCheckFileCompletions(t *testing.T) {
 			firstPiece: 0, lastPiece: 0, piecesTotal: 1,
 			earlyFinalized: true, selected: true,
 		}
-		state := &serverTorrentState{files: []*serverFileInfo{fi}}
+		state := &serverTorrentState{torrentMeta: torrentMeta{files: []*serverFileInfo{fi}}}
 
 		ctx := context.Background()
 		state.mu.Lock()
@@ -343,7 +343,7 @@ func TestCheckFileCompletions(t *testing.T) {
 			size: 100, offset: 100,
 			firstPiece: 1, lastPiece: 1, piecesTotal: 1, selected: true,
 		}
-		state := &serverTorrentState{files: []*serverFileInfo{fi}}
+		state := &serverTorrentState{torrentMeta: torrentMeta{files: []*serverFileInfo{fi}}}
 
 		ctx := context.Background()
 		state.mu.Lock()
@@ -367,7 +367,7 @@ func TestCheckFileCompletions(t *testing.T) {
 			path: partialPath, size: 10, offset: 0,
 			firstPiece: 0, lastPiece: 0, piecesTotal: 1, piecesWritten: 0, selected: true,
 		}
-		state := &serverTorrentState{files: []*serverFileInfo{fi}}
+		state := &serverTorrentState{torrentMeta: torrentMeta{files: []*serverFileInfo{fi}}}
 
 		ctx := context.Background()
 		state.mu.Lock()
@@ -399,26 +399,28 @@ func TestFinalizeFiles_SkipsEarlyFinalizedFiles(t *testing.T) {
 	}
 
 	state := &serverTorrentState{
-		written:      []bool{true, true},
-		writtenCount: 2,
-		pieceLength:  100,
-		totalSize:    200,
-		files: []*serverFileInfo{
-			{
-				path:           finalPath,
-				size:           4,
-				offset:         0,
-				earlyFinalized: true,
-				selected:       true,
-				// file is nil (closed during early finalization)
-			},
-			{
-				path:     partialPath,
-				size:     7,
-				offset:   4,
-				selected: true,
+		torrentMeta: torrentMeta{
+			pieceLength: 100,
+			totalSize:   200,
+			files: []*serverFileInfo{
+				{
+					path:           finalPath,
+					size:           4,
+					offset:         0,
+					earlyFinalized: true,
+					selected:       true,
+					// file is nil (closed during early finalization)
+				},
+				{
+					path:     partialPath,
+					size:     7,
+					offset:   4,
+					selected: true,
+				},
 			},
 		},
+		written:      []bool{true, true},
+		writtenCount: 2,
 	}
 
 	ctx := context.Background()
@@ -451,23 +453,25 @@ func TestWritePiece_EarlyFinalizesCompletedFile(t *testing.T) {
 	pieceHash := utils.ComputeSHA1(pieceData)
 
 	state := &serverTorrentState{
-		written:      []bool{false},
-		writtenCount: 0,
-		pieceHashes:  []string{pieceHash},
-		pieceLength:  int64(len(pieceData)),
-		totalSize:    int64(len(pieceData)),
-		files: []*serverFileInfo{
-			{
-				path:        partialPath,
-				size:        int64(len(pieceData)),
-				offset:      0,
-				firstPiece:  0,
-				lastPiece:   0,
-				piecesTotal: 1,
-				selected:    true,
+		torrentMeta: torrentMeta{
+			pieceHashes: []string{pieceHash},
+			pieceLength: int64(len(pieceData)),
+			totalSize:   int64(len(pieceData)),
+			files: []*serverFileInfo{
+				{
+					path:        partialPath,
+					size:        int64(len(pieceData)),
+					offset:      0,
+					firstPiece:  0,
+					lastPiece:   0,
+					piecesTotal: 1,
+					selected:    true,
+				},
 			},
 		},
-		statePath: filepath.Join(tmpDir, ".state"),
+		written:      []bool{false},
+		writtenCount: 0,
+		statePath:    filepath.Join(tmpDir, ".state"),
 	}
 
 	s.mu.Lock()
@@ -534,12 +538,14 @@ func TestCheckFileCompletions_VerifyFailure(t *testing.T) {
 		selected:      true,
 	}
 	state := &serverTorrentState{
+		torrentMeta: torrentMeta{
+			pieceHashes: []string{pieceHash},
+			pieceLength: int64(len(correctData)),
+			totalSize:   int64(len(correctData)),
+			files:       []*serverFileInfo{fi},
+		},
 		written:      []bool{true},
 		writtenCount: 1,
-		pieceHashes:  []string{pieceHash},
-		pieceLength:  int64(len(correctData)),
-		totalSize:    int64(len(correctData)),
-		files:        []*serverFileInfo{fi},
 		statePath:    filepath.Join(tmpDir, ".state"),
 	}
 
@@ -607,12 +613,14 @@ func TestCheckFileCompletions_VerifySkipsBoundaryPieces(t *testing.T) {
 		},
 	}
 	state := &serverTorrentState{
+		torrentMeta: torrentMeta{
+			pieceHashes: []string{pieceHash},
+			pieceLength: 10,
+			totalSize:   10,
+			files:       files,
+		},
 		written:      []bool{true},
 		writtenCount: 1,
-		pieceHashes:  []string{pieceHash},
-		pieceLength:  10,
-		totalSize:    10,
-		files:        files,
 	}
 
 	ctx := context.Background()
@@ -659,12 +667,14 @@ func TestCheckFileCompletions_VerifyPartialCorruption(t *testing.T) {
 		firstPiece: 0, lastPiece: 2, piecesTotal: 3, piecesWritten: 2, selected: true,
 	}
 	state := &serverTorrentState{
+		torrentMeta: torrentMeta{
+			pieceHashes: []string{hash0, hash1, hash2},
+			pieceLength: 10,
+			totalSize:   30,
+			files:       []*serverFileInfo{fi},
+		},
 		written:      []bool{true, true, true},
 		writtenCount: 3,
-		pieceHashes:  []string{hash0, hash1, hash2},
-		pieceLength:  10,
-		totalSize:    30,
-		files:        []*serverFileInfo{fi},
 		statePath:    filepath.Join(tmpDir, ".state"),
 	}
 
@@ -715,12 +725,14 @@ func TestCheckFileCompletions_VerifyNoPieceHashes(t *testing.T) {
 		firstPiece: 0, lastPiece: 0, piecesTotal: 1, piecesWritten: 0, selected: true,
 	}
 	state := &serverTorrentState{
+		torrentMeta: torrentMeta{
+			pieceHashes: nil, // No hashes available.
+			pieceLength: 4,
+			totalSize:   4,
+			files:       []*serverFileInfo{fi},
+		},
 		written:      []bool{true},
 		writtenCount: 1,
-		pieceHashes:  nil, // No hashes available.
-		pieceLength:  4,
-		totalSize:    4,
-		files:        []*serverFileInfo{fi},
 	}
 
 	ctx := context.Background()

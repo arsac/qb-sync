@@ -81,6 +81,7 @@ func (s *Server) flushDirtyStates(ctx context.Context) {
 		snapshot := make([]bool, len(t.state.written))
 		copy(snapshot, t.state.written)
 		flushedCount := t.state.piecesSinceFlush
+		snapshotGen := t.state.flushGen
 		t.state.mu.Unlock()
 
 		flushStart := time.Now()
@@ -97,6 +98,16 @@ func (s *Server) flushDirtyStates(ctx context.Context) {
 		metrics.StateFlushDuration.Observe(time.Since(flushStart).Seconds())
 
 		t.state.mu.Lock()
+		// If an inline flush occurred while we were writing, our snapshot is stale.
+		// The inline flush already wrote a newer state to disk — skip bookkeeping
+		// to avoid clearing dirty/piecesSinceFlush for pieces not in our snapshot.
+		if t.state.flushGen != snapshotGen {
+			// Still dirty from the inline flush's perspective; recount next cycle.
+			dirtyAfterFlush++
+			t.state.mu.Unlock()
+			continue
+		}
+		t.state.flushGen++
 		t.state.piecesSinceFlush -= flushedCount
 		if t.state.piecesSinceFlush <= 0 {
 			t.state.dirty = false

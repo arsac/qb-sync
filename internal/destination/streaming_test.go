@@ -295,8 +295,10 @@ func TestStreamWorker_ReleasesBudget(t *testing.T) {
 	// Pre-register a torrent so WritePiece can look it up
 	hash := "test123"
 	state := &serverTorrentState{
+		torrentMeta: torrentMeta{
+			files: []*serverFileInfo{},
+		},
 		written: make([]bool, 10),
-		files:   []*serverFileInfo{},
 	}
 	s.torrents[hash] = state
 
@@ -445,8 +447,10 @@ func TestStreamPiecesBidi_MultipleConcurrentStreams(t *testing.T) {
 	// Register a torrent so WritePiece won't fail with "not initialized"
 	hash := "concurrent"
 	s.torrents[hash] = &serverTorrentState{
+		torrentMeta: torrentMeta{
+			files: []*serverFileInfo{},
+		},
 		written: make([]bool, 10),
-		files:   []*serverFileInfo{},
 	}
 
 	var stream1Done, stream2Done atomic.Bool

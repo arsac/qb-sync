@@ -168,7 +168,7 @@ func (t *QBTask) shouldAttemptFinalize(hash string) bool {
 	backoffDuration := min(
 		minFinalizeBackoff*time.Duration(1<<uint(backoff.failures-1)),
 		maxFinalizeBackoff,
-	) //nolint:gosec // capped by maxFinalizeBackoff
+	)
 
 	return time.Since(backoff.lastAttempt) >= backoffDuration
 }

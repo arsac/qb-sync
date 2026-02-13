@@ -35,11 +35,12 @@ func (fi *serverFileInfo) openForWrite() (*os.File, error) {
 
 // verifyPieceHash checks the piece data against expected hash.
 // Returns empty string if valid, error message if invalid.
-func (s *serverTorrentState) verifyPieceHash(pieceIndex int32, data []byte, reqHash string) string {
+// Safe to call without state.mu — only accesses immutable pieceHashes.
+func (m *torrentMeta) verifyPieceHash(pieceIndex int32, data []byte, reqHash string) string {
 	// Prefer pre-stored hash from InitTorrent, fall back to request hash
 	expectedHash := reqHash
-	if int(pieceIndex) < len(s.pieceHashes) && s.pieceHashes[pieceIndex] != "" {
-		expectedHash = s.pieceHashes[pieceIndex]
+	if int(pieceIndex) < len(m.pieceHashes) && m.pieceHashes[pieceIndex] != "" {
+		expectedHash = m.pieceHashes[pieceIndex]
 	}
 
 	if err := utils.VerifyPieceHash(data, expectedHash); err != nil {
@@ -109,9 +110,10 @@ func (s *serverTorrentState) buildReadyResponse() *pb.InitTorrentResponse {
 }
 
 // countSelectedFiles returns the number of selected files.
-func (s *serverTorrentState) countSelectedFiles() int {
+// Safe to call without state.mu — only accesses immutable file selection flags.
+func (m *torrentMeta) countSelectedFiles() int {
 	count := 0
-	for _, f := range s.files {
+	for _, f := range m.files {
 		if f.selected {
 			count++
 		}
@@ -145,14 +147,15 @@ const (
 
 // classifyPiece determines a piece's relationship to the file selection in a single
 // pass with early exit on boundary detection.
-func (s *serverTorrentState) classifyPiece(pieceIdx int) pieceClass {
-	pieceStart := int64(pieceIdx) * s.pieceLength
-	pieceEnd := min(pieceStart+s.pieceLength, s.totalSize)
+// Safe to call without state.mu — only accesses immutable geometry and selection flags.
+func (m *torrentMeta) classifyPiece(pieceIdx int) pieceClass {
+	pieceStart := int64(pieceIdx) * m.pieceLength
+	pieceEnd := min(pieceStart+m.pieceLength, m.totalSize)
 
 	hasSelected := false
 	hasUnselected := false
 
-	for _, fi := range s.files {
+	for _, fi := range m.files {
 		if fi.offset >= pieceEnd || fi.offset+fi.size <= pieceStart {
 			continue
 		}

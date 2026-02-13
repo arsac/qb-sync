@@ -59,8 +59,12 @@ func (s *Server) addAndVerifyTorrent(
 		return s.waitForTorrentReady(ctx, hash)
 	}
 
-	// Torrent doesn't exist - add it
-	torrentData, readErr := os.ReadFile(state.torrentPath)
+	// Torrent doesn't exist - add it.
+	// Read torrentPath under state.mu: ensureTorrentFileWritten can write it concurrently.
+	state.mu.Lock()
+	torrentPath := state.torrentPath
+	state.mu.Unlock()
+	torrentData, readErr := os.ReadFile(torrentPath)
 	if readErr != nil {
 		return "", fmt.Errorf("reading torrent file: %w", readErr)
 	}

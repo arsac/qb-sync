@@ -94,6 +94,13 @@ type Server struct {
 	// and qBittorrent API saturation when many torrents complete together.
 	finalizeSem *semaphore.Weighted
 
+	// bgCtx is cancelled during shutdown to interrupt in-flight background
+	// finalizations. bgWg tracks all running background finalization goroutines
+	// so cleanup() waits for them to exit before saving state and closing handles.
+	bgCtx    context.Context
+	bgCancel context.CancelFunc
+	bgWg     sync.WaitGroup
+
 	// Health server for K8s probes
 	healthServer *health.Server
 
@@ -108,6 +115,8 @@ func NewServer(config ServerConfig, logger *slog.Logger) *Server {
 		bufferBytes = defaultMaxStreamBufferMB * bytesPerMB
 	}
 
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+
 	s := &Server{
 		config:         config,
 		logger:         logger,
@@ -116,6 +125,8 @@ func NewServer(config ServerConfig, logger *slog.Logger) *Server {
 		inodes:         NewInodeRegistry(config.BasePath, logger),
 		memBudget:      semaphore.NewWeighted(bufferBytes),
 		finalizeSem:    semaphore.NewWeighted(1),
+		bgCtx:          bgCtx,
+		bgCancel:       bgCancel,
 	}
 
 	if config.QB != nil && config.QB.URL != "" {
@@ -230,6 +241,12 @@ func (s *Server) Run(ctx context.Context) error {
 			<-stopped // Wait for GracefulStop to return after Stop
 		}
 
+		// Cancel background finalizations and wait for them to exit before
+		// cleanup. This prevents races where cleanup saves state or closes
+		// file handles while a finalization goroutine is still running.
+		s.bgCancel()
+		s.bgWg.Wait()
+
 		s.cleanup()
 		return ctx.Err()
 	case serveErr := <-errCh:
@@ -252,6 +269,8 @@ func (s *Server) cleanup() {
 					"hash", t.hash,
 					"error", saveErr,
 				)
+			} else {
+				t.state.flushGen++
 			}
 		}
 		for _, fi := range t.state.files {

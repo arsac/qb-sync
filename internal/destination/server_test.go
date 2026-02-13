@@ -550,7 +550,7 @@ func TestAbortTorrent_NonExistent(t *testing.T) {
 func TestAbortTorrent_RemovesFromTracking(t *testing.T) {
 	s := newAbortTestServer(t)
 	hash := "abc123"
-	s.torrents[hash] = &serverTorrentState{files: []*serverFileInfo{}}
+	s.torrents[hash] = &serverTorrentState{torrentMeta: torrentMeta{files: []*serverFileInfo{}}}
 
 	_, err := s.AbortTorrent(context.Background(), &pb.AbortTorrentRequest{
 		TorrentHash: hash,
@@ -594,7 +594,7 @@ func TestAbortTorrent_DeletesFiles(t *testing.T) {
 	}
 
 	s.torrents[hash] = &serverTorrentState{
-		files:       []*serverFileInfo{{path: partialFile, size: 4, selected: true}},
+		torrentMeta: torrentMeta{files: []*serverFileInfo{{path: partialFile, size: 4, selected: true}}},
 		statePath:   stateFile,
 		torrentPath: torrentFile,
 	}
@@ -637,7 +637,7 @@ func TestAbortTorrent_PreservesFiles(t *testing.T) {
 	}
 
 	s.torrents[hash] = &serverTorrentState{
-		files: []*serverFileInfo{{path: partialFile, size: 4, selected: true}},
+		torrentMeta: torrentMeta{files: []*serverFileInfo{{path: partialFile, size: 4, selected: true}}},
 	}
 
 	resp, err := s.AbortTorrent(context.Background(), &pb.AbortTorrentRequest{
@@ -673,7 +673,7 @@ func TestAbortTorrent_ClosesFileHandles(t *testing.T) {
 	}
 
 	s.torrents[hash] = &serverTorrentState{
-		files: []*serverFileInfo{{path: partialFile, size: 0, file: f, selected: true}},
+		torrentMeta: torrentMeta{files: []*serverFileInfo{{path: partialFile, size: 0, file: f, selected: true}}},
 	}
 
 	resp, abortErr := s.AbortTorrent(context.Background(), &pb.AbortTorrentRequest{
@@ -696,7 +696,7 @@ func TestAbortTorrent_ConcurrentRequests(t *testing.T) {
 	s := newAbortTestServer(t)
 	ctx := context.Background()
 	hash := "abc123"
-	s.torrents[hash] = &serverTorrentState{files: []*serverFileInfo{}}
+	s.torrents[hash] = &serverTorrentState{torrentMeta: torrentMeta{files: []*serverFileInfo{}}}
 
 	var wg sync.WaitGroup
 	results := make(chan *pb.AbortTorrentResponse, 10)
@@ -744,7 +744,7 @@ func TestAbortTorrent_InitWaitsForAbort(t *testing.T) {
 	}
 
 	s.torrents[hash] = &serverTorrentState{
-		files: []*serverFileInfo{{path: partialPath, size: 9, selected: true}},
+		torrentMeta: torrentMeta{files: []*serverFileInfo{{path: partialPath, size: 9, selected: true}}},
 	}
 
 	var abortFinished, initFinished time.Time
@@ -1370,10 +1370,10 @@ func TestUpdateStateAfterRelocate(t *testing.T) {
 		basePath := "/data/cold"
 		state := &serverTorrentState{
 			saveSubPath: "",
-			files: []*serverFileInfo{
+			torrentMeta: torrentMeta{files: []*serverFileInfo{
 				{path: filepath.Join(basePath, "data", "file.bin.partial"), size: 1024, selected: true},
 				{path: filepath.Join(basePath, "data", "file2.bin"), size: 2048, selected: true},
-			},
+			}},
 		}
 
 		updateStateAfterRelocate(state, basePath, "", "movies")
@@ -1495,11 +1495,13 @@ func TestFinalizeTorrent_RelocatesOnSubPathChange(t *testing.T) {
 		return &serverTorrentState{
 			written:      []bool{true, false},
 			writtenCount: 1,
-			pieceLength:  512,
-			totalSize:    1024,
 			saveSubPath:  subPath,
-			files: []*serverFileInfo{
-				{path: filePath, size: 1024, offset: 0, selected: true},
+			torrentMeta: torrentMeta{
+				pieceLength: 512,
+				totalSize:   1024,
+				files: []*serverFileInfo{
+					{path: filePath, size: 1024, offset: 0, selected: true},
+				},
 			},
 		}
 	}
@@ -1958,11 +1960,13 @@ func TestInitTorrentResync_ExistingState(t *testing.T) {
 			},
 			written:      []bool{true, true}, // Both marked written (piece 1 "covered")
 			writtenCount: 2,
-			pieceLength:  512,
-			totalSize:    1024,
-			files: []*serverFileInfo{
-				{path: filepath.Join(tmpDir, "data", "file1.bin"), size: 512, offset: 0, selected: true},
-				{path: filepath.Join(tmpDir, "data", "file2.bin"), size: 512, offset: 512, selected: false},
+			torrentMeta: torrentMeta{
+				pieceLength: 512,
+				totalSize:   1024,
+				files: []*serverFileInfo{
+					{path: filepath.Join(tmpDir, "data", "file1.bin"), size: 512, offset: 0, selected: true},
+					{path: filepath.Join(tmpDir, "data", "file2.bin"), size: 512, offset: 512, selected: false},
+				},
 			},
 		}
 
@@ -2064,11 +2068,13 @@ func TestInitTorrentResync_ExistingState(t *testing.T) {
 			},
 			written:      []bool{true, true, true},
 			writtenCount: 3,
-			pieceLength:  1024,
-			totalSize:    2560,
-			files: []*serverFileInfo{
-				{path: filepath.Join(tmpDir, "data", "file1.bin"), size: 1536, offset: 0, selected: true},
-				{path: filepath.Join(tmpDir, "data", "file2.bin"), size: 1024, offset: 1536, selected: false},
+			torrentMeta: torrentMeta{
+				pieceLength: 1024,
+				totalSize:   2560,
+				files: []*serverFileInfo{
+					{path: filepath.Join(tmpDir, "data", "file1.bin"), size: 1536, offset: 0, selected: true},
+					{path: filepath.Join(tmpDir, "data", "file2.bin"), size: 1024, offset: 1536, selected: false},
+				},
 			},
 		}
 
