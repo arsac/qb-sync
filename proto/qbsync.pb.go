@@ -264,66 +264,6 @@ func (x *WritePieceRequest) GetData() []byte {
 	return nil
 }
 
-type WritePieceResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
-	Error         string                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
-	ErrorCode     PieceErrorCode         `protobuf:"varint,3,opt,name=error_code,json=errorCode,proto3,enum=qbsync.PieceErrorCode" json:"error_code,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *WritePieceResponse) Reset() {
-	*x = WritePieceResponse{}
-	mi := &file_qbsync_proto_msgTypes[1]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *WritePieceResponse) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*WritePieceResponse) ProtoMessage() {}
-
-func (x *WritePieceResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_qbsync_proto_msgTypes[1]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use WritePieceResponse.ProtoReflect.Descriptor instead.
-func (*WritePieceResponse) Descriptor() ([]byte, []int) {
-	return file_qbsync_proto_rawDescGZIP(), []int{1}
-}
-
-func (x *WritePieceResponse) GetSuccess() bool {
-	if x != nil {
-		return x.Success
-	}
-	return false
-}
-
-func (x *WritePieceResponse) GetError() string {
-	if x != nil {
-		return x.Error
-	}
-	return ""
-}
-
-func (x *WritePieceResponse) GetErrorCode() PieceErrorCode {
-	if x != nil {
-		return x.ErrorCode
-	}
-	return PieceErrorCode_PIECE_ERROR_NONE
-}
-
 // PieceAck is sent by the receiver for each piece in bidirectional streaming.
 type PieceAck struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -338,7 +278,7 @@ type PieceAck struct {
 
 func (x *PieceAck) Reset() {
 	*x = PieceAck{}
-	mi := &file_qbsync_proto_msgTypes[2]
+	mi := &file_qbsync_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -350,7 +290,7 @@ func (x *PieceAck) String() string {
 func (*PieceAck) ProtoMessage() {}
 
 func (x *PieceAck) ProtoReflect() protoreflect.Message {
-	mi := &file_qbsync_proto_msgTypes[2]
+	mi := &file_qbsync_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -363,7 +303,7 @@ func (x *PieceAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PieceAck.ProtoReflect.Descriptor instead.
 func (*PieceAck) Descriptor() ([]byte, []int) {
-	return file_qbsync_proto_rawDescGZIP(), []int{2}
+	return file_qbsync_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *PieceAck) GetTorrentHash() string {
@@ -419,7 +359,7 @@ type InitTorrentRequest struct {
 
 func (x *InitTorrentRequest) Reset() {
 	*x = InitTorrentRequest{}
-	mi := &file_qbsync_proto_msgTypes[3]
+	mi := &file_qbsync_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -431,7 +371,7 @@ func (x *InitTorrentRequest) String() string {
 func (*InitTorrentRequest) ProtoMessage() {}
 
 func (x *InitTorrentRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_qbsync_proto_msgTypes[3]
+	mi := &file_qbsync_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -444,7 +384,7 @@ func (x *InitTorrentRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InitTorrentRequest.ProtoReflect.Descriptor instead.
 func (*InitTorrentRequest) Descriptor() ([]byte, []int) {
-	return file_qbsync_proto_rawDescGZIP(), []int{3}
+	return file_qbsync_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *InitTorrentRequest) GetTorrentHash() string {
@@ -530,7 +470,7 @@ type FileInfo struct {
 
 func (x *FileInfo) Reset() {
 	*x = FileInfo{}
-	mi := &file_qbsync_proto_msgTypes[4]
+	mi := &file_qbsync_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -542,7 +482,7 @@ func (x *FileInfo) String() string {
 func (*FileInfo) ProtoMessage() {}
 
 func (x *FileInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_qbsync_proto_msgTypes[4]
+	mi := &file_qbsync_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -555,7 +495,7 @@ func (x *FileInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FileInfo.ProtoReflect.Descriptor instead.
 func (*FileInfo) Descriptor() ([]byte, []int) {
-	return file_qbsync_proto_rawDescGZIP(), []int{4}
+	return file_qbsync_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *FileInfo) GetPath() string {
@@ -615,7 +555,7 @@ type InitTorrentResponse struct {
 
 func (x *InitTorrentResponse) Reset() {
 	*x = InitTorrentResponse{}
-	mi := &file_qbsync_proto_msgTypes[5]
+	mi := &file_qbsync_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -627,7 +567,7 @@ func (x *InitTorrentResponse) String() string {
 func (*InitTorrentResponse) ProtoMessage() {}
 
 func (x *InitTorrentResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_qbsync_proto_msgTypes[5]
+	mi := &file_qbsync_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -640,7 +580,7 @@ func (x *InitTorrentResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InitTorrentResponse.ProtoReflect.Descriptor instead.
 func (*InitTorrentResponse) Descriptor() ([]byte, []int) {
-	return file_qbsync_proto_rawDescGZIP(), []int{5}
+	return file_qbsync_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *InitTorrentResponse) GetSuccess() bool {
@@ -707,7 +647,7 @@ type HardlinkResult struct {
 
 func (x *HardlinkResult) Reset() {
 	*x = HardlinkResult{}
-	mi := &file_qbsync_proto_msgTypes[6]
+	mi := &file_qbsync_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -719,7 +659,7 @@ func (x *HardlinkResult) String() string {
 func (*HardlinkResult) ProtoMessage() {}
 
 func (x *HardlinkResult) ProtoReflect() protoreflect.Message {
-	mi := &file_qbsync_proto_msgTypes[6]
+	mi := &file_qbsync_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -732,7 +672,7 @@ func (x *HardlinkResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HardlinkResult.ProtoReflect.Descriptor instead.
 func (*HardlinkResult) Descriptor() ([]byte, []int) {
-	return file_qbsync_proto_rawDescGZIP(), []int{6}
+	return file_qbsync_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *HardlinkResult) GetFileIndex() int32 {
@@ -789,7 +729,7 @@ type CreateHardlinkRequest struct {
 
 func (x *CreateHardlinkRequest) Reset() {
 	*x = CreateHardlinkRequest{}
-	mi := &file_qbsync_proto_msgTypes[7]
+	mi := &file_qbsync_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -801,7 +741,7 @@ func (x *CreateHardlinkRequest) String() string {
 func (*CreateHardlinkRequest) ProtoMessage() {}
 
 func (x *CreateHardlinkRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_qbsync_proto_msgTypes[7]
+	mi := &file_qbsync_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -814,7 +754,7 @@ func (x *CreateHardlinkRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateHardlinkRequest.ProtoReflect.Descriptor instead.
 func (*CreateHardlinkRequest) Descriptor() ([]byte, []int) {
-	return file_qbsync_proto_rawDescGZIP(), []int{7}
+	return file_qbsync_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *CreateHardlinkRequest) GetSourcePath() string {
@@ -841,7 +781,7 @@ type CreateHardlinkResponse struct {
 
 func (x *CreateHardlinkResponse) Reset() {
 	*x = CreateHardlinkResponse{}
-	mi := &file_qbsync_proto_msgTypes[8]
+	mi := &file_qbsync_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -853,7 +793,7 @@ func (x *CreateHardlinkResponse) String() string {
 func (*CreateHardlinkResponse) ProtoMessage() {}
 
 func (x *CreateHardlinkResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_qbsync_proto_msgTypes[8]
+	mi := &file_qbsync_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -866,7 +806,7 @@ func (x *CreateHardlinkResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateHardlinkResponse.ProtoReflect.Descriptor instead.
 func (*CreateHardlinkResponse) Descriptor() ([]byte, []int) {
-	return file_qbsync_proto_rawDescGZIP(), []int{8}
+	return file_qbsync_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *CreateHardlinkResponse) GetSuccess() bool {
@@ -893,7 +833,7 @@ type GetFileByInodeRequest struct {
 
 func (x *GetFileByInodeRequest) Reset() {
 	*x = GetFileByInodeRequest{}
-	mi := &file_qbsync_proto_msgTypes[9]
+	mi := &file_qbsync_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -905,7 +845,7 @@ func (x *GetFileByInodeRequest) String() string {
 func (*GetFileByInodeRequest) ProtoMessage() {}
 
 func (x *GetFileByInodeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_qbsync_proto_msgTypes[9]
+	mi := &file_qbsync_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -918,7 +858,7 @@ func (x *GetFileByInodeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetFileByInodeRequest.ProtoReflect.Descriptor instead.
 func (*GetFileByInodeRequest) Descriptor() ([]byte, []int) {
-	return file_qbsync_proto_rawDescGZIP(), []int{9}
+	return file_qbsync_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *GetFileByInodeRequest) GetInode() uint64 {
@@ -940,7 +880,7 @@ type GetFileByInodeResponse struct {
 
 func (x *GetFileByInodeResponse) Reset() {
 	*x = GetFileByInodeResponse{}
-	mi := &file_qbsync_proto_msgTypes[10]
+	mi := &file_qbsync_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -952,7 +892,7 @@ func (x *GetFileByInodeResponse) String() string {
 func (*GetFileByInodeResponse) ProtoMessage() {}
 
 func (x *GetFileByInodeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_qbsync_proto_msgTypes[10]
+	mi := &file_qbsync_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -965,7 +905,7 @@ func (x *GetFileByInodeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetFileByInodeResponse.ProtoReflect.Descriptor instead.
 func (*GetFileByInodeResponse) Descriptor() ([]byte, []int) {
-	return file_qbsync_proto_rawDescGZIP(), []int{10}
+	return file_qbsync_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *GetFileByInodeResponse) GetFound() bool {
@@ -996,7 +936,7 @@ type RegisterFileRequest struct {
 
 func (x *RegisterFileRequest) Reset() {
 	*x = RegisterFileRequest{}
-	mi := &file_qbsync_proto_msgTypes[11]
+	mi := &file_qbsync_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1008,7 +948,7 @@ func (x *RegisterFileRequest) String() string {
 func (*RegisterFileRequest) ProtoMessage() {}
 
 func (x *RegisterFileRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_qbsync_proto_msgTypes[11]
+	mi := &file_qbsync_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1021,7 +961,7 @@ func (x *RegisterFileRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegisterFileRequest.ProtoReflect.Descriptor instead.
 func (*RegisterFileRequest) Descriptor() ([]byte, []int) {
-	return file_qbsync_proto_rawDescGZIP(), []int{11}
+	return file_qbsync_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *RegisterFileRequest) GetInode() uint64 {
@@ -1055,7 +995,7 @@ type RegisterFileResponse struct {
 
 func (x *RegisterFileResponse) Reset() {
 	*x = RegisterFileResponse{}
-	mi := &file_qbsync_proto_msgTypes[12]
+	mi := &file_qbsync_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1067,7 +1007,7 @@ func (x *RegisterFileResponse) String() string {
 func (*RegisterFileResponse) ProtoMessage() {}
 
 func (x *RegisterFileResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_qbsync_proto_msgTypes[12]
+	mi := &file_qbsync_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1080,7 +1020,7 @@ func (x *RegisterFileResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegisterFileResponse.ProtoReflect.Descriptor instead.
 func (*RegisterFileResponse) Descriptor() ([]byte, []int) {
-	return file_qbsync_proto_rawDescGZIP(), []int{12}
+	return file_qbsync_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *RegisterFileResponse) GetSuccess() bool {
@@ -1110,7 +1050,7 @@ type FinalizeTorrentRequest struct {
 
 func (x *FinalizeTorrentRequest) Reset() {
 	*x = FinalizeTorrentRequest{}
-	mi := &file_qbsync_proto_msgTypes[13]
+	mi := &file_qbsync_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1122,7 +1062,7 @@ func (x *FinalizeTorrentRequest) String() string {
 func (*FinalizeTorrentRequest) ProtoMessage() {}
 
 func (x *FinalizeTorrentRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_qbsync_proto_msgTypes[13]
+	mi := &file_qbsync_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1135,7 +1075,7 @@ func (x *FinalizeTorrentRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FinalizeTorrentRequest.ProtoReflect.Descriptor instead.
 func (*FinalizeTorrentRequest) Descriptor() ([]byte, []int) {
-	return file_qbsync_proto_rawDescGZIP(), []int{13}
+	return file_qbsync_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *FinalizeTorrentRequest) GetTorrentHash() string {
@@ -1185,7 +1125,7 @@ type FinalizeTorrentResponse struct {
 
 func (x *FinalizeTorrentResponse) Reset() {
 	*x = FinalizeTorrentResponse{}
-	mi := &file_qbsync_proto_msgTypes[14]
+	mi := &file_qbsync_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1197,7 +1137,7 @@ func (x *FinalizeTorrentResponse) String() string {
 func (*FinalizeTorrentResponse) ProtoMessage() {}
 
 func (x *FinalizeTorrentResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_qbsync_proto_msgTypes[14]
+	mi := &file_qbsync_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1210,7 +1150,7 @@ func (x *FinalizeTorrentResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FinalizeTorrentResponse.ProtoReflect.Descriptor instead.
 func (*FinalizeTorrentResponse) Descriptor() ([]byte, []int) {
-	return file_qbsync_proto_rawDescGZIP(), []int{14}
+	return file_qbsync_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *FinalizeTorrentResponse) GetSuccess() bool {
@@ -1251,7 +1191,7 @@ type AbortTorrentRequest struct {
 
 func (x *AbortTorrentRequest) Reset() {
 	*x = AbortTorrentRequest{}
-	mi := &file_qbsync_proto_msgTypes[15]
+	mi := &file_qbsync_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1263,7 +1203,7 @@ func (x *AbortTorrentRequest) String() string {
 func (*AbortTorrentRequest) ProtoMessage() {}
 
 func (x *AbortTorrentRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_qbsync_proto_msgTypes[15]
+	mi := &file_qbsync_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1276,7 +1216,7 @@ func (x *AbortTorrentRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AbortTorrentRequest.ProtoReflect.Descriptor instead.
 func (*AbortTorrentRequest) Descriptor() ([]byte, []int) {
-	return file_qbsync_proto_rawDescGZIP(), []int{15}
+	return file_qbsync_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *AbortTorrentRequest) GetTorrentHash() string {
@@ -1304,7 +1244,7 @@ type AbortTorrentResponse struct {
 
 func (x *AbortTorrentResponse) Reset() {
 	*x = AbortTorrentResponse{}
-	mi := &file_qbsync_proto_msgTypes[16]
+	mi := &file_qbsync_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1316,7 +1256,7 @@ func (x *AbortTorrentResponse) String() string {
 func (*AbortTorrentResponse) ProtoMessage() {}
 
 func (x *AbortTorrentResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_qbsync_proto_msgTypes[16]
+	mi := &file_qbsync_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1329,7 +1269,7 @@ func (x *AbortTorrentResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AbortTorrentResponse.ProtoReflect.Descriptor instead.
 func (*AbortTorrentResponse) Descriptor() ([]byte, []int) {
-	return file_qbsync_proto_rawDescGZIP(), []int{16}
+	return file_qbsync_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *AbortTorrentResponse) GetSuccess() bool {
@@ -1363,7 +1303,7 @@ type StartTorrentRequest struct {
 
 func (x *StartTorrentRequest) Reset() {
 	*x = StartTorrentRequest{}
-	mi := &file_qbsync_proto_msgTypes[17]
+	mi := &file_qbsync_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1375,7 +1315,7 @@ func (x *StartTorrentRequest) String() string {
 func (*StartTorrentRequest) ProtoMessage() {}
 
 func (x *StartTorrentRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_qbsync_proto_msgTypes[17]
+	mi := &file_qbsync_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1388,7 +1328,7 @@ func (x *StartTorrentRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartTorrentRequest.ProtoReflect.Descriptor instead.
 func (*StartTorrentRequest) Descriptor() ([]byte, []int) {
-	return file_qbsync_proto_rawDescGZIP(), []int{17}
+	return file_qbsync_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *StartTorrentRequest) GetTorrentHash() string {
@@ -1415,7 +1355,7 @@ type StartTorrentResponse struct {
 
 func (x *StartTorrentResponse) Reset() {
 	*x = StartTorrentResponse{}
-	mi := &file_qbsync_proto_msgTypes[18]
+	mi := &file_qbsync_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1427,7 +1367,7 @@ func (x *StartTorrentResponse) String() string {
 func (*StartTorrentResponse) ProtoMessage() {}
 
 func (x *StartTorrentResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_qbsync_proto_msgTypes[18]
+	mi := &file_qbsync_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1440,7 +1380,7 @@ func (x *StartTorrentResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartTorrentResponse.ProtoReflect.Descriptor instead.
 func (*StartTorrentResponse) Descriptor() ([]byte, []int) {
-	return file_qbsync_proto_rawDescGZIP(), []int{18}
+	return file_qbsync_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *StartTorrentResponse) GetSuccess() bool {
@@ -1472,7 +1412,7 @@ type Piece struct {
 
 func (x *Piece) Reset() {
 	*x = Piece{}
-	mi := &file_qbsync_proto_msgTypes[19]
+	mi := &file_qbsync_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1484,7 +1424,7 @@ func (x *Piece) String() string {
 func (*Piece) ProtoMessage() {}
 
 func (x *Piece) ProtoReflect() protoreflect.Message {
-	mi := &file_qbsync_proto_msgTypes[19]
+	mi := &file_qbsync_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1497,7 +1437,7 @@ func (x *Piece) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Piece.ProtoReflect.Descriptor instead.
 func (*Piece) Descriptor() ([]byte, []int) {
-	return file_qbsync_proto_rawDescGZIP(), []int{19}
+	return file_qbsync_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *Piece) GetTorrentHash() string {
@@ -1548,12 +1488,7 @@ const file_qbsync_proto_rawDesc = "" +
 	"\x04size\x18\x04 \x01(\x03R\x04size\x12\x1d\n" +
 	"\n" +
 	"piece_hash\x18\x05 \x01(\tR\tpieceHash\x12\x12\n" +
-	"\x04data\x18\x06 \x01(\fR\x04data\"{\n" +
-	"\x12WritePieceResponse\x12\x18\n" +
-	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\tR\x05error\x125\n" +
-	"\n" +
-	"error_code\x18\x03 \x01(\x0e2\x16.qbsync.PieceErrorCodeR\terrorCode\"\xb5\x01\n" +
+	"\x04data\x18\x06 \x01(\fR\x04data\"\xb5\x01\n" +
 	"\bPieceAck\x12!\n" +
 	"\ftorrent_hash\x18\x01 \x01(\tR\vtorrentHash\x12\x1f\n" +
 	"\vpiece_index\x18\x02 \x01(\x05R\n" +
@@ -1665,10 +1600,8 @@ const file_qbsync_proto_rawDesc = "" +
 	"\x11TorrentSyncStatus\x12\x15\n" +
 	"\x11SYNC_STATUS_READY\x10\x00\x12\x18\n" +
 	"\x14SYNC_STATUS_COMPLETE\x10\x01\x12\x19\n" +
-	"\x15SYNC_STATUS_VERIFYING\x10\x022\xb8\x05\n" +
+	"\x15SYNC_STATUS_VERIFYING\x10\x022\xf3\x04\n" +
 	"\rQBSyncService\x12C\n" +
-	"\n" +
-	"WritePiece\x12\x19.qbsync.WritePieceRequest\x1a\x1a.qbsync.WritePieceResponse\x12C\n" +
 	"\x10StreamPiecesBidi\x12\x19.qbsync.WritePieceRequest\x1a\x10.qbsync.PieceAck(\x010\x01\x12F\n" +
 	"\vInitTorrent\x12\x1a.qbsync.InitTorrentRequest\x1a\x1b.qbsync.InitTorrentResponse\x12O\n" +
 	"\x0eCreateHardlink\x12\x1d.qbsync.CreateHardlinkRequest\x1a\x1e.qbsync.CreateHardlinkResponse\x12O\n" +
@@ -1691,62 +1624,58 @@ func file_qbsync_proto_rawDescGZIP() []byte {
 }
 
 var file_qbsync_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_qbsync_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
+var file_qbsync_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
 var file_qbsync_proto_goTypes = []any{
 	(PieceErrorCode)(0),             // 0: qbsync.PieceErrorCode
 	(FinalizeErrorCode)(0),          // 1: qbsync.FinalizeErrorCode
 	(TorrentSyncStatus)(0),          // 2: qbsync.TorrentSyncStatus
 	(*WritePieceRequest)(nil),       // 3: qbsync.WritePieceRequest
-	(*WritePieceResponse)(nil),      // 4: qbsync.WritePieceResponse
-	(*PieceAck)(nil),                // 5: qbsync.PieceAck
-	(*InitTorrentRequest)(nil),      // 6: qbsync.InitTorrentRequest
-	(*FileInfo)(nil),                // 7: qbsync.FileInfo
-	(*InitTorrentResponse)(nil),     // 8: qbsync.InitTorrentResponse
-	(*HardlinkResult)(nil),          // 9: qbsync.HardlinkResult
-	(*CreateHardlinkRequest)(nil),   // 10: qbsync.CreateHardlinkRequest
-	(*CreateHardlinkResponse)(nil),  // 11: qbsync.CreateHardlinkResponse
-	(*GetFileByInodeRequest)(nil),   // 12: qbsync.GetFileByInodeRequest
-	(*GetFileByInodeResponse)(nil),  // 13: qbsync.GetFileByInodeResponse
-	(*RegisterFileRequest)(nil),     // 14: qbsync.RegisterFileRequest
-	(*RegisterFileResponse)(nil),    // 15: qbsync.RegisterFileResponse
-	(*FinalizeTorrentRequest)(nil),  // 16: qbsync.FinalizeTorrentRequest
-	(*FinalizeTorrentResponse)(nil), // 17: qbsync.FinalizeTorrentResponse
-	(*AbortTorrentRequest)(nil),     // 18: qbsync.AbortTorrentRequest
-	(*AbortTorrentResponse)(nil),    // 19: qbsync.AbortTorrentResponse
-	(*StartTorrentRequest)(nil),     // 20: qbsync.StartTorrentRequest
-	(*StartTorrentResponse)(nil),    // 21: qbsync.StartTorrentResponse
-	(*Piece)(nil),                   // 22: qbsync.Piece
+	(*PieceAck)(nil),                // 4: qbsync.PieceAck
+	(*InitTorrentRequest)(nil),      // 5: qbsync.InitTorrentRequest
+	(*FileInfo)(nil),                // 6: qbsync.FileInfo
+	(*InitTorrentResponse)(nil),     // 7: qbsync.InitTorrentResponse
+	(*HardlinkResult)(nil),          // 8: qbsync.HardlinkResult
+	(*CreateHardlinkRequest)(nil),   // 9: qbsync.CreateHardlinkRequest
+	(*CreateHardlinkResponse)(nil),  // 10: qbsync.CreateHardlinkResponse
+	(*GetFileByInodeRequest)(nil),   // 11: qbsync.GetFileByInodeRequest
+	(*GetFileByInodeResponse)(nil),  // 12: qbsync.GetFileByInodeResponse
+	(*RegisterFileRequest)(nil),     // 13: qbsync.RegisterFileRequest
+	(*RegisterFileResponse)(nil),    // 14: qbsync.RegisterFileResponse
+	(*FinalizeTorrentRequest)(nil),  // 15: qbsync.FinalizeTorrentRequest
+	(*FinalizeTorrentResponse)(nil), // 16: qbsync.FinalizeTorrentResponse
+	(*AbortTorrentRequest)(nil),     // 17: qbsync.AbortTorrentRequest
+	(*AbortTorrentResponse)(nil),    // 18: qbsync.AbortTorrentResponse
+	(*StartTorrentRequest)(nil),     // 19: qbsync.StartTorrentRequest
+	(*StartTorrentResponse)(nil),    // 20: qbsync.StartTorrentResponse
+	(*Piece)(nil),                   // 21: qbsync.Piece
 }
 var file_qbsync_proto_depIdxs = []int32{
-	0,  // 0: qbsync.WritePieceResponse.error_code:type_name -> qbsync.PieceErrorCode
-	0,  // 1: qbsync.PieceAck.error_code:type_name -> qbsync.PieceErrorCode
-	7,  // 2: qbsync.InitTorrentRequest.files:type_name -> qbsync.FileInfo
-	2,  // 3: qbsync.InitTorrentResponse.status:type_name -> qbsync.TorrentSyncStatus
-	9,  // 4: qbsync.InitTorrentResponse.hardlink_results:type_name -> qbsync.HardlinkResult
-	1,  // 5: qbsync.FinalizeTorrentResponse.error_code:type_name -> qbsync.FinalizeErrorCode
-	3,  // 6: qbsync.QBSyncService.WritePiece:input_type -> qbsync.WritePieceRequest
-	3,  // 7: qbsync.QBSyncService.StreamPiecesBidi:input_type -> qbsync.WritePieceRequest
-	6,  // 8: qbsync.QBSyncService.InitTorrent:input_type -> qbsync.InitTorrentRequest
-	10, // 9: qbsync.QBSyncService.CreateHardlink:input_type -> qbsync.CreateHardlinkRequest
-	12, // 10: qbsync.QBSyncService.GetFileByInode:input_type -> qbsync.GetFileByInodeRequest
-	14, // 11: qbsync.QBSyncService.RegisterFile:input_type -> qbsync.RegisterFileRequest
-	16, // 12: qbsync.QBSyncService.FinalizeTorrent:input_type -> qbsync.FinalizeTorrentRequest
-	18, // 13: qbsync.QBSyncService.AbortTorrent:input_type -> qbsync.AbortTorrentRequest
-	20, // 14: qbsync.QBSyncService.StartTorrent:input_type -> qbsync.StartTorrentRequest
-	4,  // 15: qbsync.QBSyncService.WritePiece:output_type -> qbsync.WritePieceResponse
-	5,  // 16: qbsync.QBSyncService.StreamPiecesBidi:output_type -> qbsync.PieceAck
-	8,  // 17: qbsync.QBSyncService.InitTorrent:output_type -> qbsync.InitTorrentResponse
-	11, // 18: qbsync.QBSyncService.CreateHardlink:output_type -> qbsync.CreateHardlinkResponse
-	13, // 19: qbsync.QBSyncService.GetFileByInode:output_type -> qbsync.GetFileByInodeResponse
-	15, // 20: qbsync.QBSyncService.RegisterFile:output_type -> qbsync.RegisterFileResponse
-	17, // 21: qbsync.QBSyncService.FinalizeTorrent:output_type -> qbsync.FinalizeTorrentResponse
-	19, // 22: qbsync.QBSyncService.AbortTorrent:output_type -> qbsync.AbortTorrentResponse
-	21, // 23: qbsync.QBSyncService.StartTorrent:output_type -> qbsync.StartTorrentResponse
-	15, // [15:24] is the sub-list for method output_type
-	6,  // [6:15] is the sub-list for method input_type
-	6,  // [6:6] is the sub-list for extension type_name
-	6,  // [6:6] is the sub-list for extension extendee
-	0,  // [0:6] is the sub-list for field type_name
+	0,  // 0: qbsync.PieceAck.error_code:type_name -> qbsync.PieceErrorCode
+	6,  // 1: qbsync.InitTorrentRequest.files:type_name -> qbsync.FileInfo
+	2,  // 2: qbsync.InitTorrentResponse.status:type_name -> qbsync.TorrentSyncStatus
+	8,  // 3: qbsync.InitTorrentResponse.hardlink_results:type_name -> qbsync.HardlinkResult
+	1,  // 4: qbsync.FinalizeTorrentResponse.error_code:type_name -> qbsync.FinalizeErrorCode
+	3,  // 5: qbsync.QBSyncService.StreamPiecesBidi:input_type -> qbsync.WritePieceRequest
+	5,  // 6: qbsync.QBSyncService.InitTorrent:input_type -> qbsync.InitTorrentRequest
+	9,  // 7: qbsync.QBSyncService.CreateHardlink:input_type -> qbsync.CreateHardlinkRequest
+	11, // 8: qbsync.QBSyncService.GetFileByInode:input_type -> qbsync.GetFileByInodeRequest
+	13, // 9: qbsync.QBSyncService.RegisterFile:input_type -> qbsync.RegisterFileRequest
+	15, // 10: qbsync.QBSyncService.FinalizeTorrent:input_type -> qbsync.FinalizeTorrentRequest
+	17, // 11: qbsync.QBSyncService.AbortTorrent:input_type -> qbsync.AbortTorrentRequest
+	19, // 12: qbsync.QBSyncService.StartTorrent:input_type -> qbsync.StartTorrentRequest
+	4,  // 13: qbsync.QBSyncService.StreamPiecesBidi:output_type -> qbsync.PieceAck
+	7,  // 14: qbsync.QBSyncService.InitTorrent:output_type -> qbsync.InitTorrentResponse
+	10, // 15: qbsync.QBSyncService.CreateHardlink:output_type -> qbsync.CreateHardlinkResponse
+	12, // 16: qbsync.QBSyncService.GetFileByInode:output_type -> qbsync.GetFileByInodeResponse
+	14, // 17: qbsync.QBSyncService.RegisterFile:output_type -> qbsync.RegisterFileResponse
+	16, // 18: qbsync.QBSyncService.FinalizeTorrent:output_type -> qbsync.FinalizeTorrentResponse
+	18, // 19: qbsync.QBSyncService.AbortTorrent:output_type -> qbsync.AbortTorrentResponse
+	20, // 20: qbsync.QBSyncService.StartTorrent:output_type -> qbsync.StartTorrentResponse
+	13, // [13:21] is the sub-list for method output_type
+	5,  // [5:13] is the sub-list for method input_type
+	5,  // [5:5] is the sub-list for extension type_name
+	5,  // [5:5] is the sub-list for extension extendee
+	0,  // [0:5] is the sub-list for field type_name
 }
 
 func init() { file_qbsync_proto_init() }
@@ -1760,7 +1689,7 @@ func file_qbsync_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_qbsync_proto_rawDesc), len(file_qbsync_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   20,
+			NumMessages:   19,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

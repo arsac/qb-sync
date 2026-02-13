@@ -10,7 +10,7 @@ const namespace = "qbsync"
 
 // Label constants for consistent labeling across metrics.
 const (
-	LabelMode       = "mode"       // hot, cold
+	LabelMode       = "mode"       // source, destination
 	LabelResult     = "result"     // success, failure
 	LabelOperation  = "operation"  // GetTorrents, Login, etc.
 	LabelComponent  = "component"  // qb_client, stream_queue
@@ -23,8 +23,8 @@ const (
 
 // Label value constants for consistent usage across the codebase.
 const (
-	ModeHot  = "hot"
-	ModeCold = "cold"
+	ModeSource      = "source"
+	ModeDestination = "destination"
 
 	ResultSuccess        = "success"
 	ResultFailure        = "failure"
@@ -85,21 +85,21 @@ var (
 		[]string{LabelMode},
 	)
 
-	// OrphanCleanupsTotal counts orphaned torrents cleaned up on cold.
+	// OrphanCleanupsTotal counts orphaned torrents cleaned up on destination.
 	OrphanCleanupsTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "orphan_cleanups_total",
-			Help:      "Total orphan torrents cleaned up on cold server",
+			Help:      "Total orphan torrents cleaned up on destination server",
 		},
 	)
 
-	// PiecesSentTotal counts pieces sent from hot server, per gRPC connection.
+	// PiecesSentTotal counts pieces sent from source server, per gRPC connection.
 	PiecesSentTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "pieces_sent_total",
-			Help:      "Total pieces sent from hot server",
+			Help:      "Total pieces sent from source server",
 		},
 		[]string{LabelConnection},
 	)
@@ -122,31 +122,31 @@ var (
 		},
 	)
 
-	// PiecesReceivedTotal counts pieces received on cold server.
+	// PiecesReceivedTotal counts pieces received on destination server.
 	PiecesReceivedTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "pieces_received_total",
-			Help:      "Total pieces received on cold server",
+			Help:      "Total pieces received on destination server",
 		},
 	)
 
-	// BytesSentTotal counts bytes sent from hot server, per gRPC connection.
+	// BytesSentTotal counts bytes sent from source server, per gRPC connection.
 	BytesSentTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "bytes_sent_total",
-			Help:      "Total bytes sent from hot server",
+			Help:      "Total bytes sent from source server",
 		},
 		[]string{LabelConnection},
 	)
 
-	// BytesReceivedTotal counts bytes received on cold server.
+	// BytesReceivedTotal counts bytes received on destination server.
 	BytesReceivedTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "bytes_received_total",
-			Help:      "Total bytes received on cold server",
+			Help:      "Total bytes received on destination server",
 		},
 	)
 
@@ -196,12 +196,12 @@ var (
 		},
 	)
 
-	// HardlinksCreatedTotal counts hardlinks created on cold server.
+	// HardlinksCreatedTotal counts hardlinks created on destination server.
 	HardlinksCreatedTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "hardlinks_created_total",
-			Help:      "Total hardlinks created on cold server",
+			Help:      "Total hardlinks created on destination server",
 		},
 	)
 
@@ -210,7 +210,7 @@ var (
 		prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "piece_hash_mismatch_total",
-			Help:      "Total pieces rejected due to hash mismatch on cold (retried automatically)",
+			Help:      "Total pieces rejected due to hash mismatch on destination (retried automatically)",
 		},
 	)
 
@@ -284,22 +284,22 @@ var (
 		[]string{LabelMode},
 	)
 
-	// HotCleanupGroupsTotal counts groups processed during hot cleanup cycles.
-	HotCleanupGroupsTotal = promauto.NewCounterVec(
+	// SourceCleanupGroupsTotal counts groups processed during source cleanup cycles.
+	SourceCleanupGroupsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: namespace,
-			Name:      "hot_cleanup_groups_total",
-			Help:      "Total groups processed during hot cleanup cycles",
+			Name:      "cleanup_groups_total",
+			Help:      "Total groups processed during source cleanup cycles",
 		},
 		[]string{LabelResult},
 	)
 
-	// HotCleanupTorrentsHandedOffTotal counts torrents handed off from hot to cold.
-	HotCleanupTorrentsHandedOffTotal = promauto.NewCounter(
+	// SourceCleanupTorrentsHandedOffTotal counts torrents handed off from source to destination.
+	SourceCleanupTorrentsHandedOffTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: namespace,
-			Name:      "hot_cleanup_torrents_handed_off_total",
-			Help:      "Total torrents handed off from hot to cold",
+			Name:      "cleanup_torrents_handed_off_total",
+			Help:      "Total torrents handed off from source to destination",
 		},
 	)
 
@@ -322,7 +322,7 @@ var (
 		},
 	)
 
-	// CycleCacheHitsTotal counts times fetchTorrentsCompletedOnCold reused the per-cycle cache.
+	// CycleCacheHitsTotal counts times fetchTorrentsCompletedOnDest reused the per-cycle cache.
 	CycleCacheHitsTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: namespace,
@@ -336,7 +336,7 @@ var (
 		prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "torrent_bytes_synced_total",
-			Help:      "Total bytes synced per torrent from hot to cold",
+			Help:      "Total bytes synced per torrent from source to destination",
 		},
 		[]string{LabelHash, LabelName},
 	)
@@ -361,7 +361,7 @@ var (
 	)
 
 	// SendTimeoutTotal counts times Send() timed out waiting for gRPC stream.Send to complete.
-	// A spike indicates the receiver has stalled (cold stopped consuming / HTTP/2 flow control full).
+	// A spike indicates the receiver has stalled (destination stopped consuming / HTTP/2 flow control full).
 	SendTimeoutTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: namespace,
@@ -434,7 +434,7 @@ var (
 		prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "file_selection_resyncs_total",
-			Help:      "Number of re-syncs triggered by file selection changes on hot",
+			Help:      "Number of re-syncs triggered by file selection changes on source",
 		},
 	)
 
@@ -535,21 +535,21 @@ var (
 		},
 	)
 
-	// TorrentsWithDirtyState tracks torrents with unflushed state on cold.
+	// TorrentsWithDirtyState tracks torrents with unflushed state on destination.
 	TorrentsWithDirtyState = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "torrents_with_dirty_state",
-			Help:      "Torrents with state not yet flushed to disk on cold server",
+			Help:      "Torrents with state not yet flushed to disk on destination server",
 		},
 	)
 
-	// ActiveFinalizationBackoffs tracks torrents in finalization backoff on hot.
+	// ActiveFinalizationBackoffs tracks torrents in finalization backoff on source.
 	ActiveFinalizationBackoffs = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "active_finalization_backoffs",
-			Help:      "Torrents currently in finalization backoff on hot server",
+			Help:      "Torrents currently in finalization backoff on source server",
 		},
 	)
 
@@ -558,7 +558,7 @@ var (
 		prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "oldest_pending_sync_seconds",
-			Help:      "Age in seconds of the oldest torrent waiting to sync from hot to cold",
+			Help:      "Age in seconds of the oldest torrent waiting to sync from source to destination",
 		},
 		[]string{LabelHash, LabelName},
 	)
@@ -573,12 +573,12 @@ var (
 		[]string{LabelHash, LabelName},
 	)
 
-	// TorrentPiecesStreamed tracks the number of pieces synced to cold per tracked torrent.
+	// TorrentPiecesStreamed tracks the number of pieces synced to destination per tracked torrent.
 	TorrentPiecesStreamed = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "torrent_pieces_streamed",
-			Help:      "Number of pieces synced to cold per tracked torrent",
+			Help:      "Number of pieces synced to destination per tracked torrent",
 		},
 		[]string{LabelHash, LabelName},
 	)
@@ -593,16 +593,16 @@ var (
 		[]string{LabelHash, LabelName},
 	)
 
-	// CompletedOnColdCacheSize tracks the size of the completed-on-cold cache on hot.
-	CompletedOnColdCacheSize = promauto.NewGauge(
+	// CompletedOnDestCacheSize tracks the size of the completed-on-destination cache on source.
+	CompletedOnDestCacheSize = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: namespace,
-			Name:      "completed_on_cold_cache_size",
-			Help:      "Number of torrents cached as complete on cold",
+			Name:      "completed_on_dest_cache_size",
+			Help:      "Number of torrents cached as complete on destination",
 		},
 	)
 
-	// InodeRegistrySize tracks the number of registered inodes on cold.
+	// InodeRegistrySize tracks the number of registered inodes on destination.
 	InodeRegistrySize = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: namespace,
@@ -611,48 +611,48 @@ var (
 		},
 	)
 
-	// ColdWorkerQueueDepth tracks pieces waiting for a worker on cold.
-	ColdWorkerQueueDepth = promauto.NewGauge(
+	// DestWorkerQueueDepth tracks pieces waiting for a worker on destination.
+	DestWorkerQueueDepth = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: namespace,
-			Name:      "cold_worker_queue_depth",
-			Help:      "Pieces queued waiting for a cold server write worker",
+			Name:      "write_worker_queue_depth",
+			Help:      "Pieces queued waiting for a destination server write worker",
 		},
 	)
 
-	// ColdWorkersBusy tracks the number of cold workers currently writing.
-	ColdWorkersBusy = promauto.NewGauge(
+	// DestWorkersBusy tracks the number of destination workers currently writing.
+	DestWorkersBusy = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: namespace,
-			Name:      "cold_workers_busy",
-			Help:      "Number of cold server write workers currently processing a piece",
+			Name:      "write_workers_busy",
+			Help:      "Number of destination server write workers currently processing a piece",
 		},
 	)
 
-	// Draining tracks whether the hot server is currently draining (1=draining, 0=normal).
+	// Draining tracks whether the source server is currently draining (1=draining, 0=normal).
 	Draining = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "draining",
-			Help:      "Whether the hot server is draining synced torrents on shutdown (1=draining, 0=normal)",
+			Help:      "Whether the source server is draining synced torrents on shutdown (1=draining, 0=normal)",
 		},
 	)
 
-	// GRPCConnectionsConfigured tracks the maximum configured TCP connections to the cold server.
+	// GRPCConnectionsConfigured tracks the maximum configured TCP connections to the destination server.
 	GRPCConnectionsConfigured = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "grpc_connections_configured",
-			Help:      "Maximum TCP connections configured for gRPC streaming to cold server",
+			Help:      "Maximum TCP connections configured for gRPC streaming to destination server",
 		},
 	)
 
-	// GRPCConnectionsActive tracks the current number of active TCP connections to the cold server.
+	// GRPCConnectionsActive tracks the current number of active TCP connections to the destination server.
 	GRPCConnectionsActive = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "grpc_connections_active",
-			Help:      "Current number of active TCP connections to cold server",
+			Help:      "Current number of active TCP connections to destination server",
 		},
 	)
 
@@ -679,22 +679,22 @@ var (
 		[]string{LabelConnection},
 	)
 
-	// PieceReadDuration tracks the time to read a piece from disk on hot.
+	// PieceReadDuration tracks the time to read a piece from disk on source.
 	PieceReadDuration = promauto.NewHistogram(
 		prometheus.HistogramOpts{
 			Namespace: namespace,
 			Name:      "piece_read_duration_seconds",
-			Help:      "Time to read a piece from disk on hot server",
+			Help:      "Time to read a piece from disk on source server",
 			Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5},
 		},
 	)
 
-	// PieceWriteDuration tracks the time to write a piece on cold (hash verify + disk write).
+	// PieceWriteDuration tracks the time to write a piece on destination (hash verify + disk write).
 	PieceWriteDuration = promauto.NewHistogram(
 		prometheus.HistogramOpts{
 			Namespace: namespace,
 			Name:      "piece_write_duration_seconds",
-			Help:      "Time to verify and write a piece on cold server",
+			Help:      "Time to verify and write a piece on destination server",
 			Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5},
 		},
 	)
@@ -731,7 +731,7 @@ var (
 		[]string{LabelMode, LabelOperation},
 	)
 
-	// StateFlushDuration tracks the time to flush dirty state to disk on cold.
+	// StateFlushDuration tracks the time to flush dirty state to disk on destination.
 	StateFlushDuration = promauto.NewHistogram(
 		prometheus.HistogramOpts{
 			Namespace: namespace,
@@ -741,12 +741,12 @@ var (
 		},
 	)
 
-	// TorrentSyncLatencySeconds tracks end-to-end sync duration from download completion to cold finalization.
+	// TorrentSyncLatencySeconds tracks end-to-end sync duration from download completion to destination finalization.
 	TorrentSyncLatencySeconds = promauto.NewHistogram(
 		prometheus.HistogramOpts{
 			Namespace: namespace,
 			Name:      "torrent_sync_latency_seconds",
-			Help:      "End-to-end sync duration from download completion on hot to finalization on cold",
+			Help:      "End-to-end sync duration from download completion on source to finalization on destination",
 			Buckets:   []float64{10, 30, 60, 120, 300, 600, 1800, 3600, 7200},
 		},
 	)

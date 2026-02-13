@@ -24,7 +24,7 @@ import (
 var _ streaming.PieceSource = (*Source)(nil)
 
 // fileHandleCache caches open file handles per torrent to avoid repeated
-// open/close syscalls on the hot read path. [os.File.ReadAt] maps to pread(2)
+// open/close syscalls on the source read path. [os.File.ReadAt] maps to pread(2)
 // which is safe for concurrent use on the same fd.
 type fileHandleCache struct {
 	mu     sync.Mutex
@@ -480,7 +480,7 @@ func (s *Source) readPieceMultiFile(
 	// Boundary piece overlapping a deselected file.
 	// Zero-fill deselected regions — the file doesn't exist on disk because
 	// qBittorrent doesn't create files with priority 0.
-	// Cold's writePieceData skips deselected files, so only the selected
+	// Destination's writePieceData skips deselected files, so only the selected
 	// file data (which IS correct here) gets written.
 	data := make([]byte, size) // zero-initialized
 	remaining := size

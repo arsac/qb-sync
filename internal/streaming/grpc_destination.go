@@ -37,7 +37,7 @@ const (
 
 	// finalizeConnTimeout is how long FinalizeTorrent waits for the gRPC
 	// connection to become READY before giving up. This prevents fail-fast
-	// behavior on unary RPCs when the cold server was recently restarted.
+	// behavior on unary RPCs when the destination server was recently restarted.
 	finalizeConnTimeout = 20 * time.Second
 
 	// maxReconnectBackoff caps gRPC's exponential reconnection backoff.
@@ -63,16 +63,16 @@ const (
 )
 
 var (
-	// ErrFinalizeVerifying is returned by FinalizeTorrent when the cold server is
+	// ErrFinalizeVerifying is returned by FinalizeTorrent when the destination server is
 	// still verifying pieces in the background. The caller should retry later
 	// without counting this as a failure.
-	ErrFinalizeVerifying = errors.New("finalization in progress: cold server is verifying pieces")
+	ErrFinalizeVerifying = errors.New("finalization in progress: destination server is verifying pieces")
 
-	// ErrFinalizeIncomplete is returned by FinalizeTorrent when cold reports that
-	// not all pieces are written. This typically happens after a cold restart where
-	// the persisted state is stale. The caller should re-sync with cold to discover
+	// ErrFinalizeIncomplete is returned by FinalizeTorrent when destination reports that
+	// not all pieces are written. This typically happens after a destination restart where
+	// the persisted state is stale. The caller should re-sync with destination to discover
 	// which pieces are actually missing and re-stream them.
-	ErrFinalizeIncomplete = errors.New("finalization failed: incomplete pieces on cold")
+	ErrFinalizeIncomplete = errors.New("finalization failed: incomplete pieces on destination")
 )
 
 // successResponse is implemented by gRPC response types that have Success/Error fields.
@@ -89,10 +89,7 @@ func checkRPCResponse(resp successResponse, operation string) error {
 	return nil
 }
 
-var (
-	_ PieceDestination    = (*GRPCDestination)(nil)
-	_ HardlinkDestination = (*GRPCDestination)(nil)
-)
+var _ HardlinkDestination = (*GRPCDestination)(nil)
 
 // GRPCDestination sends pieces to a remote gRPC server.
 // It provides PieceDestination-like functionality plus additional features
@@ -199,7 +196,7 @@ func (d *GRPCDestination) streamConnIdx() int {
 	return int(idx % uint32(n))
 }
 
-// ValidateConnection checks that the cold server is reachable on all
+// ValidateConnection checks that the destination server is reachable on all
 // connections using the standard gRPC health check protocol (grpc.health.v1.Health).
 func (d *GRPCDestination) ValidateConnection(ctx context.Context) error {
 	d.mu.RLock()
@@ -211,7 +208,7 @@ func (d *GRPCDestination) ValidateConnection(ctx context.Context) error {
 		healthClient := healthpb.NewHealthClient(conn)
 		_, err := healthClient.Check(ctx, &healthpb.HealthCheckRequest{})
 		if err != nil {
-			return fmt.Errorf("cold server not reachable (conn %d): %w", i, err)
+			return fmt.Errorf("destination server not reachable (conn %d): %w", i, err)
 		}
 	}
 	return nil
@@ -298,12 +295,12 @@ func (d *GRPCDestination) IsInitialized(hash string) bool {
 	return ok
 }
 
-// CheckTorrentStatus queries the cold server for a torrent's current sync status.
+// CheckTorrentStatus queries the destination server for a torrent's current sync status.
 // Unlike InitTorrent, this does NOT cache results and does NOT require full torrent info.
-// Use this for status checking (is torrent complete/verifying/ready on cold?).
+// Use this for status checking (is torrent complete/verifying/ready on destination?).
 // For full initialization with file tracking and hardlink detection, use InitTorrent.
 //
-// Note: This sends a minimal request with just the hash. Cold server will check:
+// Note: This sends a minimal request with just the hash. Destination server will check:
 // 1. qBittorrent status (returns COMPLETE/VERIFYING if found).
 // 2. Existing tracking state (returns READY with pieces_needed if found).
 // 3. If neither, returns READY with empty state (caller should do full InitTorrent).
@@ -323,15 +320,6 @@ func (d *GRPCDestination) CheckTorrentStatus(ctx context.Context, hash string) (
 
 	// Return result WITHOUT caching - BidiQueue should still do full InitTorrent
 	return initTorrentResultFromProto(resp), nil
-}
-
-// WritePiece sends a piece to the remote server (unary, for simple cases).
-func (d *GRPCDestination) WritePiece(ctx context.Context, req *pb.WritePieceRequest) error {
-	resp, err := d.client().WritePiece(ctx, req)
-	if err != nil {
-		return fmt.Errorf("write piece RPC failed: %w", err)
-	}
-	return checkRPCResponse(resp, "write piece")
 }
 
 // OpenStream opens a bidirectional stream for high-throughput piece transfer.
@@ -409,18 +397,18 @@ func (d *GRPCDestination) RegisterFile(ctx context.Context, inode uint64, path s
 	return checkRPCResponse(resp, "register file")
 }
 
-// FinalizeTorrent requests the cold server to finalize a torrent:
+// FinalizeTorrent requests the destination server to finalize a torrent:
 // rename .partial files, add to qBittorrent, verify, and confirm.
 // On success, clears the cached init result to prevent memory leaks.
 //
-// Returns ErrFinalizeVerifying if the cold server is still verifying pieces
+// Returns ErrFinalizeVerifying if the destination server is still verifying pieces
 // in the background. The caller should retry later without penalty.
 func (d *GRPCDestination) FinalizeTorrent(
 	ctx context.Context,
 	hash, savePath, category, tags, saveSubPath string,
 ) error {
 	// Use WaitForReady so the RPC waits for the connection to recover
-	// after a cold server restart instead of failing fast with "connection refused".
+	// after a destination server restart instead of failing fast with "connection refused".
 	// The per-call timeout prevents blocking the orchestrator loop indefinitely.
 	callCtx, cancel := context.WithTimeout(ctx, finalizeConnTimeout)
 	defer cancel()
@@ -436,8 +424,8 @@ func (d *GRPCDestination) FinalizeTorrent(
 		return fmt.Errorf("finalize torrent RPC failed: %w", err)
 	}
 	if respErr := checkRPCResponse(resp, "finalize"); respErr != nil {
-		// Detect incomplete-pieces error from cold — this means cold's written
-		// state diverged from hot's streamed state (typically after cold restart
+		// Detect incomplete-pieces error from destination — this means destination's written
+		// state diverged from source's streamed state (typically after destination restart
 		// where flushed state was stale). Return a sentinel so the orchestrator
 		// can re-sync instead of endlessly retrying.
 		if resp.GetErrorCode() == pb.FinalizeErrorCode_FINALIZE_ERROR_INCOMPLETE {
@@ -446,7 +434,7 @@ func (d *GRPCDestination) FinalizeTorrent(
 		return respErr
 	}
 
-	// Cold returns state="verifying" when background verification is still running.
+	// Destination returns state="verifying" when background verification is still running.
 	// Return a sentinel error so the orchestrator can retry without penalty.
 	if resp.GetState() == "verifying" {
 		return ErrFinalizeVerifying
@@ -456,9 +444,9 @@ func (d *GRPCDestination) FinalizeTorrent(
 	return nil
 }
 
-// AbortTorrent requests the cold server to abort an in-progress torrent
+// AbortTorrent requests the destination server to abort an in-progress torrent
 // and optionally delete partial files. Called when a torrent is removed
-// from hot before streaming completes.
+// from source before streaming completes.
 func (d *GRPCDestination) AbortTorrent(ctx context.Context, hash string, deleteFiles bool) (int32, error) {
 	// Always clear init results - the server removes tracking regardless of deletion success,
 	// and if RPC fails the torrent needs re-initialization anyway
@@ -478,9 +466,9 @@ func (d *GRPCDestination) AbortTorrent(ctx context.Context, hash string, deleteF
 	return resp.GetFilesDeleted(), nil
 }
 
-// StartTorrent resumes a stopped torrent on the cold server.
-// Called during disk pressure cleanup after hot stops seeding,
-// to ensure cold takes over before hot deletes.
+// StartTorrent resumes a stopped torrent on the destination server.
+// Called during disk pressure cleanup after source stops seeding,
+// to ensure destination takes over before source deletes.
 func (d *GRPCDestination) StartTorrent(ctx context.Context, hash, tag string) error {
 	resp, err := d.client().StartTorrent(ctx, &pb.StartTorrentRequest{
 		TorrentHash: hash,
@@ -493,7 +481,7 @@ func (d *GRPCDestination) StartTorrent(ctx context.Context, hash, tag string) er
 }
 
 // ClearInitResult removes a cached init result for a torrent hash.
-// Use this when a piece ack indicates the torrent is not initialized on cold,
+// Use this when a piece ack indicates the torrent is not initialized on destination,
 // so the next send triggers re-initialization.
 func (d *GRPCDestination) ClearInitResult(hash string) {
 	d.mu.Lock()
@@ -502,7 +490,7 @@ func (d *GRPCDestination) ClearInitResult(hash string) {
 }
 
 // ClearInitCache removes all cached init results.
-// Call this when the gRPC connection resets (e.g. cold server restart) so
+// Call this when the gRPC connection resets (e.g. destination server restart) so
 // torrents get re-initialized on the new server instance.
 func (d *GRPCDestination) ClearInitCache() {
 	d.mu.Lock()
@@ -576,8 +564,13 @@ func (d *GRPCDestination) MaxConnections() int {
 // Close closes all gRPC connections. Safe for repeated calls.
 func (d *GRPCDestination) Close() error {
 	d.closeOnce.Do(func() {
+		d.mu.Lock()
+		conns := make([]*grpc.ClientConn, len(d.conns))
+		copy(conns, d.conns)
+		d.mu.Unlock()
+
 		var errs []error
-		for _, conn := range d.conns {
+		for _, conn := range conns {
 			if err := conn.Close(); err != nil {
 				errs = append(errs, err)
 			}

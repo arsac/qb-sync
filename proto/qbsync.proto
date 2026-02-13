@@ -4,13 +4,10 @@ package qbsync;
 
 option go_package = "github.com/arsac/qb-sync/proto";
 
-// QBSyncService handles torrent synchronization between hot and cold storage.
-// Cold qBittorrent is the single source of truth for sync status.
+// QBSyncService handles torrent synchronization between source and destination.
+// Destination qBittorrent is the single source of truth for sync status.
 // InitTorrent determines what needs syncing by checking qB, active syncs, and filesystem.
 service QBSyncService {
-  // WritePiece sends a single piece to the receiver (for simple cases).
-  rpc WritePiece(WritePieceRequest) returns (WritePieceResponse);
-
   // StreamPiecesBidi provides full-duplex streaming for maximum throughput.
   // Client streams pieces, server streams back acknowledgments as pieces are written.
   // This allows immediate retry on failure without waiting for batch completion.
@@ -18,7 +15,7 @@ service QBSyncService {
 
   // InitTorrent initializes or resumes a torrent sync.
   // This is the primary entry point - it checks:
-  // 1. If torrent is already complete in cold qBittorrent -> COMPLETE
+  // 1. If torrent is already complete in destination qBittorrent -> COMPLETE
   // 2. If sync is in progress -> returns remaining pieces_needed
   // 3. If files exist on disk -> triggers qB verification, returns verified pieces
   // 4. Fresh torrent -> all pieces needed
@@ -41,21 +38,21 @@ service QBSyncService {
   rpc FinalizeTorrent(FinalizeTorrentRequest) returns (FinalizeTorrentResponse);
 
   // AbortTorrent aborts an in-progress torrent transfer and cleans up partial files.
-  // Called when a torrent is removed from hot before streaming completes.
+  // Called when a torrent is removed from source before streaming completes.
   rpc AbortTorrent(AbortTorrentRequest) returns (AbortTorrentResponse);
 
-  // StartTorrent resumes a stopped torrent on cold qBittorrent.
-  // Called by hot during disk pressure cleanup after stopping the torrent on hot,
-  // ensuring cold takes over seeding before hot deletes the torrent.
+  // StartTorrent resumes a stopped torrent on destination qBittorrent.
+  // Called by source during disk pressure cleanup after stopping the torrent on source,
+  // ensuring destination takes over seeding before source deletes the torrent.
   rpc StartTorrent(StartTorrentRequest) returns (StartTorrentResponse);
 }
 
 // PieceErrorCode categorizes piece-level failures for retry decisions.
 enum PieceErrorCode {
-  PIECE_ERROR_NONE = 0;            // Default / unknown (backward-compatible with old cold)
+  PIECE_ERROR_NONE = 0;            // Default / unknown (backward-compatible with old destination)
   PIECE_ERROR_IO = 1;              // Disk I/O, permission, disk full
   PIECE_ERROR_HASH_MISMATCH = 2;   // SHA1 verification failed
-  PIECE_ERROR_NOT_INITIALIZED = 3; // Torrent not tracked on cold
+  PIECE_ERROR_NOT_INITIALIZED = 3; // Torrent not tracked on destination
   PIECE_ERROR_FINALIZING = 4;      // Torrent is being finalized
 }
 
@@ -72,12 +69,6 @@ message WritePieceRequest {
   int64 size = 4;
   string piece_hash = 5;  // SHA1 hash for verification
   bytes data = 6;
-}
-
-message WritePieceResponse {
-  bool success = 1;
-  string error = 2;
-  PieceErrorCode error_code = 3;
 }
 
 // PieceAck is sent by the receiver for each piece in bidirectional streaming.
@@ -110,18 +101,18 @@ message FileInfo {
   bool selected = 5; // True if file is selected for download (priority > 0)
 }
 
-// TorrentSyncStatus indicates the current state of a torrent on cold.
+// TorrentSyncStatus indicates the current state of a torrent on destination.
 enum TorrentSyncStatus {
   // READY: Torrent initialized, stream pieces where pieces_needed[i] is true.
   // If all pieces_needed are false, just call FinalizeTorrent.
   SYNC_STATUS_READY = 0;
 
-  // COMPLETE: Torrent already exists in cold qBittorrent and is verified.
-  // No action needed - hot can delete this torrent if space is needed.
+  // COMPLETE: Torrent already exists in destination qBittorrent and is verified.
+  // No action needed - source can delete this torrent if space is needed.
   SYNC_STATUS_COMPLETE = 1;
 
   // VERIFYING: Files exist on disk, qBittorrent recheck is in progress.
-  // Hot should wait and retry InitTorrent after a delay.
+  // Source should wait and retry InitTorrent after a delay.
   SYNC_STATUS_VERIFYING = 2;
 }
 
@@ -129,7 +120,7 @@ message InitTorrentResponse {
   bool success = 1;
   string error = 2;
 
-  // Status indicates what action hot should take
+  // Status indicates what action source should take
   TorrentSyncStatus status = 3;
 
   // pieces_needed[i] = true means piece i needs to be streamed.
@@ -234,7 +225,7 @@ message StartTorrentResponse {
 }
 
 // Piece is a lightweight reference to a piece (no data).
-// Used for internal signaling/queueing between hot components.
+// Used for internal signaling/queueing between source components.
 message Piece {
   string torrent_hash = 1;
   int32 index = 2;

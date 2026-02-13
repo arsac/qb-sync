@@ -67,11 +67,11 @@ type ResilientClient struct {
 	logger   *slog.Logger
 	executor failsafe.Executor[any]
 	cb       circuitbreaker.CircuitBreaker[any] // nil if CB disabled; for state inspection
-	mode     string                             // metrics label: "hot" or "cold"
+	mode     string                             // metrics label: "source" or "destination"
 }
 
 // NewResilientClient creates a new resilient qBittorrent client.
-// mode is the metrics label identifying the caller ("hot" or "cold").
+// mode is the metrics label identifying the caller ("source" or "destination").
 func NewResilientClient(
 	client *qbittorrent.Client,
 	config Config,

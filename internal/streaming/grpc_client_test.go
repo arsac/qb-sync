@@ -154,7 +154,7 @@ func TestSend_AfterCloseSendReturnsError(t *testing.T) {
 // stream error and exits, it cancels the stream context, which unblocks a
 // concurrent Send stuck on HTTP/2 flow control.
 //
-// This reproduces the production deadlock: cold stops consuming → HTTP/2 flow
+// This reproduces the production deadlock: destination stops consuming → HTTP/2 flow
 // control fills → Send blocks. The fix: receiveAcks detects stream death,
 // cancels the per-stream context, gRPC resets the stream, Send unblocks.
 //
@@ -249,7 +249,7 @@ func TestReceiveAcks_AckChannelBlockedTimeout(t *testing.T) {
 // when receiveAcks is also stuck and can't call ps.cancel().
 //
 // This covers the deadlock scenario where both paths are stuck:
-// - Send() blocked on HTTP/2 flow control (cold not consuming)
+// - Send() blocked on HTTP/2 flow control (destination not consuming)
 // - receiveAcks() blocked on ack channel write (forwardAcks slow)
 // The send timeout is the independent safety net that breaks the cycle.
 func TestSend_TimeoutCancelsStream(t *testing.T) {
