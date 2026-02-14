@@ -531,9 +531,9 @@ func (s *Server) flushWrittenState(ctx context.Context, hash string, state *serv
 			"hash", hash,
 			"error", saveErr,
 		)
-	} else {
-		state.flushGen++
+		return
 	}
+	state.flushGen++
 }
 
 // registerFinalizedInodes registers inodes for files we wrote (not hardlinked)

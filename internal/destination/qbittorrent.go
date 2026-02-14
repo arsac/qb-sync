@@ -213,16 +213,16 @@ func (s *Server) waitForTorrentReady(ctx context.Context, hash string) (qbittorr
 		}
 
 		// Torrent is ready - must be in a seeding/upload state with 100% progress
-		isReady := isReadyState(torrent.State)
-		if isReady {
-			s.logger.InfoContext(pollCtx, "torrent verified and ready",
-				"hash", hash,
-				"progress", torrent.Progress,
-				"state", torrent.State,
-			)
+		if !isReadyState(torrent.State) {
+			return false, nil
 		}
 
-		return isReady, nil
+		s.logger.InfoContext(pollCtx, "torrent verified and ready",
+			"hash", hash,
+			"progress", torrent.Progress,
+			"state", torrent.State,
+		)
+		return true, nil
 	}, interval, timeout)
 
 	return finalState, waitErr
