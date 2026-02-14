@@ -2139,13 +2139,13 @@ func TestFetchTorrentsCompletedOnDest_ExcludeCleanupTag(t *testing.T) {
 	t.Run("excludes torrents with the cleanup tag", func(t *testing.T) {
 		mockClient := &mockQBClient{
 			getTorrentsResult: []qbittorrent.Torrent{
-				{Hash: "hash1", Tags: "keep-on-hot", Size: 100},
+				{Hash: "hash1", Tags: "keep-on-source", Size: 100},
 				{Hash: "hash2", Tags: "other", Size: 200},
-				{Hash: "hash3", Tags: "foo, keep-on-hot, bar", Size: 300},
+				{Hash: "hash3", Tags: "foo, keep-on-source, bar", Size: 300},
 			},
 		}
 		task := &QBTask{
-			cfg:             &config.SourceConfig{ExcludeCleanupTag: "keep-on-hot"},
+			cfg:             &config.SourceConfig{ExcludeCleanupTag: "keep-on-source"},
 			logger:          logger,
 			srcClient:       mockClient,
 			completedOnDest: map[string]string{"hash1": "", "hash2": "", "hash3": ""},
@@ -2167,7 +2167,7 @@ func TestFetchTorrentsCompletedOnDest_ExcludeCleanupTag(t *testing.T) {
 	t.Run("returns all when ExcludeCleanupTag is empty", func(t *testing.T) {
 		mockClient := &mockQBClient{
 			getTorrentsResult: []qbittorrent.Torrent{
-				{Hash: "hash1", Tags: "keep-on-hot", Size: 100},
+				{Hash: "hash1", Tags: "keep-on-source", Size: 100},
 				{Hash: "hash2", Tags: "other", Size: 200},
 			},
 		}
@@ -2191,12 +2191,12 @@ func TestFetchTorrentsCompletedOnDest_ExcludeCleanupTag(t *testing.T) {
 	t.Run("drain overrides exclusion tag", func(t *testing.T) {
 		mockClient := &mockQBClient{
 			getTorrentsResult: []qbittorrent.Torrent{
-				{Hash: "hash1", Tags: "keep-on-hot", Size: 100},
+				{Hash: "hash1", Tags: "keep-on-source", Size: 100},
 				{Hash: "hash2", Tags: "other", Size: 200},
 			},
 		}
 		task := &QBTask{
-			cfg:             &config.SourceConfig{ExcludeCleanupTag: "keep-on-hot"},
+			cfg:             &config.SourceConfig{ExcludeCleanupTag: "keep-on-source"},
 			logger:          logger,
 			srcClient:       mockClient,
 			completedOnDest: map[string]string{"hash1": "", "hash2": ""},
@@ -2456,6 +2456,240 @@ func TestLoadCompletedCache(t *testing.T) {
 
 		if len(task.completedOnDest) != 0 {
 			t.Errorf("expected 0 entries for corrupt cache, got %d", len(task.completedOnDest))
+		}
+	})
+}
+
+func TestSyncFailedTag(t *testing.T) {
+	logger := testLogger(t)
+
+	t.Run("markSyncFailed applies tag and untracks torrent", func(t *testing.T) {
+		mockClient := &mockQBClient{}
+		tracker := streaming.NewPieceMonitor(
+			nil,
+			&mockPieceSource{numPieces: 10},
+			logger,
+			streaming.DefaultPieceMonitorConfig(),
+		)
+		dest := &mockDest{}
+		task := &QBTask{
+			cfg:              &config.SourceConfig{SyncFailedTag: "sync-failed"},
+			logger:           logger,
+			srcClient:        mockClient,
+			grpcDest:         dest,
+			source:           qbclient.NewSource(nil, ""),
+			tracker:          tracker,
+			trackedTorrents:  make(map[string]trackedTorrent),
+			finalizeBackoffs: make(map[string]*finalizeBackoff),
+		}
+
+		hash := "fail-hash"
+		task.trackedMu.Lock()
+		task.trackedTorrents[hash] = trackedTorrent{name: "test"}
+		task.trackedMu.Unlock()
+		task.recordFinalizeFailure(hash)
+
+		task.markSyncFailed(context.Background(), hash)
+
+		// Tag should be applied
+		if !mockClient.addTagsCalled {
+			t.Error("expected AddTagsCtx to be called")
+		}
+		if mockClient.addTagsTag != "sync-failed" {
+			t.Errorf("expected tag 'sync-failed', got %q", mockClient.addTagsTag)
+		}
+		if len(mockClient.addTagsHashes) != 1 || mockClient.addTagsHashes[0] != hash {
+			t.Errorf("expected hash %q, got %v", hash, mockClient.addTagsHashes)
+		}
+
+		// Torrent should be untracked
+		task.trackedMu.RLock()
+		_, tracked := task.trackedTorrents[hash]
+		task.trackedMu.RUnlock()
+		if tracked {
+			t.Error("torrent should be removed from trackedTorrents")
+		}
+
+		// Backoff should be cleared
+		task.backoffMu.Lock()
+		_, hasBackoff := task.finalizeBackoffs[hash]
+		task.backoffMu.Unlock()
+		if hasBackoff {
+			t.Error("backoff should be cleared after marking sync-failed")
+		}
+
+		// Dest init cache should be cleared
+		if !dest.clearInitCalled {
+			t.Error("expected ClearInitResult to be called")
+		}
+	})
+
+	t.Run("markSyncFailed skips tag when SyncFailedTag is empty", func(t *testing.T) {
+		mockClient := &mockQBClient{}
+		task := &QBTask{
+			cfg:       &config.SourceConfig{SyncFailedTag: ""},
+			logger:    logger,
+			srcClient: mockClient,
+			grpcDest:  &mockDest{},
+			source:    qbclient.NewSource(nil, ""),
+			tracker: streaming.NewPieceMonitor(
+				nil,
+				&mockPieceSource{numPieces: 1},
+				logger,
+				streaming.DefaultPieceMonitorConfig(),
+			),
+			trackedTorrents:  make(map[string]trackedTorrent),
+			finalizeBackoffs: make(map[string]*finalizeBackoff),
+		}
+
+		task.markSyncFailed(context.Background(), "hash")
+
+		if mockClient.addTagsCalled {
+			t.Error("should not call AddTagsCtx when SyncFailedTag is empty")
+		}
+	})
+
+	t.Run("trackNewTorrents skips torrents with sync-failed tag", func(t *testing.T) {
+		const numPieces = 10
+
+		mockSource := &mockPieceSource{numPieces: numPieces}
+		tracker := streaming.NewPieceMonitor(nil, mockSource, logger, streaming.DefaultPieceMonitorConfig())
+
+		makePiecesNeeded := func() []bool {
+			needed := make([]bool, numPieces)
+			for i := range needed {
+				needed[i] = true
+			}
+			return needed
+		}
+
+		dest := &mockDest{
+			checkStatusResults: map[string]*streaming.InitTorrentResult{
+				// Only "good-hash" should reach here
+				"good-hash": {Status: pb.TorrentSyncStatus_SYNC_STATUS_READY, PiecesNeeded: makePiecesNeeded()},
+			},
+		}
+
+		mockClient := &mockQBClient{
+			getTorrentsResult: []qbittorrent.Torrent{
+				{Hash: "good-hash", Name: "good", State: qbittorrent.TorrentStateUploading, Progress: 1.0},
+				{
+					Hash:     "failed-hash",
+					Name:     "failed",
+					State:    qbittorrent.TorrentStateUploading,
+					Progress: 1.0,
+					Tags:     "sync-failed",
+				},
+				{
+					Hash:     "multi-tag",
+					Name:     "multi",
+					State:    qbittorrent.TorrentStateUploading,
+					Progress: 1.0,
+					Tags:     "other,sync-failed,more",
+				},
+			},
+		}
+
+		tmpDir := t.TempDir()
+		task := &QBTask{
+			cfg:                &config.SourceConfig{SyncFailedTag: "sync-failed"},
+			logger:             logger,
+			srcClient:          mockClient,
+			grpcDest:           dest,
+			tracker:            tracker,
+			trackedTorrents:    make(map[string]trackedTorrent),
+			completedOnDest:    make(map[string]string),
+			completedCachePath: filepath.Join(tmpDir, "cache.json"),
+			finalizeBackoffs:   make(map[string]*finalizeBackoff),
+		}
+
+		var trackOrder []string
+		task.trackingOrderHook = func(hash string) {
+			trackOrder = append(trackOrder, hash)
+		}
+
+		err := task.trackNewTorrents(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// Only "good-hash" should be tracked
+		if len(trackOrder) != 1 || trackOrder[0] != "good-hash" {
+			t.Errorf("expected only good-hash tracked, got %v", trackOrder)
+		}
+	})
+
+	t.Run("removing sync-failed tag allows re-tracking", func(t *testing.T) {
+		const numPieces = 10
+
+		mockSource := &mockPieceSource{numPieces: numPieces}
+		tracker := streaming.NewPieceMonitor(nil, mockSource, logger, streaming.DefaultPieceMonitorConfig())
+
+		dest := &mockDest{
+			checkStatusResults: map[string]*streaming.InitTorrentResult{
+				"hash1": {Status: pb.TorrentSyncStatus_SYNC_STATUS_READY, PiecesNeeded: make([]bool, numPieces)},
+			},
+		}
+
+		mockClient := &mockQBClient{
+			getTorrentsResult: []qbittorrent.Torrent{
+				{
+					Hash:     "hash1",
+					Name:     "test",
+					State:    qbittorrent.TorrentStateUploading,
+					Progress: 1.0,
+					Tags:     "sync-failed",
+				},
+			},
+		}
+
+		tmpDir := t.TempDir()
+		task := &QBTask{
+			cfg:                &config.SourceConfig{SyncFailedTag: "sync-failed"},
+			logger:             logger,
+			srcClient:          mockClient,
+			grpcDest:           dest,
+			tracker:            tracker,
+			trackedTorrents:    make(map[string]trackedTorrent),
+			completedOnDest:    make(map[string]string),
+			completedCachePath: filepath.Join(tmpDir, "cache.json"),
+			finalizeBackoffs:   make(map[string]*finalizeBackoff),
+		}
+
+		var trackOrder []string
+		task.trackingOrderHook = func(hash string) {
+			trackOrder = append(trackOrder, hash)
+		}
+
+		// First scan: torrent has sync-failed tag — should be skipped
+		_ = task.trackNewTorrents(context.Background())
+		if len(trackOrder) != 0 {
+			t.Fatalf("expected no torrents tracked with sync-failed tag, got %v", trackOrder)
+		}
+
+		// Simulate user removing the tag
+		mockClient.getTorrentsResult[0].Tags = ""
+
+		// Second scan: tag removed — should now be tracked
+		_ = task.trackNewTorrents(context.Background())
+		if len(trackOrder) != 1 || trackOrder[0] != "hash1" {
+			t.Errorf("expected hash1 tracked after tag removal, got %v", trackOrder)
+		}
+	})
+
+	t.Run("recordFinalizeFailure returns cumulative count", func(t *testing.T) {
+		task := &QBTask{
+			cfg:              &config.SourceConfig{},
+			logger:           logger,
+			finalizeBackoffs: make(map[string]*finalizeBackoff),
+		}
+
+		hash := "count-hash"
+		for i := 1; i <= 5; i++ {
+			count := task.recordFinalizeFailure(hash)
+			if count != i {
+				t.Errorf("attempt %d: expected count %d, got %d", i, i, count)
+			}
 		}
 	})
 }

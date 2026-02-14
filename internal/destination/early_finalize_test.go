@@ -185,7 +185,7 @@ func TestCheckFileCompletions(t *testing.T) {
 
 	t.Run("file completion triggers rename", func(t *testing.T) {
 		t.Parallel()
-		s, tmpDir := newTestColdServer(t)
+		s, tmpDir := newTestDestServer(t)
 
 		// Create a .partial file
 		partialPath := filepath.Join(tmpDir, "testfile.txt.partial")
@@ -233,7 +233,7 @@ func TestCheckFileCompletions(t *testing.T) {
 
 	t.Run("boundary piece completes multiple files", func(t *testing.T) {
 		t.Parallel()
-		s, tmpDir := newTestColdServer(t)
+		s, tmpDir := newTestDestServer(t)
 
 		// Two files that share piece 1
 		partial1 := filepath.Join(tmpDir, "file1.txt.partial")
@@ -277,7 +277,7 @@ func TestCheckFileCompletions(t *testing.T) {
 
 	t.Run("incomplete file not finalized", func(t *testing.T) {
 		t.Parallel()
-		s, tmpDir := newTestColdServer(t)
+		s, tmpDir := newTestDestServer(t)
 
 		partialPath := filepath.Join(tmpDir, "incomplete.txt.partial")
 		if err := os.WriteFile(partialPath, []byte("data"), 0o644); err != nil {
@@ -305,7 +305,7 @@ func TestCheckFileCompletions(t *testing.T) {
 
 	t.Run("hardlinked files skipped", func(t *testing.T) {
 		t.Parallel()
-		s, _ := newTestColdServer(t)
+		s, _ := newTestDestServer(t)
 
 		fi := &serverFileInfo{
 			size: 100, offset: 0,
@@ -326,7 +326,7 @@ func TestCheckFileCompletions(t *testing.T) {
 
 	t.Run("already early-finalized files skipped", func(t *testing.T) {
 		t.Parallel()
-		s, _ := newTestColdServer(t)
+		s, _ := newTestDestServer(t)
 
 		fi := &serverFileInfo{
 			size: 100, offset: 0,
@@ -347,7 +347,7 @@ func TestCheckFileCompletions(t *testing.T) {
 
 	t.Run("out-of-range piece does not increment", func(t *testing.T) {
 		t.Parallel()
-		s, _ := newTestColdServer(t)
+		s, _ := newTestDestServer(t)
 
 		fi := &serverFileInfo{
 			size: 100, offset: 100,
@@ -367,7 +367,7 @@ func TestCheckFileCompletions(t *testing.T) {
 
 	t.Run("sync error defers to finalization", func(t *testing.T) {
 		t.Parallel()
-		s, tmpDir := newTestColdServer(t)
+		s, tmpDir := newTestDestServer(t)
 
 		// Create file then remove it to cause sync to fail (file handle will be nil,
 		// so closeFileHandle returns nil, but we can test by making the rename fail)
@@ -394,7 +394,7 @@ func TestCheckFileCompletions(t *testing.T) {
 func TestFinalizeFiles_SkipsEarlyFinalizedFiles(t *testing.T) {
 	t.Parallel()
 
-	s, tmpDir := newTestColdServer(t)
+	s, tmpDir := newTestDestServer(t)
 
 	// File 0: already early-finalized (at final path, file handle nil)
 	finalPath := filepath.Join(tmpDir, "done.txt")
@@ -453,7 +453,7 @@ func TestFinalizeFiles_SkipsEarlyFinalizedFiles(t *testing.T) {
 func TestWritePiece_EarlyFinalizesCompletedFile(t *testing.T) {
 	t.Parallel()
 
-	s, tmpDir := newTestColdServer(t)
+	s, tmpDir := newTestDestServer(t)
 
 	hash := "write-piece-early-test"
 
@@ -524,7 +524,7 @@ func TestWritePiece_EarlyFinalizesCompletedFile(t *testing.T) {
 func TestCheckFileCompletions_VerifyFailure(t *testing.T) {
 	t.Parallel()
 
-	s, tmpDir := newTestColdServer(t)
+	s, tmpDir := newTestDestServer(t)
 
 	hash := "verify-failure-test"
 	correctData := []byte("correct piece data!")
@@ -589,7 +589,7 @@ func TestCheckFileCompletions_VerifyFailure(t *testing.T) {
 func TestCheckFileCompletions_VerifySkipsBoundaryPieces(t *testing.T) {
 	t.Parallel()
 
-	s, tmpDir := newTestColdServer(t)
+	s, tmpDir := newTestDestServer(t)
 
 	hash := "verify-boundary-test"
 
@@ -650,7 +650,7 @@ func TestCheckFileCompletions_VerifySkipsBoundaryPieces(t *testing.T) {
 func TestCheckFileCompletions_VerifyPartialCorruption(t *testing.T) {
 	t.Parallel()
 
-	s, tmpDir := newTestColdServer(t)
+	s, tmpDir := newTestDestServer(t)
 
 	hash := "verify-partial-corrupt"
 
@@ -720,7 +720,7 @@ func TestCheckFileCompletions_VerifyPartialCorruption(t *testing.T) {
 func TestCheckFileCompletions_VerifyNoPieceHashes(t *testing.T) {
 	t.Parallel()
 
-	s, tmpDir := newTestColdServer(t)
+	s, tmpDir := newTestDestServer(t)
 
 	hash := "verify-nohash-test"
 

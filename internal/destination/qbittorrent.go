@@ -36,6 +36,23 @@ func (s *Server) getQBTorrent(ctx context.Context, hash string) (*qbittorrent.To
 	return &torrents[0], true, nil
 }
 
+// isTorrentInQB checks whether the torrent exists in destination qBittorrent.
+// Fail-closed: returns true on error (QB unreachable) to prevent accidental deletion.
+func (s *Server) isTorrentInQB(ctx context.Context, hash string) bool {
+	if s.qbClient == nil {
+		return false
+	}
+	_, found, err := s.getQBTorrent(ctx, hash)
+	if err != nil {
+		s.logger.WarnContext(ctx, "qBittorrent check failed during orphan cleanup, skipping cleanup",
+			"hash", hash,
+			"error", err,
+		)
+		return true // fail-closed
+	}
+	return found
+}
+
 // addAndVerifyTorrent adds the torrent to qBittorrent and waits for verification.
 func (s *Server) addAndVerifyTorrent(
 	ctx context.Context,
@@ -196,16 +213,16 @@ func (s *Server) waitForTorrentReady(ctx context.Context, hash string) (qbittorr
 		}
 
 		// Torrent is ready - must be in a seeding/upload state with 100% progress
-		isReady := isReadyState(torrent.State)
-		if isReady {
-			s.logger.InfoContext(pollCtx, "torrent verified and ready",
-				"hash", hash,
-				"progress", torrent.Progress,
-				"state", torrent.State,
-			)
+		if !isReadyState(torrent.State) {
+			return false, nil
 		}
 
-		return isReady, nil
+		s.logger.InfoContext(pollCtx, "torrent verified and ready",
+			"hash", hash,
+			"progress", torrent.Progress,
+			"state", torrent.State,
+		)
+		return true, nil
 	}, interval, timeout)
 
 	return finalState, waitErr

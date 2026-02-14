@@ -22,6 +22,7 @@ const (
 	defaultListenAddr           = ":50051"
 	defaultHealthAddr           = ":8080"
 	defaultSyncedTag            = "synced"
+	defaultSyncFailedTag        = "sync-failed"
 	defaultSourceRemovedTag     = "source-removed"
 	defaultReconnectMaxDelaySec = 30
 	defaultNumSenders           = 4
@@ -80,6 +81,7 @@ type SourceConfig struct {
 	MaxGRPCConnections int           // Maximum TCP connections to destination server (default: 8)
 	SourceRemovedTag   string        // Tag applied on destination when torrent is removed from source (empty to disable)
 	ExcludeCleanupTag  string        // Tag that prevents torrents from being cleaned up from source (empty to disable)
+	SyncFailedTag      string        // Tag applied on source when verification fails repeatedly (empty to disable; remove tag to retry)
 }
 
 // Validate validates the base configuration shared by source and destination.
@@ -225,6 +227,11 @@ func SetupSourceFlags(cmd *cobra.Command) {
 		"",
 		"Tag that prevents torrents from being cleaned up from source (empty to disable)",
 	)
+	flags.String(
+		"sync-failed-tag",
+		defaultSyncFailedTag,
+		"Tag applied on source when verification fails repeatedly (empty to disable; remove tag to retry)",
+	)
 	flags.String("health-addr", defaultHealthAddr, "HTTP health endpoint address (empty to disable)")
 	flags.String("synced-tag", defaultSyncedTag, "Tag to apply to synced torrents (empty to disable)")
 	flags.Bool("dry-run", false, "Run without making changes")
@@ -277,7 +284,7 @@ func BindSourceFlags(cmd *cobra.Command, v *viper.Viper) error {
 		"destination-addr", "min-space", "min-seeding-time", "sleep",
 		"rate-limit", "piece-timeout", "reconnect-max-delay",
 		"num-senders", "min-connections", "max-connections",
-		"source-removed-tag", "exclude-cleanup-tag", "health-addr", "synced-tag",
+		"source-removed-tag", "exclude-cleanup-tag", "sync-failed-tag", "health-addr", "synced-tag",
 		"dry-run", "log-level", "drain-annotation", "drain-timeout",
 	})
 }
@@ -328,6 +335,7 @@ func LoadSource(v *viper.Viper) (*SourceConfig, error) {
 		MaxGRPCConnections: v.GetInt("max-connections"),
 		SourceRemovedTag:   v.GetString("source-removed-tag"),
 		ExcludeCleanupTag:  v.GetString("exclude-cleanup-tag"),
+		SyncFailedTag:      v.GetString("sync-failed-tag"),
 	}
 
 	// Support conventional env vars as fallbacks

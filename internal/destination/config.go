@@ -15,10 +15,11 @@ const (
 	defaultStateFlushCount    = 100              // Count-based: flush after N pieces as safety net
 
 	// Metadata directory and file names for recovery after restart.
-	metaDirName      = ".qbsync"
-	subPathFileName  = ".subpath"
-	selectedFileName = ".selected"
-	versionFileName  = ".version"
+	metaDirName       = ".qbsync"
+	subPathFileName   = ".subpath"
+	selectedFileName  = ".selected"
+	versionFileName   = ".version"
+	finalizedFileName = ".finalized"
 
 	// metaVersion is bumped when the metadata format changes.
 	// If a metadata directory has a missing or different version,

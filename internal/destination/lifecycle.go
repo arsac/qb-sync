@@ -181,8 +181,14 @@ func (s *Server) isOrphanedTorrent(ctx context.Context, hash string, timeout tim
 		return false
 	}
 
-	// Check state file modification time
 	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
+
+	// Finalized marker means the torrent was successfully synced — not an orphan.
+	if s.isFinalized(hash) {
+		return false
+	}
+
+	// Check state file modification time
 	info, statErr := s.statOrphanMetadata(metaDir)
 	if statErr != nil {
 		if !os.IsNotExist(statErr) {
@@ -264,6 +270,18 @@ func (s *Server) cleanupOrphan(ctx context.Context, hash string) {
 		close(cleanupCh)
 		s.mu.Unlock()
 	}()
+
+	// Final safety check: if the torrent exists in destination qBittorrent,
+	// it was successfully added at some point — do not delete its files.
+	// This covers the narrow crash window between addAndVerifyTorrent and
+	// markFinalized where the .finalized marker was not written.
+	// Fail-closed: if QB is unreachable, skip cleanup to avoid data loss.
+	if s.isTorrentInQB(ctx, hash) {
+		s.logger.InfoContext(ctx, "skipping orphan cleanup, torrent exists in destination qBittorrent",
+			"hash", hash,
+		)
+		return
+	}
 
 	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
 

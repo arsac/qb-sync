@@ -63,6 +63,7 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_file_selection_resyncs_total` | | Re-syncs triggered by file selection changes (source) |
 | `qbsync_early_finalize_verify_failures_total` | | Files that failed read-back verification during early finalization (destination) |
 | `qbsync_verification_recoveries_total` | | Torrents recovered from verification failure by marking pieces for re-streaming (destination) |
+| `qbsync_sync_failed_total` | | Torrents that failed verification repeatedly and were tagged as sync-failed (source) |
 
 ## Gauges
 
