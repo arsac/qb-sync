@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -53,11 +52,11 @@ type finalizeBackoff struct {
 	lastAttempt time.Time
 }
 
-// trackedTorrent holds metadata for a torrent being synced from source to destination.
-type trackedTorrent struct {
-	completionTime time.Time // when the torrent finished downloading on source (from qbittorrent CompletionOn)
-	name           string    // torrent name for metric labels
-	size           int64     // torrent size in bytes for TorrentBytesSyncedTotal metric
+// TrackedTorrent holds metadata for a torrent being synced from source to destination.
+type TrackedTorrent struct {
+	CompletionTime time.Time // when the torrent finished downloading on source (from qbittorrent CompletionOn)
+	Name           string    // torrent name for metric labels
+	Size           int64     // torrent size in bytes for TorrentBytesSyncedTotal metric
 }
 
 // QBTask orchestrates torrent streaming from source to destination.
@@ -72,20 +71,10 @@ type QBTask struct {
 	tracker *streaming.PieceMonitor
 	queue   *streaming.BidiQueue
 
-	// Tracked torrents currently being streamed
-	trackedTorrents map[string]trackedTorrent
-	trackedMu       sync.RWMutex
-
-	// Torrents known to be complete on destination (persisted to disk).
-	// Value is the selection fingerprint (sorted selected file indices, e.g. "0,1,3").
-	// Destination qBittorrent is the source of truth; synced tag is for visibility only.
-	completedOnDest    map[string]string
-	completedMu        sync.RWMutex
-	completedCachePath string
-
-	// Finalization backoff tracking per torrent
-	finalizeBackoffs map[string]*finalizeBackoff
-	backoffMu        sync.Mutex
+	// Extracted sub-components with internal locking
+	tracked   *TrackedSet      // torrents currently being streamed
+	completed *CompletionCache // torrents known to be complete on destination
+	backoffs  *BackoffTracker  // finalization retry backoff per torrent
 
 	// Cycle counter for periodic pruning of completedOnDest
 	pruneCycleCount int
@@ -143,21 +132,22 @@ func NewQBTask(
 	}
 	queue := streaming.NewBidiQueue(source, dest, tracker, logger, queueConfig)
 
+	cachePath := filepath.Join(cfg.DataPath, ".qb-sync", "completed_on_dest.json")
+
 	t := &QBTask{
-		cfg:                cfg,
-		logger:             logger,
-		srcClient:          srcClient,
-		grpcDest:           dest,
-		source:             source,
-		tracker:            tracker,
-		queue:              queue,
-		trackedTorrents:    make(map[string]trackedTorrent),
-		completedOnDest:    make(map[string]string),
-		completedCachePath: filepath.Join(cfg.DataPath, ".qb-sync", "completed_on_dest.json"),
-		finalizeBackoffs:   make(map[string]*finalizeBackoff),
+		cfg:       cfg,
+		logger:    logger,
+		srcClient: srcClient,
+		grpcDest:  dest,
+		source:    source,
+		tracker:   tracker,
+		queue:     queue,
+		tracked:   NewTrackedSet(),
+		completed: NewCompletionCache(cachePath, logger),
+		backoffs:  NewBackoffTracker(),
 	}
 
-	t.loadCompletedCache()
+	t.completed.Load()
 
 	return t, nil
 }
@@ -237,6 +227,7 @@ func (t *QBTask) runOnce(ctx context.Context) {
 	if err := t.trackNewTorrents(ctx); err != nil {
 		t.logger.ErrorContext(ctx, "failed to track torrents", "error", err)
 	}
+	t.checkExcludedTorrents(ctx)
 	if err := t.finalizeCompletedStreams(ctx); err != nil {
 		t.logger.ErrorContext(ctx, "failed to finalize streams", "error", err)
 	}
@@ -245,9 +236,7 @@ func (t *QBTask) runOnce(ctx context.Context) {
 			t.logger.ErrorContext(ctx, "failed to move torrents", "error", err)
 		}
 	}
-	t.trackedMu.RLock()
-	metrics.ActiveTorrents.WithLabelValues(metrics.ModeSource).Set(float64(len(t.trackedTorrents)))
-	t.trackedMu.RUnlock()
+	metrics.ActiveTorrents.WithLabelValues(metrics.ModeSource).Set(float64(t.tracked.Count()))
 	t.updateSyncAgeGauge()
 	t.updateTorrentProgressGauges()
 
@@ -256,5 +245,42 @@ func (t *QBTask) runOnce(ctx context.Context) {
 		t.pruneCycleCount = 0
 		t.pruneCompletedOnDest(ctx)
 		t.recheckFileSelections(ctx)
+	}
+}
+
+// FetchCompletedOnDestination returns torrents known to be complete on destination.
+// Exported for testing (used by E2E tests).
+func (t *QBTask) FetchCompletedOnDestination() []string {
+	return t.completed.Keys()
+}
+
+// MarkCompletedOnDestination marks a torrent as complete on destination.
+// Exported for testing only - allows tests to simulate synced state.
+func (t *QBTask) MarkCompletedOnDestination(hash string) {
+	t.completed.Mark(hash)
+}
+
+// pruneCompletedOnDest removes entries from the completed cache that are
+// no longer present in source qBittorrent. This prevents unbounded growth when
+// torrents are deleted from source after being synced to destination.
+func (t *QBTask) pruneCompletedOnDest(ctx context.Context) {
+	torrents, err := t.srcClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{})
+	if err != nil {
+		t.logger.WarnContext(ctx, "failed to fetch torrents for cache pruning", "error", err)
+		return
+	}
+
+	sourceHashes := make(map[string]struct{}, len(torrents))
+	for _, torrent := range torrents {
+		sourceHashes[torrent.Hash] = struct{}{}
+	}
+
+	pruned := t.completed.Prune(sourceHashes)
+	if pruned > 0 {
+		t.logger.InfoContext(ctx, "pruned completed-on-destination cache",
+			"pruned", pruned,
+			"remaining", t.completed.Count(),
+		)
+		t.completed.Save()
 	}
 }

@@ -30,21 +30,16 @@ func (t *QBTask) handleTorrentRemoval(ctx context.Context, hash string) {
 		"hash", hash,
 	)
 
-	t.trackedMu.Lock()
-	tt, wasTracked := t.trackedTorrents[hash]
-	delete(t.trackedTorrents, hash)
-	t.trackedMu.Unlock()
+	tt, wasTracked := t.tracked.DeleteAndGet(hash)
 
 	// Read completedOnDest but don't delete yet -- only remove after
 	// StartTorrent succeeds so pruneCompletedOnDest can retry on failure.
-	t.completedMu.RLock()
-	_, wasCompletedOnDest := t.completedOnDest[hash]
-	t.completedMu.RUnlock()
+	wasCompletedOnDest := t.completed.IsComplete(hash)
 
-	t.clearFinalizeBackoff(hash)
+	t.backoffs.Clear(hash)
 
 	if wasTracked {
-		metrics.OldestPendingSyncSeconds.DeleteLabelValues(hash, tt.name)
+		metrics.OldestPendingSyncSeconds.DeleteLabelValues(hash, tt.Name)
 	} else {
 		t.logger.DebugContext(ctx, "removed torrent was not in tracked list",
 			"hash", hash,
@@ -74,11 +69,8 @@ func (t *QBTask) handleTorrentRemoval(ctx context.Context, hash string) {
 			return
 		}
 
-		t.completedMu.Lock()
-		delete(t.completedOnDest, hash)
-		metrics.CompletedOnDestCacheSize.Set(float64(len(t.completedOnDest)))
-		t.completedMu.Unlock()
-		t.saveCompletedCache()
+		t.completed.Remove(hash)
+		t.completed.Save()
 
 		t.logger.InfoContext(ctx, "started and tagged torrent on destination after source removal",
 			"hash", hash, "tag", t.cfg.SourceRemovedTag,

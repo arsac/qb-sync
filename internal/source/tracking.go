@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -100,9 +99,13 @@ func (t *QBTask) trackNewTorrents(ctx context.Context) error {
 }
 
 // isExcludedFromTracking returns true if the torrent should be skipped during tracking:
-// non-syncable state, zero progress, sync-failed tag, already complete, or already tracked.
+// non-syncable state, zero progress, excluded/sync-failed tag, already complete, or already tracked.
 func (t *QBTask) isExcludedFromTracking(torrent qbittorrent.Torrent) bool {
 	if !isSyncableState(torrent.State) || torrent.Progress <= 0 {
+		return true
+	}
+
+	if t.cfg.ExcludeSyncTag != "" && hasTag(torrent.Tags, t.cfg.ExcludeSyncTag) {
 		return true
 	}
 
@@ -110,17 +113,11 @@ func (t *QBTask) isExcludedFromTracking(torrent qbittorrent.Torrent) bool {
 		return true
 	}
 
-	t.completedMu.RLock()
-	_, knownComplete := t.completedOnDest[torrent.Hash]
-	t.completedMu.RUnlock()
-	if knownComplete {
+	if t.completed.IsComplete(torrent.Hash) {
 		return true
 	}
 
-	t.trackedMu.RLock()
-	_, alreadyTracked := t.trackedTorrents[torrent.Hash]
-	t.trackedMu.RUnlock()
-	return alreadyTracked
+	return t.tracked.Has(torrent.Hash)
 }
 
 // queryDestStatus checks a torrent's status on destination without starting tracking.
@@ -133,13 +130,11 @@ func (t *QBTask) queryDestStatus(
 	torrent qbittorrent.Torrent,
 ) (*streaming.InitTorrentResult, error) {
 	if t.tracker.IsTracking(torrent.Hash) {
-		t.trackedMu.Lock()
-		t.trackedTorrents[torrent.Hash] = trackedTorrent{
-			completionTime: completionTimeOrNow(torrent.CompletionOn),
-			name:           torrent.Name,
-			size:           torrent.Size,
-		}
-		t.trackedMu.Unlock()
+		t.tracked.Add(torrent.Hash, TrackedTorrent{
+			CompletionTime: completionTimeOrNow(torrent.CompletionOn),
+			Name:           torrent.Name,
+			Size:           torrent.Size,
+		})
 		t.logger.DebugContext(ctx, "synced tracker state to orchestrator",
 			"name", torrent.Name,
 			"hash", torrent.Hash,
@@ -162,7 +157,8 @@ func (t *QBTask) queryDestStatus(
 
 	switch initResp.Status {
 	case pb.TorrentSyncStatus_SYNC_STATUS_COMPLETE:
-		t.markCompletedOnDest(torrent.Hash, "")
+		t.completed.MarkWithFingerprint(torrent.Hash, "")
+		t.completed.Save()
 		t.logger.InfoContext(ctx, "torrent already complete on destination",
 			"name", torrent.Name,
 			"hash", torrent.Hash,
@@ -224,19 +220,11 @@ func (t *QBTask) startTrackingReady(
 		return false
 	}
 
-	t.trackedMu.Lock()
-	if _, exists := t.trackedTorrents[torrent.Hash]; exists {
-		t.trackedMu.Unlock()
-		return false
-	}
-	t.trackedTorrents[torrent.Hash] = trackedTorrent{
-		completionTime: completionTimeOrNow(torrent.CompletionOn),
-		name:           torrent.Name,
-		size:           torrent.Size,
-	}
-	t.trackedMu.Unlock()
-
-	return true
+	return t.tracked.AddIfAbsent(torrent.Hash, TrackedTorrent{
+		CompletionTime: completionTimeOrNow(torrent.CompletionOn),
+		Name:           torrent.Name,
+		Size:           torrent.Size,
+	})
 }
 
 // selectedFingerprint computes a fingerprint from the selected (priority > 0) file indices.
@@ -277,13 +265,104 @@ func (t *QBTask) findTorrentByHash(hash string) *qbittorrent.Torrent {
 	return nil
 }
 
+// checkExcludedTorrents scans cycleTorrents for any tracked or completed torrents
+// that now have the exclude-sync tag. In-progress torrents are aborted with file
+// cleanup; completed torrents are simply forgotten from the source cache.
+func (t *QBTask) checkExcludedTorrents(ctx context.Context) {
+	if t.cfg.ExcludeSyncTag == "" {
+		return
+	}
+
+	excludedHashes := make(map[string]struct{})
+	for _, torrent := range t.cycleTorrents {
+		if hasTag(torrent.Tags, t.cfg.ExcludeSyncTag) {
+			excludedHashes[torrent.Hash] = struct{}{}
+		}
+	}
+
+	if len(excludedHashes) == 0 {
+		return
+	}
+
+	t.abortExcludedTracked(ctx, excludedHashes)
+	t.forgetExcludedCompleted(ctx, excludedHashes)
+}
+
+// abortExcludedTracked aborts in-progress torrents that now have the exclude-sync tag.
+func (t *QBTask) abortExcludedTracked(ctx context.Context, excludedHashes map[string]struct{}) {
+	allTracked := t.tracked.Snapshot()
+
+	for hash, tt := range allTracked {
+		if _, excluded := excludedHashes[hash]; !excluded {
+			continue
+		}
+		t.logger.InfoContext(ctx, "aborting in-progress torrent due to exclude-sync tag",
+			"name", tt.Name,
+			"hash", hash,
+		)
+
+		if !t.cfg.DryRun {
+			abortCtx, cancel := context.WithTimeout(ctx, destRPCTimeout)
+			filesDeleted, abortErr := t.grpcDest.AbortTorrent(abortCtx, hash, true)
+			cancel()
+			if abortErr != nil {
+				t.logger.WarnContext(ctx, "failed to abort excluded torrent on destination",
+					"hash", hash,
+					"error", abortErr,
+				)
+			} else {
+				t.logger.InfoContext(ctx, "aborted excluded torrent on destination",
+					"hash", hash,
+					"filesDeleted", filesDeleted,
+				)
+			}
+		}
+
+		t.stopTracking(hash)
+
+		metrics.OldestPendingSyncSeconds.DeleteLabelValues(hash, tt.Name)
+		metrics.ExcludeSyncAbortTotal.Inc()
+	}
+}
+
+// forgetExcludedCompleted removes completed torrents from the cache when they
+// acquire the exclude-sync tag. No destination abort — the torrent is already finalized.
+func (t *QBTask) forgetExcludedCompleted(ctx context.Context, excludedHashes map[string]struct{}) {
+	completedSnapshot := t.completed.Snapshot()
+	var completedToRemove []string
+	for hash := range completedSnapshot {
+		if _, excluded := excludedHashes[hash]; excluded {
+			completedToRemove = append(completedToRemove, hash)
+		}
+	}
+
+	if len(completedToRemove) == 0 {
+		return
+	}
+
+	t.completed.RemoveAll(completedToRemove)
+
+	for _, hash := range completedToRemove {
+		name := hash
+		if torrent := t.findTorrentByHash(hash); torrent != nil {
+			name = torrent.Name
+		}
+		t.logger.InfoContext(ctx, "forgetting completed torrent due to exclude-sync tag",
+			"name", name,
+			"hash", hash,
+		)
+		t.source.EvictCache(hash)
+		t.grpcDest.ClearInitResult(hash)
+	}
+
+	t.completed.Save()
+}
+
 // recheckFileSelections compares stored fingerprints against current qBittorrent
 // file priorities. On change: evicts caches, calls InitTorrent with resync=true,
 // and starts tracking for the newly-selected pieces.
 func (t *QBTask) recheckFileSelections(ctx context.Context) {
-	t.completedMu.RLock()
-	completed := maps.Clone(t.completedOnDest)
-	t.completedMu.RUnlock()
+	completed := t.completed.Snapshot()
 
 	var changed bool
 	for hash, storedFingerprint := range completed {
@@ -309,7 +388,7 @@ func (t *QBTask) recheckFileSelections(ctx context.Context) {
 	}
 
 	if changed {
-		t.saveCompletedCache()
+		t.completed.Save()
 	}
 }
 
@@ -317,9 +396,7 @@ func (t *QBTask) recheckFileSelections(ctx context.Context) {
 // resync=true, and starts tracking any newly-needed pieces for streaming.
 func (t *QBTask) resyncFileSelection(ctx context.Context, hash, fingerprint string) {
 	// Evict caches so next InitTorrent gets fresh metadata
-	t.completedMu.Lock()
-	delete(t.completedOnDest, hash)
-	t.completedMu.Unlock()
+	t.completed.Remove(hash)
 	t.source.EvictCache(hash)
 	t.grpcDest.ClearInitResult(hash)
 
@@ -340,7 +417,8 @@ func (t *QBTask) resyncFileSelection(ctx context.Context, hash, fingerprint stri
 
 	if result.PiecesNeededCount <= 0 {
 		// All selected pieces already on destination — mark complete directly
-		t.markCompletedOnDest(hash, fingerprint)
+		t.completed.MarkWithFingerprint(hash, fingerprint)
+		t.completed.Save()
 		return
 	}
 
@@ -351,15 +429,13 @@ func (t *QBTask) resyncFileSelection(ctx context.Context, hash, fingerprint stri
 		return
 	}
 
-	tt := trackedTorrent{completionTime: time.Now(), name: hash}
+	tt := TrackedTorrent{CompletionTime: time.Now(), Name: hash}
 	if torrent := t.findTorrentByHash(hash); torrent != nil {
-		tt = trackedTorrent{
-			completionTime: completionTimeOrNow(torrent.CompletionOn),
-			name:           torrent.Name,
-			size:           torrent.Size,
+		tt = TrackedTorrent{
+			CompletionTime: completionTimeOrNow(torrent.CompletionOn),
+			Name:           torrent.Name,
+			Size:           torrent.Size,
 		}
 	}
-	t.trackedMu.Lock()
-	t.trackedTorrents[hash] = tt
-	t.trackedMu.Unlock()
+	t.tracked.Add(hash, tt)
 }

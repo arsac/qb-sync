@@ -467,6 +467,15 @@ var (
 			Help:      "Torrents that failed verification repeatedly and were tagged as sync-failed",
 		},
 	)
+
+	// ExcludeSyncAbortTotal counts torrents aborted due to exclude-sync tag applied mid-sync.
+	ExcludeSyncAbortTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "exclude_sync_abort_total",
+			Help:      "Total torrents aborted due to exclude-sync tag applied mid-sync",
+		},
+	)
 )
 
 // Gauges track values that can go up or down.

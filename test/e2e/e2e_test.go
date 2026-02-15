@@ -1644,3 +1644,203 @@ func TestE2E_CategoryWithATM(t *testing.T) {
 
 	env.CleanupBothSides(ctx, wiredCDHash)
 }
+
+// TestE2E_ExcludeSyncTag verifies that torrents tagged with the exclude-sync tag
+// are skipped by the orchestrator, and that removing the tag allows them to sync.
+//
+// Strategy:
+//  1. Download Big Buck Bunny on source
+//  2. Apply exclude-sync tag before starting the orchestrator
+//  3. Run the orchestrator for several cycles — torrent should NOT appear on destination
+//  4. Remove the tag — torrent should sync to destination
+func TestE2E_ExcludeSyncTag(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+
+	t.Parallel()
+
+	env := SetupTestEnv(t)
+	ctx := context.Background()
+
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
+
+	// Step 1: Download torrent on source.
+	t.Log("Downloading Big Buck Bunny on source...")
+	env.DownloadTorrentOnSource(ctx, bigBuckBunnyURL, bigBuckBunnyHash, torrentDownloadTimeout)
+
+	// Step 2: Apply exclude-sync tag to the torrent.
+	t.Log("Applying 'no-sync' tag to torrent...")
+	err := env.SourceClient().AddTagsCtx(ctx, []string{bigBuckBunnyHash}, "no-sync")
+	require.NoError(t, err)
+
+	// Verify the tag was applied.
+	require.Eventually(t, func() bool {
+		torrents, tagErr := env.SourceClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+			Hashes: []string{bigBuckBunnyHash},
+		})
+		return tagErr == nil && len(torrents) > 0 && strings.Contains(torrents[0].Tags, "no-sync")
+	}, 10*time.Second, time.Second, "no-sync tag should be applied")
+
+	// Step 3: Start orchestrator with exclude-sync-tag configured.
+	t.Log("Starting orchestrator with exclude-sync-tag='no-sync'...")
+	cfg := env.CreateSourceConfig(WithExcludeSyncTag("no-sync"))
+	task, dest, err := env.CreateSourceTask(cfg)
+	require.NoError(t, err)
+	defer dest.Close()
+
+	orchestratorCtx, cancelOrchestrator := context.WithCancel(ctx)
+	defer cancelOrchestrator()
+
+	orchestratorDone := make(chan error, 1)
+	go func() {
+		orchestratorDone <- task.Run(orchestratorCtx)
+	}()
+
+	// Wait several orchestrator cycles (SleepInterval=1s, so 10s gives ~10 cycles).
+	t.Log("Waiting 10 seconds to verify torrent is NOT synced...")
+	time.Sleep(10 * time.Second)
+
+	// Verify the torrent did NOT appear on destination.
+	destTorrents, err := env.DestinationClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+		Hashes: []string{bigBuckBunnyHash},
+	})
+	require.NoError(t, err)
+	assert.Empty(t, destTorrents,
+		"torrent with exclude-sync tag should NOT appear on destination")
+	t.Log("Confirmed: torrent was excluded from sync")
+
+	// Step 4: Remove the tag — torrent should now sync.
+	t.Log("Removing 'no-sync' tag...")
+	err = env.SourceClient().RemoveTagsCtx(ctx, []string{bigBuckBunnyHash}, "no-sync")
+	require.NoError(t, err)
+
+	// Wait for sync to complete on destination.
+	t.Log("Waiting for torrent to sync after tag removal...")
+	env.WaitForTorrentCompleteOnDestination(ctx, bigBuckBunnyHash, syncCompleteTimeout,
+		"torrent should sync to destination after exclude-sync tag is removed")
+
+	cancelOrchestrator()
+	<-orchestratorDone
+
+	env.AssertTorrentCompleteOnDestination(ctx, bigBuckBunnyHash)
+
+	t.Log("Exclude-sync tag E2E test completed successfully!")
+
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
+}
+
+// TestE2E_ExcludeSyncTagReactive verifies that adding the exclude-sync tag to
+// a torrent already synced to destination causes the source to forget it from
+// the completed cache, and that removing the tag re-discovers it as complete.
+//
+// Note: the in-progress abort path (abortExcludedTracked) is covered by unit tests.
+// Big Buck Bunny syncs too fast (~15s) to reliably catch mid-sync in E2E, so this
+// test exercises the completed-torrent path (forgetExcludedCompleted).
+//
+// Strategy:
+//  1. Download Big Buck Bunny on source (no tag)
+//  2. Start the orchestrator — torrent syncs to destination
+//  3. Wait for torrent to be in the source's completedOnDest cache
+//  4. Apply exclude-sync tag
+//  5. Assert: torrent is forgotten from completedOnDest cache
+//  6. Assert: torrent still exists on destination (files preserved for completed torrents)
+//  7. Remove the tag
+//  8. Assert: orchestrator re-discovers torrent as complete on destination
+func TestE2E_ExcludeSyncTagReactive(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+
+	t.Parallel()
+
+	env := SetupTestEnv(t)
+	ctx := context.Background()
+
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
+
+	// Step 1: Download torrent on source WITHOUT the exclude-sync tag.
+	t.Log("Downloading Big Buck Bunny on source...")
+	env.DownloadTorrentOnSource(ctx, bigBuckBunnyURL, bigBuckBunnyHash, torrentDownloadTimeout)
+
+	// Step 2: Start orchestrator — torrent should sync to destination.
+	t.Log("Starting orchestrator (no exclude tag on torrent)...")
+	cfg := env.CreateSourceConfig(WithExcludeSyncTag("no-sync"))
+	task, dest, err := env.CreateSourceTask(cfg)
+	require.NoError(t, err)
+	defer dest.Close()
+
+	orchestratorCtx, cancelOrchestrator := context.WithCancel(ctx)
+	defer cancelOrchestrator()
+
+	orchestratorDone := make(chan error, 1)
+	go func() {
+		orchestratorDone <- task.Run(orchestratorCtx)
+	}()
+
+	// Step 3: Wait for the torrent to appear in the source's completedOnDest cache.
+	t.Log("Waiting for torrent to complete sync...")
+	require.Eventually(t, func() bool {
+		for _, hash := range task.FetchCompletedOnDestination() {
+			if hash == bigBuckBunnyHash {
+				return true
+			}
+		}
+		return false
+	}, syncCompleteTimeout, pollInterval,
+		"torrent should appear in completedOnDest cache after sync")
+	t.Log("Confirmed: torrent is in completedOnDest cache")
+
+	// Step 4: Apply exclude-sync tag.
+	t.Log("Applying 'no-sync' tag to synced torrent...")
+	err = env.SourceClient().AddTagsCtx(ctx, []string{bigBuckBunnyHash}, "no-sync")
+	require.NoError(t, err)
+
+	// Step 5: Wait for the torrent to be forgotten from completedOnDest cache.
+	t.Log("Waiting for torrent to be forgotten from completedOnDest cache...")
+	require.Eventually(t, func() bool {
+		for _, hash := range task.FetchCompletedOnDestination() {
+			if hash == bigBuckBunnyHash {
+				return false
+			}
+		}
+		return true
+	}, 30*time.Second, pollInterval,
+		"torrent should be forgotten from completedOnDest after exclude tag is applied")
+	t.Log("Confirmed: torrent was forgotten from completedOnDest cache")
+
+	// Step 6: Verify the torrent still exists on destination (files preserved for completed torrents).
+	destTorrents, err := env.DestinationClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+		Hashes: []string{bigBuckBunnyHash},
+	})
+	require.NoError(t, err)
+	assert.NotEmpty(t, destTorrents,
+		"torrent should still exist on destination (completed torrents are preserved)")
+	t.Log("Confirmed: torrent files preserved on destination")
+
+	// Step 7: Remove the tag — orchestrator should re-discover it as complete.
+	t.Log("Removing 'no-sync' tag...")
+	err = env.SourceClient().RemoveTagsCtx(ctx, []string{bigBuckBunnyHash}, "no-sync")
+	require.NoError(t, err)
+
+	// Step 8: Wait for the torrent to re-appear in completedOnDest cache.
+	t.Log("Waiting for orchestrator to re-discover torrent as complete...")
+	require.Eventually(t, func() bool {
+		for _, hash := range task.FetchCompletedOnDestination() {
+			if hash == bigBuckBunnyHash {
+				return true
+			}
+		}
+		return false
+	}, syncCompleteTimeout, pollInterval,
+		"torrent should be re-discovered as complete after tag removal")
+
+	cancelOrchestrator()
+	<-orchestratorDone
+
+	env.AssertTorrentCompleteOnDestination(ctx, bigBuckBunnyHash)
+
+	t.Log("Reactive exclude-sync tag E2E test completed successfully!")
+
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
+}

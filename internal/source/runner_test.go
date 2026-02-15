@@ -45,14 +45,16 @@ func setupShutdownDrain(
 	}
 	dest := &mockDest{}
 
+	completed := NewCompletionCache("", logger)
+	completed.Mark("abc123")
 	task := &QBTask{
-		cfg:             cfg,
-		logger:          logger,
-		srcClient:       mockClient,
-		grpcDest:        dest,
-		source:          qbclient.NewSource(nil, ""),
-		completedOnDest: map[string]string{"abc123": ""},
-		trackedTorrents: make(map[string]trackedTorrent),
+		cfg:       cfg,
+		logger:    logger,
+		srcClient: mockClient,
+		grpcDest:  dest,
+		source:    qbclient.NewSource(nil, ""),
+		completed: completed,
+		tracked:   NewTrackedSet(),
 	}
 
 	r := &Runner{

@@ -214,12 +214,11 @@ func (t *QBTask) fetchTorrentsCompletedOnDest(ctx context.Context) ([]qbittorren
 		}
 	}
 
-	t.completedMu.RLock()
-	defer t.completedMu.RUnlock()
+	completedSnapshot := t.completed.Snapshot()
 
 	var result []qbittorrent.Torrent
 	for _, torrent := range allTorrents {
-		if _, ok := t.completedOnDest[torrent.Hash]; !ok {
+		if _, ok := completedSnapshot[torrent.Hash]; !ok {
 			continue
 		}
 		if !t.draining.Load() && t.cfg.ExcludeCleanupTag != "" &&

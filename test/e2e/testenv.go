@@ -645,6 +645,13 @@ func WithSourceRemovedTag(tag string) SourceConfigOption {
 	}
 }
 
+// WithExcludeSyncTag sets the tag that prevents torrents from being synced.
+func WithExcludeSyncTag(tag string) SourceConfigOption {
+	return func(cfg *config.SourceConfig) {
+		cfg.ExcludeSyncTag = tag
+	}
+}
+
 // CreateSourceTask creates a QBTask for testing.
 func (env *TestEnv) CreateSourceTask(cfg *config.SourceConfig) (*source.QBTask, *streaming.GRPCDestination, error) {
 	dest, err := env.CreateGRPCDestination()
