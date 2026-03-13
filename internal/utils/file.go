@@ -66,8 +66,11 @@ func ReadChunkFromFile(path string, offset, size int64) ([]byte, error) {
 	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
 	}
+	if int64(n) < size {
+		return nil, fmt.Errorf("short read from %s at offset %d: got %d bytes, want %d", path, offset, n, size)
+	}
 
-	return data[:n], nil
+	return data, nil
 }
 
 // AreHardlinked reports whether two paths refer to the same underlying file (i.e., share an inode).

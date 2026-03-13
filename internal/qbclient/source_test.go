@@ -306,13 +306,10 @@ func TestReadChunkFromFile_Basic(t *testing.T) {
 		t.Errorf("got %q, want %q", string(data), "hello")
 	}
 
-	// Read past EOF returns available data
-	data, err = utils.ReadChunkFromFile(path, int64(len(content)-3), 10)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if string(data) != "ta!" {
-		t.Errorf("got %q, want %q", string(data), "ta!")
+	// Read past EOF returns an error (short reads are never valid in production)
+	_, err = utils.ReadChunkFromFile(path, int64(len(content)-3), 10)
+	if err == nil {
+		t.Fatal("expected error on short read, got nil")
 	}
 }
 

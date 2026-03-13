@@ -499,17 +499,8 @@ func (s *Server) renamePartialFile(ctx context.Context, hash string, fi *serverF
 
 	finalPath := strings.TrimSuffix(fi.path, partialSuffix)
 
-	// Check if final path already exists (idempotent)
-	if _, statErr := os.Stat(finalPath); statErr == nil {
-		s.logger.DebugContext(ctx, "final file already exists",
-			"hash", hash,
-			"path", finalPath,
-		)
-		return nil
-	}
-
 	if renameErr := os.Rename(fi.path, finalPath); renameErr != nil {
-		// Race condition: another rename may have completed
+		// .partial is gone but final exists: already renamed (idempotent restart case).
 		if os.IsNotExist(renameErr) {
 			if _, statErr := os.Stat(finalPath); statErr == nil {
 				return nil
