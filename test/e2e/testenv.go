@@ -557,6 +557,24 @@ func (env *TestEnv) WaitForSyncedTagOnDestination(ctx context.Context, hash stri
 	}, timeout, time.Second, msg)
 }
 
+// WaitForSyncedTagOnSource waits for the synced tag to appear on a source torrent.
+// The source synced tag is applied by markTorrentSynced after finalization succeeds.
+// Tests must wait for this before stopping the orchestrator if they intend to drain
+// afterwards — drain's fetchTorrentsCompletedOnDest requires the synced tag on source
+// to include the torrent in the evacuation list.
+func (env *TestEnv) WaitForSyncedTagOnSource(ctx context.Context, hash string, timeout time.Duration, msg string) {
+	env.t.Helper()
+	require.Eventually(env.t, func() bool {
+		torrents, err := env.sourceClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+			Hashes: []string{hash},
+		})
+		if err != nil || len(torrents) == 0 {
+			return false
+		}
+		return strings.Contains(torrents[0].Tags, "synced")
+	}, timeout, time.Second, msg)
+}
+
 // IsTorrentStopped checks if a torrent is in a stopped/paused state.
 func (env *TestEnv) IsTorrentStopped(ctx context.Context, client *qbittorrent.Client, hash string) bool {
 	torrents, err := client.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{

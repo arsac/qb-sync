@@ -510,6 +510,12 @@ func TestE2E_StopBeforeDeleteOnDiskPressure(t *testing.T) {
 	// ensures no race between the finalization stop and the drain's StartTorrent.
 	env.WaitForSyncedTagOnDestination(ctx, wiredCDHash, 30*time.Second,
 		"destination torrent should have 'synced' tag after finalization")
+	// Wait for the source synced tag: markTorrentSynced runs in the next
+	// finalizeCompletedStreams tick after finalizeTorrent returns success.
+	// Without this, the orchestrator can be cancelled before the source tag is
+	// applied, causing drain to skip the torrent.
+	env.WaitForSyncedTagOnSource(ctx, wiredCDHash, 30*time.Second,
+		"source torrent should have 'synced' tag before stopping orchestrator")
 
 	cancelOrchestrator()
 	<-orchestratorDone
@@ -600,6 +606,11 @@ func TestE2E_SourceRemovedTagOnDiskPressure(t *testing.T) {
 	// The synced tag is applied after addAndVerifyTorrent completes.
 	env.WaitForSyncedTagOnDestination(ctx, wiredCDHash, 30*time.Second,
 		"destination torrent should have 'synced' tag after finalization")
+	// Also wait for the source synced tag: markTorrentSynced runs in the next
+	// finalizeCompletedStreams tick after finalizeTorrent returns success.
+	// Without this, drain skips the torrent because it lacks the source synced tag.
+	env.WaitForSyncedTagOnSource(ctx, wiredCDHash, 30*time.Second,
+		"source torrent should have 'synced' tag before stopping orchestrator")
 
 	cancelOrchestrator()
 	<-orchestratorDone
@@ -1011,6 +1022,12 @@ func TestE2E_HardlinkGroupDeletion(t *testing.T) {
 	t.Log("Waiting for both torrents to sync to destination...")
 	env.WaitForTorrentCompleteOnDestination(ctx, bigBuckBunnyHash, syncCompleteTimeout, "BBB should be complete on destination")
 	env.WaitForTorrentCompleteOnDestination(ctx, wiredCDHash, syncCompleteTimeout, "Wired CD should be complete on destination")
+	// Wait for source synced tags before stopping the orchestrator so drain can
+	// find both torrents (fetchTorrentsCompletedOnDest requires the source synced tag).
+	env.WaitForSyncedTagOnSource(ctx, bigBuckBunnyHash, 30*time.Second,
+		"BBB source torrent should have 'synced' tag before stopping orchestrator")
+	env.WaitForSyncedTagOnSource(ctx, wiredCDHash, 30*time.Second,
+		"Wired CD source torrent should have 'synced' tag before stopping orchestrator")
 
 	cancelOrchestrator()
 	<-orchestratorDone
@@ -1322,6 +1339,12 @@ func TestE2E_NonHardlinkedDeletedIndependently(t *testing.T) {
 	t.Log("Waiting for both torrents to sync to destination...")
 	env.WaitForTorrentCompleteOnDestination(ctx, bigBuckBunnyHash, syncCompleteTimeout, "BBB should be complete on destination")
 	env.WaitForTorrentCompleteOnDestination(ctx, wiredCDHash, syncCompleteTimeout, "Wired CD should be complete on destination")
+	// Wait for source synced tags before stopping the orchestrator so drain can
+	// find both torrents (fetchTorrentsCompletedOnDest requires the source synced tag).
+	env.WaitForSyncedTagOnSource(ctx, bigBuckBunnyHash, 30*time.Second,
+		"BBB source torrent should have 'synced' tag before stopping orchestrator")
+	env.WaitForSyncedTagOnSource(ctx, wiredCDHash, 30*time.Second,
+		"Wired CD source torrent should have 'synced' tag before stopping orchestrator")
 
 	cancelOrchestrator()
 	<-orchestratorDone
