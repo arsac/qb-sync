@@ -82,10 +82,11 @@ func makeDrainTestQueue(t *testing.T) *BidiQueue {
 	t.Helper()
 	logger := testLogger
 	return &BidiQueue{
-		tracker:      NewPieceMonitor(nil, nil, logger, DefaultPieceMonitorConfig()),
-		logger:       logger,
-		config:       DefaultBidiQueueConfig(),
-		pieceStreams: make(map[string]*PooledStream),
+		tracker:             NewPieceMonitor(nil, nil, logger, DefaultPieceMonitorConfig()),
+		logger:              logger,
+		config:              DefaultBidiQueueConfig(),
+		pieceStreams:        make(map[string]*PooledStream),
+		pieceHashMismatches: make(map[string]int),
 	}
 }
 
@@ -218,12 +219,13 @@ func TestSenderWorkersConcurrency(t *testing.T) {
 	config := DefaultBidiQueueConfig()
 	config.NumSenders = numSenders
 	q := &BidiQueue{
-		source:       source,
-		dest:         dest,
-		tracker:      tracker,
-		logger:       logger,
-		config:       config,
-		pieceStreams: make(map[string]*PooledStream),
+		source:              source,
+		dest:                dest,
+		tracker:             tracker,
+		logger:              logger,
+		config:              config,
+		pieceStreams:        make(map[string]*PooledStream),
+		pieceHashMismatches: make(map[string]int),
 	}
 
 	// Pool with one stream whose window has capacity (CanSend = true).

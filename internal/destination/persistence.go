@@ -174,6 +174,15 @@ func (s *Server) recoverTorrentState(ctx context.Context, hash string) (*serverT
 		return nil, loadErr
 	}
 
+	// Apply piecesCovered overlay: pieces where all overlapping files are unselected or
+	// hardlinked are treated as already written (source never streams them).
+	// This mirrors buildWrittenBitmap in initNewTorrent — without it, recovered state
+	// can report these pieces as missing and trigger spurious INCOMPLETE responses.
+	piecesCovered := meta.calculatePiecesCovered()
+	for i, covered := range piecesCovered {
+		written[i] = written[i] || covered
+	}
+
 	meta.initFilePieceCounts(written)
 
 	writtenCount := countWritten(written)

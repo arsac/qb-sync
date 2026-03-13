@@ -36,6 +36,7 @@ const (
 	windowStatsInterval           = 5 * time.Second  // How often to log window stats
 	staleCheckInterval            = 10 * time.Second // How often to check for stale in-flight pieces
 	defaultNumSenders             = 4                // Concurrent sender workers (parallelizes ReadPiece + Send)
+	maxPieceHashMismatches        = 5                // Per-piece hash mismatch limit before forcing finalization
 )
 
 // BidiQueueConfig configures the bidirectional streaming work queue.
@@ -98,6 +99,11 @@ type BidiQueue struct {
 	pieceStreams   map[string]*PooledStream
 	pieceStreamsMu sync.RWMutex
 
+	// Track per-piece hash mismatch failures to prevent infinite retry loops.
+	// Key: pieceKey(hash, index), Value: consecutive mismatch count.
+	pieceHashMismatches   map[string]int
+	pieceHashMismatchesMu sync.Mutex
+
 	bytesSent  atomic.Int64
 	piecesOK   atomic.Int64
 	piecesFail atomic.Int64
@@ -133,12 +139,13 @@ func NewBidiQueue(
 	metrics.SenderWorkersConfigured.Set(float64(config.NumSenders))
 
 	q := &BidiQueue{
-		source:       source,
-		dest:         dest,
-		tracker:      tracker,
-		logger:       logger,
-		config:       config,
-		pieceStreams: make(map[string]*PooledStream),
+		source:              source,
+		dest:                dest,
+		tracker:             tracker,
+		logger:              logger,
+		config:              config,
+		pieceStreams:        make(map[string]*PooledStream),
+		pieceHashMismatches: make(map[string]int),
 	}
 
 	if config.MaxBytesPerSec > 0 {
@@ -656,6 +663,11 @@ func (q *BidiQueue) processAck(ctx context.Context, ack *pb.PieceAck) {
 		q.tracker.MarkStreamed(hash, index)
 		q.piecesOK.Add(1)
 
+		// Clear any accumulated hash mismatch failures on success.
+		q.pieceHashMismatchesMu.Lock()
+		delete(q.pieceHashMismatches, key)
+		q.pieceHashMismatchesMu.Unlock()
+
 		q.logger.DebugContext(ctx, "piece acknowledged",
 			"hash", hash,
 			"piece", index,
@@ -675,12 +687,7 @@ func (q *BidiQueue) processAck(ctx context.Context, ack *pb.PieceAck) {
 		switch ack.GetErrorCode() { //nolint:exhaustive // IO, FINALIZING, NONE handled by default.
 		case pb.PieceErrorCode_PIECE_ERROR_HASH_MISMATCH:
 			metrics.PieceHashMismatchTotal.Inc()
-			q.logger.ErrorContext(ctx, "piece hash mismatch, will retry",
-				"hash", hash,
-				"piece", index,
-				"stream", streamID,
-				"error", ack.GetError(),
-			)
+			q.handleHashMismatch(ctx, hash, index, key, streamID, ack.GetError())
 
 		case pb.PieceErrorCode_PIECE_ERROR_NOT_INITIALIZED:
 			// Clear init cache so next send triggers re-init
@@ -702,6 +709,45 @@ func (q *BidiQueue) processAck(ctx context.Context, ack *pb.PieceAck) {
 			)
 		}
 	}
+}
+
+// handleHashMismatch tracks consecutive hash mismatch failures for a piece.
+// After maxPieceHashMismatches, it forces the piece to streamed so finalization
+// can surface an INCOMPLETE error rather than retrying a corrupt piece forever.
+func (q *BidiQueue) handleHashMismatch(
+	ctx context.Context,
+	hash string,
+	index int,
+	key string,
+	streamID int,
+	errMsg string,
+) {
+	q.pieceHashMismatchesMu.Lock()
+	q.pieceHashMismatches[key]++
+	mismatches := q.pieceHashMismatches[key]
+	if mismatches >= maxPieceHashMismatches {
+		delete(q.pieceHashMismatches, key)
+	}
+	q.pieceHashMismatchesMu.Unlock()
+
+	if mismatches >= maxPieceHashMismatches {
+		q.tracker.MarkStreamed(hash, index)
+		q.logger.ErrorContext(ctx, "piece hash mismatch limit reached, forcing finalization attempt",
+			"hash", hash,
+			"piece", index,
+			"stream", streamID,
+			"mismatches", mismatches,
+		)
+		return
+	}
+
+	q.logger.ErrorContext(ctx, "piece hash mismatch, will retry",
+		"hash", hash,
+		"piece", index,
+		"stream", streamID,
+		"mismatches", mismatches,
+		"error", errMsg,
+	)
 }
 
 // drainInFlightPool waits for in-flight pieces across all streams to be acknowledged.

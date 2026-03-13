@@ -496,7 +496,7 @@ func (t *PieceMonitor) startTracking(ctx context.Context, hash string, alreadyWr
 	// qBittorrent doesn't download files with priority 0, so these pieces
 	// can't be read from disk and must not be queued for streaming.
 	deselectedCount := 0
-	if mask := deselectedPieceMask(
+	if mask := DeselectedPieceMask(
 		meta.GetFiles(), meta.GetNumPieces(), meta.GetPieceSize(), meta.GetTotalSize(),
 	); mask != nil {
 		for i, d := range mask {
@@ -796,12 +796,12 @@ func (t *PieceMonitor) GetTorrentMetadata(hash string) (*TorrentMetadata, bool) 
 	return state.meta, true
 }
 
-// deselectedPieceMask returns a boolean slice marking pieces whose byte range
+// DeselectedPieceMask returns a boolean slice marking pieces whose byte range
 // only overlaps deselected files (Selected=false). These pieces can't be read
 // from disk — qBittorrent doesn't download files with priority 0 — and should
 // be treated as already streamed to prevent queuing and retries.
 // Returns nil if all files are selected (common case; avoids allocation).
-func deselectedPieceMask(files []*pb.FileInfo, numPieces int32, pieceSize, totalSize int64) []bool {
+func DeselectedPieceMask(files []*pb.FileInfo, numPieces int32, pieceSize, totalSize int64) []bool {
 	if pieceSize <= 0 || numPieces <= 0 {
 		return nil
 	}

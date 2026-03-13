@@ -814,7 +814,7 @@ func TestDeselectedPieceMask(t *testing.T) {
 			{Path: "a.mp3", Size: 1000, Offset: 0, Selected: true},
 			{Path: "b.mp3", Size: 1000, Offset: 1000, Selected: true},
 		}
-		mask := deselectedPieceMask(files, 4, 500, 2000)
+		mask := DeselectedPieceMask(files, 4, 500, 2000)
 		if mask != nil {
 			t.Error("expected nil when all files selected")
 		}
@@ -830,7 +830,7 @@ func TestDeselectedPieceMask(t *testing.T) {
 			{Path: "b.mp3", Size: 500, Offset: 500, Selected: false},
 			{Path: "c.mp3", Size: 500, Offset: 1000, Selected: true},
 		}
-		mask := deselectedPieceMask(files, 15, 100, 1500)
+		mask := DeselectedPieceMask(files, 15, 100, 1500)
 		if mask == nil {
 			t.Fatal("expected non-nil mask")
 		}
@@ -868,7 +868,7 @@ func TestDeselectedPieceMask(t *testing.T) {
 		}
 		// Piece 0: 0-499 → overlaps both files → NOT deselected (selected file overlaps)
 		// Piece 1: 500-599 → only in deselected file → deselected
-		mask := deselectedPieceMask(files, 2, 500, 600)
+		mask := DeselectedPieceMask(files, 2, 500, 600)
 		if mask == nil {
 			t.Fatal("expected non-nil mask")
 		}
@@ -886,7 +886,7 @@ func TestDeselectedPieceMask(t *testing.T) {
 		files := []*pb.FileInfo{
 			{Path: "a.mp3", Size: 100, Offset: 0, Selected: false},
 		}
-		mask := deselectedPieceMask(files, 0, 100, 100)
+		mask := DeselectedPieceMask(files, 0, 100, 100)
 		if mask != nil {
 			t.Error("expected nil for zero pieces")
 		}
@@ -896,7 +896,7 @@ func TestDeselectedPieceMask(t *testing.T) {
 		files := []*pb.FileInfo{
 			{Path: "a.mp3", Size: 100, Offset: 0, Selected: false},
 		}
-		mask := deselectedPieceMask(files, 10, 0, 100)
+		mask := DeselectedPieceMask(files, 10, 0, 100)
 		if mask != nil {
 			t.Error("expected nil for zero piece size")
 		}
@@ -907,7 +907,7 @@ func TestDeselectedPieceMask(t *testing.T) {
 			{Path: "a.mp3", Size: 500, Offset: 0, Selected: false},
 			{Path: "b.mp3", Size: 500, Offset: 500, Selected: false},
 		}
-		mask := deselectedPieceMask(files, 10, 100, 1000)
+		mask := DeselectedPieceMask(files, 10, 100, 1000)
 		if mask == nil {
 			t.Fatal("expected non-nil mask")
 		}

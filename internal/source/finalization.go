@@ -237,7 +237,9 @@ func (t *QBTask) resyncWithDest(ctx context.Context, hash string) {
 		return
 	}
 
-	if result == nil || len(result.PiecesNeeded) == 0 {
+	// Bug 3 fix: use PiecesNeededCount (0 = all written) instead of len(PiecesNeeded),
+	// which would be non-zero even for an uninitialized result (-1 sentinel).
+	if result == nil || result.PiecesNeededCount == 0 {
 		t.logger.InfoContext(ctx, "resync: destination reports all pieces written",
 			"hash", hash,
 		)
@@ -246,6 +248,20 @@ func (t *QBTask) resyncWithDest(ctx context.Context, hash string) {
 
 	writtenOnDest := invertPiecesNeeded(result.PiecesNeeded)
 	reset := t.tracker.ResyncStreamed(hash, writtenOnDest)
+
+	// Bug 2 fix: re-apply the deselected piece mask so pieces that can never be
+	// read from source (priority-0 files) are not reset to un-streamed by ResyncStreamed.
+	// Destination correctly omits deselected pieces from its written bitmap, so without
+	// this, those pieces get un-marked and progress.Complete is never reached.
+	if mask := streaming.DeselectedPieceMask(
+		meta.GetFiles(), meta.GetNumPieces(), meta.GetPieceSize(), meta.GetTotalSize(),
+	); mask != nil {
+		restored := t.tracker.MarkStreamedBatch(hash, mask)
+		t.logger.InfoContext(ctx, "re-applied deselected piece mask after resync",
+			"hash", hash,
+			"restored", restored,
+		)
+	}
 
 	t.logger.InfoContext(ctx, "resync complete, pieces will be re-streamed",
 		"hash", hash,
