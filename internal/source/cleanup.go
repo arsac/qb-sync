@@ -290,6 +290,10 @@ func (t *QBTask) groupHardlinkedTorrents(ctx context.Context, torrents []qbittor
 }
 
 func newTorrentGroup(torrents []qbittorrent.Torrent) torrentGroup {
+	if len(torrents) == 0 {
+		return torrentGroup{}
+	}
+
 	group := torrentGroup{
 		torrents:   torrents,
 		minSeeding: torrents[0].SeedingTime,

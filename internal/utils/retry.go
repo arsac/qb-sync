@@ -109,6 +109,10 @@ func classifyError(err error) errorClass {
 	// The go-qbittorrent library tries to unmarshal this as JSON, resulting in:
 	// "could not unmarshal body: invalid character 'n' looking for beginning of value"
 	// (Note: lowercase 'n' after strings.ToLower normalization)
+	//
+	// FRAGILE: this string match depends on the go-qbittorrent library's error format.
+	// If the upstream library changes its error messages, this detection will break
+	// and the error will be classified as permanent instead of benign.
 	if strings.Contains(errStr, "could not unmarshal body: invalid character 'n'") {
 		return errorBenign
 	}

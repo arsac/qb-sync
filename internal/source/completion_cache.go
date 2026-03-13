@@ -43,6 +43,7 @@ func (c *CompletionCache) Keys() []string {
 func (c *CompletionCache) Mark(hash string) {
 	c.mu.Lock()
 	c.completed[hash] = ""
+	metrics.CompletedOnDestCacheSize.Set(float64(len(c.completed)))
 	c.mu.Unlock()
 }
 

@@ -79,13 +79,15 @@ func (ps *PieceStream) receiveAcks() { //nolint:gocognit // complexity from pani
 	defer ps.cancel() // Unblock stuck Send() by cancelling the stream context
 	defer func() {
 		if r := recover(); r != nil {
+			panicErr := fmt.Errorf("panic in receiveAcks: %v", r)
 			ps.logger.Error("panic in receiveAcks",
 				"panic", r,
 				"stack", string(debug.Stack()),
 			)
 			select {
-			case ps.errors <- fmt.Errorf("panic in receiveAcks: %v", r):
+			case ps.errors <- panicErr:
 			default:
+				ps.logger.Error("panic error dropped: error channel full", "error", panicErr)
 			}
 		}
 	}()

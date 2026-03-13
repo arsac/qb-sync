@@ -293,6 +293,9 @@ func (s *Server) markFinalized(metaDir, hash string) {
 }
 
 // relocateForSubPathChange moves files when save_sub_path changed between init and finalize.
+// Safe to read state.files and state.saveSubPath without state.mu here because
+// finalization.active prevents concurrent WritePiece. However, updateStateAfterRelocate
+// mutates state.files paths and state.saveSubPath, so it acquires state.mu.
 func (s *Server) relocateForSubPathChange(
 	ctx context.Context,
 	hash string,
@@ -315,7 +318,10 @@ func (s *Server) relocateForSubPathChange(
 		return fmt.Errorf("relocating files: %w", relocErr)
 	}
 
+	state.mu.Lock()
 	updateStateAfterRelocate(state, s.config.BasePath, oldSubPath, newSubPath)
+	state.mu.Unlock()
+
 	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
 	if subPathErr := saveSubPathFile(metaDir, newSubPath); subPathErr != nil {
 		return fmt.Errorf("persisting sub-path after relocation: %w", subPathErr)

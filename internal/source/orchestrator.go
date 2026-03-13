@@ -32,10 +32,6 @@ const (
 	// Streaming queue configuration defaults.
 	defaultRetryDelay = 5 * time.Second
 
-	// Finalization retry settings - exponential backoff.
-	minFinalizeBackoff = 2 * time.Second
-	maxFinalizeBackoff = 30 * time.Second
-
 	// maxVerificationRetries is the number of consecutive verification failures
 	// before the torrent is tagged as sync-failed and excluded from future syncs.
 	maxVerificationRetries = 3
@@ -45,12 +41,6 @@ const (
 
 	cacheFilePermissions = 0o644
 )
-
-// finalizeBackoff tracks exponential backoff state for finalization retries.
-type finalizeBackoff struct {
-	failures    int
-	lastAttempt time.Time
-}
 
 // TrackedTorrent holds metadata for a torrent being synced from source to destination.
 type TrackedTorrent struct {
@@ -245,6 +235,7 @@ func (t *QBTask) runOnce(ctx context.Context) {
 		t.pruneCycleCount = 0
 		t.pruneCompletedOnDest(ctx)
 		t.recheckFileSelections(ctx)
+		t.pruneStaleMonitorEntries(ctx)
 	}
 }
 
@@ -282,5 +273,17 @@ func (t *QBTask) pruneCompletedOnDest(ctx context.Context) {
 			"remaining", t.completed.Count(),
 		)
 		t.completed.Save()
+	}
+}
+
+// pruneStaleMonitorEntries removes PieceMonitor entries for torrents that the
+// orchestrator no longer tracks. This is a safety net for cases where Untrack
+// was missed due to an error path.
+func (t *QBTask) pruneStaleMonitorEntries(ctx context.Context) {
+	pruned := t.tracker.PruneStale(t.tracked.Hashes())
+	if pruned > 0 {
+		t.logger.WarnContext(ctx, "pruned stale PieceMonitor entries",
+			"pruned", pruned,
+		)
 	}
 }

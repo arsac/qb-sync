@@ -53,7 +53,6 @@ const (
 	partialSuffix = ".partial"
 
 	// Memory management.
-	bytesPerMB               = 1024 * 1024
 	defaultMaxStreamBufferMB = 512 // Default global memory budget for buffered piece data
 	maxVerifyConcurrency     = 4   // Limit concurrent piece reads during finalization to cap transient memory
 

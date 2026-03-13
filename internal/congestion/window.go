@@ -1,6 +1,7 @@
 package congestion
 
 import (
+	"fmt"
 	"math"
 	"sync"
 	"time"
@@ -349,9 +350,14 @@ func (w *AdaptiveWindow) OnFail(key string) {
 
 	// Recovery deduplication: if this piece was sent before the last cutback,
 	// it belongs to the same loss event — skip reduction.
+	// Invariant: all inflight pieces must have sequence numbers assigned via OnSend/TrySend.
 	seq, hasSeq := w.pieceSeq[key]
 	delete(w.pieceSeq, key)
-	if hasSeq && w.largestSentAtCutback >= 0 && seq <= w.largestSentAtCutback {
+	if !hasSeq {
+		panic(fmt.Sprintf("congestion.OnFail: piece %q in inflight map has no sequence number — "+
+			"all inflight pieces must be registered via OnSend or TrySend", key))
+	}
+	if w.largestSentAtCutback >= 0 && seq <= w.largestSentAtCutback {
 		return
 	}
 

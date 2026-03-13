@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/arsac/qb-sync/internal/congestion"
+	"github.com/arsac/qb-sync/internal/grpcutil"
 	"github.com/arsac/qb-sync/internal/metrics"
 	pb "github.com/arsac/qb-sync/proto"
 
@@ -20,7 +21,7 @@ const (
 	defaultStreamRetryDelay = 5 * time.Second
 
 	// streamingRateLimiterBurst is the burst size for rate limiting (1MB).
-	streamingRateLimiterBurst = bytesPerMB
+	streamingRateLimiterBurst = grpcutil.BytesPerMB
 
 	// senderRetryBackoff is the safety-net polling interval for sender workers
 	// when no stream has capacity. Handles missed AckReady signals and stale-cleanup capacity changes.

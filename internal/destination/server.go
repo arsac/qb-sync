@@ -14,6 +14,7 @@ import (
 	"github.com/autobrr/go-qbittorrent"
 	"golang.org/x/sync/semaphore"
 
+	"github.com/arsac/qb-sync/internal/grpcutil"
 	"github.com/arsac/qb-sync/internal/health"
 	"github.com/arsac/qb-sync/internal/metrics"
 	"github.com/arsac/qb-sync/internal/qbclient"
@@ -30,18 +31,6 @@ const (
 	// before re-running the actual check. Prevents excessive login calls on every
 	// K8s probe request.
 	healthCheckCacheTTL = 30 * time.Second
-
-	// maxGRPCMessageSize is the maximum gRPC message size for piece transfers.
-	// Torrent pieces are commonly 1-16 MB; the default gRPC limit of 4 MB is too small.
-	maxGRPCMessageSize = 32 * 1024 * 1024 // 32 MB
-
-	// HTTP/2 flow control window sizes. Must match the client (source) side.
-	// The default 64 KB window throttles bulk piece transfers — the receiver
-	// can only buffer 64 KB before sending WINDOW_UPDATE, forcing the sender
-	// to stall on every round trip. Larger windows let the sender push data
-	// continuously without waiting for per-RTT acknowledgments.
-	initialStreamWindowSize = 16 * 1024 * 1024 // 16 MB per-stream flow control window
-	initialConnWindowSize   = 64 * 1024 * 1024 // 64 MB connection-level flow control window
 
 	// gracefulShutdownTimeout is how long GracefulStop waits for active streams
 	// to finish before force-stopping. Long-lived bidirectional streams (piece
@@ -112,10 +101,12 @@ type Server struct {
 func NewServer(config ServerConfig, logger *slog.Logger) *Server {
 	bufferBytes := config.MaxStreamBufferBytes
 	if bufferBytes <= 0 {
-		bufferBytes = defaultMaxStreamBufferMB * bytesPerMB
+		bufferBytes = defaultMaxStreamBufferMB * grpcutil.BytesPerMB
 	}
 
-	bgCtx, bgCancel := context.WithCancel(context.Background())
+	bgCtx, bgCancel := context.WithCancel(
+		context.Background(),
+	) //nolint:gosec // G118: cancel stored on struct, called in Server.Stop
 
 	s := &Server{
 		config:         config,
@@ -176,10 +167,10 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	s.server = grpc.NewServer(
-		grpc.MaxRecvMsgSize(maxGRPCMessageSize),
-		grpc.MaxSendMsgSize(maxGRPCMessageSize),
-		grpc.InitialWindowSize(initialStreamWindowSize),
-		grpc.InitialConnWindowSize(initialConnWindowSize),
+		grpc.MaxRecvMsgSize(grpcutil.MaxGRPCMessageSize),
+		grpc.MaxSendMsgSize(grpcutil.MaxGRPCMessageSize),
+		grpc.InitialWindowSize(grpcutil.InitialStreamWindowSize),
+		grpc.InitialConnWindowSize(grpcutil.InitialConnWindowSize),
 		grpc.KeepaliveParams(keepalive.ServerParameters{
 			Time:    keepalivePingInterval, // Send pings every 30s if no activity
 			Timeout: keepalivePingTimeout,  // Wait 10s for ping ack

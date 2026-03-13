@@ -429,7 +429,7 @@ func (t *QBTask) resyncFileSelection(ctx context.Context, hash, fingerprint stri
 		return
 	}
 
-	tt := TrackedTorrent{CompletionTime: time.Now(), Name: hash}
+	tt := TrackedTorrent{CompletionTime: time.Now(), Name: meta.GetName()}
 	if torrent := t.findTorrentByHash(hash); torrent != nil {
 		tt = TrackedTorrent{
 			CompletionTime: completionTimeOrNow(torrent.CompletionOn),

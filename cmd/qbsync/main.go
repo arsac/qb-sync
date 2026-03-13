@@ -14,12 +14,11 @@ import (
 
 	"github.com/arsac/qb-sync/internal/config"
 	"github.com/arsac/qb-sync/internal/destination"
+	"github.com/arsac/qb-sync/internal/grpcutil"
 	"github.com/arsac/qb-sync/internal/health"
 	"github.com/arsac/qb-sync/internal/logger"
 	"github.com/arsac/qb-sync/internal/source"
 )
-
-const bytesPerMB = 1024 * 1024
 
 func main() {
 	if err := run(); err != nil {
@@ -155,7 +154,7 @@ func runDestination(cmd *cobra.Command, _ []string) error {
 		BasePath:             cfg.DataPath,
 		SavePath:             cfg.SavePath,
 		StreamWorkers:        cfg.StreamWorkers,
-		MaxStreamBufferBytes: int64(cfg.MaxStreamBufferMB) * bytesPerMB,
+		MaxStreamBufferBytes: int64(cfg.MaxStreamBufferMB) * grpcutil.BytesPerMB,
 		SyncedTag:            cfg.SyncedTag,
 		DryRun:               cfg.DryRun,
 	}

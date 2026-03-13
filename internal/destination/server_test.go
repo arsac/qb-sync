@@ -1936,10 +1936,10 @@ func TestInitTorrentResync_PartialRecovery(t *testing.T) {
 		s.mu.RLock()
 		state := s.torrents["resyncpartial"]
 		s.mu.RUnlock()
-		if state == nil {
+		if state == nil { //nolint:staticcheck // SA5011: t.Fatal terminates goroutine; state is non-nil after this block
 			t.Fatal("torrent state should exist")
 		}
-		if !strings.HasSuffix(state.files[1].path, ".partial") {
+		if !strings.HasSuffix(state.files[1].path, ".partial") { //nolint:staticcheck // SA5011: guarded above
 			t.Errorf("file 1 path should end with .partial, got %s", state.files[1].path)
 		}
 	})
@@ -2090,10 +2090,10 @@ func TestInitTorrentResync_ExistingState(t *testing.T) {
 		s.mu.RLock()
 		state := s.torrents["resyncstate"]
 		s.mu.RUnlock()
-		if state == nil {
+		if state == nil { //nolint:staticcheck // SA5011: t.Fatal terminates goroutine; state is non-nil after this block
 			t.Fatal("torrent state should exist after re-sync")
 		}
-		if !state.files[1].selected {
+		if !state.files[1].selected { //nolint:staticcheck // SA5011: guarded above
 			t.Error("file2 should be selected after re-sync")
 		}
 	})

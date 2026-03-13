@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/arsac/qb-sync/internal/congestion"
+	"github.com/arsac/qb-sync/internal/grpcutil"
 	"github.com/arsac/qb-sync/internal/metrics"
 	pb "github.com/arsac/qb-sync/proto"
 )
@@ -47,7 +48,6 @@ const (
 	drainPollInterval = 100 * time.Millisecond
 
 	// Conversion constants.
-	bytesPerMB      = 1024 * 1024
 	percentMultiple = 100
 )
 
@@ -205,7 +205,9 @@ func (p *StreamPool) Open(ctx context.Context, numStreams int) error {
 		return ErrPoolClosed
 	}
 
-	p.ctx, p.cancel = context.WithCancel(ctx)
+	p.ctx, p.cancel = context.WithCancel(
+		ctx,
+	) //nolint:gosec // G118: cancel stored on struct, called in StreamPool.Close
 
 	// Clamp stream count
 	numStreams = max(min(numStreams, p.maxStreams), MinPoolSize)
@@ -476,7 +478,7 @@ func (p *StreamPool) measureThroughput() (float64, bool) {
 	if p.lastThroughput == 0 {
 		p.lastThroughput = currentThroughput
 		p.logger.InfoContext(p.ctx, "adaptive scaling baseline",
-			"throughputMBps", currentThroughput/bytesPerMB,
+			"throughputMBps", currentThroughput/grpcutil.BytesPerMB,
 			"streams", len(p.streams),
 		)
 		return 0, false
@@ -518,8 +520,8 @@ func (p *StreamPool) applyScalingDecision(currentThroughput float64) {
 	streamCount := len(p.streams)
 
 	p.logger.DebugContext(p.ctx, "adaptive scaling check",
-		"throughputMBps", currentThroughput/bytesPerMB,
-		"lastThroughputMBps", p.lastThroughput/bytesPerMB,
+		"throughputMBps", currentThroughput/grpcutil.BytesPerMB,
+		"lastThroughputMBps", p.lastThroughput/grpcutil.BytesPerMB,
 		"changePercent", changeRatio*percentMultiple,
 		"streams", streamCount,
 		"plateauCount", p.plateauCount,
@@ -604,7 +606,7 @@ func (p *StreamPool) handlePlateau(currentThroughput float64) {
 		metrics.ConnectionScaleEventsTotal.WithLabelValues(metrics.DirectionUp).Inc()
 		p.logger.InfoContext(p.ctx, "added TCP connection",
 			"connections", connCount,
-			"throughputMBps", currentThroughput/bytesPerMB,
+			"throughputMBps", currentThroughput/grpcutil.BytesPerMB,
 		)
 		return
 	}
@@ -613,7 +615,7 @@ func (p *StreamPool) handlePlateau(currentThroughput float64) {
 	p.logger.InfoContext(p.ctx, "full saturation detected",
 		"streams", len(p.streams),
 		"connections", p.dest.ConnectionCount(),
-		"throughputMBps", currentThroughput/bytesPerMB,
+		"throughputMBps", currentThroughput/grpcutil.BytesPerMB,
 	)
 	p.pauseScaling("full saturation")
 }
@@ -886,7 +888,7 @@ func (p *StreamPool) Stats() StreamPoolStats {
 		Streams:         make([]PooledStreamStats, len(p.streams)),
 		AdaptiveEnabled: p.adaptive,
 		ScalingPaused:   p.scalingPaused,
-		ThroughputMBps:  p.lastThroughput / bytesPerMB,
+		ThroughputMBps:  p.lastThroughput / grpcutil.BytesPerMB,
 	}
 
 	var totalWindow int

@@ -635,6 +635,9 @@ func (t *PieceMonitor) queueCompletedPieces(ctx context.Context, state *torrentS
 		if pieceState != PieceStateDownloaded {
 			continue
 		}
+		// Benign TOCTOU: a piece could be marked streamed between this check and
+		// the channel send below. Handled safely downstream — sendPiecePool rechecks
+		// IsPieceStreamed before the actual gRPC send, so duplicates are discarded.
 		if state.streamed[i] {
 			continue
 		}
@@ -733,6 +736,24 @@ func (t *PieceMonitor) TrackedCount() int {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return len(t.torrents)
+}
+
+// PruneStale removes tracked torrents whose hashes are not in activeHashes.
+// Call this periodically with the set of actively managed torrent hashes to
+// prevent memory leaks from torrents that were interrupted without an Untrack call.
+// Returns the number of entries pruned.
+func (t *PieceMonitor) PruneStale(activeHashes map[string]struct{}) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	var pruned int
+	for hash := range t.torrents {
+		if _, active := activeHashes[hash]; !active {
+			delete(t.torrents, hash)
+			pruned++
+		}
+	}
+	return pruned
 }
 
 // IsTracking returns true if the given torrent is being tracked.

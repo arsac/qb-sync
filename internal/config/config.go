@@ -86,6 +86,8 @@ type SourceConfig struct {
 }
 
 // Validate validates the base configuration shared by source and destination.
+// Note: QBURL is not validated here because it is required for source but
+// optional for destination (destination can run without qBittorrent integration).
 func (c *BaseConfig) Validate() error {
 	if c.DataPath == "" {
 		return errors.New("data path is required")
@@ -127,6 +129,12 @@ func (c *SourceConfig) Validate() error {
 	}
 	if c.MinGRPCConnections > 0 && c.MaxGRPCConnections > 0 && c.MinGRPCConnections > c.MaxGRPCConnections {
 		return errors.New("min connections cannot exceed max connections")
+	}
+	if c.MinSeedingTime < 0 {
+		return errors.New("min seeding time cannot be negative")
+	}
+	if c.DrainTimeout < 0 {
+		return errors.New("drain timeout cannot be negative")
 	}
 	return nil
 }

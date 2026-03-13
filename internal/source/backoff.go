@@ -7,6 +7,18 @@ import (
 	"github.com/arsac/qb-sync/internal/metrics"
 )
 
+// Finalization retry settings - exponential backoff.
+const (
+	minFinalizeBackoff = 2 * time.Second
+	maxFinalizeBackoff = 30 * time.Second
+)
+
+// finalizeBackoff tracks exponential backoff state for finalization retries.
+type finalizeBackoff struct {
+	failures    int
+	lastAttempt time.Time
+}
+
 // BackoffTracker manages exponential backoff for finalization retries.
 // Thread-safe with internal locking.
 type BackoffTracker struct {

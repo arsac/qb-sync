@@ -131,7 +131,10 @@ message InitTorrentResponse {
   // Hardlink results - which files were hardlinked (for logging/debugging)
   repeated HardlinkResult hardlink_results = 5;
 
-  // Count of pieces that need streaming (convenience field)
+  // Count of pieces that need streaming (derived from pieces_needed).
+  // Special value -1 means torrent not yet initialized on destination
+  // (i.e., a minimal CheckTorrentStatus call — caller should send full InitTorrent).
+  // Must stay in sync with pieces_needed when status is SYNC_STATUS_READY.
   int32 pieces_needed_count = 6;
 
   // Count of pieces already present (hardlinked, verified, or previously received)

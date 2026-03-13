@@ -16,6 +16,7 @@ import (
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/keepalive"
 
+	"github.com/arsac/qb-sync/internal/grpcutil"
 	pb "github.com/arsac/qb-sync/proto"
 )
 
@@ -23,17 +24,6 @@ const (
 	// gRPC keepalive parameters.
 	keepaliveTime    = 30 * time.Second // Send pings every 30 seconds if no activity
 	keepaliveTimeout = 10 * time.Second // Wait 10 seconds for ping ack
-
-	// maxGRPCMessageSize is the maximum gRPC message size for piece transfers.
-	// Torrent pieces are commonly 1–16 MB; the default gRPC limit of 4 MB is too small.
-	maxGRPCMessageSize = 32 * 1024 * 1024 // 32 MB
-
-	// HTTP/2 flow control window sizes. The default 64 KB initial window requires
-	// 262 RTTs to transfer a 16 MB piece, capping first-piece throughput at ~61 MB/s
-	// on a 1 ms LAN. Larger windows allow the sender to push data without waiting
-	// for WINDOW_UPDATE frames, closing the gap with rsync on fast links.
-	initialStreamWindowSize = 16 * 1024 * 1024 // 16 MB per-stream flow control window
-	initialConnWindowSize   = 64 * 1024 * 1024 // 64 MB connection-level flow control window
 
 	// finalizeConnTimeout is how long FinalizeTorrent waits for the gRPC
 	// connection to become READY before giving up. This prevents fail-fast
@@ -144,11 +134,11 @@ func NewGRPCDestination(addr string, minConns, maxConns int) (*GRPCDestination, 
 				MaxDelay:   maxReconnectBackoff,
 			},
 		}),
-		grpc.WithInitialWindowSize(initialStreamWindowSize),
-		grpc.WithInitialConnWindowSize(initialConnWindowSize),
+		grpc.WithInitialWindowSize(grpcutil.InitialStreamWindowSize),
+		grpc.WithInitialConnWindowSize(grpcutil.InitialConnWindowSize),
 		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(maxGRPCMessageSize),
-			grpc.MaxCallSendMsgSize(maxGRPCMessageSize),
+			grpc.MaxCallRecvMsgSize(grpcutil.MaxGRPCMessageSize),
+			grpc.MaxCallSendMsgSize(grpcutil.MaxGRPCMessageSize),
 		),
 	}
 

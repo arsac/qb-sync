@@ -86,6 +86,18 @@ func (s *TrackedSet) Count() int {
 	return n
 }
 
+// Hashes returns the set of tracked hashes as a map[string]struct{}.
+// Useful for set-membership checks (e.g., pruning stale entries in other data structures).
+func (s *TrackedSet) Hashes() map[string]struct{} {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make(map[string]struct{}, len(s.torrents))
+	for hash := range s.torrents {
+		result[hash] = struct{}{}
+	}
+	return result
+}
+
 // Range calls fn for each tracked torrent while holding the read lock.
 // If fn returns false, iteration stops.
 func (s *TrackedSet) Range(fn func(hash string, tt TrackedTorrent) bool) {
