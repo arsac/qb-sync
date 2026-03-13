@@ -100,15 +100,24 @@ func (t *QBTask) markTorrentSynced(ctx context.Context, hash string, tt TrackedT
 
 	t.logger.InfoContext(ctx, "torrent synced successfully", "hash", hash)
 
-	if t.cfg.SyncedTag != "" && !t.cfg.DryRun {
-		if tagErr := t.srcClient.AddTagsCtx(ctx, []string{hash}, t.cfg.SyncedTag); tagErr != nil {
-			metrics.TagApplicationErrorsTotal.WithLabelValues(metrics.ModeSource).Inc()
-			t.logger.ErrorContext(ctx, "failed to add synced tag",
-				"hash", hash,
-				"tag", t.cfg.SyncedTag,
-				"error", tagErr,
-			)
-		}
+	t.applySyncedTag(ctx, hash)
+}
+
+// applySyncedTag adds the configured synced tag to the source torrent.
+// Non-fatal: logs and increments a metric on failure so the torrent is retried
+// on the next cleanup cycle (fetchTorrentsCompletedOnDest skips untagged entries
+// and calls applySyncedTag again, so transient API errors self-heal).
+func (t *QBTask) applySyncedTag(ctx context.Context, hash string) {
+	if t.cfg.SyncedTag == "" || t.cfg.DryRun {
+		return
+	}
+	if tagErr := t.srcClient.AddTagsCtx(ctx, []string{hash}, t.cfg.SyncedTag); tagErr != nil {
+		metrics.TagApplicationErrorsTotal.WithLabelValues(metrics.ModeSource).Inc()
+		t.logger.ErrorContext(ctx, "failed to add synced tag",
+			"hash", hash,
+			"tag", t.cfg.SyncedTag,
+			"error", tagErr,
+		)
 	}
 }
 

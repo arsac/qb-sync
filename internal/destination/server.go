@@ -104,9 +104,9 @@ func NewServer(config ServerConfig, logger *slog.Logger) *Server {
 		bufferBytes = defaultMaxStreamBufferMB * grpcutil.BytesPerMB
 	}
 
-	bgCtx, bgCancel := context.WithCancel(
+	bgCtx, bgCancel := context.WithCancel( //nolint:gosec // G118: cancel stored on struct, called in Server.Stop
 		context.Background(),
-	) //nolint:gosec // G118: cancel stored on struct, called in Server.Stop
+	)
 
 	s := &Server{
 		config:         config,

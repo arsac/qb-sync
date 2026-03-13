@@ -159,6 +159,7 @@ func (t *QBTask) queryDestStatus(
 	case pb.TorrentSyncStatus_SYNC_STATUS_COMPLETE:
 		t.completed.MarkWithFingerprint(torrent.Hash, "")
 		t.completed.Save()
+		t.applySyncedTag(ctx, torrent.Hash)
 		t.logger.InfoContext(ctx, "torrent already complete on destination",
 			"name", torrent.Name,
 			"hash", torrent.Hash,
@@ -415,11 +416,25 @@ func (t *QBTask) resyncFileSelection(ctx context.Context, hash, fingerprint stri
 		return
 	}
 
-	if result.PiecesNeededCount <= 0 {
-		// All selected pieces already on destination — mark complete directly
+	switch result.Status {
+	case pb.TorrentSyncStatus_SYNC_STATUS_COMPLETE:
+		// Torrent is verified in destination qBittorrent — no streaming needed.
 		t.completed.MarkWithFingerprint(hash, fingerprint)
 		t.completed.Save()
+		t.applySyncedTag(ctx, hash)
 		return
+	case pb.TorrentSyncStatus_SYNC_STATUS_VERIFYING:
+		// Destination is verifying; queryDestStatus will detect COMPLETE next cycle.
+		return
+	case pb.TorrentSyncStatus_SYNC_STATUS_READY:
+		// Fall through to tracking below.
+		// PiecesNeededCount == 0 here means all pieces are in .partial files — the
+		// tracker will detect no streaming needed and go straight to finalization.
+	default:
+		t.logger.WarnContext(ctx, "re-sync: unknown status from InitTorrent, treating as READY",
+			"hash", hash,
+			"status", result.Status,
+		)
 	}
 
 	// Start tracking for streaming

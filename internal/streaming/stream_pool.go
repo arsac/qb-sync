@@ -205,9 +205,9 @@ func (p *StreamPool) Open(ctx context.Context, numStreams int) error {
 		return ErrPoolClosed
 	}
 
-	p.ctx, p.cancel = context.WithCancel(
+	p.ctx, p.cancel = context.WithCancel( //nolint:gosec // G118: cancel stored on struct, called in StreamPool.Close
 		ctx,
-	) //nolint:gosec // G118: cancel stored on struct, called in StreamPool.Close
+	)
 
 	// Clamp stream count
 	numStreams = max(min(numStreams, p.maxStreams), MinPoolSize)

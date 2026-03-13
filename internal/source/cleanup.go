@@ -225,6 +225,15 @@ func (t *QBTask) fetchTorrentsCompletedOnDest(ctx context.Context) ([]qbittorren
 			hasTag(torrent.Tags, t.cfg.ExcludeCleanupTag) {
 			continue
 		}
+		// Require SyncedTag if configured: protects re-downloaded torrents that
+		// destination already has (they get the completed cache entry via
+		// queryDestStatus but never went through markTorrentSynced).
+		// applySyncedTag is called here so transient tag-application failures
+		// self-heal on the next cleanup cycle rather than blocking indefinitely.
+		if t.cfg.SyncedTag != "" && !hasTag(torrent.Tags, t.cfg.SyncedTag) {
+			t.applySyncedTag(ctx, torrent.Hash)
+			continue
+		}
 		result = append(result, torrent)
 	}
 
