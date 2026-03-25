@@ -201,6 +201,18 @@ func (s *Server) initNewTorrent(
 	pieceSize := req.GetPieceSize()
 	totalSize := req.GetTotalSize()
 
+	// If a stale .state file claims pieces are written but the data files
+	// don't exist on disk (externally deleted, or hardlinks never created),
+	// remove it so buildWrittenBitmap starts with a clean bitmap instead
+	// of trusting the stale claim.
+	if validateErr := validateRecoveredFiles(files); validateErr != nil {
+		s.logger.WarnContext(ctx, "stale state file detected during init, removing",
+			"hash", hash,
+			"error", validateErr,
+		)
+		_ = os.Remove(statePath)
+	}
+
 	// Create torrentMeta early so buildWrittenBitmap can use its methods.
 	meta := torrentMeta{
 		pieceHashes: req.GetPieceHashes(),

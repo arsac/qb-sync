@@ -259,10 +259,15 @@ func restoreFileSelection(files []*serverFileInfo, metaDir string) {
 }
 
 // validateRecoveredFiles checks that every selected file exists on disk.
+// Skips unselected files and files with pending/complete hardlinks (those
+// are created during finalization, not during streaming).
 // Returns a non-nil error listing the first missing file if any are absent.
 func validateRecoveredFiles(files []*serverFileInfo) error {
 	for _, fi := range files {
 		if !fi.selected {
+			continue
+		}
+		if fi.hardlink.state == hlStatePending || fi.hardlink.state == hlStateComplete {
 			continue
 		}
 		if _, err := os.Stat(fi.path); err != nil {
