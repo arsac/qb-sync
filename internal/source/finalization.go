@@ -15,7 +15,7 @@ import (
 // finalizeCompletedStreams checks for streams where all pieces are streamed
 // and calls FinalizeTorrent on the destination server.
 //
-//nolint:unparam // error return kept for interface consistency; errors handled internally
+//nolint:unparam,gocognit // error return kept for interface consistency; complexity is linear error-dispatch
 func (t *QBTask) finalizeCompletedStreams(ctx context.Context) error {
 	tracked := t.tracked.Snapshot()
 
@@ -54,6 +54,11 @@ func (t *QBTask) finalizeCompletedStreams(ctx context.Context) error {
 
 			if errors.Is(finalizeErr, streaming.ErrFinalizeIncomplete) {
 				t.handleIncompleteFinalization(ctx, hash)
+				continue
+			}
+
+			if errors.Is(finalizeErr, streaming.ErrFinalizeNotFound) {
+				t.handleNotFoundFinalization(ctx, hash)
 				continue
 			}
 
@@ -171,6 +176,17 @@ func (t *QBTask) handleIncompleteFinalization(ctx context.Context, hash string) 
 		"maxRetries", maxVerificationRetries,
 	)
 	t.resyncWithDest(ctx, hash)
+}
+
+// handleNotFoundFinalization handles a FINALIZE_ERROR_NOT_FOUND response from
+// the destination. The destination has no state for this torrent (metadata missing
+// or data files externally deleted). Untrack so the next poll cycle re-discovers
+// and re-initializes the torrent from scratch.
+func (t *QBTask) handleNotFoundFinalization(ctx context.Context, hash string) {
+	t.logger.WarnContext(ctx, "destination has no state for torrent, untracking for re-init",
+		"hash", hash,
+	)
+	t.stopTracking(hash)
 }
 
 // markSyncFailed tags the torrent as sync-failed on source qBittorrent and stops

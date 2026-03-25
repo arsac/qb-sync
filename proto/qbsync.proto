@@ -60,6 +60,7 @@ enum PieceErrorCode {
 enum FinalizeErrorCode {
   FINALIZE_ERROR_NONE = 0;       // Default / unknown
   FINALIZE_ERROR_INCOMPLETE = 1; // Not all pieces written
+  FINALIZE_ERROR_NOT_FOUND = 2;  // Torrent state not found or stale (data files missing)
 }
 
 message WritePieceRequest {

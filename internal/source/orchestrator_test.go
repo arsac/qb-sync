@@ -1249,6 +1249,91 @@ func TestResyncWithDest(t *testing.T) {
 	})
 }
 
+func TestFinalizeTorrent_ErrFinalizeNotFoundPropagates(t *testing.T) {
+	logger := testLogger(t)
+
+	t.Run("ErrFinalizeNotFound is returned by finalizeTorrent", func(t *testing.T) {
+		mockClient := &mockQBClient{
+			getTorrentsResult: []qbittorrent.Torrent{
+				{Hash: "abc123", SavePath: "/data", Category: "movies"},
+			},
+		}
+		dest := &mockDest{
+			finalizeErr: fmt.Errorf("%w: stale state for abc123", streaming.ErrFinalizeNotFound),
+		}
+		task := &QBTask{
+			cfg:       &config.SourceConfig{},
+			logger:    logger,
+			srcClient: mockClient,
+			grpcDest:  dest,
+			source:    qbclient.NewSource(nil, ""),
+		}
+
+		err := task.finalizeTorrent(context.Background(), "abc123")
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !errors.Is(err, streaming.ErrFinalizeNotFound) {
+			t.Errorf("expected ErrFinalizeNotFound, got: %v", err)
+		}
+	})
+
+	t.Run("ErrFinalizeNotFound does not increment backoff", func(t *testing.T) {
+		mockClient := &mockQBClient{
+			getTorrentsResult: []qbittorrent.Torrent{
+				{Hash: "abc123", SavePath: "/data"},
+			},
+		}
+		dest := &mockDest{
+			finalizeErr: fmt.Errorf("%w: stale state", streaming.ErrFinalizeNotFound),
+		}
+		task := &QBTask{
+			cfg:       &config.SourceConfig{},
+			logger:    logger,
+			srcClient: mockClient,
+			grpcDest:  dest,
+			source:    qbclient.NewSource(nil, ""),
+			backoffs:  NewBackoffTracker(),
+		}
+
+		_ = task.finalizeTorrent(context.Background(), "abc123")
+
+		if !task.backoffs.ShouldAttempt("abc123") {
+			t.Error("ErrFinalizeNotFound should not create a backoff entry")
+		}
+	})
+}
+
+func TestHandleNotFoundFinalization_Untracks(t *testing.T) {
+	logger := testLogger(t)
+
+	monitor := streaming.NewPieceMonitor(nil, nil, logger, streaming.PieceMonitorConfig{
+		PollInterval: time.Second,
+	})
+	dest := &mockDest{}
+	tracked := NewTrackedSet()
+	tracked.AddIfAbsent("abc123", TrackedTorrent{Name: "test"})
+
+	task := &QBTask{
+		cfg:      &config.SourceConfig{},
+		logger:   logger,
+		tracker:  monitor,
+		grpcDest: dest,
+		source:   qbclient.NewSource(nil, ""),
+		tracked:  tracked,
+		backoffs: NewBackoffTracker(),
+	}
+
+	task.handleNotFoundFinalization(context.Background(), "abc123")
+
+	if tracked.Has("abc123") {
+		t.Error("torrent should have been untracked")
+	}
+	if !task.backoffs.ShouldAttempt("abc123") {
+		t.Error("backoff should have been cleared")
+	}
+}
+
 // TestSyncedTagApplication tests that the synced tag is applied correctly.
 func TestSyncedTagApplication(t *testing.T) {
 	logger := testLogger(t)

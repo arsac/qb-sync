@@ -63,6 +63,11 @@ var (
 	// the persisted state is stale. The caller should re-sync with destination to discover
 	// which pieces are actually missing and re-stream them.
 	ErrFinalizeIncomplete = errors.New("finalization failed: incomplete pieces on destination")
+
+	// ErrFinalizeNotFound is returned by FinalizeTorrent when the destination has no
+	// state for the torrent (metadata missing or data files deleted). The caller should
+	// untrack the torrent so it gets re-discovered and re-initialized from scratch.
+	ErrFinalizeNotFound = errors.New("finalization failed: torrent not found on destination")
 )
 
 // successResponse is implemented by gRPC response types that have Success/Error fields.
@@ -414,14 +419,19 @@ func (d *GRPCDestination) FinalizeTorrent(
 		return fmt.Errorf("finalize torrent RPC failed: %w", err)
 	}
 	if respErr := checkRPCResponse(resp, "finalize"); respErr != nil {
-		// Detect incomplete-pieces error from destination — this means destination's written
-		// state diverged from source's streamed state (typically after destination restart
-		// where flushed state was stale). Return a sentinel so the orchestrator
-		// can re-sync instead of endlessly retrying.
-		if resp.GetErrorCode() == pb.FinalizeErrorCode_FINALIZE_ERROR_INCOMPLETE {
+		switch resp.GetErrorCode() { //nolint:exhaustive // FINALIZE_ERROR_NONE falls through to default
+		case pb.FinalizeErrorCode_FINALIZE_ERROR_INCOMPLETE:
+			// Destination's written state diverged from source's streamed state
+			// (typically after destination restart where flushed state was stale).
+			// Return a sentinel so the orchestrator can re-sync.
 			return fmt.Errorf("%w: %s", ErrFinalizeIncomplete, resp.GetError())
+		case pb.FinalizeErrorCode_FINALIZE_ERROR_NOT_FOUND:
+			// Destination has no state for this torrent (metadata missing or data
+			// files externally deleted). Caller should untrack and re-initialize.
+			return fmt.Errorf("%w: %s", ErrFinalizeNotFound, resp.GetError())
+		default:
+			return respErr
 		}
-		return respErr
 	}
 
 	// Destination returns state="verifying" when background verification is still running.

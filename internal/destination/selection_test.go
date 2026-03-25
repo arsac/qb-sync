@@ -656,6 +656,101 @@ func TestRecoverTorrentState_MissingStateFile(t *testing.T) {
 	})
 }
 
+// --- Recovery file validation ---
+
+func TestRecoverTorrentState_MissingDataFiles_ReturnsError(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+
+	hash := "recover-missing-files"
+	metaDir := filepath.Join(tmpDir, metaDirName, hash)
+
+	createTestTorrentFileWithPaths(t, tmpDir, hash, []string{"file1.bin"})
+
+	// Create state file (all pieces written) but do NOT create the data file
+	statePath := filepath.Join(metaDir, ".state")
+	if err := os.WriteFile(statePath, []byte{1, 1, 1, 1, 1, 1, 1, 1, 1, 1}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	_, err := s.recoverTorrentState(ctx, hash)
+	if err == nil {
+		t.Fatal("expected error when data files are missing")
+	}
+
+	// Metadata directory should be cleaned up
+	if _, statErr := os.Stat(metaDir); !os.IsNotExist(statErr) {
+		t.Error("expected stale metadata directory to be removed")
+	}
+}
+
+func TestRecoverTorrentState_MissingDataFiles_UnselectedIgnored(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+
+	hash := "recover-missing-unselected"
+	metaDir := filepath.Join(tmpDir, metaDirName, hash)
+
+	createTestTorrentFileWithPaths(t, tmpDir, hash, []string{"file1.bin", "file2.bin"})
+
+	// State: all pieces written
+	statePath := filepath.Join(metaDir, ".state")
+	if err := os.WriteFile(statePath, []byte{1, 1, 1, 1, 1, 1, 1, 1, 1, 1}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// file1 selected, file2 unselected
+	if err := os.WriteFile(filepath.Join(metaDir, selectedFileName), []byte{1, 0}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Only create the selected file — unselected file may legitimately not exist
+	writeTestFile(t, filepath.Join(tmpDir, "test", "file1.bin"), make([]byte, 1024))
+
+	ctx := context.Background()
+	state, err := s.recoverTorrentState(ctx, hash)
+	if err != nil {
+		t.Fatalf("expected success when only unselected files are missing, got: %v", err)
+	}
+
+	if !state.files[0].selected {
+		t.Error("file 0 should be selected")
+	}
+	if state.files[1].selected {
+		t.Error("file 1 should be unselected")
+	}
+}
+
+func TestValidateRecoveredFiles(t *testing.T) {
+	t.Parallel()
+	tmpDir := t.TempDir()
+
+	existingFile := filepath.Join(tmpDir, "exists.bin")
+	writeTestFile(t, existingFile, []byte("data"))
+
+	t.Run("all selected files exist", func(t *testing.T) {
+		t.Parallel()
+		files := []*serverFileInfo{
+			{path: existingFile, selected: true},
+			{path: filepath.Join(tmpDir, "missing.bin"), selected: false},
+		}
+		if err := validateRecoveredFiles(files); err != nil {
+			t.Errorf("expected nil, got: %v", err)
+		}
+	})
+
+	t.Run("selected file missing", func(t *testing.T) {
+		t.Parallel()
+		files := []*serverFileInfo{
+			{path: filepath.Join(tmpDir, "missing.bin"), selected: true},
+		}
+		if err := validateRecoveredFiles(files); err == nil {
+			t.Error("expected error for missing selected file")
+		}
+	})
+}
+
 // --- InitTorrent state cleaning ---
 
 func TestInitTorrent_StaleMetadata_NukedBeforeInit(t *testing.T) {

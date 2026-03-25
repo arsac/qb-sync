@@ -797,3 +797,22 @@ func TestVerifyFinalizedPieces_CollectsAllFailures(t *testing.T) {
 		t.Error("piece 3 should be in failed set")
 	}
 }
+
+func TestFinalizeTorrent_NotFound_ReturnsErrorCode(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestDestServer(t)
+
+	// No torrent state exists — not in memory and no metadata on disk.
+	resp, err := s.FinalizeTorrent(context.Background(), &pb.FinalizeTorrentRequest{
+		TorrentHash: "nonexistent",
+	})
+	if err != nil {
+		t.Fatalf("unexpected gRPC error: %v", err)
+	}
+	if resp.GetSuccess() {
+		t.Fatal("expected failure response")
+	}
+	if resp.GetErrorCode() != pb.FinalizeErrorCode_FINALIZE_ERROR_NOT_FOUND {
+		t.Errorf("expected FINALIZE_ERROR_NOT_FOUND, got %v", resp.GetErrorCode())
+	}
+}

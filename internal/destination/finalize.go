@@ -36,7 +36,11 @@ func (s *Server) FinalizeTorrent(
 	state, stateErr := s.getOrRecoverState(ctx, hash)
 	if stateErr != nil {
 		//nolint:nilerr // gRPC returns errors in response body
-		return &pb.FinalizeTorrentResponse{Success: false, Error: stateErr.Error()}, nil
+		return &pb.FinalizeTorrentResponse{
+			Success:   false,
+			Error:     stateErr.Error(),
+			ErrorCode: pb.FinalizeErrorCode_FINALIZE_ERROR_NOT_FOUND,
+		}, nil
 	}
 
 	// Check if finalization is already in progress or completed.

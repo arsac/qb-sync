@@ -155,6 +155,22 @@ func (s *Server) recoverTorrentState(ctx context.Context, hash string) (*serverT
 	files := s.reconstructFiles(parsed.Files, saveSubPath)
 	restoreFileSelection(files, metaDir)
 
+	// Validate that data files actually exist on disk. If any selected file
+	// is missing (externally deleted, or hardlink never created), the state
+	// is stale and unrecoverable — clean up metadata so the torrent can be
+	// re-initialized from scratch.
+	if validateErr := validateRecoveredFiles(files); validateErr != nil {
+		s.logger.WarnContext(ctx, "stale recovery state, cleaning up metadata",
+			"hash", hash,
+			"error", validateErr,
+		)
+		if removeErr := os.RemoveAll(metaDir); removeErr != nil {
+			s.logger.ErrorContext(ctx, "failed to remove stale metadata",
+				"hash", hash, "error", removeErr)
+		}
+		return nil, fmt.Errorf("stale state for %s: %w", hash, validateErr)
+	}
+
 	meta := torrentMeta{
 		pieceHashes: parsed.PieceHashes,
 		pieceLength: parsed.PieceLength,
@@ -205,15 +221,22 @@ func (s *Server) recoverTorrentState(ctx context.Context, hash string) (*serverT
 }
 
 // reconstructFiles builds serverFileInfo entries from torrent metadata.
-// Uses the finalized path if the file exists on disk, otherwise assumes .partial.
+// Uses the finalized path if the file exists on disk, the .partial path if
+// that exists, or defaults to the .partial path when neither is found.
+// Callers must check selected files for existence after restoring selection.
 func (s *Server) reconstructFiles(parsedFiles []parsedFile, saveSubPath string) []*serverFileInfo {
 	files := make([]*serverFileInfo, len(parsedFiles))
 	for i, f := range parsedFiles {
 		finalPath := filepath.Join(s.config.BasePath, saveSubPath, f.Path)
-		diskPath := finalPath + partialSuffix
+		partialPath := finalPath + partialSuffix
+
+		diskPath := partialPath
 		if _, err := os.Stat(finalPath); err == nil {
 			diskPath = finalPath
 		}
+		// When neither exists, diskPath remains partialPath. This is
+		// detected by validateRecoveredFiles after selection is restored.
+
 		files[i] = &serverFileInfo{
 			path:     diskPath,
 			size:     f.Size,
@@ -233,6 +256,20 @@ func restoreFileSelection(files []*serverFileInfo, metaDir string) {
 	for i, fi := range files {
 		fi.selected = selectedBitmap[i]
 	}
+}
+
+// validateRecoveredFiles checks that every selected file exists on disk.
+// Returns a non-nil error listing the first missing file if any are absent.
+func validateRecoveredFiles(files []*serverFileInfo) error {
+	for _, fi := range files {
+		if !fi.selected {
+			continue
+		}
+		if _, err := os.Stat(fi.path); err != nil {
+			return fmt.Errorf("data file missing: %s", fi.path)
+		}
+	}
+	return nil
 }
 
 // loadOrReconstructState loads the .state file, or reconstructs the written
