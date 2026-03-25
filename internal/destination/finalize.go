@@ -170,6 +170,11 @@ func (s *Server) runBackgroundFinalization(
 	ctx, cancel := context.WithTimeout(s.bgCtx, backgroundFinalizeTimeout)
 	defer cancel()
 
+	// Sync parent directories before verification to ensure NFS has flushed
+	// file data and renames to the server. Without this, verification can
+	// read stale data from the NFS client cache, causing false hash mismatches.
+	s.syncFileParentDirs(ctx, hash, state)
+
 	// Verify all pieces by reading back from finalized files.
 	failedPieces, verifyErr := s.verifyFinalizedPieces(ctx, hash, state)
 	if verifyErr != nil {
@@ -496,6 +501,35 @@ func (s *Server) renamePartialFile(ctx context.Context, hash string, fi *serverF
 		"to", finalPath,
 	)
 	return nil
+}
+
+// syncFileParentDirs fsyncs the parent directories of finalized files to ensure
+// NFS has flushed file data and renames to the server before verification reads.
+// Best-effort: sync failures are logged but do not block verification.
+func (s *Server) syncFileParentDirs(ctx context.Context, hash string, state *serverTorrentState) {
+	synced := make(map[string]bool)
+	for _, fi := range state.files {
+		if !fi.selected {
+			continue
+		}
+		dir := filepath.Dir(fi.path)
+		if synced[dir] {
+			continue
+		}
+		synced[dir] = true
+
+		dirFD, openErr := os.Open(dir)
+		if openErr != nil {
+			s.logger.DebugContext(ctx, "failed to open dir for sync",
+				"hash", hash, "dir", dir, "error", openErr)
+			continue
+		}
+		if syncErr := dirFD.Sync(); syncErr != nil {
+			s.logger.DebugContext(ctx, "failed to sync dir",
+				"hash", hash, "dir", dir, "error", syncErr)
+		}
+		_ = dirFD.Close()
+	}
 }
 
 // flushWrittenState persists the written bitmap to disk.

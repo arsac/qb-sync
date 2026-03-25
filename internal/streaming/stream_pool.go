@@ -31,13 +31,14 @@ const (
 	// DefaultAckChannelSize is the default buffer size for ack aggregation per stream.
 	DefaultAckChannelSize = 1000
 
-	// Adaptive scaling constants.
-	defaultScaleInterval      = 5 * time.Second // How often to check for scaling
-	defaultScaleUpThreshold   = 0.05            // 5% throughput increase to scale up
-	defaultScaleDownThreshold = 0.15            // 15% throughput decrease to scale down
-	defaultPlateauThreshold   = 0.03            // <3% change considered plateau
-	defaultPlateauCount       = 3               // Consecutive plateaus before stopping
-	scalingCooldownPeriod     = 2 * time.Minute // Cooldown before resuming scaling after pause
+	// Adaptive scaling constants, tuned for high-latency links (WireGuard tunnels).
+	// Longer measurement window and shorter cooldown for stable signal at 550ms+ RTT.
+	defaultScaleInterval      = 10 * time.Second // How often to check for scaling (was 5s)
+	defaultScaleUpThreshold   = 0.05             // 5% throughput increase to scale up
+	defaultScaleDownThreshold = 0.15             // 15% throughput decrease to scale down
+	defaultPlateauThreshold   = 0.03             // <3% change considered plateau
+	defaultPlateauCount       = 3                // Consecutive plateaus before stopping
+	scalingCooldownPeriod     = 30 * time.Second // Cooldown before resuming scaling (was 2min)
 
 	// streamDrainTimeout is how long drainAndRemoveStream waits for in-flight
 	// pieces to complete before closing the stream anyway.

@@ -14,10 +14,13 @@ const (
 	DefaultMaxWindow     = 2000
 	DefaultInitialWindow = 512
 
-	// CUBIC constants (RFC 8312).
+	// CUBIC constants (RFC 8312), tuned for high-latency links (WireGuard tunnels).
+	// Standard CUBIC uses beta=0.7, but at 550ms RTT that causes severe
+	// throughput loss on jitter-induced timeouts. Higher beta reduces the
+	// penalty per loss event, allowing faster recovery.
 	cubicC           = 0.4  // Scaling constant.
-	cubicBeta        = 0.7  // Multiplicative decrease on loss (keep 70%).
-	cubicBetaLastMax = 0.85 // Extra backoff when competing flows detected.
+	cubicBeta        = 0.85 // Multiplicative decrease on loss (keep 85%, was 70%).
+	cubicBetaLastMax = 0.92 // Extra backoff when competing flows detected (was 0.85).
 	maxBurstPieces   = 3    // Burst allowance for isCwndLimited check.
 
 	// TCP-friendly Reno alpha: 3*(1-beta)/(1+beta).

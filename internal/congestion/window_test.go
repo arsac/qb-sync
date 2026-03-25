@@ -427,7 +427,8 @@ func TestSlowStart_ExitOnLoss(t *testing.T) {
 	stats := w.Stats()
 
 	// ssthresh should be set to reduced window.
-	expectedWindow := int(float64(50) * cubicBeta)
+	windowBefore := 50
+	expectedWindow := int(float64(windowBefore) * cubicBeta)
 	if stats.Window != expectedWindow {
 		t.Errorf("expected window %d after loss, got %d", expectedWindow, stats.Window)
 	}
@@ -547,9 +548,11 @@ func TestCubic_GrowthAfterLoss(t *testing.T) {
 	w.OnSend("piece:init")
 	w.OnFail("piece:init")
 
-	windowAfterLoss := w.Window() // 70 (100 * 0.7)
-	if windowAfterLoss != 70 {
-		t.Fatalf("expected window 70 after loss, got %d", windowAfterLoss)
+	beta := cubicBeta // runtime variable to avoid constant-folding.
+	expectedAfterLoss := int(float64(100) * beta)
+	windowAfterLoss := w.Window()
+	if windowAfterLoss != expectedAfterLoss {
+		t.Fatalf("expected window %d after loss, got %d", expectedAfterLoss, windowAfterLoss)
 	}
 
 	// Now simulate congestion avoidance growth over time.
@@ -574,7 +577,7 @@ func TestCubic_GrowthAfterLoss(t *testing.T) {
 
 	finalWindow := w.Window()
 
-	// Window should have grown from 70 back toward lastMaxWindow (100) and beyond.
+	// Window should have grown back toward lastMaxWindow (100) and beyond.
 	if finalWindow <= windowAfterLoss {
 		t.Errorf("expected cubic growth, window stayed at %d (started at %d)", finalWindow, windowAfterLoss)
 	}
@@ -606,13 +609,14 @@ func TestCubic_TCPFriendlyMode(t *testing.T) {
 	w.OnSend("piece:init")
 	w.OnFail("piece:init")
 
-	windowAfterLoss := w.Window() // 7
-	if windowAfterLoss != 7 {
-		t.Fatalf("expected window 7 after loss, got %d", windowAfterLoss)
+	beta := cubicBeta // runtime variable to avoid constant-folding.
+	expectedAfterLoss := int(float64(10) * beta)
+	windowAfterLoss := w.Window()
+	if windowAfterLoss != expectedAfterLoss {
+		t.Fatalf("expected window %d after loss, got %d", expectedAfterLoss, windowAfterLoss)
 	}
 
 	// Send enough ACKs to observe Reno growth.
-	// With alpha ≈ 0.529 and window ≈ 7, we need ~13 ACKs per window increase.
 	for round := range 20 {
 		window := w.Window()
 		keys := make([]string, window)
@@ -696,20 +700,22 @@ func TestLoss_CompetingFlows(t *testing.T) {
 	w.OnFail("piece:0")
 
 	// lastMaxWindow should be 100 (original window).
-	// Window should be 70 (100 * 0.7).
-	if w.Window() != 70 {
-		t.Fatalf("expected window 70, got %d", w.Window())
+	// Window should be 100 * cubicBeta.
+	beta := cubicBeta               // runtime variable to avoid constant-folding.
+	betaLastMax := cubicBetaLastMax // runtime variable to avoid constant-folding.
+	expectedFirst := int(float64(100) * beta)
+	if w.Window() != expectedFirst {
+		t.Fatalf("expected window %d, got %d", expectedFirst, w.Window())
 	}
 
-	// Second loss while window (70) is still below lastMaxWindow (100).
-	// This triggers competing flow detection: lastMaxWindow = 70 * 0.85 = 59.
+	// Second loss while window is still below lastMaxWindow (100).
+	// This triggers competing flow detection: lastMaxWindow = window * cubicBetaLastMax.
 	w.OnSend("piece:1")
 	w.OnFail("piece:1")
 
-	lmw := 70.0 * cubicBetaLastMax
-	expectedLastMax := int(lmw) // 59
-	ew := 70.0 * cubicBeta
-	expectedWindow := int(ew) // 49
+	windowAt70 := expectedFirst
+	expectedLastMax := int(float64(windowAt70) * betaLastMax)
+	expectedWindow := int(float64(windowAt70) * beta)
 
 	if w.Window() != expectedWindow {
 		t.Errorf("expected window %d, got %d", expectedWindow, w.Window())
@@ -723,7 +729,7 @@ func TestLoss_CompetingFlows(t *testing.T) {
 	w.OnFail("piece:2")
 
 	// window was 49, lastMaxWindow should have been set via betaLastMax (49 < 59).
-	tw := float64(expectedWindow) * cubicBeta
+	tw := float64(expectedWindow) * beta
 	thirdExpected := int(tw) // 34
 	if w.Window() != thirdExpected {
 		t.Errorf("expected window %d after third loss, got %d", thirdExpected, w.Window())
@@ -745,7 +751,7 @@ func TestCubic_ConcaveConvexTransition(t *testing.T) {
 	// Loss to enter congestion avoidance.
 	w.OnSend("piece:init")
 	w.OnFail("piece:init")
-	// Window = 70, lastMaxWindow = 100.
+	// Window = 100*cubicBeta, lastMaxWindow = 100.
 
 	windowReachedMax := false
 	windowPastMax := false
@@ -781,7 +787,8 @@ func TestCubic_ConcaveConvexTransition(t *testing.T) {
 
 func TestCubic_RenoAlpha(t *testing.T) {
 	// Verify the Reno alpha constant matches RFC 8312.
-	expected := 3.0 * (1.0 - 0.7) / (1.0 + 0.7) // ~0.529
+	beta := cubicBeta // runtime variable to avoid constant-folding.
+	expected := 3.0 * (1.0 - beta) / (1.0 + beta)
 	if math.Abs(renoAlpha-expected) > 0.001 {
 		t.Errorf("expected renoAlpha ~%.3f, got %.3f", expected, renoAlpha)
 	}
