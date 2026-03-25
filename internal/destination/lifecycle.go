@@ -78,8 +78,7 @@ func (s *Server) flushDirtyStates(ctx context.Context) {
 			continue
 		}
 		statePath := t.state.statePath
-		snapshot := make([]bool, len(t.state.written))
-		copy(snapshot, t.state.written)
+		snapshot := t.state.written.Clone()
 		flushedCount := t.state.piecesSinceFlush
 		snapshotGen := t.state.flushGen
 		t.state.mu.Unlock()
@@ -119,7 +118,7 @@ func (s *Server) flushDirtyStates(ctx context.Context) {
 
 		s.logger.DebugContext(ctx, "flushed state",
 			"hash", t.hash,
-			"written", countWritten(snapshot),
+			"written", snapshot.Count(),
 		)
 	}
 	metrics.TorrentsWithDirtyState.Set(float64(dirtyAfterFlush))

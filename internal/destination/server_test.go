@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/autobrr/go-qbittorrent"
+	"github.com/bits-and-blooms/bitset"
 
 	pb "github.com/arsac/qb-sync/proto"
 )
@@ -1574,9 +1575,8 @@ func TestFinalizeTorrent_RelocatesOnSubPathChange(t *testing.T) {
 	// FinalizeTorrent aborts after the relocation check without triggering full finalization.
 	newIncompleteState := func(filePath, subPath string) *serverTorrentState {
 		return &serverTorrentState{
-			written:      []bool{true, false},
-			writtenCount: 1,
-			saveSubPath:  subPath,
+			written:     boolSliceToBitSet([]bool{true, false}),
+			saveSubPath: subPath,
 			torrentMeta: torrentMeta{
 				pieceLength: 512,
 				totalSize:   1024,
@@ -1936,10 +1936,10 @@ func TestInitTorrentResync_PartialRecovery(t *testing.T) {
 		s.mu.RLock()
 		state := s.torrents["resyncpartial"]
 		s.mu.RUnlock()
-		if state == nil { //nolint:staticcheck // SA5011: t.Fatal terminates goroutine; state is non-nil after this block
+		if state == nil {
 			t.Fatal("torrent state should exist")
 		}
-		if !strings.HasSuffix(state.files[1].path, ".partial") { //nolint:staticcheck // SA5011: guarded above
+		if !strings.HasSuffix(state.files[1].path, ".partial") {
 			t.Errorf("file 1 path should end with .partial, got %s", state.files[1].path)
 		}
 	})
@@ -1954,7 +1954,7 @@ func TestInitTorrentResync_PartialRecovery(t *testing.T) {
 		}
 
 		var savedPath string
-		var savedWritten []bool
+		var savedWritten *bitset.BitSet
 		s := &Server{
 			config:         ServerConfig{BasePath: tmpDir},
 			logger:         logger,
@@ -1962,9 +1962,9 @@ func TestInitTorrentResync_PartialRecovery(t *testing.T) {
 			abortingHashes: make(map[string]chan struct{}),
 			inodes:         NewInodeRegistry(tmpDir, logger),
 			qbClient:       mock,
-			saveStateFunc: func(path string, written []bool) error {
+			saveStateFunc: func(path string, written *bitset.BitSet) error {
 				savedPath = path
-				savedWritten = append([]bool(nil), written...)
+				savedWritten = written.Clone()
 				return nil
 			},
 		}
@@ -1996,15 +1996,15 @@ func TestInitTorrentResync_PartialRecovery(t *testing.T) {
 		if savedPath == "" {
 			t.Fatal("doSaveState should have been called for initial state persistence")
 		}
-		if len(savedWritten) != 2 {
-			t.Fatalf("expected 2 pieces in saved state, got %d", len(savedWritten))
+		if savedWritten == nil || savedWritten.Len() != 2 {
+			t.Fatalf("expected 2 pieces in saved state, got %d", savedWritten.Len())
 		}
 		// Piece 0 (file1, pre-existing) should be marked as written
-		if !savedWritten[0] {
+		if !savedWritten.Test(0) {
 			t.Error("piece 0 should be written (pre-existing file)")
 		}
 		// Piece 1 (file2, missing) should not be written
-		if savedWritten[1] {
+		if savedWritten.Test(1) {
 			t.Error("piece 1 should NOT be written (file2 not on disk)")
 		}
 	})
@@ -2039,8 +2039,7 @@ func TestInitTorrentResync_ExistingState(t *testing.T) {
 				PieceSize:   512,
 				TotalSize:   1024,
 			},
-			written:      []bool{true, true}, // Both marked written (piece 1 "covered")
-			writtenCount: 2,
+			written: boolSliceToBitSet([]bool{true, true}), // Both marked written (piece 1 "covered")
 			torrentMeta: torrentMeta{
 				pieceLength: 512,
 				totalSize:   1024,
@@ -2090,10 +2089,10 @@ func TestInitTorrentResync_ExistingState(t *testing.T) {
 		s.mu.RLock()
 		state := s.torrents["resyncstate"]
 		s.mu.RUnlock()
-		if state == nil { //nolint:staticcheck // SA5011: t.Fatal terminates goroutine; state is non-nil after this block
+		if state == nil {
 			t.Fatal("torrent state should exist after re-sync")
 		}
-		if !state.files[1].selected { //nolint:staticcheck // SA5011: guarded above
+		if !state.files[1].selected {
 			t.Error("file2 should be selected after re-sync")
 		}
 	})
@@ -2147,8 +2146,7 @@ func TestInitTorrentResync_ExistingState(t *testing.T) {
 				PieceSize:   1024,
 				TotalSize:   2560,
 			},
-			written:      []bool{true, true, true},
-			writtenCount: 3,
+			written: boolSliceToBitSet([]bool{true, true, true}),
 			torrentMeta: torrentMeta{
 				pieceLength: 1024,
 				totalSize:   2560,

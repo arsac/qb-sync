@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bits-and-blooms/bitset"
 	"golang.org/x/sync/semaphore"
 	"google.golang.org/grpc/metadata"
 
@@ -298,7 +299,7 @@ func TestStreamWorker_ReleasesBudget(t *testing.T) {
 		torrentMeta: torrentMeta{
 			files: []*serverFileInfo{},
 		},
-		written: make([]bool, 10),
+		written: bitset.New(10),
 	}
 	s.torrents[hash] = state
 
@@ -450,7 +451,7 @@ func TestStreamPiecesBidi_MultipleConcurrentStreams(t *testing.T) {
 		torrentMeta: torrentMeta{
 			files: []*serverFileInfo{},
 		},
-		written: make([]bool, 10),
+		written: bitset.New(10),
 	}
 
 	var stream1Done, stream2Done atomic.Bool

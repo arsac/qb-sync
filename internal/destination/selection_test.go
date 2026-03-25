@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/bits-and-blooms/bitset"
+
 	"github.com/arsac/qb-sync/internal/utils"
 	pb "github.com/arsac/qb-sync/proto"
 )
@@ -106,7 +108,7 @@ func TestCountSelectedPiecesTotal(t *testing.T) {
 				{offset: 200, size: 100, selected: true},
 			},
 		},
-		written: []bool{false, false, false},
+		written: bitset.New(3),
 	}
 
 	got := state.countSelectedPiecesTotal()
@@ -393,9 +395,8 @@ func TestFinalizeTorrent_PartialSelection(t *testing.T) {
 				{path: partialFile2, size: 16, offset: 32, selected: true},
 			},
 		},
-		written:      []bool{false, false, false},
-		writtenCount: 0,
-		statePath:    filepath.Join(tmpDir, ".state"),
+		written:   bitset.New(3),
+		statePath: filepath.Join(tmpDir, ".state"),
 	}
 
 	// Register state
@@ -433,7 +434,7 @@ func TestFinalizeTorrent_PartialSelection(t *testing.T) {
 
 	// Verify written count is 2 (not 3)
 	state.mu.Lock()
-	wc := state.writtenCount
+	wc := state.written.Count()
 	state.mu.Unlock()
 	if wc != 2 {
 		t.Errorf("writtenCount = %d, want 2", wc)
@@ -480,19 +481,19 @@ func TestClearStalePieces(t *testing.T) {
 			{path: existingFile, selected: true, firstPiece: 0, lastPiece: 2},
 			{path: filepath.Join(tmpDir, "missing.bin"), selected: true, firstPiece: 3, lastPiece: 5},
 		}
-		written := []bool{true, true, true, true, true, true}
+		written := boolSliceToBitSet([]bool{true, true, true, true, true, true})
 
 		s.clearStalePieces(context.Background(), "test", written, files)
 
 		// Pieces 0-2 (existing file) should be preserved
-		for i := range 3 {
-			if !written[i] {
+		for i := range uint(3) {
+			if !written.Test(i) {
 				t.Errorf("piece %d should be preserved (file exists)", i)
 			}
 		}
 		// Pieces 3-5 (missing file) should be cleared
-		for i := 3; i < 6; i++ {
-			if written[i] {
+		for i := uint(3); i < 6; i++ {
+			if written.Test(i) {
 				t.Errorf("piece %d should be cleared (file missing)", i)
 			}
 		}
@@ -505,13 +506,13 @@ func TestClearStalePieces(t *testing.T) {
 			{path: filepath.Join(tmpDir, "missing2.bin"), selected: true, firstPiece: 2, lastPiece: 3,
 				hardlink: hardlinkInfo{state: hlStatePending}},
 		}
-		written := []bool{true, true, true, true}
+		written := boolSliceToBitSet([]bool{true, true, true, true})
 
 		s.clearStalePieces(context.Background(), "test", written, files)
 
 		// All pieces should be preserved — unselected and pending-hardlink files are skipped
-		for i := range 4 {
-			if !written[i] {
+		for i := range uint(4) {
+			if !written.Test(i) {
 				t.Errorf("piece %d should be preserved", i)
 			}
 		}

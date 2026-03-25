@@ -5,6 +5,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/bits-and-blooms/bitset"
 )
 
 // TestFlushDirtyStates_ReleasesLockDuringIO verifies that flushDirtyStates
@@ -22,13 +24,14 @@ func TestFlushDirtyStates_ReleasesLockDuringIO(t *testing.T) {
 	tmpDir := t.TempDir()
 	logger := testLogger(t)
 
+	written := bitset.New(100)
+	written.Set(0)
 	state := &serverTorrentState{
-		written:          make([]bool, 100),
+		written:          written,
 		dirty:            true,
 		statePath:        tmpDir + "/.state",
 		piecesSinceFlush: 1,
 	}
-	state.written[0] = true
 
 	s := &Server{
 		config:         ServerConfig{BasePath: tmpDir},
@@ -40,7 +43,7 @@ func TestFlushDirtyStates_ReleasesLockDuringIO(t *testing.T) {
 	// saveStateFunc blocks until unblockIO is closed, simulating slow disk I/O.
 	unblockIO := make(chan struct{})
 	ioStarted := make(chan struct{})
-	s.saveStateFunc = func(_ string, _ []bool) error {
+	s.saveStateFunc = func(_ string, _ *bitset.BitSet) error {
 		close(ioStarted) // signal that we're in the I/O phase
 		<-unblockIO      // block until test unblocks us
 		return nil
@@ -101,14 +104,15 @@ func TestFlushDirtyStates_ConcurrentWritesDuringIO(t *testing.T) {
 	tmpDir := t.TempDir()
 	logger := testLogger(t)
 
+	written := bitset.New(100)
+	for i := range uint(10) {
+		written.Set(i)
+	}
 	state := &serverTorrentState{
-		written:          make([]bool, 100),
+		written:          written,
 		dirty:            true,
 		statePath:        tmpDir + "/.state",
 		piecesSinceFlush: 5,
-	}
-	for i := range 10 {
-		state.written[i] = true
 	}
 
 	s := &Server{
@@ -121,7 +125,7 @@ func TestFlushDirtyStates_ConcurrentWritesDuringIO(t *testing.T) {
 	// During the I/O phase, simulate new pieces arriving.
 	unblockIO := make(chan struct{})
 	ioStarted := make(chan struct{})
-	s.saveStateFunc = func(_ string, _ []bool) error {
+	s.saveStateFunc = func(_ string, _ *bitset.BitSet) error {
 		close(ioStarted)
 		<-unblockIO
 		return nil
@@ -137,8 +141,7 @@ func TestFlushDirtyStates_ConcurrentWritesDuringIO(t *testing.T) {
 	// Wait for I/O phase, then simulate concurrent writes.
 	<-ioStarted
 	state.mu.Lock()
-	state.written[50] = true
-	state.writtenCount++
+	state.written.Set(50)
 	state.dirty = true
 	state.piecesSinceFlush += 3 // 3 new pieces arrived during I/O
 	state.mu.Unlock()

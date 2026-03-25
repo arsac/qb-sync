@@ -8,21 +8,23 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/bits-and-blooms/bitset"
+
 	"github.com/arsac/qb-sync/internal/utils"
 )
 
 // loadState loads the written pieces state from disk.
-func (s *Server) loadState(path string, numPieces int) ([]bool, error) {
+func (s *Server) loadState(path string, numPieces int) (*bitset.BitSet, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
 
-	written := make([]bool, numPieces)
-	for i := range min(numPieces, len(data)) {
-		written[i] = data[i] == 1
+	written := bitset.New(0)
+	if unmarshalErr := written.UnmarshalBinary(data); unmarshalErr != nil {
+		return nil, fmt.Errorf("unmarshaling bitset: %w", unmarshalErr)
 	}
-	return written, nil
+	return ensureBitSetLength(written, uint(numPieces)), nil
 }
 
 // atomicWriteFile writes data atomically using standard server permissions.
@@ -31,18 +33,16 @@ func atomicWriteFile(path string, data []byte) error {
 }
 
 // saveState persists the written pieces state to disk.
-func (s *Server) saveState(path string, written []bool) error {
-	data := make([]byte, len(written))
-	for i, w := range written {
-		if w {
-			data[i] = 1
-		}
+func (s *Server) saveState(path string, written *bitset.BitSet) error {
+	data, marshalErr := written.MarshalBinary()
+	if marshalErr != nil {
+		return fmt.Errorf("marshaling bitset: %w", marshalErr)
 	}
 	return atomicWriteFile(path, data)
 }
 
 // doSaveState persists state using saveStateFunc (injected for tests) or the default saveState.
-func (s *Server) doSaveState(path string, written []bool) error {
+func (s *Server) doSaveState(path string, written *bitset.BitSet) error {
 	if s.saveStateFunc != nil {
 		return s.saveStateFunc(path, written)
 	}
@@ -126,7 +126,7 @@ func findTorrentFile(metaDir string) (string, error) {
 func (s *Server) clearStalePieces(
 	ctx context.Context,
 	hash string,
-	written []bool,
+	written *bitset.BitSet,
 	files []*serverFileInfo,
 ) {
 	for _, fi := range files {
@@ -143,8 +143,8 @@ func (s *Server) clearStalePieces(
 		// Data file missing — clear its pieces from the bitmap.
 		cleared := 0
 		for p := fi.firstPiece; p <= fi.lastPiece; p++ {
-			if written[p] {
-				written[p] = false
+			if written.Test(uint(p)) {
+				written.Clear(uint(p))
 				cleared++
 			}
 		}

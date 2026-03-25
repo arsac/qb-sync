@@ -4,6 +4,8 @@ import (
 	"os"
 	"sync"
 
+	"github.com/bits-and-blooms/bitset"
+
 	pb "github.com/arsac/qb-sync/proto"
 )
 
@@ -86,7 +88,7 @@ func (m *torrentMeta) computeFilePieceRanges() {
 }
 
 // initFilePieceCounts initializes piecesWritten on each file from the existing written bitmap.
-func (m *torrentMeta) initFilePieceCounts(written []bool) {
+func (m *torrentMeta) initFilePieceCounts(written *bitset.BitSet) {
 	for _, f := range m.files {
 		if f.earlyFinalized || f.size <= 0 {
 			continue
@@ -126,14 +128,13 @@ type serverTorrentState struct {
 	statePath string                 // Path to written pieces state file
 
 	// Mutable state (require state.mu):
-	torrentPath      string // Path to stored .torrent file; may be set late during resumeTorrent
-	saveSubPath      string // Relative sub-path prefix; may change if category relocates at finalize
-	written          []bool
-	writtenCount     int    // Number of true entries in written (maintained for O(1) checks)
-	dirty            bool   // Whether state needs to be flushed
-	piecesSinceFlush int    // Pieces written since last flush (for count-based trigger)
-	flushGen         uint64 // Monotonic counter incremented on every successful state flush
-	initializing     bool   // True while disk I/O is in progress during InitTorrent
+	torrentPath      string         // Path to stored .torrent file; may be set late during resumeTorrent
+	saveSubPath      string         // Relative sub-path prefix; may change if category relocates at finalize
+	written          *bitset.BitSet // Bitmap of written pieces (use Count()/Len() instead of separate counter)
+	dirty            bool           // Whether state needs to be flushed
+	piecesSinceFlush int            // Pieces written since last flush (for count-based trigger)
+	flushGen         uint64         // Monotonic counter incremented on every successful state flush
+	initializing     bool           // True while disk I/O is in progress during InitTorrent
 	mu               sync.Mutex
 
 	// Finalization lifecycle (state machine: inactive -> active -> result stored).
@@ -259,10 +260,10 @@ func (f *serverFileInfo) overlaps(pieceIdx int) bool {
 }
 
 // recalcPiecesWritten recomputes piecesWritten from the torrent's written bitmap.
-func (f *serverFileInfo) recalcPiecesWritten(written []bool) {
+func (f *serverFileInfo) recalcPiecesWritten(written *bitset.BitSet) {
 	f.piecesWritten = 0
 	for p := f.firstPiece; p <= f.lastPiece; p++ {
-		if written[p] {
+		if written.Test(uint(p)) {
 			f.piecesWritten++
 		}
 	}

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/autobrr/go-qbittorrent"
+	"github.com/bits-and-blooms/bitset"
 	"golang.org/x/sync/semaphore"
 
 	"github.com/arsac/qb-sync/internal/grpcutil"
@@ -94,7 +95,7 @@ type Server struct {
 	healthServer *health.Server
 
 	// saveStateFunc overrides saveState for testing. nil in production.
-	saveStateFunc func(path string, written []bool) error
+	saveStateFunc func(path string, written *bitset.BitSet) error
 }
 
 // NewServer creates a new gRPC piece receiver server.

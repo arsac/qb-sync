@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/bits-and-blooms/bitset"
+
 	"github.com/arsac/qb-sync/internal/metrics"
 	pb "github.com/arsac/qb-sync/proto"
 )
@@ -211,11 +213,10 @@ func (s *Server) initNewTorrent(
 
 	// Build written bitmap from persisted state + hardlink coverage.
 	written := s.buildWrittenBitmap(ctx, hash, statePath, &meta)
-	writtenCount := countWritten(written)
 
 	// Persist initial written state so pre-existing/hardlinked piece coverage
 	// survives a crash before the first WritePiece triggers a periodic flush.
-	if writtenCount > 0 {
+	if written.Count() > 0 {
 		if saveErr := s.doSaveState(statePath, written); saveErr != nil {
 			s.logger.WarnContext(ctx, "failed to persist initial state",
 				"hash", hash, "error", saveErr)
@@ -236,7 +237,6 @@ func (s *Server) initNewTorrent(
 		torrentMeta:     meta,
 		info:            req,
 		written:         written,
-		writtenCount:    writtenCount,
 		torrentPath:     torrentPath,
 		statePath:       statePath,
 		saveSubPath:     saveSubPath,
@@ -278,24 +278,21 @@ func (s *Server) buildWrittenBitmap(
 	ctx context.Context,
 	hash, statePath string,
 	meta *torrentMeta,
-) []bool {
+) *bitset.BitSet {
 	numPieces := meta.numPieces()
 	piecesCovered := meta.calculatePiecesCovered()
 
-	written := make([]bool, numPieces)
+	written := bitset.New(uint(numPieces))
 	if existingState, loadErr := s.loadState(statePath, int(numPieces)); loadErr == nil {
 		written = existingState
-		_, _, haveCount := calculatePiecesNeeded(written)
 		s.logger.InfoContext(ctx, "resumed torrent state",
 			"hash", hash,
-			"written", haveCount,
+			"written", written.Count(),
 			"total", numPieces,
 		)
 	}
 
-	for i, covered := range piecesCovered {
-		written[i] = written[i] || covered
-	}
+	written.InPlaceUnion(boolSliceToBitSet(piecesCovered))
 
 	// Compute per-file piece ranges and mark files that need no streamed data as already finalized.
 	meta.computeFilePieceRanges()

@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bits-and-blooms/bitset"
+
 	"github.com/arsac/qb-sync/internal/utils"
 	pb "github.com/arsac/qb-sync/proto"
 )
@@ -117,7 +119,7 @@ func TestInitFilePieceCounts(t *testing.T) {
 			{offset: 0, size: 150, firstPiece: 0, lastPiece: 1, piecesTotal: 2, selected: true},
 			{offset: 150, size: 150, firstPiece: 1, lastPiece: 2, piecesTotal: 2, selected: true},
 		}
-		written := []bool{true, false, true}
+		written := boolSliceToBitSet([]bool{true, false, true})
 		meta := torrentMeta{files: files}
 		meta.initFilePieceCounts(written)
 
@@ -134,7 +136,7 @@ func TestInitFilePieceCounts(t *testing.T) {
 		files := []*serverFileInfo{
 			{offset: 0, size: 200, firstPiece: 0, lastPiece: 1, piecesTotal: 2, selected: true},
 		}
-		written := []bool{true, true}
+		written := boolSliceToBitSet([]bool{true, true})
 		meta := torrentMeta{files: files}
 		meta.initFilePieceCounts(written)
 
@@ -149,7 +151,7 @@ func TestInitFilePieceCounts(t *testing.T) {
 			{offset: 0, size: 100, firstPiece: 0, lastPiece: 0, piecesTotal: 1, earlyFinalized: true, selected: true},
 			{offset: 100, size: 100, firstPiece: 1, lastPiece: 1, piecesTotal: 1, selected: true},
 		}
-		written := []bool{true, true}
+		written := boolSliceToBitSet([]bool{true, true})
 		meta := torrentMeta{files: files}
 		meta.initFilePieceCounts(written)
 
@@ -167,7 +169,7 @@ func TestInitFilePieceCounts(t *testing.T) {
 			{offset: 0, size: 0, selected: true},
 			{offset: 0, size: 100, firstPiece: 0, lastPiece: 0, piecesTotal: 1, selected: true},
 		}
-		written := []bool{true}
+		written := boolSliceToBitSet([]bool{true})
 		meta := torrentMeta{files: files}
 		meta.initFilePieceCounts(written)
 
@@ -429,8 +431,7 @@ func TestFinalizeFiles_SkipsEarlyFinalizedFiles(t *testing.T) {
 				},
 			},
 		},
-		written:      []bool{true, true},
-		writtenCount: 2,
+		written: boolSliceToBitSet([]bool{true, true}),
 	}
 
 	ctx := context.Background()
@@ -479,9 +480,8 @@ func TestWritePiece_EarlyFinalizesCompletedFile(t *testing.T) {
 				},
 			},
 		},
-		written:      []bool{false},
-		writtenCount: 0,
-		statePath:    filepath.Join(tmpDir, ".state"),
+		written:   bitset.New(1),
+		statePath: filepath.Join(tmpDir, ".state"),
 	}
 
 	s.mu.Lock()
@@ -554,9 +554,8 @@ func TestCheckFileCompletions_VerifyFailure(t *testing.T) {
 			totalSize:   int64(len(correctData)),
 			files:       []*serverFileInfo{fi},
 		},
-		written:      []bool{true},
-		writtenCount: 1,
-		statePath:    filepath.Join(tmpDir, ".state"),
+		written:   boolSliceToBitSet([]bool{true}),
+		statePath: filepath.Join(tmpDir, ".state"),
 	}
 
 	ctx := context.Background()
@@ -575,11 +574,11 @@ func TestCheckFileCompletions_VerifyFailure(t *testing.T) {
 	}
 
 	// Corrupted piece should be marked unwritten.
-	if state.written[0] {
+	if state.written.Test(0) {
 		t.Error("corrupted piece should be marked as unwritten")
 	}
-	if state.writtenCount != 0 {
-		t.Errorf("writtenCount = %d, want 0", state.writtenCount)
+	if state.written.Count() != 0 {
+		t.Errorf("writtenCount = %d, want 0", state.written.Count())
 	}
 	if fi.piecesWritten != 0 {
 		t.Errorf("piecesWritten = %d, want 0", fi.piecesWritten)
@@ -629,8 +628,7 @@ func TestCheckFileCompletions_VerifySkipsBoundaryPieces(t *testing.T) {
 			totalSize:   10,
 			files:       files,
 		},
-		written:      []bool{true},
-		writtenCount: 1,
+		written: boolSliceToBitSet([]bool{true}),
 	}
 
 	ctx := context.Background()
@@ -683,9 +681,8 @@ func TestCheckFileCompletions_VerifyPartialCorruption(t *testing.T) {
 			totalSize:   30,
 			files:       []*serverFileInfo{fi},
 		},
-		written:      []bool{true, true, true},
-		writtenCount: 3,
-		statePath:    filepath.Join(tmpDir, ".state"),
+		written:   boolSliceToBitSet([]bool{true, true, true}),
+		statePath: filepath.Join(tmpDir, ".state"),
 	}
 
 	ctx := context.Background()
@@ -700,17 +697,17 @@ func TestCheckFileCompletions_VerifyPartialCorruption(t *testing.T) {
 	}
 
 	// Only piece 1 should be marked unwritten; pieces 0 and 2 stay written.
-	if !state.written[0] {
+	if !state.written.Test(0) {
 		t.Error("piece 0 should remain written (verified OK)")
 	}
-	if state.written[1] {
+	if state.written.Test(1) {
 		t.Error("piece 1 should be marked unwritten (corrupted)")
 	}
-	if !state.written[2] {
+	if !state.written.Test(2) {
 		t.Error("piece 2 should remain written (verified OK)")
 	}
-	if state.writtenCount != 2 {
-		t.Errorf("writtenCount = %d, want 2", state.writtenCount)
+	if state.written.Count() != 2 {
+		t.Errorf("writtenCount = %d, want 2", state.written.Count())
 	}
 	if fi.piecesWritten != 2 {
 		t.Errorf("piecesWritten = %d, want 2", fi.piecesWritten)
@@ -741,8 +738,7 @@ func TestCheckFileCompletions_VerifyNoPieceHashes(t *testing.T) {
 			totalSize:   4,
 			files:       []*serverFileInfo{fi},
 		},
-		written:      []bool{true},
-		writtenCount: 1,
+		written: boolSliceToBitSet([]bool{true}),
 	}
 
 	ctx := context.Background()

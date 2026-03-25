@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bits-and-blooms/bitset"
 	"golang.org/x/sync/semaphore"
 
 	"github.com/arsac/qb-sync/internal/utils"
@@ -170,8 +171,7 @@ func TestFinalizeTorrent_PollReturnsVerifying(t *testing.T) {
 			totalSize:   512,
 			files:       []*serverFileInfo{},
 		},
-		written:      []bool{true, true},
-		writtenCount: 2,
+		written: boolSliceToBitSet([]bool{true, true}),
 		finalization: finalizationState{
 			active: true,
 			done:   done,
@@ -221,8 +221,7 @@ func TestFinalizeTorrent_PollReturnsCompletedResult(t *testing.T) {
 			totalSize:   256,
 			files:       []*serverFileInfo{},
 		},
-		written:      []bool{true},
-		writtenCount: 1,
+		written: boolSliceToBitSet([]bool{true}),
 		finalization: finalizationState{
 			active: true,
 			done:   done,
@@ -308,8 +307,7 @@ func TestFinalizeTorrent_PollReturnsFailedResult(t *testing.T) {
 				{size: 256, offset: 0, selected: true},
 			},
 		},
-		written:      []bool{true},
-		writtenCount: 1,
+		written: boolSliceToBitSet([]bool{true}),
 		finalization: finalizationState{
 			active: true,
 			done:   done,
@@ -347,10 +345,10 @@ func TestFinalizeTorrent_PollReturnsFailedResult(t *testing.T) {
 	}
 
 	// Verify a second call actually retries (doesn't reject as "already in progress").
-	// It will fail with "incomplete" since writtenCount < totalPieces after state reset,
+	// It will fail with "incomplete" since written.Count() < totalPieces after clearing,
 	// but that proves it entered the normal finalization path.
 	state.mu.Lock()
-	state.writtenCount = 0
+	state.written = bitset.New(1) // Clear all bits
 	state.mu.Unlock()
 	resp2, err2 := s.FinalizeTorrent(context.Background(), &pb.FinalizeTorrentRequest{
 		TorrentHash: hash,
@@ -395,8 +393,7 @@ func TestFinalizeTorrent_ConcurrentPollDuringSetup(t *testing.T) {
 			totalSize:   256,
 			files:       []*serverFileInfo{},
 		},
-		written:      []bool{true},
-		writtenCount: 1,
+		written: boolSliceToBitSet([]bool{true}),
 		finalization: finalizationState{
 			active: true,
 			done:   done,
@@ -623,7 +620,7 @@ func TestRecoverVerificationFailure(t *testing.T) {
 		inodes:         NewInodeRegistry(tmpDir, logger),
 		memBudget:      semaphore.NewWeighted(512 * 1024 * 1024),
 		finalizeSem:    semaphore.NewWeighted(1),
-		saveStateFunc: func(_ string, _ []bool) error {
+		saveStateFunc: func(_ string, _ *bitset.BitSet) error {
 			stateSaved.Store(true)
 			return nil
 		},
@@ -670,29 +667,28 @@ func TestRecoverVerificationFailure(t *testing.T) {
 				},
 			},
 		},
-		written:      []bool{true, true, true},
-		writtenCount: 3,
-		statePath:    filepath.Join(tmpDir, ".state"),
+		written:   boolSliceToBitSet([]bool{true, true, true}),
+		statePath: filepath.Join(tmpDir, ".state"),
 	}
 
 	// Fail piece 1 — should affect file0 (which spans pieces 0–1) but not file1.
 	s.recoverVerificationFailure(context.Background(), "test-hash", state, []int{1})
 
 	// Piece 1 should be unwritten.
-	if state.written[1] {
+	if state.written.Test(1) {
 		t.Error("piece 1 should be marked unwritten")
 	}
 	// Pieces 0 and 2 should still be written.
-	if !state.written[0] {
+	if !state.written.Test(0) {
 		t.Error("piece 0 should still be written")
 	}
-	if !state.written[2] {
+	if !state.written.Test(2) {
 		t.Error("piece 2 should still be written")
 	}
 
 	// writtenCount should be decremented.
-	if state.writtenCount != 2 {
-		t.Errorf("writtenCount = %d, want 2", state.writtenCount)
+	if state.written.Count() != 2 {
+		t.Errorf("writtenCount = %d, want 2", state.written.Count())
 	}
 
 	// File0 should be renamed back to .partial.

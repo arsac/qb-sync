@@ -52,7 +52,7 @@ func (s *Server) FinalizeTorrent(
 	}
 	// Create finalizeDone immediately so concurrent polls always see it.
 	done := state.finalization.start()
-	writtenCount := state.writtenCount
+	writtenCount := int(state.written.Count())
 	state.mu.Unlock()
 
 	// Helper to clear finalizing state, close the done channel, record failure
@@ -755,8 +755,7 @@ func (s *Server) recoverVerificationFailure(
 	defer state.mu.Unlock()
 
 	for _, p := range failedPieces {
-		state.written[p] = false
-		state.writtenCount--
+		state.written.Clear(uint(p))
 	}
 
 	// Find and recover affected files.
@@ -779,7 +778,7 @@ func (s *Server) recoverVerificationFailure(
 	s.logger.InfoContext(ctx, "recovered from verification failure",
 		"hash", hash,
 		"failedPieces", len(failedPieces),
-		"writtenCount", state.writtenCount,
+		"writtenCount", int(state.written.Count()),
 	)
 }
 

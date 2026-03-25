@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/bits-and-blooms/bitset"
+
 	"github.com/arsac/qb-sync/internal/utils"
 	pb "github.com/arsac/qb-sync/proto"
 )
@@ -118,7 +120,7 @@ func (m *torrentMeta) countSelectedFiles() int {
 // countSelectedPiecesTotal returns the number of pieces that overlap at least one selected file.
 func (s *serverTorrentState) countSelectedPiecesTotal() int {
 	count := 0
-	for i := range s.written {
+	for i := range int(s.written.Len()) {
 		if s.classifyPiece(i) != pieceNoSelectedOverlap {
 			count++
 		}
@@ -169,11 +171,12 @@ func (m *torrentMeta) classifyPiece(pieceIdx int) pieceClass {
 
 // calculatePiecesNeeded converts written state to pieces_needed (inverse).
 // pieces_needed[i] = true means the piece needs to be streamed.
-func calculatePiecesNeeded(written []bool) ([]bool, int32, int32) {
-	piecesNeeded := make([]bool, len(written))
+func calculatePiecesNeeded(written *bitset.BitSet) ([]bool, int32, int32) {
+	n := int(written.Len())
+	piecesNeeded := make([]bool, n)
 	var needCount, haveCount int32
-	for i, w := range written {
-		if w {
+	for i := range n {
+		if written.Test(uint(i)) {
 			haveCount++
 		} else {
 			piecesNeeded[i] = true
@@ -197,15 +200,4 @@ func countHardlinkResults(results []*pb.HardlinkResult) (int, int, int) {
 		}
 	}
 	return hardlinked, pending, preExisting
-}
-
-// countWritten counts the number of written pieces.
-func countWritten(written []bool) int {
-	count := 0
-	for _, w := range written {
-		if w {
-			count++
-		}
-	}
-	return count
 }

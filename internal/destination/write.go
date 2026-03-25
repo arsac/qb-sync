@@ -34,33 +34,14 @@ func writePieceError(msg string, code pb.PieceErrorCode) writeResult {
 
 // markPieceWritten updates state tracking after a piece is written.
 // Caller must hold state.mu.
-func (s *Server) markPieceWritten(ctx context.Context, hash string, state *serverTorrentState, pieceIndex int32) {
-	if int(pieceIndex) >= len(state.written) {
+func (s *Server) markPieceWritten(_ context.Context, _ string, state *serverTorrentState, pieceIndex int32) {
+	if pieceIndex < 0 || uint(pieceIndex) >= state.written.Len() {
 		return
 	}
 
-	state.written[pieceIndex] = true
-	state.writtenCount++
+	state.written.Set(uint(pieceIndex))
 	state.dirty = true
 	state.piecesSinceFlush++
-
-	flushCount := s.config.StateFlushCount
-	if flushCount == 0 {
-		flushCount = defaultStateFlushCount
-	}
-
-	shouldFlush := state.piecesSinceFlush >= flushCount || state.writtenCount == len(state.written)
-
-	if shouldFlush && state.statePath != "" {
-		if saveErr := s.saveState(state.statePath, state.written); saveErr != nil {
-			metrics.StateSaveErrorsTotal.WithLabelValues(metrics.ModeDestination).Inc()
-			s.logger.WarnContext(ctx, "failed to save state", "hash", hash, "error", saveErr)
-		} else {
-			state.dirty = false
-			state.piecesSinceFlush = 0
-			state.flushGen++
-		}
-	}
 }
 
 // writePiece receives and writes a single piece.
@@ -81,12 +62,15 @@ func (s *Server) writePiece(ctx context.Context, req *pb.WritePieceRequest) writ
 	}
 
 	pieceIndex := req.GetPieceIndex()
+	if pieceIndex < 0 {
+		return writePieceError("negative piece index", pb.PieceErrorCode_PIECE_ERROR_IO)
+	}
 	data := req.GetData()
 
 	// Early check with lock (optimization to skip hash verification in common cases).
 	// This is NOT the correctness check - see double-check below after hash verification.
 	state.mu.Lock()
-	alreadyWritten := int(pieceIndex) < len(state.written) && state.written[pieceIndex]
+	alreadyWritten := uint(pieceIndex) < state.written.Len() && state.written.Test(uint(pieceIndex))
 	isFinalizing := state.finalization.active
 	state.mu.Unlock()
 
@@ -113,6 +97,15 @@ func (s *Server) writePiece(ctx context.Context, req *pb.WritePieceRequest) writ
 		}
 	}
 
+	// Disk I/O outside state.mu: writePieceData only touches immutable metadata
+	// (files slice, offsets) and file handles that are safe to use without the lock
+	// because the early-written check above ensures no concurrent writer for the
+	// same piece, and finalization check prevents races with file rename.
+	if writeErr := state.writePieceData(req.GetOffset(), data); writeErr != nil {
+		metrics.PieceWriteErrorsTotal.WithLabelValues(metrics.ModeDestination).Inc()
+		return writePieceError(fmt.Sprintf("write failed: %v", writeErr), pb.PieceErrorCode_PIECE_ERROR_IO)
+	}
+
 	state.mu.Lock()
 	defer state.mu.Unlock()
 
@@ -122,13 +115,9 @@ func (s *Server) writePiece(ctx context.Context, req *pb.WritePieceRequest) writ
 		return writePieceError("torrent is being finalized", pb.PieceErrorCode_PIECE_ERROR_FINALIZING)
 	}
 
-	if int(pieceIndex) < len(state.written) && state.written[pieceIndex] {
+	// Re-check under lock: a concurrent writer may have marked this piece.
+	if uint(pieceIndex) < state.written.Len() && state.written.Test(uint(pieceIndex)) {
 		return writePieceOK()
-	}
-
-	if writeErr := state.writePieceData(req.GetOffset(), data); writeErr != nil {
-		metrics.PieceWriteErrorsTotal.WithLabelValues(metrics.ModeDestination).Inc()
-		return writePieceError(fmt.Sprintf("write failed: %v", writeErr), pb.PieceErrorCode_PIECE_ERROR_IO)
 	}
 
 	s.markPieceWritten(ctx, torrentHash, state, pieceIndex)
@@ -138,10 +127,11 @@ func (s *Server) writePiece(ctx context.Context, req *pb.WritePieceRequest) writ
 	metrics.PiecesReceivedTotal.Inc()
 	metrics.BytesReceivedTotal.Add(float64(len(data)))
 
-	if state.writtenCount%50 == 0 || state.writtenCount == len(state.written) {
+	count := state.written.Count()
+	if count%50 == 0 || count == state.written.Len() {
 		s.logger.InfoContext(ctx, "write progress",
 			"hash", torrentHash,
-			"progress", fmt.Sprintf("%d/%d", state.writtenCount, len(state.written)),
+			"progress", fmt.Sprintf("%d/%d", int(count), int(state.written.Len())),
 		)
 	}
 
@@ -271,8 +261,7 @@ func (s *Server) earlyFinalizeFile(
 	if len(failedPieces) > 0 {
 		fi.earlyFinalized = false
 		for _, p := range failedPieces {
-			state.written[p] = false
-			state.writtenCount--
+			state.written.Clear(uint(p))
 			fi.piecesWritten--
 		}
 		state.dirty = true
