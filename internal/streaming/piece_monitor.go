@@ -22,13 +22,13 @@ var (
 )
 
 const (
-	defaultPollInterval     = 2 * time.Second
+	defaultPollInterval     = 500 * time.Millisecond
 	completedChannelBufSize = 5000
 	removedChannelBufSize   = 100
 	completeProgress        = 1.0
 
 	idleThreshold  = 5 // consecutive polls with no new pieces before slowing down
-	idleSlowFactor = 5 // poll idle torrents every Nth tick (10s instead of 2s)
+	idleSlowFactor = 5 // poll idle torrents every Nth tick (2.5s instead of 500ms)
 
 	queueFullLogInterval = 30 * time.Second // minimum interval between "queue full" warnings
 )
