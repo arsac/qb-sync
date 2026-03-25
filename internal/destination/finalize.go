@@ -33,7 +33,7 @@ func (s *Server) FinalizeTorrent(
 	startTime := time.Now()
 	hash := req.GetTorrentHash()
 
-	state, stateErr := s.getOrRecoverState(ctx, hash)
+	state, stateErr := s.getState(ctx, hash)
 	if stateErr != nil {
 		//nolint:nilerr // gRPC returns errors in response body
 		return &pb.FinalizeTorrentResponse{
@@ -334,8 +334,12 @@ func (s *Server) relocateForSubPathChange(
 	return nil
 }
 
-// getOrRecoverState gets the torrent state from memory, or recovers it from disk.
-func (s *Server) getOrRecoverState(ctx context.Context, hash string) (*serverTorrentState, error) {
+// getState gets the torrent state from memory.
+// Returns an error if the torrent is not tracked or is still initializing.
+// After a destination restart, state is not in memory until the source
+// re-initializes the torrent via InitTorrent. FinalizeTorrent returns
+// FINALIZE_ERROR_NOT_FOUND so the source can untrack and re-initialize.
+func (s *Server) getState(_ context.Context, hash string) (*serverTorrentState, error) {
 	s.mu.RLock()
 	state, exists := s.torrents[hash]
 	initializing := exists && state.initializing
@@ -348,34 +352,7 @@ func (s *Server) getOrRecoverState(ctx context.Context, hash string) (*serverTor
 		return state, nil
 	}
 
-	// Try to recover state from disk (after server restart)
-	recoveredState, recoverErr := s.recoverTorrentState(ctx, hash)
-	if recoverErr != nil {
-		s.logger.DebugContext(ctx, "failed to recover torrent state",
-			"hash", hash,
-			"error", recoverErr,
-		)
-		return nil, errors.New("torrent not found")
-	}
-
-	// Check-and-insert atomically to prevent TOCTOU race — another concurrent
-	// FinalizeTorrent could have recovered and inserted state between our
-	// RUnlock above and this Lock.
-	s.mu.Lock()
-	if existing, alreadyInserted := s.torrents[hash]; alreadyInserted {
-		s.mu.Unlock()
-		return existing, nil
-	}
-	s.torrents[hash] = recoveredState
-	s.mu.Unlock()
-
-	s.logger.InfoContext(ctx, "recovered torrent state from disk",
-		"hash", hash,
-		"pieces", len(recoveredState.written),
-		"files", len(recoveredState.files),
-	)
-
-	return recoveredState, nil
+	return nil, errors.New("torrent not found")
 }
 
 // finalizeFiles syncs all file handles, closes them, and renames from .partial to final.
