@@ -12,7 +12,7 @@ import (
 const (
 	DefaultMinWindow     = 8
 	DefaultMaxWindow     = 2000
-	DefaultInitialWindow = 64
+	DefaultInitialWindow = 512
 
 	// CUBIC constants (RFC 8312).
 	cubicC           = 0.4  // Scaling constant.
