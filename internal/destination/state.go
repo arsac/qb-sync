@@ -11,7 +11,11 @@ import (
 )
 
 // openForWrite lazily opens the file for writing, creating and pre-allocating it if needed.
+// Protected by fileMu so it can be called outside state.mu for concurrent disk I/O.
 func (f *serverFileInfo) openForWrite() (*os.File, error) {
+	f.fileMu.Lock()
+	defer f.fileMu.Unlock()
+
 	if f.file != nil {
 		return f.file, nil
 	}

@@ -227,12 +227,16 @@ func (h *hardlinkInfo) markComplete() {
 //
 // Mutable fields (require state.mu):
 //
-//	path, file, earlyFinalized, piecesWritten, hardlink.state
+//	path, earlyFinalized, piecesWritten, hardlink.state
+//
+// The file handle is protected by fileMu (not state.mu) so that
+// openForWrite can be called outside state.mu for concurrent disk I/O.
 type serverFileInfo struct {
-	path   string   // Full path on disk (mutable: renamed during early finalize)
-	size   int64    // File size
-	offset int64    // Offset within torrent's total data
-	file   *os.File // Open file handle (lazy opened, mutable)
+	path   string     // Full path on disk (mutable: renamed during early finalize)
+	size   int64      // File size
+	offset int64      // Offset within torrent's total data
+	file   *os.File   // Open file handle (lazy opened, protected by fileMu)
+	fileMu sync.Mutex // Protects file handle open/close
 
 	// Hardlink tracking (state machine for cross-torrent file dedup)
 	hardlink hardlinkInfo

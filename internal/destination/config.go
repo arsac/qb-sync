@@ -10,9 +10,8 @@ const (
 	serverDirPermissions  = 0o755
 	serverFilePermissions = 0o644
 
-	// Default state persistence settings (hybrid time + count approach).
-	defaultStateFlushInterval = 30 * time.Second // Time-based: flush dirty state every 30s
-	defaultStateFlushCount    = 100              // Count-based: flush after N pieces as safety net
+	// Default state persistence interval for the background flusher.
+	defaultStateFlushInterval = 30 * time.Second
 
 	// Metadata directory and file names for recovery after restart.
 	metaDirName       = ".qbsync"
@@ -91,7 +90,6 @@ type ServerConfig struct {
 	BasePath           string        // Base path for writing torrent data
 	SavePath           string        // Path as destination qBittorrent sees it (container mount, e.g., "/downloads"). Defaults to BasePath.
 	StateFlushInterval time.Duration // How often to flush dirty state (0 = use default)
-	StateFlushCount    int           // Flush after this many pieces written (0 = use default)
 	StreamWorkers      int           // Number of concurrent piece writers (0 = use default)
 
 	// Orphan cleanup settings - clean up partial files when source disconnects unexpectedly.
