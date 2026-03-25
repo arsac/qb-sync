@@ -10,6 +10,7 @@ import (
 
 	"github.com/bits-and-blooms/bitset"
 
+	"github.com/arsac/qb-sync/internal/metrics"
 	"github.com/arsac/qb-sync/internal/utils"
 )
 
@@ -149,6 +150,7 @@ func (s *Server) clearStalePieces(
 			}
 		}
 		if cleared > 0 {
+			metrics.StaleBitmapPiecesClearedTotal.Add(float64(cleared))
 			s.logger.WarnContext(ctx, "cleared stale pieces for missing file",
 				"hash", hash,
 				"file", fi.path,

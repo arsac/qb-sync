@@ -129,7 +129,7 @@ func (s *Server) writePiece(ctx context.Context, req *pb.WritePieceRequest) writ
 
 	count := state.written.Count()
 	if count%50 == 0 || count == state.written.Len() {
-		s.logger.InfoContext(ctx, "write progress",
+		s.logger.DebugContext(ctx, "write progress",
 			"hash", torrentHash,
 			"progress", fmt.Sprintf("%d/%d", int(count), int(state.written.Len())),
 		)

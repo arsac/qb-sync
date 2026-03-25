@@ -183,6 +183,7 @@ func (t *QBTask) handleIncompleteFinalization(ctx context.Context, hash string) 
 // or data files externally deleted). Untrack so the next poll cycle re-discovers
 // and re-initializes the torrent from scratch.
 func (t *QBTask) handleNotFoundFinalization(ctx context.Context, hash string) {
+	metrics.FinalizeNotFoundTotal.Inc()
 	t.logger.WarnContext(ctx, "destination has no state for torrent, untracking for re-init",
 		"hash", hash,
 	)

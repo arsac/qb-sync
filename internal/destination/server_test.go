@@ -1934,9 +1934,9 @@ func TestInitTorrentResync_PartialRecovery(t *testing.T) {
 
 		// Verify that .partial was reused — the file should still be at the .partial path.
 		s.mu.RLock()
-		state := s.torrents["resyncpartial"]
+		state, ok := s.torrents["resyncpartial"]
 		s.mu.RUnlock()
-		if state == nil {
+		if !ok {
 			t.Fatal("torrent state should exist")
 		}
 		if !strings.HasSuffix(state.files[1].path, ".partial") {
@@ -2087,9 +2087,9 @@ func TestInitTorrentResync_ExistingState(t *testing.T) {
 
 		// Verify state was re-initialized with updated selection
 		s.mu.RLock()
-		state := s.torrents["resyncstate"]
+		state, ok := s.torrents["resyncstate"]
 		s.mu.RUnlock()
-		if state == nil {
+		if !ok {
 			t.Fatal("torrent state should exist after re-sync")
 		}
 		if !state.files[1].selected {

@@ -476,6 +476,26 @@ var (
 			Help:      "Total torrents aborted due to exclude-sync tag applied mid-sync",
 		},
 	)
+
+	// FinalizeNotFoundTotal counts torrents where the destination had no state
+	// (metadata missing or data files deleted) and the source untracked for re-init.
+	FinalizeNotFoundTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "finalize_not_found_total",
+			Help:      "Torrents untracked because destination had no state (will re-initialize)",
+		},
+	)
+
+	// StaleBitmapPiecesClearedTotal counts piece bits cleared from the written bitmap
+	// during init because the backing data file was missing from disk.
+	StaleBitmapPiecesClearedTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "stale_bitmap_pieces_cleared_total",
+			Help:      "Piece bits cleared from written bitmap because backing data file was missing",
+		},
+	)
 )
 
 // Gauges track values that can go up or down.

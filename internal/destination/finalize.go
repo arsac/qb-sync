@@ -159,7 +159,7 @@ func (s *Server) runBackgroundFinalization(
 	waitCancel()
 	defer s.finalizeSem.Release(1)
 
-	s.logger.InfoContext(s.bgCtx, "acquired finalization slot",
+	s.logger.DebugContext(s.bgCtx, "acquired finalization slot",
 		"hash", hash,
 		"queueWait", time.Since(startTime).Round(time.Millisecond),
 	)
@@ -653,7 +653,7 @@ func (s *Server) verifyFinalizedPieces(
 			lastProgress.Store(time.Now())
 
 			if count := verified.Add(1); count%50 == 0 || count == int64(numPieces) {
-				s.logger.InfoContext(ctx, "verification progress",
+				s.logger.DebugContext(ctx, "verification progress",
 					"hash", hash,
 					"verified", count,
 					"total", numPieces,

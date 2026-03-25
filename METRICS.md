@@ -65,6 +65,8 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_verification_recoveries_total` | | Torrents recovered from verification failure by marking pieces for re-streaming (destination) |
 | `qbsync_sync_failed_total` | | Torrents that failed verification repeatedly and were tagged as sync-failed (source) |
 | `qbsync_exclude_sync_abort_total` | | Torrents aborted due to exclude-sync tag applied mid-sync (source) |
+| `qbsync_finalize_not_found_total` | | Torrents untracked because destination had no state — will re-initialize (source) |
+| `qbsync_stale_bitmap_pieces_cleared_total` | | Piece bits cleared from written bitmap because backing data file was missing (destination) |
 
 ## Gauges
 
