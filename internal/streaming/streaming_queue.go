@@ -483,21 +483,38 @@ func (q *BidiQueue) sendPiecePool(ctx context.Context, pool *StreamPool, piece *
 		return nil
 	}
 
+	// Acquire window slot BEFORE the disk read so we fail fast when the
+	// window is full, avoiding a wasted NFS I/O round-trip.
+	ps, selectErr := pool.SelectStream()
+	if selectErr != nil {
+		return fmt.Errorf("selecting stream: %w", selectErr)
+	}
+
+	if !ps.window.TrySend(key) {
+		q.logger.DebugContext(ctx, "window full, skipping disk read",
+			"hash", hash,
+			"piece", index,
+			"stream", ps.id,
+		)
+		return errors.New("window full")
+	}
+
+	// Track which stream this piece was sent on for correct ack handling
+	q.setPieceStream(key, ps)
+
 	data, err := q.source.ReadPiece(ctx, piece)
 	if err != nil {
+		ps.window.OnFail(key)
+		q.deletePieceStream(key)
 		return fmt.Errorf("reading piece: %w", err)
 	}
 
 	if q.limiter != nil {
 		if waitErr := q.waitForRateLimit(ctx, len(data)); waitErr != nil {
+			ps.window.OnFail(key)
+			q.deletePieceStream(key)
 			return fmt.Errorf("rate limit: %w", waitErr)
 		}
-	}
-
-	// Select best stream (least loaded)
-	ps, selectErr := pool.SelectStream()
-	if selectErr != nil {
-		return fmt.Errorf("selecting stream: %w", selectErr)
 	}
 
 	req := &pb.WritePieceRequest{
@@ -508,19 +525,6 @@ func (q *BidiQueue) sendPiecePool(ctx context.Context, pool *StreamPool, piece *
 		PieceHash:   piece.GetHash(),
 		Data:        data,
 	}
-
-	// Use TrySend for atomic check-and-record to avoid TOCTOU race.
-	if !ps.window.TrySend(key) {
-		q.logger.DebugContext(ctx, "window full after preparation, will retry piece",
-			"hash", hash,
-			"piece", index,
-			"stream", ps.id,
-		)
-		return errors.New("window full")
-	}
-
-	// Track which stream this piece was sent on for correct ack handling
-	q.setPieceStream(key, ps)
 
 	if sendErr := ps.stream.Send(req); sendErr != nil {
 		ps.window.OnFail(key)
