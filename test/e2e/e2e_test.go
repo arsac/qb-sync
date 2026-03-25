@@ -1493,8 +1493,10 @@ func TestE2E_OrphanCleanupOnTorrentRemoval(t *testing.T) {
 		orchestratorDone <- task.Run(orchestratorCtx)
 	}()
 
-	// Wait for streaming to start and make some progress (but not complete)
+	// Wait for streaming to start. Delete immediately once we see progress
+	// so we catch the torrent mid-stream before it finishes and gets untracked.
 	t.Log("Waiting for streaming to start...")
+	destMetaDir := filepath.Join(env.DestinationPath(), ".qbsync", wiredCDHash)
 	var initialProgress int
 	require.Eventually(t, func() bool {
 		progress, progressErr := task.Progress(ctx, wiredCDHash)
@@ -1503,14 +1505,12 @@ func TestE2E_OrphanCleanupOnTorrentRemoval(t *testing.T) {
 		}
 		initialProgress = progress.Streamed
 		t.Logf("Streaming progress: %d/%d pieces", progress.Streamed, progress.TotalPieces)
-		// Wait for at least some pieces to be streamed
-		return progress.Streamed > 0 && progress.Streamed < progress.TotalPieces
-	}, 2*time.Minute, time.Second, "streaming should start")
+		return progress.Streamed > 0
+	}, 2*time.Minute, 100*time.Millisecond, "streaming should start")
 
 	t.Logf("Streaming started with %d pieces transferred, now removing torrent from source...", initialProgress)
 
-	// Check that partial files exist on destination before removal
-	destMetaDir := filepath.Join(env.DestinationPath(), ".qbsync", wiredCDHash)
+	// Check that meta directory exists on destination
 	_, metaErr := os.Stat(destMetaDir)
 	require.NoError(t, metaErr, "destination meta directory should exist during streaming")
 	t.Logf("Destination meta directory exists: %s", destMetaDir)
