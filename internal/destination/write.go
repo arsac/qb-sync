@@ -253,9 +253,17 @@ func (s *Server) earlyFinalizeFile(
 
 	if syncCloseErr != nil {
 		fi.earlyFinalized = false
-		s.logger.WarnContext(ctx, "early finalization sync failed, deferring",
+		// Reopen the file so finalizeFiles() can retry the sync.
+		// The original handle was closed by syncAndCloseHandle even on error.
+		if reopened, reopenErr := fi.openForWrite(); reopenErr != nil {
+			s.logger.ErrorContext(ctx, "failed to reopen file after sync failure",
+				"hash", hash, "file", fi.path, "error", reopenErr)
+		} else {
+			_ = reopened // stored in fi.file by openForWrite
+		}
+		s.logger.WarnContext(ctx, "early finalization sync failed, deferring to finalizeFiles",
 			"hash", hash, "file", fi.path, "error", syncCloseErr)
-		return // finalizeFiles() will retry
+		return
 	}
 
 	if len(failedPieces) > 0 {
