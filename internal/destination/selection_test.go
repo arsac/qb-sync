@@ -467,7 +467,7 @@ func TestFinalizeTorrent_PartialSelection(t *testing.T) {
 
 // --- File validation ---
 
-func TestValidateRecoveredFiles(t *testing.T) {
+func TestValidateDataFiles(t *testing.T) {
 	t.Parallel()
 	tmpDir := t.TempDir()
 
@@ -480,7 +480,7 @@ func TestValidateRecoveredFiles(t *testing.T) {
 			{path: existingFile, selected: true},
 			{path: filepath.Join(tmpDir, "missing.bin"), selected: false},
 		}
-		if err := validateRecoveredFiles(files); err != nil {
+		if err := validateDataFiles(files); err != nil {
 			t.Errorf("expected nil, got: %v", err)
 		}
 	})
@@ -490,7 +490,7 @@ func TestValidateRecoveredFiles(t *testing.T) {
 		files := []*serverFileInfo{
 			{path: filepath.Join(tmpDir, "missing.bin"), selected: true},
 		}
-		if err := validateRecoveredFiles(files); err == nil {
+		if err := validateDataFiles(files); err == nil {
 			t.Error("expected error for missing selected file")
 		}
 	})

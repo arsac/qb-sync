@@ -38,7 +38,7 @@ func (i *inProgressInode) close() {
 }
 
 // torrentMeta holds piece geometry and hash data that is immutable after initialization.
-// All fields are set once during initNewTorrent (or recoverTorrentState) and never modified.
+// All fields are set once during initNewTorrent and never modified.
 // Safe to read without holding state.mu.
 //
 // Note: the files slice reference is immutable (never appended/removed), but individual
@@ -121,8 +121,8 @@ func (m *torrentMeta) calculatePiecesCovered() []bool {
 type serverTorrentState struct {
 	torrentMeta // Immutable metadata (safe to read without mu)
 
-	// Immutable after init (set once during initNewTorrent or recoverTorrentState):
-	info      *pb.InitTorrentRequest // Original init request; nil when recovered from disk
+	// Immutable after init (set once during initNewTorrent):
+	info      *pb.InitTorrentRequest // Original init request
 	statePath string                 // Path to written pieces state file
 
 	// Mutable state (require state.mu):

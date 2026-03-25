@@ -33,7 +33,7 @@ func (s *Server) FinalizeTorrent(
 	startTime := time.Now()
 	hash := req.GetTorrentHash()
 
-	state, stateErr := s.getState(ctx, hash)
+	state, stateErr := s.getState(hash)
 	if stateErr != nil {
 		//nolint:nilerr // gRPC returns errors in response body
 		return &pb.FinalizeTorrentResponse{
@@ -339,7 +339,7 @@ func (s *Server) relocateForSubPathChange(
 // After a destination restart, state is not in memory until the source
 // re-initializes the torrent via InitTorrent. FinalizeTorrent returns
 // FINALIZE_ERROR_NOT_FOUND so the source can untrack and re-initialize.
-func (s *Server) getState(_ context.Context, hash string) (*serverTorrentState, error) {
+func (s *Server) getState(hash string) (*serverTorrentState, error) {
 	s.mu.RLock()
 	state, exists := s.torrents[hash]
 	initializing := exists && state.initializing

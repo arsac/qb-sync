@@ -205,7 +205,7 @@ func (s *Server) initNewTorrent(
 	// don't exist on disk (externally deleted, or hardlinks never created),
 	// remove it so buildWrittenBitmap starts with a clean bitmap instead
 	// of trusting the stale claim.
-	if validateErr := validateRecoveredFiles(files); validateErr != nil {
+	if validateErr := validateDataFiles(files); validateErr != nil {
 		s.logger.WarnContext(ctx, "stale state file detected during init, removing",
 			"hash", hash,
 			"error", validateErr,

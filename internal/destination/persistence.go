@@ -116,11 +116,11 @@ func findTorrentFile(metaDir string) (string, error) {
 	return "", errors.New("torrent file not found")
 }
 
-// validateRecoveredFiles checks that every selected file exists on disk.
+// validateDataFiles checks that every selected file exists on disk.
 // Skips unselected files and files with pending/complete hardlinks (those
 // are created during finalization, not during streaming).
 // Returns a non-nil error listing the first missing file if any are absent.
-func validateRecoveredFiles(files []*serverFileInfo) error {
+func validateDataFiles(files []*serverFileInfo) error {
 	for _, fi := range files {
 		if !fi.selected {
 			continue
