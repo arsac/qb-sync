@@ -28,6 +28,7 @@ const (
 
 	// Concurrent streaming settings.
 	defaultStreamWorkers = 8   // Number of concurrent piece writers (tuned for NFS/ZFS)
+	workChBufferMultiple = 2   // Work channel is N*workers; memory bounded by memBudget semaphore
 	ackQueueSize         = 100 // Buffer size for outbound acks (small messages, larger buffer is fine)
 
 	// Default polling settings for waitForTorrentReady.

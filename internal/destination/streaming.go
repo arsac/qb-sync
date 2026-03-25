@@ -21,11 +21,10 @@ func (s *Server) StreamPiecesBidi(stream pb.QBSyncService_StreamPiecesBidiServer
 		numWorkers = defaultStreamWorkers
 	}
 
-	// Bound work channel to numWorkers: each queued item holds full piece data
-	// (up to 16 MB), so a larger buffer risks unbounded memory growth across
-	// concurrent streams. When full, streamReceiver blocks and gRPC HTTP/2 flow
-	// control provides backpressure to the sender.
-	workCh := make(chan *pb.WritePieceRequest, numWorkers)
+	// Buffer 2x workers so the gRPC receiver can stay ahead of NFS write
+	// latency. Memory is still bounded by the memBudget semaphore, so the
+	// extra buffering doesn't risk unbounded growth.
+	workCh := make(chan *pb.WritePieceRequest, numWorkers*workChBufferMultiple)
 	ackCh := make(chan *pb.PieceAck, ackQueueSize)
 	errCh := make(chan error, 1)
 
