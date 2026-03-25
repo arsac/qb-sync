@@ -465,33 +465,55 @@ func TestFinalizeTorrent_PartialSelection(t *testing.T) {
 	}
 }
 
-// --- File validation ---
+// --- Stale piece clearing ---
 
-func TestValidateDataFiles(t *testing.T) {
+func TestClearStalePieces(t *testing.T) {
 	t.Parallel()
-	tmpDir := t.TempDir()
+	s, tmpDir := newTestDestServer(t)
 
 	existingFile := filepath.Join(tmpDir, "exists.bin")
 	writeTestFile(t, existingFile, []byte("data"))
 
-	t.Run("all selected files exist", func(t *testing.T) {
+	t.Run("clears only missing file pieces", func(t *testing.T) {
 		t.Parallel()
 		files := []*serverFileInfo{
-			{path: existingFile, selected: true},
-			{path: filepath.Join(tmpDir, "missing.bin"), selected: false},
+			{path: existingFile, selected: true, firstPiece: 0, lastPiece: 2},
+			{path: filepath.Join(tmpDir, "missing.bin"), selected: true, firstPiece: 3, lastPiece: 5},
 		}
-		if err := validateDataFiles(files); err != nil {
-			t.Errorf("expected nil, got: %v", err)
+		written := []bool{true, true, true, true, true, true}
+
+		s.clearStalePieces(context.Background(), "test", written, files)
+
+		// Pieces 0-2 (existing file) should be preserved
+		for i := range 3 {
+			if !written[i] {
+				t.Errorf("piece %d should be preserved (file exists)", i)
+			}
+		}
+		// Pieces 3-5 (missing file) should be cleared
+		for i := 3; i < 6; i++ {
+			if written[i] {
+				t.Errorf("piece %d should be cleared (file missing)", i)
+			}
 		}
 	})
 
-	t.Run("selected file missing", func(t *testing.T) {
+	t.Run("skips unselected and hardlinked files", func(t *testing.T) {
 		t.Parallel()
 		files := []*serverFileInfo{
-			{path: filepath.Join(tmpDir, "missing.bin"), selected: true},
+			{path: filepath.Join(tmpDir, "missing1.bin"), selected: false, firstPiece: 0, lastPiece: 1},
+			{path: filepath.Join(tmpDir, "missing2.bin"), selected: true, firstPiece: 2, lastPiece: 3,
+				hardlink: hardlinkInfo{state: hlStatePending}},
 		}
-		if err := validateDataFiles(files); err == nil {
-			t.Error("expected error for missing selected file")
+		written := []bool{true, true, true, true}
+
+		s.clearStalePieces(context.Background(), "test", written, files)
+
+		// All pieces should be preserved — unselected and pending-hardlink files are skipped
+		for i := range 4 {
+			if !written[i] {
+				t.Errorf("piece %d should be preserved", i)
+			}
 		}
 	})
 }

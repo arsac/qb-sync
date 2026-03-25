@@ -1,6 +1,7 @@
 package destination
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -116,21 +117,43 @@ func findTorrentFile(metaDir string) (string, error) {
 	return "", errors.New("torrent file not found")
 }
 
-// validateDataFiles checks that every selected file exists on disk.
-// Skips unselected files and files with pending/complete hardlinks (those
-// are created during finalization, not during streaming).
-// Returns a non-nil error listing the first missing file if any are absent.
-func validateDataFiles(files []*serverFileInfo) error {
+// clearStalePieces checks each selected file for existence on disk.
+// If a file is missing, all pieces in its range are cleared from the
+// written bitmap. Files with pending/complete hardlinks are skipped
+// since they are created during finalization, not streaming.
+// This preserves progress for files that DO exist while invalidating
+// only the pieces whose data was lost.
+func (s *Server) clearStalePieces(
+	ctx context.Context,
+	hash string,
+	written []bool,
+	files []*serverFileInfo,
+) {
 	for _, fi := range files {
-		if !fi.selected {
+		if !fi.selected || fi.earlyFinalized {
 			continue
 		}
 		if fi.hardlink.state == hlStatePending || fi.hardlink.state == hlStateComplete {
 			continue
 		}
-		if _, err := os.Stat(fi.path); err != nil {
-			return fmt.Errorf("data file missing: %s", fi.path)
+		if _, err := os.Stat(fi.path); err == nil {
+			continue
+		}
+
+		// Data file missing — clear its pieces from the bitmap.
+		cleared := 0
+		for p := fi.firstPiece; p <= fi.lastPiece; p++ {
+			if written[p] {
+				written[p] = false
+				cleared++
+			}
+		}
+		if cleared > 0 {
+			s.logger.WarnContext(ctx, "cleared stale pieces for missing file",
+				"hash", hash,
+				"file", fi.path,
+				"pieces", cleared,
+			)
 		}
 	}
-	return nil
 }
