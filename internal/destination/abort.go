@@ -78,6 +78,7 @@ func (s *Server) AbortTorrent(
 
 	state, exists := s.torrents[hash]
 	if exists {
+		s.unregisterFilePaths(hash, state.files)
 		delete(s.torrents, hash)
 	}
 	s.mu.Unlock()
@@ -102,14 +103,11 @@ func (s *Server) AbortTorrent(
 	state.mu.Lock()
 	defer state.mu.Unlock()
 
-	// Clean up in-progress inode entries for this torrent's files.
-	// Signal waiters so they can handle the abort (their hardlink attempt will fail).
-	// AbortInProgress is idempotent: no-ops for zero inodes, completed, or pending files.
 	for _, fi := range state.files {
+		// Signal waiters so they can handle the abort (their hardlink attempt will fail).
+		// AbortInProgress is idempotent: no-ops for zero inodes, completed, or pending files.
 		s.inodes.AbortInProgress(ctx, fi.hardlink.sourceInode, hash)
-	}
 
-	for _, fi := range state.files {
 		// closeFileHandle is idempotent (no-op if fi.file is nil).
 		_ = s.closeFileHandle(ctx, hash, fi)
 

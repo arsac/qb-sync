@@ -61,17 +61,20 @@ func (s *Server) relocateFiles(
 }
 
 // updateStateAfterRelocate updates in-memory state file paths and saveSubPath
-// after a successful relocation.
-func updateStateAfterRelocate(state *serverTorrentState, basePath, oldSubPath, newSubPath string) {
+// after a successful relocation. Returns an error if any file path cannot be
+// rewritten — this indicates a mismatch between disk state and memory state.
+func updateStateAfterRelocate(state *serverTorrentState, basePath, oldSubPath, newSubPath string) error {
 	oldBase := filepath.Join(basePath, oldSubPath)
 	newBase := filepath.Join(basePath, newSubPath)
 
 	for _, fi := range state.files {
 		rel, relErr := filepath.Rel(oldBase, fi.path)
-		if relErr == nil {
-			fi.path = filepath.Join(newBase, rel)
+		if relErr != nil {
+			return fmt.Errorf("computing relative path for %s from %s: %w", fi.path, oldBase, relErr)
 		}
+		fi.path = filepath.Join(newBase, rel)
 	}
 
 	state.saveSubPath = newSubPath
+	return nil
 }

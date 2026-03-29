@@ -243,7 +243,13 @@ func (s *Server) initNewTorrent(
 		hardlinkResults: hardlinkResults,
 	}
 	s.mu.Lock()
+	if collisionErr := s.checkPathCollisions(hash, files); collisionErr != nil {
+		delete(s.torrents, hash) // remove sentinel
+		s.mu.Unlock()
+		return initErrorResponse("path collision: %v", collisionErr)
+	}
 	s.torrents[hash] = state
+	s.registerFilePaths(hash, files)
 	s.mu.Unlock()
 
 	// Log summary
@@ -337,8 +343,11 @@ func (s *Server) cleanupForResync(ctx context.Context, hash string) error {
 		return fmt.Errorf("failed to delete stale qB entry: %w", delErr)
 	}
 
-	// 2. Delete in-memory state.
+	// 2. Delete in-memory state and file path ownership.
 	s.mu.Lock()
+	if state, exists := s.torrents[hash]; exists {
+		s.unregisterFilePaths(hash, state.files)
+	}
 	delete(s.torrents, hash)
 	s.mu.Unlock()
 
@@ -590,7 +599,7 @@ func (s *Server) setupFile(
 
 	// Check for hardlink opportunities if inode is provided
 	if sourceInode != 0 {
-		outcome := s.resolveHardlink(ctx, hash, f.GetPath(), targetPath, sourceInode)
+		outcome := s.resolveHardlink(ctx, hash, f.GetPath(), targetPath, sourceInode, f.GetSize())
 		s.applyHardlinkOutcome(fileInfo, result, targetPath, outcome)
 	}
 
@@ -602,9 +611,10 @@ func (s *Server) resolveHardlink(
 	ctx context.Context,
 	hash, filePath, targetPath string,
 	sourceInode Inode,
+	expectedSize int64,
 ) hardlinkOutcome {
 	// Case 1: Check if inode is already registered (completed file from previous torrent)
-	if outcome, ok := s.tryHardlinkFromRegistered(ctx, hash, filePath, targetPath, sourceInode); ok {
+	if outcome, ok := s.tryHardlinkFromRegistered(ctx, hash, filePath, targetPath, sourceInode, expectedSize); ok {
 		return outcome
 	}
 
@@ -613,8 +623,16 @@ func (s *Server) resolveHardlink(
 		return outcome
 	}
 
-	// Case 3: We're the first to write this inode - register as in-progress
-	s.registerInodeInProgress(ctx, hash, filePath, targetPath, sourceInode)
+	// Case 3: Try to register as the first writer for this inode.
+	// RegisterInProgress returns false if another torrent raced us between
+	// Case 2 (GetInProgress) and now. In that case, retry Case 2 to pick
+	// up the winner's doneCh and become pending instead of duplicating work.
+	if !s.registerInodeInProgress(ctx, hash, filePath, targetPath, sourceInode) {
+		if outcome, ok := s.tryHardlinkFromInProgress(ctx, hash, filePath, sourceInode); ok {
+			return outcome
+		}
+		// Winner already completed between our two checks — write from scratch.
+	}
 	return hardlinkOutcome{state: hlStateInProgress}
 }
 
@@ -647,10 +665,15 @@ func (s *Server) applyHardlinkOutcome(
 
 // tryHardlinkFromRegistered attempts to hardlink from a registered (completed) inode.
 // Returns the outcome and true if a registered inode was found (even if hardlink failed).
+//
+// Validates that the registered file's size matches expectedSize before linking.
+// Source filesystems recycle inodes after file deletion; a stale registry entry
+// for a recycled inode would hardlink to a completely different file's content.
 func (s *Server) tryHardlinkFromRegistered(
 	ctx context.Context,
 	hash, filePath, targetPath string,
 	sourceInode Inode,
+	expectedSize int64,
 ) (hardlinkOutcome, bool) {
 	existingPath, found := s.inodes.GetRegistered(sourceInode)
 	if !found {
@@ -658,6 +681,22 @@ func (s *Server) tryHardlinkFromRegistered(
 	}
 
 	sourcePath := filepath.Join(s.config.BasePath, existingPath)
+
+	// Guard against stale inode entries from recycled inodes.
+	sourceInfo, statErr := os.Stat(sourcePath)
+	if statErr != nil || sourceInfo.Size() != expectedSize {
+		s.inodes.Evict(sourceInode)
+		s.logger.InfoContext(ctx, "evicted stale inode registry entry",
+			"torrent", hash,
+			"file", filePath,
+			"inode", sourceInode,
+			"registeredPath", existingPath,
+			"statErr", statErr,
+		)
+		metrics.StaleInodeEvictionsTotal.Inc()
+		return hardlinkOutcome{}, false
+	}
+
 	if err := os.Link(sourcePath, targetPath); err == nil {
 		metrics.HardlinksCreatedTotal.Inc()
 		s.logger.InfoContext(ctx, "created hardlink from registered inode",
@@ -710,7 +749,12 @@ func (s *Server) tryHardlinkFromInProgress(
 }
 
 // registerInodeInProgress registers this torrent as the first writer for an inode.
-func (s *Server) registerInodeInProgress(ctx context.Context, hash, filePath, targetPath string, sourceInode Inode) {
+// Returns true if registration succeeded, false if another torrent already registered.
+func (s *Server) registerInodeInProgress(
+	ctx context.Context,
+	hash, filePath, targetPath string,
+	sourceInode Inode,
+) bool {
 	relTargetPath, err := filepath.Rel(s.config.BasePath, targetPath)
 	if err != nil {
 		s.logger.WarnContext(ctx, "failed to compute relative path for in-progress inode",
@@ -722,5 +766,5 @@ func (s *Server) registerInodeInProgress(ctx context.Context, hash, filePath, ta
 		relTargetPath = filePath
 	}
 
-	s.inodes.RegisterInProgress(sourceInode, hash, relTargetPath)
+	return s.inodes.RegisterInProgress(sourceInode, hash, relTargetPath)
 }

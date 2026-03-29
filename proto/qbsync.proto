@@ -198,6 +198,7 @@ message FinalizeTorrentRequest {
   string category = 3;     // Optional category
   string tags = 4;         // Optional tags (comma-separated)
   string save_sub_path = 5; // Relative sub-path prefix for file storage (e.g., "movies" from category)
+  bool save_sub_path_explicit = 6; // True when save_sub_path is explicitly set (distinguishes "" from unset for backwards compat)
 }
 
 message FinalizeTorrentResponse {

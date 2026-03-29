@@ -26,6 +26,7 @@ func newTestDestServer(t *testing.T) (*Server, string) {
 		logger:         logger,
 		torrents:       make(map[string]*serverTorrentState),
 		abortingHashes: make(map[string]chan struct{}),
+		filePaths:      make(map[string]string),
 		inodes:         NewInodeRegistry(tmpDir, logger),
 		memBudget:      semaphore.NewWeighted(512 * 1024 * 1024),
 		finalizeSem:    semaphore.NewWeighted(1),

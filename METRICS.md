@@ -46,6 +46,7 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_file_sync_errors_total` | `mode` | File sync/close failures before finalization rename |
 | `qbsync_verification_errors_total` | `mode` | Piece verification failures during finalization |
 | `qbsync_hardlink_errors_total` | `mode` | Hardlink creation failures |
+| `qbsync_stale_inode_evictions_total` | | Inode registry entries evicted due to recycled source inodes |
 | `qbsync_stream_open_errors_total` | `mode` | Stream open or poll failures |
 | `qbsync_cleanup_groups_total` | `result` | Hardlink groups processed during source cleanup |
 | `qbsync_cleanup_torrents_handed_off_total` | | Torrents handed off from source to destination |

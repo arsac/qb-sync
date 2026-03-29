@@ -47,14 +47,16 @@ const (
 // Server receives pieces over gRPC and writes them to disk.
 //
 // Lock ordering (to prevent deadlocks):
-//  1. s.mu - server-level lock for torrents map and abortingHashes
+//  1. s.mu - server-level lock for torrents map, abortingHashes, filePaths
 //  2. state.mu - per-torrent lock for torrent state
-//  3. s.inodes.registeredMu - lock for inode-to-path mapping
-//  4. s.inodes.inProgressMu - lock for in-progress inode tracking
+//  3. fi.fileMu - per-file lock for file handle open/close/write
+//  4. s.inodes.registeredMu - lock for inode-to-path mapping
+//  5. s.inodes.inProgressMu - lock for in-progress inode tracking
 //
 // Always acquire locks in the order above. Release s.mu before acquiring
-// state.mu when possible to reduce contention. The inode locks (3, 4) may
+// state.mu when possible to reduce contention. The inode locks (4, 5) may
 // be acquired independently when s.mu and state.mu are not held.
+// fileMu (3) may be acquired with or without state.mu held.
 type Server struct {
 	pb.UnimplementedQBSyncServiceServer
 
@@ -62,13 +64,19 @@ type Server struct {
 	logger   *slog.Logger
 	server   *grpc.Server
 	torrents map[string]*serverTorrentState
-	mu       sync.RWMutex // Protects torrents and abortingHashes
+	mu       sync.RWMutex // Protects torrents, abortingHashes, and filePaths
 
 	// Abort tracking: prevents race between AbortTorrent and InitTorrent.
 	// When a hash is being aborted, the channel is present and open.
 	// InitTorrent waits for the channel to close before proceeding.
 	// AbortTorrent closes the channel when cleanup is complete.
 	abortingHashes map[string]chan struct{}
+
+	// filePaths tracks which target file paths are owned by active torrents.
+	// Maps absolute target path (without .partial suffix) to torrent hash.
+	// Prevents two concurrent torrents with the same file path from
+	// corrupting each other's .partial file.
+	filePaths map[string]string
 
 	// Inode registry for hardlink deduplication
 	inodes *InodeRegistry
@@ -114,6 +122,7 @@ func NewServer(config ServerConfig, logger *slog.Logger) *Server {
 		logger:         logger,
 		torrents:       make(map[string]*serverTorrentState),
 		abortingHashes: make(map[string]chan struct{}),
+		filePaths:      make(map[string]string),
 		inodes:         NewInodeRegistry(config.BasePath, logger),
 		memBudget:      semaphore.NewWeighted(bufferBytes),
 		finalizeSem:    semaphore.NewWeighted(1),
@@ -251,6 +260,7 @@ func (s *Server) cleanup() {
 	s.mu.Lock()
 	torrents := s.collectTorrents()
 	s.torrents = make(map[string]*serverTorrentState)
+	s.filePaths = make(map[string]string)
 	s.mu.Unlock()
 
 	for _, t := range torrents {

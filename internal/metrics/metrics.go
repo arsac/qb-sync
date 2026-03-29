@@ -274,6 +274,16 @@ var (
 		[]string{LabelMode},
 	)
 
+	// StaleInodeEvictionsTotal counts inode registry entries evicted due to
+	// size mismatch (recycled source inode).
+	StaleInodeEvictionsTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "stale_inode_evictions_total",
+			Help:      "Total inode registry entries evicted due to recycled source inodes",
+		},
+	)
+
 	// StreamOpenErrorsTotal counts stream open failures or poll errors.
 	StreamOpenErrorsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{

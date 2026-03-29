@@ -1458,7 +1458,9 @@ func TestUpdateStateAfterRelocate(t *testing.T) {
 			}},
 		}
 
-		updateStateAfterRelocate(state, basePath, "", "movies")
+		if err := updateStateAfterRelocate(state, basePath, "", "movies"); err != nil {
+			t.Fatalf("updateStateAfterRelocate: %v", err)
+		}
 
 		if state.saveSubPath != "movies" {
 			t.Errorf("expected saveSubPath=movies, got %q", state.saveSubPath)
@@ -1607,8 +1609,9 @@ func TestFinalizeTorrent_RelocatesOnSubPathChange(t *testing.T) {
 		s.mu.Unlock()
 
 		resp, err := s.FinalizeTorrent(ctx, &pb.FinalizeTorrentRequest{
-			TorrentHash: hash,
-			SaveSubPath: "movies",
+			TorrentHash:         hash,
+			SaveSubPath:         "movies",
+			SaveSubPathExplicit: true,
 		})
 		if err != nil {
 			t.Fatalf("FinalizeTorrent RPC error: %v", err)

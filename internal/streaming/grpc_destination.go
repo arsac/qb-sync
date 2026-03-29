@@ -409,11 +409,12 @@ func (d *GRPCDestination) FinalizeTorrent(
 	defer cancel()
 
 	resp, err := d.client().FinalizeTorrent(callCtx, &pb.FinalizeTorrentRequest{
-		TorrentHash: hash,
-		SavePath:    savePath,
-		Category:    category,
-		Tags:        tags,
-		SaveSubPath: saveSubPath,
+		TorrentHash:         hash,
+		SavePath:            savePath,
+		Category:            category,
+		Tags:                tags,
+		SaveSubPath:         saveSubPath,
+		SaveSubPathExplicit: true,
 	}, grpc.WaitForReady(true))
 	if err != nil {
 		return fmt.Errorf("finalize torrent RPC failed: %w", err)

@@ -12,27 +12,27 @@ import (
 
 // openForWrite lazily opens the file for writing, creating and pre-allocating it if needed.
 // Protected by fileMu so it can be called outside state.mu for concurrent disk I/O.
-func (f *serverFileInfo) openForWrite() (*os.File, error) {
+func (f *serverFileInfo) openForWrite() error {
 	f.fileMu.Lock()
 	defer f.fileMu.Unlock()
 
 	if f.file != nil {
-		return f.file, nil
+		return nil
 	}
 
 	file, err := os.OpenFile(f.path, os.O_RDWR|os.O_CREATE, serverFilePermissions)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	// Pre-allocate to expected size
 	if truncErr := file.Truncate(f.size); truncErr != nil {
 		_ = file.Close()
-		return nil, truncErr
+		return truncErr
 	}
 
 	f.file = file
-	return file, nil
+	return nil
 }
 
 // verifyPieceHash checks the piece data against expected hash.
@@ -48,6 +48,28 @@ func (m *torrentMeta) verifyPieceHash(pieceIndex int32, data []byte, reqHash str
 		return err.Error()
 	}
 	return ""
+}
+
+// writeAt ensures the file is open and writes data at the given offset.
+// Holds fileMu.RLock during the write so closeFileHandle (which acquires
+// the exclusive lock) blocks until all in-flight writes complete.
+func (f *serverFileInfo) writeAt(data []byte, offset int64) error {
+	// Ensure file is open (uses exclusive lock internally for creation).
+	if openErr := f.openForWrite(); openErr != nil {
+		return openErr
+	}
+
+	// Read-lock for the actual write — concurrent writes to different
+	// offsets are safe (pwrite), while Close waits for all to drain.
+	f.fileMu.RLock()
+	defer f.fileMu.RUnlock()
+
+	if f.file == nil {
+		return fmt.Errorf("file closed during write: %s", f.path)
+	}
+
+	_, writeErr := f.file.WriteAt(data, offset)
+	return writeErr
 }
 
 // writePieceData writes piece data to the correct file(s) based on offset.
@@ -78,15 +100,11 @@ func (s *serverTorrentState) writePieceData(offset int64, data []byte) error {
 			continue
 		}
 
-		file, openErr := fi.openForWrite()
-		if openErr != nil {
-			return fmt.Errorf("opening %s: %w", fi.path, openErr)
-		}
 		// No per-piece fsync: data integrity is guaranteed by verifyFilePieces
 		// (early finalization) and verifyFinalizedPieces (full finalization),
 		// which read back and SHA1-verify pieces before rename.
 		// Per-piece fsync would severely degrade write throughput on NFS/spinning disks.
-		if _, writeErr := file.WriteAt(remaining[:toProcess], fileWriteOffset); writeErr != nil {
+		if writeErr := fi.writeAt(remaining[:toProcess], fileWriteOffset); writeErr != nil {
 			return fmt.Errorf("writing to %s: %w", fi.path, writeErr)
 		}
 

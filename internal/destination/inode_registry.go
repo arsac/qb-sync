@@ -56,6 +56,16 @@ func (r *InodeRegistry) Register(inode Inode, relPath string) {
 	r.registeredMu.Unlock()
 }
 
+// Evict removes a registered inode mapping. Used to purge stale entries
+// when a source inode has been recycled (e.g., file deleted and inode reused
+// by the filesystem for a different file).
+func (r *InodeRegistry) Evict(inode Inode) {
+	r.registeredMu.Lock()
+	delete(r.registered, inode)
+	metrics.InodeRegistrySize.Set(float64(len(r.registered)))
+	r.registeredMu.Unlock()
+}
+
 // GetInProgress looks up an in-progress inode.
 // Returns targetPath, doneCh, torrentHash, and found.
 func (r *InodeRegistry) GetInProgress(inode Inode) (string, chan struct{}, string, bool) {

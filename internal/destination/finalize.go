@@ -69,9 +69,9 @@ func (s *Server) FinalizeTorrent(
 	}
 
 	// Relocate files if save_sub_path changed (e.g., source moved torrent to different category).
-	// Only relocate when request carries a non-empty sub-path to avoid accidental relocation
-	// from an old source version that doesn't send this field.
-	if newSubPath := req.GetSaveSubPath(); newSubPath != "" && newSubPath != state.saveSubPath {
+	// Only relocate when the source explicitly set save_sub_path (save_sub_path_explicit=true)
+	// to avoid accidental relocation from an old source version that doesn't send this field.
+	if newSubPath := req.GetSaveSubPath(); req.GetSaveSubPathExplicit() && newSubPath != state.saveSubPath {
 		if relocErr := s.relocateForSubPathChange(ctx, hash, state, newSubPath); relocErr != nil {
 			return failureResponse(relocErr.Error(), pb.FinalizeErrorCode_FINALIZE_ERROR_NONE), nil
 		}
@@ -192,6 +192,7 @@ func (s *Server) runBackgroundFinalization(
 	if len(failedPieces) > 0 {
 		// Piece corruption — recover and signal incomplete to source.
 		s.recoverVerificationFailure(ctx, hash, state, failedPieces)
+		s.abortInProgressInodes(ctx, hash, state)
 		metrics.VerificationRecoveriesTotal.Inc()
 		storeFailure(
 			fmt.Sprintf("verification failed: %d pieces corrupted, will re-stream", len(failedPieces)),
@@ -268,6 +269,9 @@ func (s *Server) storeSuccessResult(
 // polls and receives the success response.
 func (s *Server) cleanupFinalizedTorrent(hash string) {
 	s.mu.Lock()
+	if state, exists := s.torrents[hash]; exists {
+		s.unregisterFilePaths(hash, state.files)
+	}
 	delete(s.torrents, hash)
 	s.mu.Unlock()
 }
@@ -328,8 +332,11 @@ func (s *Server) relocateForSubPathChange(
 	}
 
 	state.mu.Lock()
-	updateStateAfterRelocate(state, s.config.BasePath, oldSubPath, newSubPath)
+	relocErr := updateStateAfterRelocate(state, s.config.BasePath, oldSubPath, newSubPath)
 	state.mu.Unlock()
+	if relocErr != nil {
+		return fmt.Errorf("updating state after relocation: %w", relocErr)
+	}
 
 	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
 	if subPathErr := saveSubPathFile(metaDir, newSubPath); subPathErr != nil {
@@ -428,7 +435,7 @@ func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTo
 		}
 	}
 
-	// Then rename partial files
+	// Then rename partial files and update in-memory paths.
 	for _, fi := range state.files {
 		if fi.hardlink.state == hlStateComplete {
 			continue
@@ -436,6 +443,7 @@ func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTo
 		if err := s.renamePartialFile(ctx, hash, fi); err != nil {
 			return err
 		}
+		fi.path = strings.TrimSuffix(fi.path, partialSuffix)
 	}
 
 	s.flushWrittenState(ctx, hash, state)
@@ -443,8 +451,13 @@ func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTo
 }
 
 // closeFileHandle syncs and closes an open file handle.
+// Acquires fileMu to ensure in-flight writeAt calls (which hold fileMu.RLock)
+// complete before the file descriptor is closed.
 // Returns an error if sync or close fails (data may not be durable).
 func (s *Server) closeFileHandle(ctx context.Context, hash string, fi *serverFileInfo) error {
+	fi.fileMu.Lock()
+	defer fi.fileMu.Unlock()
+
 	if fi.file == nil {
 		return nil
 	}
@@ -816,8 +829,19 @@ func (s *Server) recoverVerificationFailure(
 	)
 }
 
-// recoverAffectedFile renames a single file back to .partial and recalculates
-// its piecesWritten if any failed piece overlaps it.
+// abortInProgressInodes aborts in-progress inode entries for all files in the
+// torrent so pending torrents waiting on this torrent's doneCh are unblocked
+// instead of timing out.
+func (s *Server) abortInProgressInodes(ctx context.Context, hash string, state *serverTorrentState) {
+	for _, fi := range state.files {
+		s.inodes.AbortInProgress(ctx, fi.hardlink.sourceInode, hash)
+	}
+}
+
+// recoverAffectedFile recovers a single file that overlaps failed pieces.
+// For normal (streamed) files: renames back to .partial.
+// For hardlinked/pre-existing files: deletes the file to break the hardlink
+// and resets state so the file can be re-streamed from scratch.
 func (s *Server) recoverAffectedFile(
 	ctx context.Context,
 	hash string,
@@ -825,7 +849,7 @@ func (s *Server) recoverAffectedFile(
 	fi *serverFileInfo,
 	failedPieces []int,
 ) {
-	if fi.skipForWriteData() {
+	if !fi.selected {
 		return
 	}
 
@@ -835,7 +859,27 @@ func (s *Server) recoverAffectedFile(
 		return
 	}
 
-	// Rename final file back to .partial (skip if already .partial).
+	// Hardlinked or pre-existing files with wrong content: break the hardlink
+	// by deleting the file. Writing to a renamed hardlink would corrupt the
+	// source file that other torrents still reference.
+	if fi.hardlink.state == hlStateComplete || fi.hardlink.state == hlStatePending {
+		s.logger.WarnContext(ctx, "breaking hardlink for file with failed pieces",
+			"hash", hash, "path", fi.path, "hardlinkState", fi.hardlink.state)
+
+		if removeErr := os.Remove(fi.path); removeErr != nil && !os.IsNotExist(removeErr) {
+			s.logger.WarnContext(ctx, "failed to remove hardlinked file",
+				"hash", hash, "path", fi.path, "error", removeErr)
+		}
+
+		fi.hardlink.state = hlStateNone
+		finalPath := strings.TrimSuffix(fi.path, partialSuffix)
+		fi.path = finalPath + partialSuffix
+		fi.earlyFinalized = false
+		fi.recalcPiecesWritten(state.written)
+		return
+	}
+
+	// Normal (streamed) files: rename back to .partial (skip if already .partial).
 	// Even if rename fails, we still clear earlyFinalized and recalculate
 	// piecesWritten so bookkeeping stays consistent with state.written.
 	if !strings.HasSuffix(fi.path, partialSuffix) {
