@@ -205,6 +205,16 @@ func TestResolveReadDir(t *testing.T) {
 			},
 			want: "/data/movies",
 		},
+		{
+			name:              "trailing slash on ContentPath is cleaned before Dir",
+			dataPath:          "/data",
+			qbDefaultSavePath: "/downloads",
+			torrent: qbittorrent.Torrent{
+				SavePath:    "/downloads/movies",
+				ContentPath: "/downloads/movies/MyMovie/",
+			},
+			want: "/data/movies",
+		},
 	}
 
 	for _, tt := range tests {

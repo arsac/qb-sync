@@ -189,9 +189,12 @@ func (s *Source) ResolveContentDir(torrentSavePath string) string {
 // resolveReadDir returns the directory for reading pieces.
 // Uses ContentPath (the actual current location on disk) as the authoritative
 // source. On ENOENT (torrent moved mid-read), callers should re-query.
+// Clean before Dir: [filepath.Dir] does not strip the last component when the
+// path has a trailing slash (e.g. Dir("/a/b/") = "/a/b"), which would cause
+// the torrent name to appear twice in the resolved path.
 func (s *Source) resolveReadDir(torrent qbittorrent.Torrent) string {
 	if torrent.ContentPath != "" {
-		return s.resolveQBDir(filepath.Dir(torrent.ContentPath))
+		return s.resolveQBDir(filepath.Dir(filepath.Clean(torrent.ContentPath)))
 	}
 	return s.resolveQBDir(torrent.SavePath)
 }
