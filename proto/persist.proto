@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package qbsync;
+
+option go_package = "github.com/arsac/qb-sync/proto";
+
+// PersistedTorrentMeta is the on-disk metadata for an in-flight torrent sync.
+// Written once during initNewTorrent, read on startup recovery and during
+// finalization (to extract torrent_file bytes for qBittorrent).
+//
+// This message is a persistence contract, separate from RPC messages in
+// qbsync.proto. The two evolve independently.
+message PersistedTorrentMeta {
+  int32  schema_version = 1;
+  string torrent_hash   = 2;
+  string name           = 3;
+  int64  piece_size     = 4;
+  int64  total_size     = 5;
+  int32  num_pieces     = 6;
+  repeated PersistedFileInfo files = 7;
+  bytes  torrent_file   = 8;
+  repeated string piece_hashes = 9;
+  string save_sub_path  = 10;
+}
+
+// PersistedFileInfo is the per-file metadata within a persisted torrent.
+// Inode is deliberately omitted — it is a runtime property of the source
+// filesystem, only meaningful during the initial InitTorrent handshake.
+message PersistedFileInfo {
+  string path     = 1;
+  int64  size     = 2;
+  int64  offset   = 3;
+  bool   selected = 4;
+}
