@@ -6,7 +6,7 @@ import (
 	"sync"
 )
 
-// TorrentStore owns all shared mutable state for the destination server:
+// torrentStore owns all shared mutable state for the destination server:
 // torrent tracking, file path ownership, inode registry, and abort coordination.
 //
 // Lock ordering: store.mu -> state.mu -> InodeRegistry internal locks.

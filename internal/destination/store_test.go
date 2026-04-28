@@ -71,17 +71,14 @@ func TestTorrentStore_ReserveCommit(t *testing.T) {
 	t.Parallel()
 	ts := newTestStore(t)
 
-	// Reserve succeeds for a new hash.
 	if err := ts.Reserve("abc"); err != nil {
 		t.Fatalf("Reserve: unexpected error: %v", err)
 	}
 
-	// Duplicate Reserve while sentinel is present returns error.
 	if err := ts.Reserve("abc"); err == nil {
 		t.Fatal("Reserve duplicate: expected error, got nil")
 	}
 
-	// Commit replaces the sentinel with real state.
 	state := &serverTorrentState{
 		torrentMeta: torrentMeta{
 			files: []*serverFileInfo{
@@ -93,7 +90,6 @@ func TestTorrentStore_ReserveCommit(t *testing.T) {
 		t.Fatalf("Commit: unexpected error: %v", err)
 	}
 
-	// State is accessible via Get and is no longer a sentinel.
 	got, ok := ts.Get("abc")
 	if !ok || got == nil {
 		t.Fatal("Get after Commit: expected state")
@@ -102,7 +98,6 @@ func TestTorrentStore_ReserveCommit(t *testing.T) {
 		t.Fatal("Get after Commit: state still marked initializing")
 	}
 
-	// File path was registered.
 	ts.mu.RLock()
 	owner, exists := ts.filePaths["data/file.txt"]
 	ts.mu.RUnlock()
@@ -124,7 +119,6 @@ func TestTorrentStore_Unreserve(t *testing.T) {
 
 	ts.Unreserve("xyz")
 
-	// After Unreserve the hash is free; Reserve must succeed again.
 	if err := ts.Reserve("xyz"); err != nil {
 		t.Fatalf("Reserve after Unreserve: unexpected error: %v", err)
 	}
@@ -134,7 +128,6 @@ func TestTorrentStore_CommitCollision(t *testing.T) {
 	t.Parallel()
 	ts := newTestStore(t)
 
-	// Commit the first torrent so it owns "shared/file.dat".
 	if err := ts.Reserve("torrent1"); err != nil {
 		t.Fatalf("Reserve torrent1: %v", err)
 	}
@@ -149,7 +142,6 @@ func TestTorrentStore_CommitCollision(t *testing.T) {
 		t.Fatalf("Commit torrent1: %v", err)
 	}
 
-	// Reserve the second torrent and try to Commit with the same path — collision.
 	if err := ts.Reserve("torrent2"); err != nil {
 		t.Fatalf("Reserve torrent2: %v", err)
 	}
@@ -168,7 +160,6 @@ func TestTorrentStore_CommitCollision(t *testing.T) {
 		t.Fatalf("Commit torrent2: unexpected error message: %v", commitErr)
 	}
 
-	// Sentinel for torrent2 must have been cleaned up (not present in entries).
 	_, ok := ts.Get("torrent2")
 	if ok {
 		t.Fatal("torrent2 sentinel should have been removed after collision")
