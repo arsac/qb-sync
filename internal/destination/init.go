@@ -356,8 +356,12 @@ func (s *Server) cleanupForResync(ctx context.Context, hash string) error {
 	// 2. Delete in-memory state and file path ownership.
 	s.store.Remove(hash)
 
-	// 3. Delete persisted .state and .finalized marker so buildWrittenBitmap
-	// starts fresh and isFinalized returns false.
+	// 3. Delete persisted .state, .finalized marker, and .meta so the next
+	// setupMetadataDir writes a fresh .meta from the new request. Without
+	// the .meta removal, setupMetadataDir's idempotent skip would preserve
+	// the stale file selection on disk — and a crash before the new
+	// InitTorrent completes would leave recovery rebuilding state from the
+	// old metadata.
 	// During the first sync with partial selection, boundary pieces spanning
 	// selected + unselected files were marked "written" but only the
 	// selected-file portion was actually written to disk. On re-sync those
@@ -365,6 +369,7 @@ func (s *Server) cleanupForResync(ctx context.Context, hash string) error {
 	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
 	_ = os.Remove(filepath.Join(metaDir, ".state"))
 	_ = os.Remove(filepath.Join(metaDir, finalizedFileName))
+	_ = os.Remove(filepath.Join(metaDir, metaFileName))
 
 	s.logger.InfoContext(ctx, "re-sync: cleared all prior state",
 		"hash", hash)
