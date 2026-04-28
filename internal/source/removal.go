@@ -79,31 +79,10 @@ func (t *QBTask) handleTorrentRemoval(ctx context.Context, hash string) {
 	}
 
 	// Safety check: if streaming was fully complete on destination but finalization
-	// hadn't run yet, aborting would delete fully-streamed data. Query destination
-	// status first to avoid this narrow race between streaming completion and finalization.
-	if wasTracked {
-		checkCtx, checkCancel := context.WithTimeout(ctx, destRPCTimeout)
-		result, checkErr := t.grpcDest.CheckTorrentStatus(checkCtx, hash)
-		checkCancel()
-
-		if checkErr == nil && result.PiecesNeededCount == 0 {
-			t.logger.InfoContext(ctx, "torrent fully streamed on destination, treating as complete instead of aborting",
-				"hash", hash,
-			)
-			startCtx, startCancel := context.WithTimeout(ctx, destRPCTimeout)
-			if startErr := t.grpcDest.StartTorrent(startCtx, hash, t.cfg.SourceRemovedTag); startErr != nil {
-				t.logger.WarnContext(
-					ctx,
-					"failed to start fully-streamed torrent on destination (will retry via prune)",
-					"hash",
-					hash,
-					"error",
-					startErr,
-				)
-			}
-			startCancel()
-			return
-		}
+	// hadn't run yet, aborting would delete fully-streamed data. Try to finalize
+	// first to avoid this narrow race between streaming completion and finalization.
+	if wasTracked && t.tryFinalizeFullyStreamed(ctx, hash) {
+		return
 	}
 
 	abortCtx, cancel := context.WithTimeout(ctx, destRPCTimeout)
@@ -122,4 +101,50 @@ func (t *QBTask) handleTorrentRemoval(ctx context.Context, hash string) {
 		"hash", hash,
 		"filesDeleted", filesDeleted,
 	)
+}
+
+// tryFinalizeFullyStreamed handles the race where streaming finished on
+// destination but finalization hasn't run yet, when the torrent has just been
+// removed from source. Returns true if the path was taken (caller should not
+// fall through to abort), false if the torrent isn't fully streamed and
+// abort should proceed.
+//
+// Without this path, the subsequent abort would delete fully-streamed data;
+// if we instead finalize and then start, the destination retains the torrent
+// tagged as source-removed.
+func (t *QBTask) tryFinalizeFullyStreamed(ctx context.Context, hash string) bool {
+	checkCtx, checkCancel := context.WithTimeout(ctx, destRPCTimeout)
+	result, checkErr := t.grpcDest.CheckTorrentStatus(checkCtx, hash)
+	checkCancel()
+
+	if checkErr != nil || result.PiecesNeededCount != 0 {
+		return false
+	}
+
+	t.logger.InfoContext(ctx, "torrent fully streamed on destination, finalizing instead of aborting",
+		"hash", hash,
+	)
+
+	// finalizeTorrent fetches source metadata via GetTorrentsCtx; if the
+	// torrent is already gone from source (the common case once the user
+	// has deleted it), the call fails and the .partial files remain on
+	// destination for the orphan cleaner to handle.
+	finalizeCtx, finalizeCancel := context.WithTimeout(ctx, destRPCTimeout)
+	finalizeErr := t.finalizeTorrent(finalizeCtx, hash)
+	finalizeCancel()
+	if finalizeErr != nil {
+		t.logger.WarnContext(ctx, "failed to finalize fully-streamed torrent on removal",
+			"hash", hash, "error", finalizeErr,
+		)
+		return true
+	}
+
+	startCtx, startCancel := context.WithTimeout(ctx, destRPCTimeout)
+	defer startCancel()
+	if startErr := t.grpcDest.StartTorrent(startCtx, hash, t.cfg.SourceRemovedTag); startErr != nil {
+		t.logger.WarnContext(ctx, "failed to start fully-streamed torrent on destination (will retry via prune)",
+			"hash", hash, "error", startErr,
+		)
+	}
+	return true
 }
