@@ -1175,6 +1175,36 @@ func TestCountHardlinkResults_PreExisting(t *testing.T) {
 	}
 }
 
+func TestSetupMetadataDir_Idempotent(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestDestServer(t)
+
+	torrentData := []byte("d4:infod4:name4:test12:piece lengthi16384e6:pieces20:" +
+		strings.Repeat("A", 20) + "6:lengthi1024eee")
+
+	metaDir1, torrentPath1, statePath1, err := s.setupMetadataDir("abc", "TestTorrent", torrentData)
+	if err != nil {
+		t.Fatalf("first call failed: %v", err)
+	}
+	if _, statErr := os.Stat(torrentPath1); statErr != nil {
+		t.Fatalf("torrent file not created: %v", statErr)
+	}
+
+	metaDir2, torrentPath2, statePath2, err := s.setupMetadataDir("abc", "TestTorrent", torrentData)
+	if err != nil {
+		t.Fatalf("second call failed: %v", err)
+	}
+	if metaDir1 != metaDir2 || torrentPath1 != torrentPath2 || statePath1 != statePath2 {
+		t.Fatal("paths should be identical on idempotent call")
+	}
+
+	// Recovery path: nil torrent data must not error when file already exists.
+	_, _, _, err = s.setupMetadataDir("abc", "TestTorrent", nil)
+	if err != nil {
+		t.Fatalf("nil torrent data call failed: %v", err)
+	}
+}
+
 // Helper functions
 
 func createTestMetadata(t *testing.T, basePath, hash string, modTime time.Time) {

@@ -151,8 +151,10 @@ func (s *Server) setupMetadataDir(
 	statePath := filepath.Join(metaDir, ".state")
 
 	if len(torrentFile) > 0 {
-		if err := atomicWriteFile(torrentPath, torrentFile); err != nil {
-			return "", "", "", fmt.Errorf("writing .torrent file: %w", err)
+		if info, statErr := os.Stat(torrentPath); statErr != nil || info.Size() != int64(len(torrentFile)) {
+			if err := atomicWriteFile(torrentPath, torrentFile); err != nil {
+				return "", "", "", fmt.Errorf("writing .torrent file: %w", err)
+			}
 		}
 	}
 
