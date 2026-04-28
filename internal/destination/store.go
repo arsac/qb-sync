@@ -1,6 +1,7 @@
 package destination
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -103,4 +104,80 @@ func (ts *torrentStore) Unreserve(hash string) {
 	if state, exists := ts.entries[hash]; exists && state.initializing {
 		delete(ts.entries, hash)
 	}
+}
+
+// Remove deletes a torrent, unregisters file paths, and aborts any in-progress
+// inodes for the hash. Returns the old state for caller cleanup. No-op if not found.
+func (ts *torrentStore) Remove(hash string) *serverTorrentState {
+	ts.mu.Lock()
+	state, exists := ts.entries[hash]
+	if exists {
+		unregisterFilePaths(ts.filePaths, hash, state.files)
+		delete(ts.entries, hash)
+	}
+	ts.mu.Unlock()
+	if exists {
+		for _, fi := range state.files {
+			ts.inodes.AbortInProgress(context.Background(), fi.hardlink.sourceInode, hash)
+		}
+	}
+	return state
+}
+
+// Drain removes all entries and returns them. Used for shutdown.
+func (ts *torrentStore) Drain() map[string]*serverTorrentState {
+	ts.mu.Lock()
+	old := ts.entries
+	ts.entries = make(map[string]*serverTorrentState)
+	ts.filePaths = make(map[string]string)
+	ts.mu.Unlock()
+	return old
+}
+
+// BeginAbort atomically removes the torrent from the store and registers a
+// cleanup channel. If an abort is already in progress, returns (nil, existingCh).
+// Caller closes ch after cleanup, then calls EndCleanup.
+func (ts *torrentStore) BeginAbort(hash string, ch chan struct{}) (*serverTorrentState, chan struct{}) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if existing, alreadyAborting := ts.aborting[hash]; alreadyAborting {
+		return nil, existing
+	}
+	ts.aborting[hash] = ch
+	state, exists := ts.entries[hash]
+	if exists {
+		unregisterFilePaths(ts.filePaths, hash, state.files)
+		delete(ts.entries, hash)
+	}
+	return state, nil
+}
+
+// BeginCleanup registers a cleanup channel for an untracked hash (orphan cleanup).
+// Returns false if the hash is tracked or already being cleaned.
+func (ts *torrentStore) BeginCleanup(hash string, ch chan struct{}) bool {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if _, tracked := ts.entries[hash]; tracked {
+		return false
+	}
+	if _, cleaning := ts.aborting[hash]; cleaning {
+		return false
+	}
+	ts.aborting[hash] = ch
+	return true
+}
+
+// EndCleanup deregisters the cleanup/abort channel.
+func (ts *torrentStore) EndCleanup(hash string) {
+	ts.mu.Lock()
+	delete(ts.aborting, hash)
+	ts.mu.Unlock()
+}
+
+// AbortCh returns the abort/cleanup channel if one is registered.
+func (ts *torrentStore) AbortCh(hash string) (chan struct{}, bool) {
+	ts.mu.RLock()
+	ch, ok := ts.aborting[hash]
+	ts.mu.RUnlock()
+	return ch, ok
 }

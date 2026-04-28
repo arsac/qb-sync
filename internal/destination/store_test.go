@@ -5,6 +5,24 @@ import (
 	"testing"
 )
 
+func commitTestTorrent(t *testing.T, ts *torrentStore, hash, path string) *serverTorrentState {
+	t.Helper()
+	if err := ts.Reserve(hash); err != nil {
+		t.Fatalf("Reserve(%q): %v", hash, err)
+	}
+	state := &serverTorrentState{
+		torrentMeta: torrentMeta{
+			files: []*serverFileInfo{
+				{path: path, selected: true},
+			},
+		},
+	}
+	if err := ts.Commit(hash, state); err != nil {
+		t.Fatalf("Commit(%q): %v", hash, err)
+	}
+	return state
+}
+
 func newTestStore(t *testing.T) *torrentStore {
 	t.Helper()
 	logger := slogDiscard()
@@ -163,5 +181,148 @@ func TestTorrentStore_CommitCollision(t *testing.T) {
 	_, ok := ts.Get("torrent2")
 	if ok {
 		t.Fatal("torrent2 sentinel should have been removed after collision")
+	}
+}
+
+func TestTorrentStore_Remove(t *testing.T) {
+	t.Parallel()
+	ts := newTestStore(t)
+
+	// Remove unknown hash is a no-op and returns nil.
+	if got := ts.Remove("unknown"); got != nil {
+		t.Fatal("Remove unknown: expected nil")
+	}
+
+	state := commitTestTorrent(t, ts, "abc", "data/file.txt")
+
+	got := ts.Remove("abc")
+	if got == nil {
+		t.Fatal("Remove: expected non-nil state")
+	}
+	if got != state {
+		t.Fatal("Remove: returned state differs from committed state")
+	}
+
+	// Hash gone from entries.
+	if _, ok := ts.Get("abc"); ok {
+		t.Fatal("Remove: hash still present after remove")
+	}
+
+	// File path unregistered.
+	ts.mu.RLock()
+	_, pathExists := ts.filePaths["data/file.txt"]
+	ts.mu.RUnlock()
+	if pathExists {
+		t.Fatal("Remove: file path still registered after remove")
+	}
+}
+
+func TestTorrentStore_Drain(t *testing.T) {
+	t.Parallel()
+	ts := newTestStore(t)
+
+	commitTestTorrent(t, ts, "torrent1", "a/file1.txt")
+	commitTestTorrent(t, ts, "torrent2", "b/file2.txt")
+
+	drained := ts.Drain()
+
+	if len(drained) != 2 {
+		t.Fatalf("Drain: expected 2 entries, got %d", len(drained))
+	}
+	if _, ok := drained["torrent1"]; !ok {
+		t.Fatal("Drain: torrent1 missing from drained map")
+	}
+	if _, ok := drained["torrent2"]; !ok {
+		t.Fatal("Drain: torrent2 missing from drained map")
+	}
+
+	if ts.Len() != 0 {
+		t.Fatalf("Drain: store not empty after drain, len=%d", ts.Len())
+	}
+
+	ts.mu.RLock()
+	fpLen := len(ts.filePaths)
+	ts.mu.RUnlock()
+	if fpLen != 0 {
+		t.Fatalf("Drain: filePaths not empty after drain, len=%d", fpLen)
+	}
+}
+
+func TestTorrentStore_BeginAbort(t *testing.T) {
+	t.Parallel()
+	ts := newTestStore(t)
+
+	commitTestTorrent(t, ts, "abc", "data/file.txt")
+
+	ch := make(chan struct{})
+	state, existingCh := ts.BeginAbort("abc", ch)
+	if state == nil {
+		t.Fatal("BeginAbort: expected non-nil state")
+	}
+	if existingCh != nil {
+		t.Fatal("BeginAbort: expected nil existingCh on first call")
+	}
+
+	// Hash removed from entries.
+	if _, ok := ts.Get("abc"); ok {
+		t.Fatal("BeginAbort: hash still present after abort")
+	}
+
+	// File path unregistered.
+	ts.mu.RLock()
+	_, pathExists := ts.filePaths["data/file.txt"]
+	ts.mu.RUnlock()
+	if pathExists {
+		t.Fatal("BeginAbort: file path still registered after abort")
+	}
+
+	// AbortCh returns the channel.
+	gotCh, ok := ts.AbortCh("abc")
+	if !ok {
+		t.Fatal("AbortCh: expected channel registered")
+	}
+	if gotCh != ch {
+		t.Fatal("AbortCh: returned wrong channel")
+	}
+
+	// Second BeginAbort returns existing channel.
+	ch2 := make(chan struct{})
+	state2, existingCh2 := ts.BeginAbort("abc", ch2)
+	if state2 != nil {
+		t.Fatal("BeginAbort second: expected nil state")
+	}
+	if existingCh2 != ch {
+		t.Fatal("BeginAbort second: expected existing channel")
+	}
+
+	// EndCleanup deregisters the channel.
+	ts.EndCleanup("abc")
+	if _, found := ts.AbortCh("abc"); found {
+		t.Fatal("AbortCh after EndCleanup: expected not found")
+	}
+}
+
+func TestTorrentStore_BeginCleanup(t *testing.T) {
+	t.Parallel()
+	ts := newTestStore(t)
+
+	// Succeeds for an untracked, unaborting hash.
+	ch := make(chan struct{})
+	if !ts.BeginCleanup("orphan", ch) {
+		t.Fatal("BeginCleanup: expected true for untracked hash")
+	}
+
+	// Returns false if already cleaning.
+	ch2 := make(chan struct{})
+	if ts.BeginCleanup("orphan", ch2) {
+		t.Fatal("BeginCleanup: expected false when already cleaning")
+	}
+
+	ts.EndCleanup("orphan")
+
+	// Returns false if hash is tracked in entries.
+	commitTestTorrent(t, ts, "tracked", "tracked/file.txt")
+	if ts.BeginCleanup("tracked", make(chan struct{})) {
+		t.Fatal("BeginCleanup: expected false for tracked torrent")
 	}
 }
