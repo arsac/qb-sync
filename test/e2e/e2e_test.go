@@ -1235,22 +1235,24 @@ func TestE2E_DestinationHardlinkDeduplication(t *testing.T) {
 
 	t.Log("Getting inodes of files on SOURCE filesystem...")
 	type fileWithInode struct {
-		path  string
-		size  int64
-		inode uint64
+		path   string
+		size   int64
+		device uint64
+		inode  uint64
 	}
 	var sourceFileInodes []fileWithInode
 
 	for _, f := range *sourceFiles {
 		filePath := filepath.Join(env.SourcePath(), f.Name)
-		_, inode, inodeErr := utils.GetFileID(filePath)
+		dev, ino, inodeErr := utils.GetFileID(filePath)
 		require.NoError(t, inodeErr, "should be able to get inode for %s", filePath)
 		sourceFileInodes = append(sourceFileInodes, fileWithInode{
-			path:  f.Name,
-			size:  f.Size,
-			inode: inode,
+			path:   f.Name,
+			size:   f.Size,
+			device: dev,
+			inode:  ino,
 		})
-		t.Logf("  SOURCE File: %s, Size: %d, Inode: %d", f.Name, f.Size, inode)
+		t.Logf("  SOURCE File: %s, Size: %d, Device: %d, Inode: %d", f.Name, f.Size, dev, ino)
 	}
 
 	// Create source task and run orchestrator to sync to destination
@@ -1292,7 +1294,8 @@ func TestE2E_DestinationHardlinkDeduplication(t *testing.T) {
 			Path:     "FakeTorrentB/" + baseName, // Different path, same HOT inode
 			Size:     f.size,
 			Offset:   offset,
-			Inode:    f.inode, // Same SOURCE inode - this triggers hardlink detection!
+			Device:   f.device, // Same SOURCE device+inode - this triggers hardlink detection!
+			Inode:    f.inode,
 			Selected: true,
 		})
 		offset += f.size
