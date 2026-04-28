@@ -251,63 +251,6 @@ func TestWritePieceData_SkipsUnselectedFiles(t *testing.T) {
 	}
 }
 
-// --- Persistence tests ---
-
-func TestSaveLoadSelectedFile(t *testing.T) {
-	t.Parallel()
-
-	t.Run("roundtrip", func(t *testing.T) {
-		t.Parallel()
-		tmpDir := t.TempDir()
-
-		// Write .selected bytes directly (migration format: 1=selected, 0=unselected).
-		data := []byte{1, 0, 1, 0}
-		if err := os.WriteFile(filepath.Join(tmpDir, selectedFileName), data, 0o644); err != nil {
-			t.Fatalf("writing .selected: %v", err)
-		}
-
-		loaded := loadSelectedFile(tmpDir, 4)
-		if loaded == nil {
-			t.Fatal("loadSelectedFile returned nil")
-		}
-
-		expected := []bool{true, false, true, false}
-		for i, want := range expected {
-			if loaded[i] != want {
-				t.Errorf("file %d: got %v, want %v", i, loaded[i], want)
-			}
-		}
-	})
-
-	t.Run("missing file returns nil", func(t *testing.T) {
-		t.Parallel()
-		tmpDir := t.TempDir()
-		loaded := loadSelectedFile(tmpDir, 3)
-		if loaded != nil {
-			t.Error("expected nil for missing file")
-		}
-	})
-
-	t.Run("file shorter than numFiles pads with false", func(t *testing.T) {
-		t.Parallel()
-		tmpDir := t.TempDir()
-
-		// Write .selected bytes for 2 files, then load expecting 4.
-		data := []byte{1, 0}
-		if err := os.WriteFile(filepath.Join(tmpDir, selectedFileName), data, 0o644); err != nil {
-			t.Fatal(err)
-		}
-
-		loaded := loadSelectedFile(tmpDir, 4)
-		if loaded == nil {
-			t.Fatal("loadSelectedFile returned nil")
-		}
-		if !loaded[0] || loaded[1] || loaded[2] || loaded[3] {
-			t.Errorf("loaded = %v, want [true false false false]", loaded)
-		}
-	})
-}
-
 // --- setupFile tests for unselected files ---
 
 func TestSetupFile_UnselectedFile(t *testing.T) {

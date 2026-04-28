@@ -1,9 +1,7 @@
 package destination
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha1"
 	"errors"
 	"os"
 	"path/filepath"
@@ -237,7 +235,7 @@ func TestIsOrphanedTorrent(t *testing.T) {
 		}
 	})
 
-	t.Run("falls back to torrent file when state file missing", func(t *testing.T) {
+	t.Run("falls back to meta file when state file missing", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		s := &Server{
 			config: ServerConfig{BasePath: tmpDir},
@@ -246,11 +244,11 @@ func TestIsOrphanedTorrent(t *testing.T) {
 		}
 
 		hash := "abc123"
-		// Create only .torrent file (no .state file)
+		// Create only .meta file (no .state file)
 		createTestTorrentFile(t, tmpDir, hash, time.Now().Add(-48*time.Hour))
 
 		if !s.isOrphanedTorrent(ctx, hash, 24*time.Hour) {
-			t.Error("torrent with old .torrent file should be orphaned")
+			t.Error("torrent with old .meta file should be orphaned")
 		}
 	})
 
@@ -513,10 +511,9 @@ func TestCleanupOrphanedTorrents(t *testing.T) {
 			t.Fatal(err)
 		}
 		createTestTorrentFileWithPaths(t, tmpDir, orphanHash, []string{"orphan"})
-		// Backdate the torrent file to make it appear orphaned
+		// Backdate the .meta file to make it appear orphaned
 		metaDir := filepath.Join(tmpDir, metaDirName, orphanHash)
-		torrentPath, _ := findTorrentFile(metaDir)
-		setModTime(t, torrentPath, time.Now().Add(-2*time.Hour))
+		setModTime(t, filepath.Join(metaDir, metaFileName), time.Now().Add(-2*time.Hour))
 
 		// Create a fresh torrent (recent metadata)
 		freshHash := "fresh456"
@@ -1245,20 +1242,17 @@ func createTestStateFile(t *testing.T, basePath, hash string, modTime time.Time)
 	setModTime(t, statePath, modTime)
 }
 
-// createTestTorrentFile creates a .torrent file in the metaDir with the given modTime.
+// createTestTorrentFile creates a .meta file in the metaDir with the given modTime.
 // If no file paths are provided, uses a single dummy file.
 func createTestTorrentFile(t *testing.T, basePath, hash string, modTime time.Time) {
 	t.Helper()
 	createTestTorrentFileWithPaths(t, basePath, hash, nil)
-	torrentPath, err := findTorrentFile(filepath.Join(basePath, metaDirName, hash))
-	if err != nil {
-		t.Fatal(err)
-	}
-	setModTime(t, torrentPath, modTime)
+	metaPath := filepath.Join(basePath, metaDirName, hash, metaFileName)
+	setModTime(t, metaPath, modTime)
 }
 
-// createTestTorrentFileWithPaths creates a .torrent file in the metaDir.
-// relPaths are torrent-relative paths (e.g., "data/test.txt"). If empty, uses a dummy file.
+// createTestTorrentFileWithPaths creates a .meta file in the metaDir.
+// relPaths are torrent-relative paths (e.g., "data/test.txt"). If empty, uses a single dummy file.
 func createTestTorrentFileWithPaths(t *testing.T, basePath, hash string, relPaths []string) {
 	t.Helper()
 	metaDir := filepath.Join(basePath, metaDirName, hash)
@@ -1266,39 +1260,41 @@ func createTestTorrentFileWithPaths(t *testing.T, basePath, hash string, relPath
 		t.Fatal(err)
 	}
 
-	// Build pieces (10 fake piece hashes)
-	numPieces := 10
-	var piecesBuf bytes.Buffer
-	for range numPieces {
-		h := sha1.Sum([]byte("fake-piece"))
-		piecesBuf.Write(h[:])
-	}
+	numPieces := int32(10)
+	pieceSize := int64(1024)
 
-	bt := bencodeTorrent{
-		Info: bencodeInfo{
-			Name:        "test",
-			PieceLength: 1024,
-			Pieces:      piecesBuf.String(),
-		},
-	}
+	var files []*pb.FileInfo
 	if len(relPaths) == 0 {
-		bt.Info.Length = int64(numPieces) * 1024
+		files = []*pb.FileInfo{{
+			Path:     "test",
+			Size:     int64(numPieces) * pieceSize,
+			Offset:   0,
+			Selected: true,
+		}}
 	} else {
-		files := make([]bencodeFile, len(relPaths))
+		files = make([]*pb.FileInfo, len(relPaths))
 		for i, p := range relPaths {
-			files[i] = bencodeFile{
-				Length: 1024,
-				Path:   strings.Split(p, "/"),
+			files[i] = &pb.FileInfo{
+				Path:     p,
+				Size:     pieceSize,
+				Offset:   int64(i) * pieceSize,
+				Selected: true,
 			}
 		}
-		bt.Info.Files = files
 	}
 
-	torrentPath := filepath.Join(metaDir, "test.torrent")
-	if err := os.WriteFile(torrentPath, encodeTorrent(t, bt), 0o644); err != nil {
-		t.Fatal(err)
+	req := &pb.InitTorrentRequest{
+		TorrentHash: hash,
+		Name:        "test",
+		PieceSize:   pieceSize,
+		TotalSize:   int64(numPieces) * pieceSize,
+		NumPieces:   numPieces,
+		Files:       files,
+		SaveSubPath: "test",
 	}
-	if err := os.WriteFile(filepath.Join(metaDir, versionFileName), []byte(metaVersion), 0o644); err != nil {
+	meta := buildPersistedMeta(req)
+	metaPath := filepath.Join(metaDir, metaFileName)
+	if err := savePersistedMeta(metaPath, meta); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -2132,7 +2128,21 @@ func TestInitTorrentResync_ExistingState(t *testing.T) {
 		if err := os.MkdirAll(metaDir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		writeTestFile(t, filepath.Join(metaDir, versionFileName), []byte(metaVersion))
+		// Write a .meta file so setupMetadataDir doesn't nuke the directory.
+		dummyMeta := buildPersistedMeta(&pb.InitTorrentRequest{
+			TorrentHash: "boundaryhash",
+			Name:        "test-boundary",
+			NumPieces:   3,
+			PieceSize:   1024,
+			TotalSize:   2560,
+			Files: []*pb.FileInfo{
+				{Path: "data/file1.bin", Size: 1536, Offset: 0, Selected: true},
+				{Path: "data/file2.bin", Size: 1024, Offset: 1536, Selected: false},
+			},
+		})
+		if saveErr := savePersistedMeta(filepath.Join(metaDir, metaFileName), dummyMeta); saveErr != nil {
+			t.Fatal(saveErr)
+		}
 
 		// Persist old .state: all 3 pieces "written"
 		// (piece 2 was "covered" because file2 was unselected)

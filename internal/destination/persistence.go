@@ -2,11 +2,8 @@ package destination
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
-	"strings"
 
 	"github.com/bits-and-blooms/bitset"
 
@@ -53,54 +50,6 @@ func (s *Server) doSaveState(path string, written *bitset.BitSet) error {
 		return s.saveStateFunc(path, written)
 	}
 	return s.saveState(path, written)
-}
-
-// loadSubPathFile reads the save sub-path from the .subpath file.
-// Returns "" if the file is missing or unreadable.
-func loadSubPathFile(metaDir string) string {
-	path := filepath.Join(metaDir, subPathFileName)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(data))
-}
-
-// loadSelectedFile reads the file selection bitmap from the .selected file.
-// Returns nil if the file is missing (callers default to all-selected).
-func loadSelectedFile(metaDir string, numFiles int) []bool {
-	data, err := os.ReadFile(filepath.Join(metaDir, selectedFileName))
-	if err != nil {
-		return nil
-	}
-	selected := make([]bool, numFiles)
-	for i := range min(numFiles, len(data)) {
-		selected[i] = data[i] == 1
-	}
-	return selected
-}
-
-// checkMetaVersion returns true if the metadata directory has the current version.
-func checkMetaVersion(metaDir string) bool {
-	data, err := os.ReadFile(filepath.Join(metaDir, versionFileName))
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(string(data)) == metaVersion
-}
-
-// findTorrentFile locates the .torrent file in metaDir.
-func findTorrentFile(metaDir string) (string, error) {
-	entries, readErr := os.ReadDir(metaDir)
-	if readErr != nil {
-		return "", fmt.Errorf("reading meta dir: %w", readErr)
-	}
-	for _, entry := range entries {
-		if strings.HasSuffix(entry.Name(), ".torrent") {
-			return filepath.Join(metaDir, entry.Name()), nil
-		}
-	}
-	return "", errors.New("torrent file not found")
 }
 
 func savePersistedMeta(path string, meta *pb.PersistedTorrentMeta) error {

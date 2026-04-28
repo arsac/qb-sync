@@ -41,13 +41,6 @@ func (s *Server) FinalizeTorrent(
 			ErrorCode: pb.FinalizeErrorCode_FINALIZE_ERROR_NOT_FOUND,
 		}, nil
 	}
-	if state.initializing {
-		return &pb.FinalizeTorrentResponse{
-			Success:   false,
-			Error:     "torrent initialization in progress",
-			ErrorCode: pb.FinalizeErrorCode_FINALIZE_ERROR_NOT_FOUND,
-		}, nil
-	}
 
 	// Check if finalization is already in progress or completed.
 	state.mu.Lock()

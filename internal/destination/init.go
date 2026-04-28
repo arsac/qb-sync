@@ -67,7 +67,8 @@ func (s *Server) InitTorrent(
 	}
 
 	// Check for existing state (resume case).
-	if state, exists := s.store.Get(hash); exists {
+	// Use GetWithSentinel to distinguish "not found" from "initializing".
+	if state, exists := s.store.GetWithSentinel(hash); exists {
 		if state.initializing {
 			return initErrorResponse("torrent initialization already in progress"), nil
 		}
@@ -88,7 +89,7 @@ func (s *Server) InitTorrent(
 	// This prevents concurrent InitTorrent calls for the same hash from racing.
 	if reserveErr := s.store.Reserve(hash); reserveErr != nil {
 		// Another goroutine beat us -- retry the check.
-		if state, exists := s.store.Get(hash); exists {
+		if state, exists := s.store.GetWithSentinel(hash); exists {
 			if state.initializing {
 				return initErrorResponse("torrent initialization already in progress"), nil
 			}
@@ -133,8 +134,8 @@ func (s *Server) resumeTorrent(
 }
 
 // setupMetadataDir creates the metadata directory and writes the .meta file
-// (serialized PersistedTorrentMeta). If the directory exists with stale metadata
-// (no .meta and old .version check fails), it is removed first.
+// (serialized PersistedTorrentMeta). If the directory exists without .meta
+// (old format or corrupted), it is removed first.
 // Skips .meta write if it already exists (idempotent for recovery path).
 // Returns metaDir, statePath, and error.
 func (s *Server) setupMetadataDir(
@@ -143,13 +144,10 @@ func (s *Server) setupMetadataDir(
 ) (string, string, error) {
 	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
 
-	// Nuke stale metadata directory before re-creating:
-	// only if .meta is absent AND old .version check fails.
+	// Nuke stale metadata directory if .meta is absent (old format or corrupted).
 	metaPath := filepath.Join(metaDir, metaFileName)
 	if _, statErr := os.Stat(metaPath); statErr != nil {
-		if !checkMetaVersion(metaDir) {
-			_ = os.RemoveAll(metaDir)
-		}
+		_ = os.RemoveAll(metaDir)
 	}
 
 	if err := os.MkdirAll(metaDir, serverDirPermissions); err != nil {

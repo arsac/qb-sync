@@ -15,15 +15,7 @@ const (
 
 	// Metadata directory and file names for recovery after restart.
 	metaDirName       = ".qbsync"
-	subPathFileName   = ".subpath"
-	selectedFileName  = ".selected"
-	versionFileName   = ".version"
 	finalizedFileName = ".finalized"
-
-	// metaVersion is bumped when the metadata format changes.
-	// If a metadata directory has a missing or different version,
-	// it is nuked and re-initialized from scratch on next InitTorrent.
-	metaVersion = "2"
 
 	// Concurrent streaming settings.
 	defaultStreamWorkers = 8   // Number of concurrent piece writers (tuned for NFS/ZFS)

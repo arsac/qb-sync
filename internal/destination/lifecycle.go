@@ -210,8 +210,8 @@ func (s *Server) isOrphanedTorrent(ctx context.Context, hash string, timeout tim
 }
 
 // statOrphanMetadata returns FileInfo for the torrent's metadata, checking
-// .state first, then .meta (new format), then falling back to the .torrent file
-// (migration). Returns [os.ErrNotExist] when no metadata file is found.
+// .state first, then .meta. Returns [os.ErrNotExist] when no metadata file
+// is found.
 func (s *Server) statOrphanMetadata(metaDir string) (os.FileInfo, error) {
 	statePath := filepath.Join(metaDir, ".state")
 	info, err := os.Stat(statePath)
@@ -222,22 +222,8 @@ func (s *Server) statOrphanMetadata(metaDir string) (os.FileInfo, error) {
 		return nil, err
 	}
 
-	// Check .meta (new format).
 	metaPath := filepath.Join(metaDir, metaFileName)
-	info, err = os.Stat(metaPath)
-	if err == nil {
-		return info, nil
-	}
-	if !os.IsNotExist(err) {
-		return nil, err
-	}
-
-	// Migration: check old .torrent file.
-	torrentPath, findErr := findTorrentFile(metaDir)
-	if findErr != nil {
-		return nil, os.ErrNotExist
-	}
-	return os.Stat(torrentPath)
+	return os.Stat(metaPath)
 }
 
 // cleanupOrphan removes all data associated with an orphaned torrent.
@@ -292,34 +278,21 @@ func (s *Server) cleanupOrphan(ctx context.Context, hash string) {
 	)
 }
 
-// deleteOrphanFiles parses the .torrent file in metaDir to locate and remove
+// deleteOrphanFiles loads the .meta file in metaDir to locate and remove
 // data files (both .partial and finalized versions). Returns the number of files deleted.
 func (s *Server) deleteOrphanFiles(ctx context.Context, hash, metaDir string) int {
-	torrentPath, findErr := findTorrentFile(metaDir)
-	if findErr != nil {
-		s.logger.WarnContext(ctx, "orphan cleanup without torrent file, .partial files may remain on disk",
-			"hash", hash, "metaDir", metaDir, "error", findErr)
-		return 0
-	}
-
-	torrentData, readErr := os.ReadFile(torrentPath)
-	if readErr != nil {
-		s.logger.WarnContext(ctx, "orphan cleanup: failed to read torrent file",
-			"hash", hash, "error", readErr)
-		return 0
-	}
-
-	parsed, parseErr := parseTorrentFile(torrentData)
-	if parseErr != nil {
-		s.logger.WarnContext(ctx, "orphan cleanup: failed to parse torrent file",
-			"hash", hash, "error", parseErr)
+	metaPath := filepath.Join(metaDir, metaFileName)
+	meta, loadErr := loadPersistedMeta(metaPath)
+	if loadErr != nil {
+		s.logger.WarnContext(ctx, "cannot load metadata for orphan cleanup",
+			"hash", hash, "error", loadErr)
 		return 0
 	}
 
 	var deleted int
-	subPath := loadSubPathFile(metaDir)
-	for _, f := range parsed.Files {
-		filePath := filepath.Join(s.config.BasePath, subPath, f.Path)
+	subPath := meta.GetSaveSubPath()
+	for _, f := range meta.GetFiles() {
+		filePath := filepath.Join(s.config.BasePath, subPath, f.GetPath())
 
 		// Try to remove .partial version
 		partialPath := filePath + partialSuffix

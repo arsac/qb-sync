@@ -37,7 +37,21 @@ func newTorrentStore(basePath string, logger *slog.Logger) *torrentStore {
 }
 
 // Get returns a torrent's state, safe to use outside the lock.
+// Sentinel entries (initializing=true) are filtered out — callers see (nil, false).
+// Use GetWithSentinel when the distinction between "not found" and "initializing" matters.
 func (ts *torrentStore) Get(hash string) (*serverTorrentState, bool) {
+	ts.mu.RLock()
+	state, ok := ts.entries[hash]
+	ts.mu.RUnlock()
+	if ok && state.initializing {
+		return nil, false
+	}
+	return state, ok
+}
+
+// GetWithSentinel returns a torrent's state including sentinel entries.
+// Only use when distinguishing "not found" from "initializing" is required (e.g., InitTorrent).
+func (ts *torrentStore) GetWithSentinel(hash string) (*serverTorrentState, bool) {
 	ts.mu.RLock()
 	state, ok := ts.entries[hash]
 	ts.mu.RUnlock()
@@ -140,8 +154,8 @@ func (ts *torrentStore) Drain() map[string]*serverTorrentState {
 // Caller closes ch after cleanup, then calls EndCleanup.
 func (ts *torrentStore) BeginAbort(hash string, ch chan struct{}) (*serverTorrentState, chan struct{}) {
 	ts.mu.Lock()
-	defer ts.mu.Unlock()
 	if existing, alreadyAborting := ts.aborting[hash]; alreadyAborting {
+		ts.mu.Unlock()
 		return nil, existing
 	}
 	ts.aborting[hash] = ch
@@ -150,6 +164,15 @@ func (ts *torrentStore) BeginAbort(hash string, ch chan struct{}) (*serverTorren
 		unregisterFilePaths(ts.filePaths, hash, state.files)
 		delete(ts.entries, hash)
 	}
+	ts.mu.Unlock()
+
+	// Abort in-progress inodes outside the lock (matching Remove behavior).
+	if exists {
+		for _, fi := range state.files {
+			ts.inodes.AbortInProgress(context.Background(), fi.hardlink.sourceInode, hash)
+		}
+	}
+
 	return state, nil
 }
 

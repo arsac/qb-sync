@@ -85,10 +85,6 @@ func (s *Server) AbortTorrent(
 	defer state.mu.Unlock()
 
 	for _, fi := range state.files {
-		// Signal waiters so they can handle the abort (their hardlink attempt will fail).
-		// AbortInProgress is idempotent: no-ops for zero inodes, completed, or pending files.
-		s.store.Inodes().AbortInProgress(ctx, fi.hardlink.sourceInode, hash)
-
 		// closeFileHandle is idempotent (no-op if fi.file is nil).
 		_ = s.closeFileHandle(ctx, hash, fi)
 
