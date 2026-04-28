@@ -84,7 +84,7 @@ func checkRPCResponse(resp successResponse, operation string) error {
 	return nil
 }
 
-var _ HardlinkDestination = (*GRPCDestination)(nil)
+var _ PieceDestination = (*GRPCDestination)(nil)
 
 // GRPCDestination sends pieces to a remote gRPC server.
 // It provides PieceDestination-like functionality plus additional features
@@ -353,43 +353,6 @@ func (d *GRPCDestination) OpenStream(ctx context.Context, logger *slog.Logger) (
 	go ps.sendLoop()
 
 	return ps, nil
-}
-
-// GetFileByInode checks if a file with the given inode exists on the receiver.
-func (d *GRPCDestination) GetFileByInode(ctx context.Context, inode uint64) (string, bool, error) {
-	resp, err := d.client().GetFileByInode(ctx, &pb.GetFileByInodeRequest{
-		Inode: inode,
-	})
-	if err != nil {
-		return "", false, fmt.Errorf("get file by inode RPC failed: %w", err)
-	}
-
-	return resp.GetPath(), resp.GetFound(), nil
-}
-
-// CreateHardlink creates a hardlink on the receiver from source to target path.
-func (d *GRPCDestination) CreateHardlink(ctx context.Context, sourcePath, targetPath string) error {
-	resp, err := d.client().CreateHardlink(ctx, &pb.CreateHardlinkRequest{
-		SourcePath: sourcePath,
-		TargetPath: targetPath,
-	})
-	if err != nil {
-		return fmt.Errorf("create hardlink RPC failed: %w", err)
-	}
-	return checkRPCResponse(resp, "create hardlink")
-}
-
-// RegisterFile registers a completed file for hardlink tracking on the receiver.
-func (d *GRPCDestination) RegisterFile(ctx context.Context, inode uint64, path string, size int64) error {
-	resp, err := d.client().RegisterFile(ctx, &pb.RegisterFileRequest{
-		Inode: inode,
-		Path:  path,
-		Size:  size,
-	})
-	if err != nil {
-		return fmt.Errorf("register file RPC failed: %w", err)
-	}
-	return checkRPCResponse(resp, "register file")
 }
 
 // FinalizeTorrent requests the destination server to finalize a torrent:

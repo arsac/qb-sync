@@ -21,9 +21,6 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	QBSyncService_StreamPiecesBidi_FullMethodName = "/qbsync.QBSyncService/StreamPiecesBidi"
 	QBSyncService_InitTorrent_FullMethodName      = "/qbsync.QBSyncService/InitTorrent"
-	QBSyncService_CreateHardlink_FullMethodName   = "/qbsync.QBSyncService/CreateHardlink"
-	QBSyncService_GetFileByInode_FullMethodName   = "/qbsync.QBSyncService/GetFileByInode"
-	QBSyncService_RegisterFile_FullMethodName     = "/qbsync.QBSyncService/RegisterFile"
 	QBSyncService_FinalizeTorrent_FullMethodName  = "/qbsync.QBSyncService/FinalizeTorrent"
 	QBSyncService_AbortTorrent_FullMethodName     = "/qbsync.QBSyncService/AbortTorrent"
 	QBSyncService_StartTorrent_FullMethodName     = "/qbsync.QBSyncService/StartTorrent"
@@ -49,14 +46,6 @@ type QBSyncServiceClient interface {
 	// 4. Fresh torrent -> all pieces needed
 	// This RPC is idempotent - safe to call multiple times.
 	InitTorrent(ctx context.Context, in *InitTorrentRequest, opts ...grpc.CallOption) (*InitTorrentResponse, error)
-	// CreateHardlink creates a hardlink from an existing file to a new path.
-	// Used when source files are hardlinked to avoid re-sending duplicate data.
-	CreateHardlink(ctx context.Context, in *CreateHardlinkRequest, opts ...grpc.CallOption) (*CreateHardlinkResponse, error)
-	// GetFileByInode checks if a file with the given inode has been received.
-	// Returns the path if found, allowing the sender to use CreateHardlink.
-	GetFileByInode(ctx context.Context, in *GetFileByInodeRequest, opts ...grpc.CallOption) (*GetFileByInodeResponse, error)
-	// RegisterFile registers a completed file's inode for hardlink tracking.
-	RegisterFile(ctx context.Context, in *RegisterFileRequest, opts ...grpc.CallOption) (*RegisterFileResponse, error)
 	// FinalizeTorrent completes torrent transfer: renames partial files,
 	// adds to local qBittorrent, triggers recheck, and waits for verification.
 	FinalizeTorrent(ctx context.Context, in *FinalizeTorrentRequest, opts ...grpc.CallOption) (*FinalizeTorrentResponse, error)
@@ -94,36 +83,6 @@ func (c *qBSyncServiceClient) InitTorrent(ctx context.Context, in *InitTorrentRe
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(InitTorrentResponse)
 	err := c.cc.Invoke(ctx, QBSyncService_InitTorrent_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *qBSyncServiceClient) CreateHardlink(ctx context.Context, in *CreateHardlinkRequest, opts ...grpc.CallOption) (*CreateHardlinkResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(CreateHardlinkResponse)
-	err := c.cc.Invoke(ctx, QBSyncService_CreateHardlink_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *qBSyncServiceClient) GetFileByInode(ctx context.Context, in *GetFileByInodeRequest, opts ...grpc.CallOption) (*GetFileByInodeResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(GetFileByInodeResponse)
-	err := c.cc.Invoke(ctx, QBSyncService_GetFileByInode_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *qBSyncServiceClient) RegisterFile(ctx context.Context, in *RegisterFileRequest, opts ...grpc.CallOption) (*RegisterFileResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(RegisterFileResponse)
-	err := c.cc.Invoke(ctx, QBSyncService_RegisterFile_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -180,14 +139,6 @@ type QBSyncServiceServer interface {
 	// 4. Fresh torrent -> all pieces needed
 	// This RPC is idempotent - safe to call multiple times.
 	InitTorrent(context.Context, *InitTorrentRequest) (*InitTorrentResponse, error)
-	// CreateHardlink creates a hardlink from an existing file to a new path.
-	// Used when source files are hardlinked to avoid re-sending duplicate data.
-	CreateHardlink(context.Context, *CreateHardlinkRequest) (*CreateHardlinkResponse, error)
-	// GetFileByInode checks if a file with the given inode has been received.
-	// Returns the path if found, allowing the sender to use CreateHardlink.
-	GetFileByInode(context.Context, *GetFileByInodeRequest) (*GetFileByInodeResponse, error)
-	// RegisterFile registers a completed file's inode for hardlink tracking.
-	RegisterFile(context.Context, *RegisterFileRequest) (*RegisterFileResponse, error)
 	// FinalizeTorrent completes torrent transfer: renames partial files,
 	// adds to local qBittorrent, triggers recheck, and waits for verification.
 	FinalizeTorrent(context.Context, *FinalizeTorrentRequest) (*FinalizeTorrentResponse, error)
@@ -213,15 +164,6 @@ func (UnimplementedQBSyncServiceServer) StreamPiecesBidi(grpc.BidiStreamingServe
 }
 func (UnimplementedQBSyncServiceServer) InitTorrent(context.Context, *InitTorrentRequest) (*InitTorrentResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method InitTorrent not implemented")
-}
-func (UnimplementedQBSyncServiceServer) CreateHardlink(context.Context, *CreateHardlinkRequest) (*CreateHardlinkResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method CreateHardlink not implemented")
-}
-func (UnimplementedQBSyncServiceServer) GetFileByInode(context.Context, *GetFileByInodeRequest) (*GetFileByInodeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method GetFileByInode not implemented")
-}
-func (UnimplementedQBSyncServiceServer) RegisterFile(context.Context, *RegisterFileRequest) (*RegisterFileResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method RegisterFile not implemented")
 }
 func (UnimplementedQBSyncServiceServer) FinalizeTorrent(context.Context, *FinalizeTorrentRequest) (*FinalizeTorrentResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method FinalizeTorrent not implemented")
@@ -274,60 +216,6 @@ func _QBSyncService_InitTorrent_Handler(srv interface{}, ctx context.Context, de
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(QBSyncServiceServer).InitTorrent(ctx, req.(*InitTorrentRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _QBSyncService_CreateHardlink_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(CreateHardlinkRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(QBSyncServiceServer).CreateHardlink(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: QBSyncService_CreateHardlink_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(QBSyncServiceServer).CreateHardlink(ctx, req.(*CreateHardlinkRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _QBSyncService_GetFileByInode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(GetFileByInodeRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(QBSyncServiceServer).GetFileByInode(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: QBSyncService_GetFileByInode_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(QBSyncServiceServer).GetFileByInode(ctx, req.(*GetFileByInodeRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _QBSyncService_RegisterFile_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(RegisterFileRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(QBSyncServiceServer).RegisterFile(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: QBSyncService_RegisterFile_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(QBSyncServiceServer).RegisterFile(ctx, req.(*RegisterFileRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -396,18 +284,6 @@ var QBSyncService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "InitTorrent",
 			Handler:    _QBSyncService_InitTorrent_Handler,
-		},
-		{
-			MethodName: "CreateHardlink",
-			Handler:    _QBSyncService_CreateHardlink_Handler,
-		},
-		{
-			MethodName: "GetFileByInode",
-			Handler:    _QBSyncService_GetFileByInode_Handler,
-		},
-		{
-			MethodName: "RegisterFile",
-			Handler:    _QBSyncService_RegisterFile_Handler,
 		},
 		{
 			MethodName: "FinalizeTorrent",

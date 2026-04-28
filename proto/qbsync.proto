@@ -22,17 +22,6 @@ service QBSyncService {
   // This RPC is idempotent - safe to call multiple times.
   rpc InitTorrent(InitTorrentRequest) returns (InitTorrentResponse);
 
-  // CreateHardlink creates a hardlink from an existing file to a new path.
-  // Used when source files are hardlinked to avoid re-sending duplicate data.
-  rpc CreateHardlink(CreateHardlinkRequest) returns (CreateHardlinkResponse);
-
-  // GetFileByInode checks if a file with the given inode has been received.
-  // Returns the path if found, allowing the sender to use CreateHardlink.
-  rpc GetFileByInode(GetFileByInodeRequest) returns (GetFileByInodeResponse);
-
-  // RegisterFile registers a completed file's inode for hardlink tracking.
-  rpc RegisterFile(RegisterFileRequest) returns (RegisterFileResponse);
-
   // FinalizeTorrent completes torrent transfer: renames partial files,
   // adds to local qBittorrent, triggers recheck, and waits for verification.
   rpc FinalizeTorrent(FinalizeTorrentRequest) returns (FinalizeTorrentResponse);
@@ -151,48 +140,6 @@ message HardlinkResult {
   string error = 4;            // Error message if hardlink failed
   bool pending = 5;            // Waiting for another torrent to finish this file
   bool pre_existing = 6;       // File already existed on disk with correct size
-}
-
-// Hardlink support messages
-
-message CreateHardlinkRequest {
-  // Source file path (relative to base path) that already exists on receiver
-  string source_path = 1;
-  // Target file path (relative to base path) to create as hardlink
-  string target_path = 2;
-}
-
-message CreateHardlinkResponse {
-  bool success = 1;
-  string error = 2;
-}
-
-message GetFileByInodeRequest {
-  // Inode from the source filesystem (used as unique file identifier)
-  uint64 inode = 1;
-  uint64 device = 2;
-}
-
-message GetFileByInodeResponse {
-  // Whether a file with this inode has been registered
-  bool found = 1;
-  // Path to the existing file (relative to base path) if found
-  string path = 2;
-}
-
-message RegisterFileRequest {
-  // Inode from the source filesystem
-  uint64 inode = 1;
-  // Path where the file was written (relative to base path)
-  string path = 2;
-  // File size for verification
-  int64 size = 3;
-  uint64 device = 4;
-}
-
-message RegisterFileResponse {
-  bool success = 1;
-  string error = 2;
 }
 
 message FinalizeTorrentRequest {
