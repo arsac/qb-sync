@@ -101,16 +101,23 @@ func (ts *torrentStore) Reserve(hash string) error {
 }
 
 // Commit replaces the sentinel with real state. Checks file path collisions
-// and registers paths atomically. On collision, removes the sentinel.
+// and registers paths atomically. On collision, removes the sentinel and
+// aborts any in-progress inode registrations from setupFiles.
 func (ts *torrentStore) Commit(hash string, state *serverTorrentState) error {
 	ts.mu.Lock()
-	defer ts.mu.Unlock()
 	if err := checkPathCollisions(ts.filePaths, hash, state.files); err != nil {
 		delete(ts.entries, hash)
+		ts.mu.Unlock()
+		// Clean up in-progress inode registrations made during setupFiles
+		// so pending waiters aren't stuck on a doneCh for a dead torrent.
+		for _, fi := range state.files {
+			ts.inodes.AbortInProgress(context.Background(), fi.hardlink.sourceInode, hash)
+		}
 		return err
 	}
 	ts.entries[hash] = state
 	registerFilePaths(ts.filePaths, hash, state.files)
+	ts.mu.Unlock()
 	return nil
 }
 

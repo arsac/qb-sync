@@ -411,6 +411,56 @@ func TestTorrentStore_AbortThenReAbort(t *testing.T) {
 // for sentinel entries (initializing=true). Sentinels are placeholders inserted
 // by Reserve to block concurrent InitTorrent for the same hash while disk I/O
 // is in progress. Callers using Get should never see these half-initialized entries.
+func TestTorrentStore_CommitCollisionAbortsInProgressInodes(t *testing.T) {
+	t.Parallel()
+	ts := newTestStore(t)
+
+	inode := Inode(55555)
+
+	// Torrent1 owns the path.
+	_ = ts.Reserve("torrent1")
+	_ = ts.Commit("torrent1", &serverTorrentState{
+		torrentMeta: torrentMeta{
+			files: []*serverFileInfo{
+				{path: "shared/file.dat", selected: true},
+			},
+		},
+	})
+
+	// Torrent2 registered an in-progress inode during setupFiles.
+	ts.Inodes().RegisterInProgress(inode, "torrent2", "shared/file.dat")
+
+	// Verify inode is in-progress.
+	_, _, _, inProg := ts.Inodes().GetInProgress(inode)
+	if !inProg {
+		t.Fatal("expected inode to be in-progress before Commit")
+	}
+
+	// Commit fails due to path collision.
+	_ = ts.Reserve("torrent2")
+	state2 := &serverTorrentState{
+		torrentMeta: torrentMeta{
+			files: []*serverFileInfo{
+				{
+					path:     "shared/file.dat",
+					selected: true,
+					hardlink: hardlinkInfo{sourceInode: inode, state: hlStateInProgress},
+				},
+			},
+		},
+	}
+	commitErr := ts.Commit("torrent2", state2)
+	if commitErr == nil {
+		t.Fatal("expected collision error")
+	}
+
+	// The in-progress inode should have been aborted by Commit.
+	_, _, _, inProg = ts.Inodes().GetInProgress(inode)
+	if inProg {
+		t.Fatal("in-progress inode should have been aborted after Commit collision")
+	}
+}
+
 func TestTorrentStore_GetFiltersSentinel(t *testing.T) {
 	t.Parallel()
 	ts := newTestStore(t)
