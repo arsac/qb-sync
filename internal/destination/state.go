@@ -35,16 +35,14 @@ func (f *serverFileInfo) openForWrite() error {
 	return nil
 }
 
-// verifyPieceHash checks the piece data against expected hash.
-// Returns empty string if valid, error message if invalid.
-func (m *torrentMeta) verifyPieceHash(pieceIndex int32, data []byte, reqHash string) string {
-	// Prefer pre-stored hash from InitTorrent, fall back to request hash
-	expectedHash := reqHash
-	if int(pieceIndex) < len(m.pieceHashes) && m.pieceHashes[pieceIndex] != "" {
-		expectedHash = m.pieceHashes[pieceIndex]
+// verifyPieceHash checks the piece data against the hash recorded for this
+// piece at InitTorrent time. Returns empty string if valid or no hash is
+// known (best-effort), error message if invalid.
+func (m *torrentMeta) verifyPieceHash(pieceIndex int32, data []byte) string {
+	if int(pieceIndex) >= len(m.pieceHashes) || m.pieceHashes[pieceIndex] == "" {
+		return ""
 	}
-
-	if err := utils.VerifyPieceHash(data, expectedHash); err != nil {
+	if err := utils.VerifyPieceHash(data, m.pieceHashes[pieceIndex]); err != nil {
 		return err.Error()
 	}
 	return ""

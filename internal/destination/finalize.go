@@ -305,7 +305,7 @@ func (s *Server) relocateForSubPathChange(
 
 	relPaths := make([]string, len(state.files))
 	for i, fi := range state.files {
-		rel, relErr := filepath.Rel(oldBase, strings.TrimSuffix(fi.path, partialSuffix))
+		rel, relErr := filepath.Rel(oldBase, targetPath(fi))
 		if relErr != nil {
 			return fmt.Errorf("computing relative path: %w", relErr)
 		}
@@ -423,7 +423,7 @@ func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTo
 		if err := s.renamePartialFile(ctx, hash, fi); err != nil {
 			return err
 		}
-		fi.path = strings.TrimSuffix(fi.path, partialSuffix)
+		fi.path = targetPath(fi)
 	}
 
 	s.flushWrittenState(ctx, hash, state)
@@ -476,7 +476,7 @@ func (s *Server) renamePartialFile(ctx context.Context, hash string, fi *serverF
 		return nil
 	}
 
-	finalPath := strings.TrimSuffix(fi.path, partialSuffix)
+	finalPath := targetPath(fi)
 
 	if renameErr := os.Rename(fi.path, finalPath); renameErr != nil {
 		// .partial is gone but final exists: already renamed (idempotent restart case).
@@ -499,30 +499,38 @@ func (s *Server) renamePartialFile(ctx context.Context, hash string, fi *serverF
 // syncFileParentDirs fsyncs the parent directories of finalized files to ensure
 // NFS has flushed file data and renames to the server before verification reads.
 // Best-effort: sync failures are logged but do not block verification.
+// Each dir fsync is an independent NFS commit RTT; run them in parallel.
 func (s *Server) syncFileParentDirs(ctx context.Context, hash string, state *serverTorrentState) {
-	synced := make(map[string]bool)
+	uniqueDirs := make(map[string]struct{})
 	for _, fi := range state.files {
 		if !fi.selected {
 			continue
 		}
-		dir := filepath.Dir(fi.path)
-		if synced[dir] {
-			continue
-		}
-		synced[dir] = true
-
-		dirFD, openErr := os.Open(dir)
-		if openErr != nil {
-			s.logger.DebugContext(ctx, "failed to open dir for sync",
-				"hash", hash, "dir", dir, "error", openErr)
-			continue
-		}
-		if syncErr := dirFD.Sync(); syncErr != nil {
-			s.logger.DebugContext(ctx, "failed to sync dir",
-				"hash", hash, "dir", dir, "error", syncErr)
-		}
-		_ = dirFD.Close()
+		uniqueDirs[filepath.Dir(fi.path)] = struct{}{}
 	}
+	if len(uniqueDirs) == 0 {
+		return
+	}
+
+	g := new(errgroup.Group)
+	g.SetLimit(parentDirSyncConcurrency)
+	for dir := range uniqueDirs {
+		g.Go(func() error {
+			dirFD, openErr := os.Open(dir)
+			if openErr != nil {
+				s.logger.DebugContext(ctx, "failed to open dir for sync",
+					"hash", hash, "dir", dir, "error", openErr)
+				return nil
+			}
+			if syncErr := dirFD.Sync(); syncErr != nil {
+				s.logger.DebugContext(ctx, "failed to sync dir",
+					"hash", hash, "dir", dir, "error", syncErr)
+			}
+			_ = dirFD.Close()
+			return nil
+		})
+	}
+	_ = g.Wait()
 }
 
 // flushWrittenState persists the written bitmap to disk.
@@ -615,6 +623,17 @@ func (s *Server) verifyFinalizedPieces(
 		// unselected file's data doesn't exist on disk. Those were hash-verified
 		// at write time.
 		if state.classifyPiece(i) != pieceFullySelected {
+			continue
+		}
+
+		// Skip pieces already verified post-flush via earlyFinalizeFile. Pieces
+		// not in this set still need a finalize-time read-back: hardlinked-file
+		// pieces (skipForWriteData skipped writePiece's hash check) and pieces in
+		// files that didn't go through earlyFinalizeFile (e.g., the file's last
+		// piece arrived during finalization itself).
+		if state.verified != nil && state.verified.Test(uint(i)) {
+			verified.Add(1)
+			lastProgress.Store(time.Now())
 			continue
 		}
 
@@ -796,10 +815,14 @@ func (s *Server) recoverAffectedFile(
 	}
 
 	// Check if any failed piece overlaps this file.
-	affected := slices.ContainsFunc(failedPieces, fi.overlaps)
-	if !affected {
+	if !slices.ContainsFunc(failedPieces, fi.overlaps) {
 		return
 	}
+
+	defer func() {
+		fi.earlyFinalized = false
+		fi.recalcPiecesWritten(state.written)
+	}()
 
 	// Hardlinked or pre-existing files with wrong content: break the hardlink
 	// by deleting the file. Writing to a renamed hardlink would corrupt the
@@ -814,30 +837,26 @@ func (s *Server) recoverAffectedFile(
 		}
 
 		fi.hardlink.state = hlStateNone
-		finalPath := strings.TrimSuffix(fi.path, partialSuffix)
-		fi.path = finalPath + partialSuffix
-		fi.earlyFinalized = false
-		fi.recalcPiecesWritten(state.written)
+		fi.path = targetPath(fi) + partialSuffix
 		return
 	}
 
 	// Normal (streamed) files: rename back to .partial (skip if already .partial).
-	// Even if rename fails, we still clear earlyFinalized and recalculate
-	// piecesWritten so bookkeeping stays consistent with state.written.
-	if !strings.HasSuffix(fi.path, partialSuffix) {
-		partialPath := fi.path + partialSuffix
-		if renameErr := os.Rename(fi.path, partialPath); renameErr != nil {
-			s.logger.WarnContext(ctx, "failed to rename file back to partial",
-				"hash", hash,
-				"path", fi.path,
-				"error", renameErr,
-			)
-		} else {
-			fi.path = partialPath
-		}
+	// Even if rename fails, the deferred cleanup keeps earlyFinalized and
+	// piecesWritten consistent with state.written.
+	if strings.HasSuffix(fi.path, partialSuffix) {
+		return
 	}
-	fi.earlyFinalized = false
-	fi.recalcPiecesWritten(state.written)
+	partialPath := fi.path + partialSuffix
+	if renameErr := os.Rename(fi.path, partialPath); renameErr != nil {
+		s.logger.WarnContext(ctx, "failed to rename file back to partial",
+			"hash", hash,
+			"path", fi.path,
+			"error", renameErr,
+		)
+		return
+	}
+	fi.path = partialPath
 }
 
 // handleExistingFinalization handles a FinalizeTorrent call when background
@@ -881,8 +900,7 @@ func (s *Server) handleExistingFinalization(
 func (s *Server) readPieceFromFinalizedFiles(state *serverTorrentState, offset, size int64) ([]byte, error) {
 	regions := make([]utils.FileRegion, len(state.files))
 	for i, fi := range state.files {
-		path, _ := strings.CutSuffix(fi.path, partialSuffix)
-		regions[i] = utils.FileRegion{Path: path, Offset: fi.offset, Size: fi.size}
+		regions[i] = utils.FileRegion{Path: targetPath(fi), Offset: fi.offset, Size: fi.size}
 	}
 	return utils.ReadPieceFromFiles(regions, offset, size)
 }

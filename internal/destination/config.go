@@ -16,6 +16,7 @@ const (
 	// Metadata directory and file names for recovery after restart.
 	metaDirName       = ".qbsync"
 	finalizedFileName = ".finalized"
+	stateFileName     = ".state"
 
 	// Concurrent streaming settings.
 	defaultStreamWorkers = 8   // Number of concurrent piece writers (tuned for NFS/ZFS)
@@ -37,7 +38,7 @@ const (
 
 	// Default inode cleanup settings.
 	defaultInodeCleanupInterval = 6 * time.Hour // How often to check for stale inode entries
-	inodeRebuildWorkers         = 8             // Concurrent workers for startup inode rebuild from .meta
+	inodeRebuildWorkers         = 32            // Concurrent workers for startup inode rebuild from .meta (sized to hide NFS RTT)
 
 	// Default hardlink wait timeout.
 	defaultHardlinkWaitTimeout = 30 * time.Minute // Max time to wait for pending hardlink source
@@ -51,6 +52,7 @@ const (
 	// Memory management.
 	defaultMaxStreamBufferMB = 512 // Default global memory budget for buffered piece data
 	maxVerifyConcurrency     = 4   // Limit concurrent piece reads during finalization to cap transient memory
+	parentDirSyncConcurrency = 8   // Concurrent fsyncs of unique parent dirs during finalize (each is a separate NFS commit RTT)
 
 	// verifyIdleTimeout is how long verification can go without verifying a piece
 	// before it is considered stalled. Resets on each successfully verified piece.

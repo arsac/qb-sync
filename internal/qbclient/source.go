@@ -363,14 +363,14 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 		return nil, fmt.Errorf("piece count %d exceeds maximum supported value", numPieces)
 	}
 
-	torrentFile, exportErr := s.client.ExportTorrentCtx(ctx, hash)
-	if exportErr != nil {
-		return nil, fmt.Errorf("exporting torrent: %w", exportErr)
+	torrentFile, err := s.client.ExportTorrentCtx(ctx, hash)
+	if err != nil {
+		return nil, fmt.Errorf("exporting torrent: %w", err)
 	}
 
-	pieceHashes, hashErr := s.client.GetTorrentPieceHashesCtx(ctx, hash)
-	if hashErr != nil {
-		return nil, fmt.Errorf("getting piece hashes: %w", hashErr)
+	pieceHashes, err := s.client.GetTorrentPieceHashesCtx(ctx, hash)
+	if err != nil {
+		return nil, fmt.Errorf("getting piece hashes: %w", err)
 	}
 
 	return &streaming.TorrentMetadata{
@@ -426,11 +426,10 @@ func (s *Source) ReadPiece(ctx context.Context, piece *pb.Piece) ([]byte, error)
 // cachedTorrentMeta returns the cached metadata for a torrent, fetching on first access.
 func (s *Source) cachedTorrentMeta(ctx context.Context, hash string) (*cachedMeta, error) {
 	if cached, ok := s.fileCache.Load(hash); ok {
-		cm, valid := cached.(*cachedMeta)
-		if !valid {
-			return nil, fmt.Errorf("invalid cached type for %s", hash)
+		if cm, valid := cached.(*cachedMeta); valid {
+			return cm, nil
 		}
-		return cm, nil
+		return nil, fmt.Errorf("invalid cached type for %s", hash)
 	}
 
 	meta, err := s.GetTorrentMetadata(ctx, hash)
@@ -452,44 +451,50 @@ func (s *Source) EvictCache(hash string) {
 	s.handles.evict(hash)
 }
 
-// readChunkCached reads a chunk using a cached file handle. On ReadAt error
-// (not [io.EOF]), it evicts the stale handle and retries once with a fresh open.
-func (s *Source) readChunkCached(hash, path string, offset, size int64) ([]byte, error) {
+// readChunkIntoCached reads len(buf) bytes from path at offset into buf using
+// a cached file handle. On ReadAt error (not [io.EOF]), evicts the stale handle
+// and retries once with a fresh open. Reading directly into the caller's buffer
+// avoids per-chunk allocation when filling a multi-file piece buffer.
+func (s *Source) readChunkIntoCached(hash, path string, offset int64, buf []byte) error {
 	f, err := s.handles.get(hash, path)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	data := make([]byte, size)
-	n, err := f.ReadAt(data, offset)
+	n, err := f.ReadAt(buf, offset)
 	if err != nil && !errors.Is(err, io.EOF) {
 		// Stale handle (e.g., file replaced in-place) — evict and retry once.
 		s.handles.evictPath(hash, path)
 		f, err = s.handles.get(hash, path)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		n, err = f.ReadAt(data, offset)
+		n, err = f.ReadAt(buf, offset)
 		if err != nil && !errors.Is(err, io.EOF) {
-			return nil, err
+			return err
 		}
 	}
 
-	return data[:n], nil
+	if n < len(buf) {
+		return fmt.Errorf("short read from %s at offset %d: got %d bytes, want %d", path, offset, n, len(buf))
+	}
+	return nil
 }
 
-// readPieceFromRegions reads piece data spanning multiple files using cached handles.
+// readPieceFromRegions reads piece data spanning multiple files using cached
+// handles. Allocates a single pieceSize buffer and reads each region's
+// contribution directly into the appropriate slice.
 func (s *Source) readPieceFromRegions(
 	hash string,
 	regions []utils.FileRegion,
 	pieceOffset, pieceSize int64,
 ) ([]byte, error) {
-	data := make([]byte, 0, pieceSize)
-	remaining := pieceSize
+	buf := make([]byte, pieceSize)
+	written := int64(0)
 	currentOffset := pieceOffset
 
 	for _, region := range regions {
-		if remaining <= 0 {
+		if written >= pieceSize {
 			break
 		}
 
@@ -500,19 +505,20 @@ func (s *Source) readPieceFromRegions(
 
 		fileReadOffset := max(currentOffset-region.Offset, 0)
 		availableInFile := region.Size - fileReadOffset
-		toRead := min(remaining, availableInFile)
+		toRead := min(pieceSize-written, availableInFile)
 
-		chunk, err := s.readChunkCached(hash, region.Path, fileReadOffset, toRead)
-		if err != nil {
+		if err := s.readChunkIntoCached(hash, region.Path, fileReadOffset, buf[written:written+toRead]); err != nil {
 			return nil, fmt.Errorf("reading from %s at offset %d: %w", region.Path, fileReadOffset, err)
 		}
 
-		data = append(data, chunk...)
-		remaining -= int64(len(chunk))
-		currentOffset += int64(len(chunk))
+		written += toRead
+		currentOffset += toRead
 	}
 
-	return data, nil
+	if written < pieceSize {
+		return nil, fmt.Errorf("short read: got %d bytes, want %d", written, pieceSize)
+	}
+	return buf, nil
 }
 
 func (s *Source) readPieceMultiFile(
@@ -569,12 +575,11 @@ func (s *Source) readPieceMultiFile(
 
 		if f.GetSelected() {
 			path := filepath.Join(basePath, f.GetPath())
-			chunk, chunkErr := s.readChunkCached(hash, path, fileReadOffset, toRead)
-			if chunkErr != nil {
+			dataOffset := currentOffset - offset
+			dst := data[dataOffset : dataOffset+toRead]
+			if chunkErr := s.readChunkIntoCached(hash, path, fileReadOffset, dst); chunkErr != nil {
 				return nil, fmt.Errorf("reading from %s at offset %d: %w", path, fileReadOffset, chunkErr)
 			}
-			dataOffset := currentOffset - offset
-			copy(data[dataOffset:], chunk)
 		}
 		// Deselected: zeros remain in place
 

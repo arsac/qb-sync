@@ -69,11 +69,8 @@ func (s *Server) InitTorrent(
 
 	// Check for existing state (resume case).
 	// Use GetWithSentinel to distinguish "not found" from "initializing".
-	if state, exists := s.store.GetWithSentinel(hash); exists {
-		if state.initializing.Load() {
-			return initErrorResponse("torrent initialization already in progress"), nil
-		}
-		return s.resumeTorrent(ctx, hash, state, req), nil
+	if resp, found := s.lookupExistingState(hash, req); found {
+		return resp, nil
 	}
 
 	// Don't create state for minimal requests (e.g., CheckTorrentStatus sends only hash).
@@ -90,11 +87,8 @@ func (s *Server) InitTorrent(
 	// This prevents concurrent InitTorrent calls for the same hash from racing.
 	if reserveErr := s.store.Reserve(hash); reserveErr != nil {
 		// Another goroutine beat us -- retry the check.
-		if state, exists := s.store.GetWithSentinel(hash); exists {
-			if state.initializing.Load() {
-				return initErrorResponse("torrent initialization already in progress"), nil
-			}
-			return s.resumeTorrent(ctx, hash, state, req), nil
+		if resp, found := s.lookupExistingState(hash, req); found {
+			return resp, nil
 		}
 		return initErrorResponse("reserve failed: %v", reserveErr), nil
 	}
@@ -110,28 +104,38 @@ func (s *Server) InitTorrent(
 	return resp, nil
 }
 
+// lookupExistingState returns a response for any pre-existing entry for hash:
+// an "in progress" error if a sentinel is present, or a resume response if
+// real state is present. Returns (nil, false) when no entry exists.
+func (s *Server) lookupExistingState(
+	hash string,
+	req *pb.InitTorrentRequest,
+) (*pb.InitTorrentResponse, bool) {
+	state, exists := s.store.GetWithSentinel(hash)
+	if !exists {
+		return nil, false
+	}
+	if state.initializing.Load() {
+		return initErrorResponse("torrent initialization already in progress"), true
+	}
+	return s.resumeTorrent(state, req), true
+}
+
 // resumeTorrent handles resuming an existing torrent sync.
 func (s *Server) resumeTorrent(
-	_ context.Context,
-	_ string,
 	state *serverTorrentState,
 	req *pb.InitTorrentRequest,
 ) *pb.InitTorrentResponse {
-	// Cache torrent file bytes on state if not already set.
-	if len(req.GetTorrentFile()) > 0 {
-		state.mu.Lock()
-		if len(state.torrentFile) == 0 {
-			state.torrentFile = req.GetTorrentFile()
-		}
-		state.mu.Unlock()
-	}
-
 	// Acquire state.mu to read written/hardlinkResults safely — a concurrent
-	// WritePiece may be modifying state.written under this lock.
+	// WritePiece may be modifying state.written under this lock. Cache the
+	// torrent file bytes under the same lock when missing to avoid two
+	// lock/unlock cycles.
 	state.mu.Lock()
-	resp := state.buildReadyResponse()
-	state.mu.Unlock()
-	return resp
+	defer state.mu.Unlock()
+	if len(state.torrentFile) == 0 && len(req.GetTorrentFile()) > 0 {
+		state.torrentFile = req.GetTorrentFile()
+	}
+	return state.buildReadyResponse()
 }
 
 // setupMetadataDir creates the metadata directory and writes the .meta file
@@ -145,7 +149,7 @@ func (s *Server) setupMetadataDir(
 ) (string, string, error) {
 	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
 	metaPath := filepath.Join(metaDir, metaFileName)
-	statePath := filepath.Join(metaDir, ".state")
+	statePath := filepath.Join(metaDir, stateFileName)
 
 	// If .meta already exists, this is a recovery/idempotent call — skip all writes.
 	if _, err := os.Stat(metaPath); err == nil {
@@ -221,6 +225,7 @@ func (s *Server) initNewTorrent(
 	state := &serverTorrentState{
 		torrentMeta:     meta,
 		written:         written,
+		verified:        bitset.New(uint(meta.numPieces())),
 		torrentFile:     req.GetTorrentFile(),
 		statePath:       statePath,
 		saveSubPath:     saveSubPath,
@@ -367,7 +372,7 @@ func (s *Server) cleanupForResync(ctx context.Context, hash string) error {
 	// selected-file portion was actually written to disk. On re-sync those
 	// pieces must be re-streamed for the newly-selected portions.
 	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
-	_ = os.Remove(filepath.Join(metaDir, ".state"))
+	_ = os.Remove(filepath.Join(metaDir, stateFileName))
 	_ = os.Remove(filepath.Join(metaDir, finalizedFileName))
 	_ = os.Remove(filepath.Join(metaDir, metaFileName))
 
@@ -502,17 +507,20 @@ func (s *Server) setupFile(
 ) (*serverFileInfo, *pb.HardlinkResult, error) {
 	result := &pb.HardlinkResult{FileIndex: int32(fileIndex)}
 	targetPath := filepath.Join(s.config.BasePath, saveSubPath, f.GetPath())
+	sourceFileID := FileID{Dev: f.GetDevice(), Ino: f.GetInode()}
+
+	fileInfo := &serverFileInfo{
+		path:     targetPath,
+		size:     f.GetSize(),
+		offset:   f.GetOffset(),
+		hardlink: hardlinkInfo{sourceFileID: sourceFileID},
+		selected: f.GetSelected(),
+	}
 
 	// Unselected files: no .partial, no directory creation, no hardlink resolution.
 	// The serverFileInfo entry is still needed for offset tracking in writePieceData.
 	if !f.GetSelected() {
-		return &serverFileInfo{
-			path:     targetPath,
-			size:     f.GetSize(),
-			offset:   f.GetOffset(),
-			hardlink: hardlinkInfo{sourceFileID: FileID{Dev: f.GetDevice(), Ino: f.GetInode()}},
-			selected: false,
-		}, result, nil
+		return fileInfo, result, nil
 	}
 
 	// Ensure parent directory exists
@@ -522,13 +530,7 @@ func (s *Server) setupFile(
 
 	// Check if file already exists with correct size (pre-existing data)
 	if info, statErr := os.Stat(targetPath); statErr == nil && info.Size() == f.GetSize() {
-		fileInfo := &serverFileInfo{
-			path:     targetPath,
-			size:     f.GetSize(),
-			offset:   f.GetOffset(),
-			hardlink: hardlinkInfo{sourceFileID: FileID{Dev: f.GetDevice(), Ino: f.GetInode()}, state: hlStateComplete},
-			selected: true,
-		}
+		fileInfo.hardlink.state = hlStateComplete
 		result.PreExisting = true
 		return fileInfo, result, nil
 	}
@@ -536,24 +538,10 @@ func (s *Server) setupFile(
 	// Check if .partial file exists from a previous interrupted sync.
 	// Piece-level progress is recovered from .state in buildWrittenBitmap;
 	// skip hardlink resolution since the file already has data on disk.
-	partialPath := targetPath + ".partial"
+	partialPath := targetPath + partialSuffix
+	fileInfo.path = partialPath
 	if info, statErr := os.Stat(partialPath); statErr == nil && info.Size() == f.GetSize() {
-		return &serverFileInfo{
-			path:     partialPath,
-			size:     f.GetSize(),
-			offset:   f.GetOffset(),
-			hardlink: hardlinkInfo{sourceFileID: FileID{Dev: f.GetDevice(), Ino: f.GetInode()}},
-			selected: true,
-		}, result, nil
-	}
-
-	sourceFileID := FileID{Dev: f.GetDevice(), Ino: f.GetInode()}
-	fileInfo := &serverFileInfo{
-		path:     partialPath,
-		size:     f.GetSize(),
-		offset:   f.GetOffset(),
-		hardlink: hardlinkInfo{sourceFileID: sourceFileID},
-		selected: true,
+		return fileInfo, result, nil
 	}
 
 	// Check for hardlink opportunities if file ID is provided

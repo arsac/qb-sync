@@ -708,8 +708,8 @@ func TestReadChunkCached_StaleHandleRetry(t *testing.T) {
 	s := &Source{}
 
 	// Prime the cache with a handle to "original".
-	data, err := s.readChunkCached("h1", path, 0, 8)
-	if err != nil {
+	data := make([]byte, 8)
+	if err := s.readChunkIntoCached("h1", path, 0, data); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if string(data) != "original" {
@@ -727,8 +727,8 @@ func TestReadChunkCached_StaleHandleRetry(t *testing.T) {
 
 	// Evict and re-read to prove the retry path works.
 	s.handles.evictPath("h1", path)
-	data, err = s.readChunkCached("h1", path, 0, 8)
-	if err != nil {
+	data = make([]byte, 8)
+	if err := s.readChunkIntoCached("h1", path, 0, data); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if string(data) != "replaced" {

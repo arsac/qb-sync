@@ -140,6 +140,7 @@ type serverTorrentState struct {
 	torrentFile      []byte         // Raw bencode bytes for qBittorrent API; cached in memory
 	saveSubPath      string         // Relative sub-path prefix; may change if category relocates at finalize
 	written          *bitset.BitSet // Bitmap of written pieces (use Count()/Len() instead of separate counter)
+	verified         *bitset.BitSet // Bitmap of pieces already hash-verified post-disk-flush; pieces with this bit set may be skipped during verifyFinalizedPieces
 	dirty            bool           // Whether state needs to be flushed
 	piecesSinceFlush int            // Pieces written since last flush (for count-based trigger)
 	flushGen         uint64         // Monotonic counter incremented on every successful state flush

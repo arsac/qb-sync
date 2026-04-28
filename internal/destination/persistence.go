@@ -35,13 +35,16 @@ func atomicWriteFile(path string, data []byte) error {
 	return utils.AtomicWriteFile(path, data, serverFilePermissions)
 }
 
-// saveState persists the written pieces state to disk.
+// saveState persists the written pieces state to disk. Uses the no-sync
+// fast path: .state is a regenerable checkpoint, and a torn write at crash
+// time is recovered automatically via clearStalePieces (any piece whose
+// data file is missing on disk has its bit cleared on next init).
 func (s *Server) saveState(path string, written *bitset.BitSet) error {
 	data, marshalErr := written.MarshalBinary()
 	if marshalErr != nil {
 		return fmt.Errorf("marshaling bitset: %w", marshalErr)
 	}
-	return atomicWriteFile(path, data)
+	return utils.AtomicWriteFileNoSync(path, data)
 }
 
 // doSaveState persists state using saveStateFunc (injected for tests) or the default saveState.
@@ -136,10 +139,11 @@ func (s *Server) clearStalePieces(
 	files []*serverFileInfo,
 ) {
 	for _, fi := range files {
-		if !fi.selected || fi.earlyFinalized {
-			continue
-		}
-		if fi.hardlink.state == hlStatePending || fi.hardlink.state == hlStateComplete {
+		// skipForWriteData covers unselected files and files whose data is
+		// supplied via hardlinks (pending/complete). Those are created at
+		// finalize time, not by streaming, so the bitmap may legitimately
+		// claim coverage even though the file isn't on disk yet.
+		if fi.skipForWriteData() || fi.earlyFinalized {
 			continue
 		}
 		if _, err := os.Stat(fi.path); err == nil {
