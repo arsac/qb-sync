@@ -369,6 +369,15 @@ func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTo
 		}
 
 		sourcePath := filepath.Join(s.config.BasePath, fi.hardlink.sourcePath)
+		// Defense in depth: tryHardlinkFromInProgress already screens for
+		// cross-filesystem cases at init time, but if BasePath layout changed
+		// between init and finalize (rare: bind-mount swap, filesystem remount)
+		// the os.Link below would fail with EXDEV. Detect upfront for a
+		// clearer error.
+		if !sameFilesystem(sourcePath, filepath.Dir(fi.path)) {
+			return fmt.Errorf("pending hardlink %s -> %s spans filesystems (source removed or remounted?)",
+				sourcePath, fi.path)
+		}
 		if linkErr := os.Link(sourcePath, fi.path); linkErr != nil {
 			if os.IsExist(linkErr) {
 				s.logger.DebugContext(ctx, "pending hardlink target already exists",

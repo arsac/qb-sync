@@ -573,7 +573,7 @@ func (s *Server) resolveHardlink(
 	}
 
 	// Case 2: Check if another torrent is currently writing this inode
-	if outcome, ok := s.tryHardlinkFromInProgress(ctx, hash, filePath, sourceFileID); ok {
+	if outcome, ok := s.tryHardlinkFromInProgress(ctx, hash, filePath, targetPath, sourceFileID); ok {
 		return outcome
 	}
 
@@ -582,7 +582,7 @@ func (s *Server) resolveHardlink(
 	// Case 2 (GetInProgress) and now. In that case, retry Case 2 to pick
 	// up the winner's doneCh and become pending instead of duplicating work.
 	if !s.registerInodeInProgress(ctx, hash, filePath, targetPath, sourceFileID) {
-		if outcome, ok := s.tryHardlinkFromInProgress(ctx, hash, filePath, sourceFileID); ok {
+		if outcome, ok := s.tryHardlinkFromInProgress(ctx, hash, filePath, targetPath, sourceFileID); ok {
 			return outcome
 		}
 		// Winner already completed between our two checks — write from scratch.
@@ -652,19 +652,8 @@ func (s *Server) tryHardlinkFromRegistered(
 	}
 
 	// Same-filesystem guard: hardlinks only work within one filesystem.
-	// If source and target are on different devices, skip hardlink and fall
-	// through to normal streaming. On overlayfs destinations this fires for
-	// all files, safely disabling hardlinks.
-	targetDirInfo, targetStatErr := os.Stat(filepath.Dir(targetPath))
-	if targetStatErr != nil {
-		return hardlinkOutcome{}, false
-	}
-	targetStat, targetOk := targetDirInfo.Sys().(*syscall.Stat_t)
-	sourceStat, sourceOk := sourceInfo.Sys().(*syscall.Stat_t)
-	if !targetOk || !sourceOk {
-		return hardlinkOutcome{}, false
-	}
-	if uint64(sourceStat.Dev) != uint64(targetStat.Dev) {
+	// On overlayfs destinations this fires for all files, safely disabling hardlinks.
+	if !sameFilesystem(sourcePath, filepath.Dir(targetPath)) {
 		return hardlinkOutcome{}, false
 	}
 
@@ -698,11 +687,20 @@ func (s *Server) tryHardlinkFromRegistered(
 // Returns the outcome and true if the inode is being written by another torrent.
 func (s *Server) tryHardlinkFromInProgress(
 	ctx context.Context,
-	hash, filePath string,
+	hash, filePath, targetPath string,
 	sourceFileID FileID,
 ) (hardlinkOutcome, bool) {
-	targetPath, doneCh, sourceTorrent, found := s.store.Inodes().GetInProgress(sourceFileID)
+	sourceRelPath, doneCh, sourceTorrent, found := s.store.Inodes().GetInProgress(sourceFileID)
 	if !found {
+		return hardlinkOutcome{}, false
+	}
+
+	// Same-filesystem guard: if the in-progress writer's target lives on a
+	// different filesystem from this file's target, the eventual hardlink at
+	// finalize would fail with EXDEV. Skip pending and fall through so the
+	// data gets streamed independently.
+	sourceDir := filepath.Dir(filepath.Join(s.config.BasePath, sourceRelPath))
+	if !sameFilesystem(sourceDir, filepath.Dir(targetPath)) {
 		return hardlinkOutcome{}, false
 	}
 
@@ -714,9 +712,30 @@ func (s *Server) tryHardlinkFromInProgress(
 
 	return hardlinkOutcome{
 		state:      hlStatePending,
-		sourcePath: targetPath,
+		sourcePath: sourceRelPath,
 		doneCh:     doneCh,
 	}, true
+}
+
+// sameFilesystem reports whether two paths reside on the same filesystem
+// by comparing the device IDs of their stat results. Returns false on any
+// stat error or if device IDs cannot be obtained — callers treat that as
+// "not safe to hardlink".
+func sameFilesystem(pathA, pathB string) bool {
+	infoA, errA := os.Stat(pathA)
+	if errA != nil {
+		return false
+	}
+	infoB, errB := os.Stat(pathB)
+	if errB != nil {
+		return false
+	}
+	statA, okA := infoA.Sys().(*syscall.Stat_t)
+	statB, okB := infoB.Sys().(*syscall.Stat_t)
+	if !okA || !okB {
+		return false
+	}
+	return uint64(statA.Dev) == uint64(statB.Dev)
 }
 
 // registerInodeInProgress registers this torrent as the first writer for an inode.
