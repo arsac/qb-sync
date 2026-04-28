@@ -2,7 +2,6 @@ package destination
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 	"maps"
 	"os"
@@ -137,68 +136,6 @@ func (r *InodeRegistry) AbortInProgress(ctx context.Context, fileID FileID, torr
 			)
 		}
 	}
-}
-
-// mapPath returns the path to the inode map persistence file.
-func (r *InodeRegistry) mapPath() string {
-	return filepath.Join(r.basePath, metaDirName, ".inode_map.json")
-}
-
-// inodeEntry is a JSON-serializable representation of a FileID-to-path mapping.
-type inodeEntry struct {
-	Dev  uint64 `json:"dev"`
-	Ino  uint64 `json:"ino"`
-	Path string `json:"path"`
-}
-
-// Load loads the persisted inode-to-path mapping from disk.
-func (r *InodeRegistry) Load() error {
-	data, err := os.ReadFile(r.mapPath())
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-
-	var entries []inodeEntry
-	if unmarshalErr := json.Unmarshal(data, &entries); unmarshalErr != nil {
-		return unmarshalErr
-	}
-
-	loaded := make(map[FileID]string, len(entries))
-	for _, e := range entries {
-		loaded[FileID{Dev: e.Dev, Ino: e.Ino}] = e.Path
-	}
-
-	r.registeredMu.Lock()
-	r.registered = loaded
-	metrics.InodeRegistrySize.Set(float64(len(r.registered)))
-	r.registeredMu.Unlock()
-
-	return nil
-}
-
-// Save persists the inode-to-path mapping to disk.
-func (r *InodeRegistry) Save() error {
-	r.registeredMu.RLock()
-	entries := make([]inodeEntry, 0, len(r.registered))
-	for fid, path := range r.registered {
-		entries = append(entries, inodeEntry{Dev: fid.Dev, Ino: fid.Ino, Path: path})
-	}
-	r.registeredMu.RUnlock()
-
-	data, err := json.Marshal(entries)
-	if err != nil {
-		return err
-	}
-
-	mapFile := r.mapPath()
-	if mkdirErr := os.MkdirAll(filepath.Dir(mapFile), serverDirPermissions); mkdirErr != nil {
-		return mkdirErr
-	}
-
-	return atomicWriteFile(mapFile, data)
 }
 
 // CleanupStale removes entries where the file no longer exists on disk.

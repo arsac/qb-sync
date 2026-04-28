@@ -37,6 +37,7 @@ const (
 
 	// Default inode cleanup settings.
 	defaultInodeCleanupInterval = 6 * time.Hour // How often to check for stale inode entries
+	inodeRebuildWorkers         = 8             // Concurrent workers for startup inode rebuild from .meta
 
 	// Default hardlink wait timeout.
 	defaultHardlinkWaitTimeout = 30 * time.Minute // Max time to wait for pending hardlink source

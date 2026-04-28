@@ -6,13 +6,21 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 // recoverInFlightTorrents scans persisted metadata directories and rebuilds
 // in-memory state for in-flight torrents. Called once during Server.Run
 // before accepting gRPC requests.
 func (s *Server) recoverInFlightTorrents(ctx context.Context) error {
-	s.store.Inodes().CleanupStale(ctx)
+	// Rebuild inode registry from all .meta files before recovering in-flight torrents.
+	s.rebuildInodeMap(ctx)
+
+	// Delete legacy .inode_map.json if it exists (superseded by .meta-based rebuild).
+	oldInodeMap := filepath.Join(s.config.BasePath, metaDirName, ".inode_map.json")
+	if removeErr := os.Remove(oldInodeMap); removeErr == nil {
+		s.logger.InfoContext(ctx, "deleted legacy .inode_map.json")
+	}
 
 	metaRoot := filepath.Join(s.config.BasePath, metaDirName)
 	entries, err := os.ReadDir(metaRoot)
@@ -80,4 +88,92 @@ func (s *Server) recoverTorrent(ctx context.Context, hash, metaDir string) error
 		"piecesHave", resp.GetPiecesHaveCount(),
 	)
 	return nil
+}
+
+// inodeEntry pairs a FileID with the relative path of the file on disk.
+type inodeEntry struct {
+	fileID  FileID
+	relPath string
+}
+
+// rebuildInodeMap scans all .meta files (finalized and in-flight) and rebuilds
+// the in-memory inode registry. Uses a worker pool to manage NFS latency.
+func (s *Server) rebuildInodeMap(ctx context.Context) {
+	metaRoot := filepath.Join(s.config.BasePath, metaDirName)
+	entries, err := os.ReadDir(metaRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return
+		}
+		s.logger.WarnContext(ctx, "failed to read metadata root for inode rebuild", "error", err)
+		return
+	}
+
+	// Collect entries concurrently with bounded workers.
+	var mu sync.Mutex
+	var results []inodeEntry
+	sem := make(chan struct{}, inodeRebuildWorkers)
+
+	var wg sync.WaitGroup
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		metaPath := filepath.Join(metaRoot, entry.Name(), metaFileName)
+
+		wg.Go(func() {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			found := s.collectInodeEntries(metaPath)
+			if len(found) > 0 {
+				mu.Lock()
+				results = append(results, found...)
+				mu.Unlock()
+			}
+		})
+	}
+	wg.Wait()
+
+	// Register all collected entries.
+	for _, e := range results {
+		s.store.Inodes().Register(e.fileID, e.relPath)
+	}
+
+	if len(results) > 0 {
+		s.logger.InfoContext(ctx, "rebuilt inode registry from .meta files",
+			"registered", len(results))
+	}
+}
+
+// collectInodeEntries reads a single .meta file and returns inode entries
+// for files that exist on disk with non-zero source device+inode.
+func (s *Server) collectInodeEntries(metaPath string) []inodeEntry {
+	meta, loadErr := loadPersistedMeta(metaPath)
+	if loadErr != nil {
+		return nil
+	}
+
+	subPath := meta.GetSaveSubPath()
+	var entries []inodeEntry
+	for _, f := range meta.GetFiles() {
+		dev := f.GetSourceDevice()
+		ino := f.GetSourceInode()
+		if dev == 0 && ino == 0 {
+			continue
+		}
+		relPath := filepath.Join(subPath, f.GetPath())
+		fullPath := filepath.Join(s.config.BasePath, relPath)
+
+		// Verify file exists on disk — skip stale entries.
+		if _, statErr := os.Stat(fullPath); statErr != nil {
+			continue
+		}
+
+		entries = append(entries, inodeEntry{
+			fileID:  FileID{Dev: dev, Ino: ino},
+			relPath: relPath,
+		})
+	}
+	return entries
 }

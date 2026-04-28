@@ -24,7 +24,7 @@ type torrentStore struct {
 	logger    *slog.Logger
 }
 
-// NewTorrentStore creates a new store. Call Load to restore persisted inode state.
+// newTorrentStore creates a new store.
 func newTorrentStore(basePath string, logger *slog.Logger) *torrentStore {
 	return &torrentStore{
 		entries:   make(map[string]*serverTorrentState),
@@ -256,8 +256,5 @@ func (ts *torrentStore) RegisterInodes(ctx context.Context, hash string, files [
 			"hash", hash,
 			"count", registered,
 		)
-		if saveErr := ts.inodes.Save(); saveErr != nil {
-			ts.logger.WarnContext(ctx, "failed to save inode map", "error", saveErr)
-		}
 	}
 }

@@ -113,11 +113,6 @@ func (s *Server) RegisterFile(
 
 	s.store.Inodes().Register(fileID, path)
 
-	// Persist inode map after registration
-	if saveErr := s.store.Inodes().Save(); saveErr != nil {
-		s.logger.WarnContext(ctx, "failed to persist inode map", "error", saveErr)
-	}
-
 	s.logger.DebugContext(ctx, "registered file for hardlink tracking",
 		"fileID", fileID,
 		"path", path,

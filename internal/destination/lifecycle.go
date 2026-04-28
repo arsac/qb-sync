@@ -323,8 +323,5 @@ func (s *Server) runInodeCleaner(ctx context.Context) {
 
 	runPeriodic(ctx, interval, s.logger, "inode-cleaner", func(ctx context.Context) {
 		s.store.Inodes().CleanupStale(ctx)
-		if saveErr := s.store.Inodes().Save(); saveErr != nil {
-			s.logger.WarnContext(ctx, "failed to persist inode map after cleanup", "error", saveErr)
-		}
 	})
 }

@@ -126,10 +126,6 @@ func NewServer(config ServerConfig, logger *slog.Logger) *Server {
 		)
 	}
 
-	if loadErr := s.store.Inodes().Load(); loadErr != nil {
-		logger.Warn("failed to load inode map, starting fresh", "error", loadErr)
-	}
-
 	return s
 }
 
@@ -251,9 +247,5 @@ func (s *Server) cleanup() {
 			_ = s.closeFileHandle(context.Background(), hash, fi)
 		}
 		state.mu.Unlock()
-	}
-
-	if saveErr := s.store.Inodes().Save(); saveErr != nil {
-		s.logger.Warn("failed to save inode map on cleanup", "error", saveErr)
 	}
 }
