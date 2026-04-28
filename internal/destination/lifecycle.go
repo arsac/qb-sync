@@ -210,8 +210,8 @@ func (s *Server) isOrphanedTorrent(ctx context.Context, hash string, timeout tim
 }
 
 // statOrphanMetadata returns FileInfo for the torrent's metadata, checking
-// .state first and falling back to the .torrent file. Returns [os.ErrNotExist]
-// when neither file exists.
+// .state first, then .meta (new format), then falling back to the .torrent file
+// (migration). Returns [os.ErrNotExist] when no metadata file is found.
 func (s *Server) statOrphanMetadata(metaDir string) (os.FileInfo, error) {
 	statePath := filepath.Join(metaDir, ".state")
 	info, err := os.Stat(statePath)
@@ -222,7 +222,17 @@ func (s *Server) statOrphanMetadata(metaDir string) (os.FileInfo, error) {
 		return nil, err
 	}
 
-	// No state file - check for .torrent file as fallback timestamp
+	// Check .meta (new format).
+	metaPath := filepath.Join(metaDir, metaFileName)
+	info, err = os.Stat(metaPath)
+	if err == nil {
+		return info, nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	// Migration: check old .torrent file.
 	torrentPath, findErr := findTorrentFile(metaDir)
 	if findErr != nil {
 		return nil, os.ErrNotExist

@@ -260,15 +260,10 @@ func TestSaveLoadSelectedFile(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
 
-		files := []*serverFileInfo{
-			{selected: true},
-			{selected: false},
-			{selected: true},
-			{selected: false},
-		}
-
-		if err := saveSelectedFile(tmpDir, files); err != nil {
-			t.Fatalf("saveSelectedFile: %v", err)
+		// Write .selected bytes directly (migration format: 1=selected, 0=unselected).
+		data := []byte{1, 0, 1, 0}
+		if err := os.WriteFile(filepath.Join(tmpDir, selectedFileName), data, 0o644); err != nil {
+			t.Fatalf("writing .selected: %v", err)
 		}
 
 		loaded := loadSelectedFile(tmpDir, 4)
@@ -297,12 +292,9 @@ func TestSaveLoadSelectedFile(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
 
-		// Save 2 files, then load expecting 4
-		files := []*serverFileInfo{
-			{selected: true},
-			{selected: false},
-		}
-		if err := saveSelectedFile(tmpDir, files); err != nil {
+		// Write .selected bytes for 2 files, then load expecting 4.
+		data := []byte{1, 0}
+		if err := os.WriteFile(filepath.Join(tmpDir, selectedFileName), data, 0o644); err != nil {
 			t.Fatal(err)
 		}
 

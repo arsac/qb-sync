@@ -331,8 +331,15 @@ func (s *Server) relocateForSubPathChange(
 	}
 
 	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
-	if subPathErr := saveSubPathFile(metaDir, newSubPath); subPathErr != nil {
-		return fmt.Errorf("persisting sub-path after relocation: %w", subPathErr)
+	metaPath := filepath.Join(metaDir, metaFileName)
+	if existingMeta, loadErr := loadPersistedMeta(metaPath); loadErr == nil {
+		existingMeta.SaveSubPath = newSubPath
+		if saveErr := savePersistedMeta(metaPath, existingMeta); saveErr != nil {
+			return fmt.Errorf("persisting sub-path after relocation: %w", saveErr)
+		}
+	} else {
+		s.logger.WarnContext(ctx, "could not update .meta after relocation",
+			"hash", hash, "error", loadErr)
 	}
 
 	return nil

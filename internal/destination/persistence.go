@@ -55,15 +55,6 @@ func (s *Server) doSaveState(path string, written *bitset.BitSet) error {
 	return s.saveState(path, written)
 }
 
-// saveSubPathFile persists the save sub-path to a .subpath file in the metadata directory.
-func saveSubPathFile(metaDir, subPath string) error {
-	if subPath == "" {
-		return nil
-	}
-	path := filepath.Join(metaDir, subPathFileName)
-	return atomicWriteFile(path, []byte(subPath))
-}
-
 // loadSubPathFile reads the save sub-path from the .subpath file.
 // Returns "" if the file is missing or unreadable.
 func loadSubPathFile(metaDir string) string {
@@ -73,17 +64,6 @@ func loadSubPathFile(metaDir string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(data))
-}
-
-// saveSelectedFile persists the file selection bitmap to a .selected file.
-func saveSelectedFile(metaDir string, files []*serverFileInfo) error {
-	data := make([]byte, len(files))
-	for i, fi := range files {
-		if fi.selected {
-			data[i] = 1
-		}
-	}
-	return atomicWriteFile(filepath.Join(metaDir, selectedFileName), data)
 }
 
 // loadSelectedFile reads the file selection bitmap from the .selected file.
