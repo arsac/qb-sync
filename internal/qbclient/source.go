@@ -156,7 +156,7 @@ func (s *Source) Init(ctx context.Context) error {
 // this captures the category subdirectory (e.g., "movies").
 // Returns "" when the torrent is at the default save path root.
 func (s *Source) ResolveSubPath(torrentSavePath string) string {
-	rel, err := filepath.Rel(s.qbDefaultSavePath, torrentSavePath)
+	rel, err := filepath.Rel(s.qbDefaultSavePath, filepath.Clean(torrentSavePath))
 	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
 		return ""
 	}
@@ -183,7 +183,7 @@ func (s *Source) resolveQBDir(qbDir string) string {
 // (e.g., /downloads/movies instead of /downloads). This method computes the
 // relative subdirectory and applies it to the local dataPath.
 func (s *Source) ResolveContentDir(torrentSavePath string) string {
-	return s.resolveQBDir(torrentSavePath)
+	return s.resolveQBDir(filepath.Clean(torrentSavePath))
 }
 
 // resolveReadDir returns the directory for reading pieces.
@@ -192,11 +192,40 @@ func (s *Source) ResolveContentDir(torrentSavePath string) string {
 // Clean before Dir: [filepath.Dir] does not strip the last component when the
 // path has a trailing slash (e.g. Dir("/a/b/") = "/a/b"), which would cause
 // the torrent name to appear twice in the resolved path.
+//
+// Note: this assumes a rooted torrent (ContentPath = SavePath/Name). For rootless
+// multi-file torrents, the caller must correct the result — see [GetTorrentMetadata].
 func (s *Source) resolveReadDir(torrent qbittorrent.Torrent) string {
 	if torrent.ContentPath != "" {
 		return s.resolveQBDir(filepath.Dir(filepath.Clean(torrent.ContentPath)))
 	}
-	return s.resolveQBDir(torrent.SavePath)
+	return s.resolveQBDir(filepath.Clean(torrent.SavePath))
+}
+
+// hasRootFolder reports whether a multi-file torrent's files share a common
+// root directory (e.g. all paths start with "TorrentName/..."). Torrents added
+// with qBittorrent's "No subfolder" content layout have no root folder — their
+// files sit directly in SavePath and ContentPath equals SavePath, so
+// [filepath.Dir](ContentPath) goes one level too high.
+func hasRootFolder(files qbittorrent.TorrentFiles) bool {
+	if len(files) <= 1 {
+		return false
+	}
+	var root string
+	for _, f := range files {
+		first, _, hasSep := strings.Cut(f.Name, "/")
+		if !hasSep {
+			return false // bare filename — no directory prefix
+		}
+		if root == "" {
+			root = first
+			continue
+		}
+		if first != root {
+			return false // different first components
+		}
+	}
+	return root != ""
 }
 
 // GetPieceStates returns the current state of all pieces for a torrent.
@@ -266,6 +295,14 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 	sort.Slice(sortedQBFiles, func(i, j int) bool {
 		return sortedQBFiles[i].Index < sortedQBFiles[j].Index
 	})
+
+	// Rootless multi-file torrents (added with "No subfolder" content layout)
+	// have ContentPath == SavePath. For these, resolveReadDir's filepath.Dir
+	// goes one level too high. Detect via file structure and use ContentPath
+	// directly as the content directory.
+	if len(sortedQBFiles) > 1 && torrent.ContentPath != "" && !hasRootFolder(sortedQBFiles) {
+		contentDir = s.resolveQBDir(filepath.Clean(torrent.ContentPath))
+	}
 
 	files := make([]*pb.FileInfo, len(sortedQBFiles))
 	var offset int64

@@ -233,6 +233,87 @@ func TestResolveReadDir(t *testing.T) {
 	}
 }
 
+func TestHasRootFolder(t *testing.T) {
+	tests := []struct {
+		name  string
+		files qbittorrent.TorrentFiles
+		want  bool
+	}{
+		{
+			name:  "single file (no root)",
+			files: qbittorrent.TorrentFiles{{Name: "movie.mkv"}},
+			want:  false,
+		},
+		{
+			name:  "empty file list",
+			files: qbittorrent.TorrentFiles{},
+			want:  false,
+		},
+		{
+			name: "rooted multi-file",
+			files: qbittorrent.TorrentFiles{
+				{Name: "MyTorrent/video.mkv"},
+				{Name: "MyTorrent/subs.srt"},
+			},
+			want: true,
+		},
+		{
+			name: "rooted with nested dirs",
+			files: qbittorrent.TorrentFiles{
+				{Name: "Show/Season 1/ep1.mkv"},
+				{Name: "Show/Season 2/ep2.mkv"},
+			},
+			want: true,
+		},
+		{
+			name: "rootless bare files",
+			files: qbittorrent.TorrentFiles{
+				{Name: "file1.mkv"},
+				{Name: "file2.mkv"},
+			},
+			want: false,
+		},
+		{
+			name: "rootless with different subdirs",
+			files: qbittorrent.TorrentFiles{
+				{Name: "Season 1/ep1.mkv"},
+				{Name: "Season 2/ep2.mkv"},
+			},
+			want: false,
+		},
+		{
+			name: "rootless mixed bare and subdir",
+			files: qbittorrent.TorrentFiles{
+				{Name: "readme.txt"},
+				{Name: "data/file.bin"},
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := hasRootFolder(tt.files)
+			if got != tt.want {
+				t.Errorf("hasRootFolder() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveSubPath_TrailingSlash(t *testing.T) {
+	s := &Source{
+		dataPath:          "/data",
+		qbDefaultSavePath: "/downloads",
+	}
+
+	// SavePath with trailing slash should give the same result as without.
+	got := s.ResolveSubPath("/downloads/movies/")
+	if got != "movies" {
+		t.Errorf("ResolveSubPath with trailing slash = %q, want %q", got, "movies")
+	}
+}
+
 func TestReadPiece_ENOENTRetry(t *testing.T) {
 	content := []byte("piece data here!")
 	files := []*pb.FileInfo{
