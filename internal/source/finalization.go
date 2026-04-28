@@ -15,17 +15,14 @@ import (
 // finalizeCompletedStreams checks for streams where all pieces are streamed
 // and calls FinalizeTorrent on the destination server.
 //
-//nolint:unparam,gocognit // error return kept for interface consistency; complexity is linear error-dispatch
+//nolint:unparam // error return kept for interface consistency
 func (t *QBTask) finalizeCompletedStreams(ctx context.Context) error {
 	tracked := t.tracked.Snapshot()
 
 	for hash := range tracked {
 		progress, err := t.tracker.GetProgress(hash)
 		if err != nil {
-			t.logger.DebugContext(ctx, "GetProgress failed",
-				"hash", hash,
-				"error", err,
-			)
+			t.logger.DebugContext(ctx, "GetProgress failed", "hash", hash, "error", err)
 			continue
 		}
 
@@ -36,51 +33,50 @@ func (t *QBTask) finalizeCompletedStreams(ctx context.Context) error {
 			"complete", progress.Complete,
 		)
 
-		if !progress.Complete {
+		if !progress.Complete || !t.backoffs.ShouldAttempt(hash) {
 			continue
 		}
 
-		if !t.backoffs.ShouldAttempt(hash) {
+		finalizeErr := t.finalizeTorrent(ctx, hash)
+		if finalizeErr == nil {
+			t.markTorrentSynced(ctx, hash, tracked[hash])
 			continue
 		}
-
-		if finalizeErr := t.finalizeTorrent(ctx, hash); finalizeErr != nil {
-			if errors.Is(finalizeErr, streaming.ErrFinalizeVerifying) {
-				t.logger.InfoContext(ctx, "destination server still verifying, will poll again",
-					"hash", hash,
-				)
-				continue
-			}
-
-			if errors.Is(finalizeErr, streaming.ErrFinalizeIncomplete) {
-				t.handleIncompleteFinalization(ctx, hash)
-				continue
-			}
-
-			if errors.Is(finalizeErr, streaming.ErrFinalizeNotFound) {
-				t.handleNotFoundFinalization(ctx, hash)
-				continue
-			}
-
-			metrics.FinalizationErrorsTotal.WithLabelValues(metrics.ModeSource).Inc()
-			t.logger.ErrorContext(ctx, "finalize failed",
-				"hash", hash,
-				"error", finalizeErr,
-			)
-			t.backoffs.RecordFailure(hash)
-			if streaming.IsTransientError(finalizeErr) {
-				t.logger.WarnContext(ctx, "destination server unreachable, skipping remaining finalizations",
-					"error", finalizeErr,
-				)
-				break
-			}
-			continue
+		if t.handleFinalizeError(ctx, hash, finalizeErr) {
+			break
 		}
-
-		t.markTorrentSynced(ctx, hash, tracked[hash])
 	}
 
 	return nil
+}
+
+// handleFinalizeError dispatches a non-nil finalize error to the appropriate
+// handler. Returns true if the caller should stop iterating (e.g. destination
+// is unreachable and remaining finalizations would just pile up errors).
+func (t *QBTask) handleFinalizeError(ctx context.Context, hash string, finalizeErr error) bool {
+	switch {
+	case errors.Is(finalizeErr, streaming.ErrFinalizeVerifying):
+		t.logger.InfoContext(ctx, "destination server still verifying, will poll again", "hash", hash)
+		return false
+	case errors.Is(finalizeErr, streaming.ErrFinalizeIncomplete):
+		t.handleIncompleteFinalization(ctx, hash)
+		return false
+	case errors.Is(finalizeErr, streaming.ErrFinalizeNotFound):
+		t.handleNotFoundFinalization(ctx, hash)
+		return false
+	}
+
+	metrics.FinalizationErrorsTotal.WithLabelValues(metrics.ModeSource).Inc()
+	t.logger.ErrorContext(ctx, "finalize failed", "hash", hash, "error", finalizeErr)
+	t.backoffs.RecordFailure(hash)
+
+	if streaming.IsTransientError(finalizeErr) {
+		t.logger.WarnContext(ctx, "destination server unreachable, skipping remaining finalizations",
+			"error", finalizeErr,
+		)
+		return true
+	}
+	return false
 }
 
 // markTorrentSynced handles post-finalization bookkeeping: clears backoff, updates

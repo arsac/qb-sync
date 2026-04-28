@@ -83,12 +83,10 @@ func (t *QBTask) maybeMoveToDest(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("getting free space: %w", err)
 		}
-
 		t.logger.InfoContext(ctx, "checking free space",
 			"freeGB", freeSpaceGB,
 			"minGB", t.cfg.MinSpaceGB,
 		)
-
 		if freeSpaceGB >= t.cfg.MinSpaceGB {
 			return nil
 		}
@@ -98,13 +96,11 @@ func (t *QBTask) maybeMoveToDest(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("fetching torrents completed on destination: %w", err)
 	}
-
 	if len(torrents) == 0 {
 		return nil
 	}
 
-	groups := t.groupHardlinkedTorrents(ctx, torrents)
-	sortedGroups := sortGroupsByPriority(groups)
+	sortedGroups := sortGroupsByPriority(t.groupHardlinkedTorrents(ctx, torrents))
 
 	var freeSpaceBefore int64
 	if !isDraining {
@@ -115,7 +111,26 @@ func (t *QBTask) maybeMoveToDest(ctx context.Context) error {
 		}
 	}
 
-	var groupsDeleted, groupsSkippedSeeding, groupsFailed, torrentsHandedOff int
+	stats := t.processGroups(ctx, sortedGroups, isDraining, freeSpaceBefore)
+	t.recordCleanupMetrics(ctx, stats)
+	return nil
+}
+
+// processGroups iterates the prioritized groups and performs the per-group
+// handoff, returning a populated cleanupStats. It honors the seeding threshold
+// (unless draining) and stops early once the estimated free space passes the
+// configured minimum.
+func (t *QBTask) processGroups(
+	ctx context.Context,
+	sortedGroups []torrentGroup,
+	isDraining bool,
+	freeSpaceBefore int64,
+) cleanupStats {
+	stats := cleanupStats{
+		groupsEvaluated: len(sortedGroups),
+		isDraining:      isDraining,
+		freeSpaceBefore: freeSpaceBefore,
+	}
 	minSeedingSeconds := int64(t.cfg.MinSeedingTime.Seconds())
 
 	// Track estimated freed bytes instead of re-querying after each deletion.
@@ -131,17 +146,17 @@ func (t *QBTask) maybeMoveToDest(ctx context.Context) error {
 				"minSeeding", group.minSeeding,
 				"required", minSeedingSeconds,
 			)
-			groupsSkippedSeeding++
+			stats.groupsSkippedSeed++
 			continue
 		}
 
 		handed, moveErr := t.deleteGroupFromHot(ctx, group)
-		torrentsHandedOff += handed
+		stats.torrentsHandedOff += handed
 		if moveErr != nil {
 			t.logger.ErrorContext(ctx, "failed to delete group", "error", moveErr)
-			groupsFailed++
+			stats.groupsFailed++
 		} else {
-			groupsDeleted++
+			stats.groupsDeleted++
 			estimatedFreedBytes += group.maxSize
 		}
 
@@ -154,18 +169,7 @@ func (t *QBTask) maybeMoveToDest(ctx context.Context) error {
 			break
 		}
 	}
-
-	t.recordCleanupMetrics(ctx, cleanupStats{
-		groupsEvaluated:   len(sortedGroups),
-		groupsDeleted:     groupsDeleted,
-		groupsSkippedSeed: groupsSkippedSeeding,
-		groupsFailed:      groupsFailed,
-		torrentsHandedOff: torrentsHandedOff,
-		isDraining:        isDraining,
-		freeSpaceBefore:   freeSpaceBefore,
-	})
-
-	return nil
+	return stats
 }
 
 // recordCleanupMetrics records Prometheus counters and logs a summary for a cleanup cycle.

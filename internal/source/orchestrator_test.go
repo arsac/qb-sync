@@ -37,7 +37,6 @@ type mockQBClient struct {
 	deleteCalled bool
 	deleteErr    error
 	stopCalled   bool
-	stopHashes   []string
 	stopErr      error
 	stopFailHash map[string]bool
 	resumeCalled bool
@@ -111,7 +110,6 @@ func (m *mockQBClient) AddTagsCtx(_ context.Context, hashes []string, tags strin
 
 func (m *mockQBClient) StopCtx(_ context.Context, hashes []string) error {
 	m.stopCalled = true
-	m.stopHashes = hashes
 	if m.stopFailHash != nil && m.stopFailHash[hashes[0]] {
 		return errors.New("stop failed")
 	}

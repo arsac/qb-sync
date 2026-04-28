@@ -11,33 +11,36 @@ import (
 )
 
 // tryRemoveWithLog attempts to remove a file, logging and collecting errors.
+// Returns true on successful removal, false if the file was missing or removal
+// failed (in which case the error is appended to deleteErrors).
 func tryRemoveWithLog(
 	ctx context.Context,
 	logger *slog.Logger,
 	path, fileType, hash string,
 	deleteErrors *[]string,
 ) bool {
-	if err := os.Remove(path); err == nil {
+	err := os.Remove(path)
+	if err == nil {
 		logger.DebugContext(ctx, "deleted "+fileType,
 			"hash", hash,
 			"path", path,
 		)
 		return true
-	} else if !os.IsNotExist(err) {
-		*deleteErrors = append(*deleteErrors, fmt.Sprintf("%s %s: %v", fileType, path, err))
-		logger.WarnContext(ctx, "failed to delete "+fileType,
-			"hash", hash,
-			"path", path,
-			"error", err,
-		)
 	}
+	if os.IsNotExist(err) {
+		return false
+	}
+	*deleteErrors = append(*deleteErrors, fmt.Sprintf("%s %s: %v", fileType, path, err))
+	logger.WarnContext(ctx, "failed to delete "+fileType,
+		"hash", hash,
+		"path", path,
+		"error", err,
+	)
 	return false
 }
 
 // AbortTorrent aborts an in-progress torrent transfer and optionally cleans up partial files.
 // This is called when a torrent is removed from source before streaming completes.
-//
-
 func (s *Server) AbortTorrent(
 	ctx context.Context,
 	req *pb.AbortTorrentRequest,

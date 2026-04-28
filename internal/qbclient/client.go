@@ -81,15 +81,12 @@ func NewResilientClient(
 	// Wrap the retriable checker to explicitly reject circuitbreaker.ErrOpen,
 	// so retry aborts immediately when the circuit breaker is open.
 	retryConfig := config.Retry
-	originalChecker := retryConfig.RetriableChecker
-	if originalChecker == nil {
-		originalChecker = utils.IsRetriableError
+	baseChecker := retryConfig.RetriableChecker
+	if baseChecker == nil {
+		baseChecker = utils.IsRetriableError
 	}
 	retryConfig.RetriableChecker = func(err error) bool {
-		if errors.Is(err, circuitbreaker.ErrOpen) {
-			return false
-		}
-		return originalChecker(err)
+		return !errors.Is(err, circuitbreaker.ErrOpen) && baseChecker(err)
 	}
 
 	retryPolicy := utils.NewRetryPolicy(retryConfig, logger, func() {

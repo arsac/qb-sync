@@ -40,6 +40,10 @@ const (
 	destRPCTimeout = 30 * time.Second
 
 	cacheFilePermissions = 0o644
+
+	// pruneCycleInterval controls how often runOnce runs the periodic
+	// prune/recheck/cleanup pass (every Nth cycle).
+	pruneCycleInterval = 50
 )
 
 // TrackedTorrent holds metadata for a torrent being synced from source to destination.
@@ -171,21 +175,20 @@ func (t *QBTask) Run(ctx context.Context) error {
 
 	g, gCtx := errgroup.WithContext(ctx)
 
-	g.Go(func() error {
-		if err := t.tracker.Run(gCtx); err != nil && gCtx.Err() == nil {
-			t.logger.ErrorContext(gCtx, "piece monitor error", "error", err)
-			return fmt.Errorf("piece monitor failed: %w", err)
+	// runComponent wraps a long-running subsystem so cancellation is silent
+	// (errors raised after gCtx is done are noise from the shutdown cascade).
+	runComponent := func(name string, fn func(context.Context) error) func() error {
+		return func() error {
+			if err := fn(gCtx); err != nil && gCtx.Err() == nil {
+				t.logger.ErrorContext(gCtx, name+" error", "error", err)
+				return fmt.Errorf("%s failed: %w", name, err)
+			}
+			return nil
 		}
-		return nil
-	})
+	}
 
-	g.Go(func() error {
-		if err := t.queue.Run(gCtx); err != nil && gCtx.Err() == nil {
-			t.logger.ErrorContext(gCtx, "streaming queue error", "error", err)
-			return fmt.Errorf("streaming queue failed: %w", err)
-		}
-		return nil
-	})
+	g.Go(runComponent("piece monitor", t.tracker.Run))
+	g.Go(runComponent("streaming queue", t.queue.Run))
 
 	g.Go(func() error {
 		ticker := time.NewTicker(t.cfg.SleepInterval)
@@ -208,8 +211,6 @@ func (t *QBTask) Run(ctx context.Context) error {
 
 	return g.Wait()
 }
-
-const pruneCycleInterval = 50
 
 func (t *QBTask) runOnce(ctx context.Context) {
 	t.cycleTorrents = nil
@@ -249,6 +250,13 @@ func (t *QBTask) FetchCompletedOnDestination() []string {
 // Exported for testing only - allows tests to simulate synced state.
 func (t *QBTask) MarkCompletedOnDestination(hash string) {
 	t.completed.Mark(hash)
+}
+
+// withDestRPCTimeout derives a context with destRPCTimeout from the parent
+// and returns it alongside its cancel func. Used for unary destination RPCs
+// to bound blocking time during cleanup/handoff paths.
+func withDestRPCTimeout(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(parent, destRPCTimeout)
 }
 
 // pruneCompletedOnDest removes entries from the completed cache that are

@@ -27,6 +27,15 @@ func completionTimeOrNow(completionOn int64) time.Time {
 	return time.Now()
 }
 
+// trackedTorrentFromQB constructs a TrackedTorrent from a qBittorrent Torrent.
+func trackedTorrentFromQB(torrent qbittorrent.Torrent) TrackedTorrent {
+	return TrackedTorrent{
+		CompletionTime: completionTimeOrNow(torrent.CompletionOn),
+		Name:           torrent.Name,
+		Size:           torrent.Size,
+	}
+}
+
 // candidateTorrent pairs a torrent with its destination status for priority sorting.
 type candidateTorrent struct {
 	torrent    qbittorrent.Torrent
@@ -130,11 +139,7 @@ func (t *QBTask) queryDestStatus(
 	torrent qbittorrent.Torrent,
 ) (*streaming.InitTorrentResult, error) {
 	if t.tracker.IsTracking(torrent.Hash) {
-		t.tracked.Add(torrent.Hash, TrackedTorrent{
-			CompletionTime: completionTimeOrNow(torrent.CompletionOn),
-			Name:           torrent.Name,
-			Size:           torrent.Size,
-		})
+		t.tracked.Add(torrent.Hash, trackedTorrentFromQB(torrent))
 		t.logger.DebugContext(ctx, "synced tracker state to orchestrator",
 			"name", torrent.Name,
 			"hash", torrent.Hash,
@@ -221,11 +226,7 @@ func (t *QBTask) startTrackingReady(
 		return false
 	}
 
-	return t.tracked.AddIfAbsent(torrent.Hash, TrackedTorrent{
-		CompletionTime: completionTimeOrNow(torrent.CompletionOn),
-		Name:           torrent.Name,
-		Size:           torrent.Size,
-	})
+	return t.tracked.AddIfAbsent(torrent.Hash, trackedTorrentFromQB(torrent))
 }
 
 // selectedFingerprint computes a fingerprint from the selected (priority > 0) file indices.
@@ -303,7 +304,7 @@ func (t *QBTask) abortExcludedTracked(ctx context.Context, excludedHashes map[st
 		)
 
 		if !t.cfg.DryRun {
-			abortCtx, cancel := context.WithTimeout(ctx, destRPCTimeout)
+			abortCtx, cancel := withDestRPCTimeout(ctx)
 			filesDeleted, abortErr := t.grpcDest.AbortTorrent(abortCtx, hash, true)
 			cancel()
 			if abortErr != nil {
@@ -446,11 +447,7 @@ func (t *QBTask) resyncFileSelection(ctx context.Context, hash, fingerprint stri
 
 	tt := TrackedTorrent{CompletionTime: time.Now(), Name: meta.GetName()}
 	if torrent := t.findTorrentByHash(hash); torrent != nil {
-		tt = TrackedTorrent{
-			CompletionTime: completionTimeOrNow(torrent.CompletionOn),
-			Name:           torrent.Name,
-			Size:           torrent.Size,
-		}
+		tt = trackedTorrentFromQB(*torrent)
 	}
 	t.tracked.Add(hash, tt)
 }

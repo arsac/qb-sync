@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
-	"strings"
 	"sync"
 )
 
@@ -100,6 +99,15 @@ func (ts *torrentStore) Reserve(hash string) error {
 	return nil
 }
 
+// abortInodesForFiles aborts in-progress inode registrations for every file
+// in the slice. Called outside the store lock to match the documented lock
+// ordering (store.mu -> InodeRegistry locks).
+func (ts *torrentStore) abortInodesForFiles(hash string, files []*serverFileInfo) {
+	for _, fi := range files {
+		ts.inodes.AbortInProgress(context.Background(), fi.hardlink.sourceFileID, hash)
+	}
+}
+
 // Commit replaces the sentinel with real state. Checks file path collisions
 // and registers paths atomically. On collision, removes the sentinel and
 // aborts any in-progress inode registrations from setupFiles.
@@ -110,9 +118,7 @@ func (ts *torrentStore) Commit(hash string, state *serverTorrentState) error {
 		ts.mu.Unlock()
 		// Clean up in-progress inode registrations made during setupFiles
 		// so pending waiters aren't stuck on a doneCh for a dead torrent.
-		for _, fi := range state.files {
-			ts.inodes.AbortInProgress(context.Background(), fi.hardlink.sourceFileID, hash)
-		}
+		ts.abortInodesForFiles(hash, state.files)
 		return err
 	}
 	ts.entries[hash] = state
@@ -141,9 +147,7 @@ func (ts *torrentStore) Remove(hash string) *serverTorrentState {
 	}
 	ts.mu.Unlock()
 	if exists {
-		for _, fi := range state.files {
-			ts.inodes.AbortInProgress(context.Background(), fi.hardlink.sourceFileID, hash)
-		}
+		ts.abortInodesForFiles(hash, state.files)
 	}
 	return state
 }
@@ -157,11 +161,8 @@ func (ts *torrentStore) Drain() map[string]*serverTorrentState {
 	ts.filePaths = make(map[string]string)
 	ts.mu.Unlock()
 
-	// Abort in-progress inodes for all drained entries.
 	for hash, state := range old {
-		for _, fi := range state.files {
-			ts.inodes.AbortInProgress(context.Background(), fi.hardlink.sourceFileID, hash)
-		}
+		ts.abortInodesForFiles(hash, state.files)
 	}
 
 	return old
@@ -186,9 +187,7 @@ func (ts *torrentStore) BeginAbort(hash string, ch chan struct{}) (*serverTorren
 
 	// Abort in-progress inodes outside the lock (matching Remove behavior).
 	if exists {
-		for _, fi := range state.files {
-			ts.inodes.AbortInProgress(context.Background(), fi.hardlink.sourceFileID, hash)
-		}
+		ts.abortInodesForFiles(hash, state.files)
 	}
 
 	return state, nil
@@ -238,7 +237,7 @@ func (ts *torrentStore) RegisterInodes(ctx context.Context, hash string, files [
 			continue
 		}
 
-		finalPath, _ := strings.CutSuffix(fi.path, partialSuffix)
+		finalPath := targetPath(fi)
 		relPath, relErr := filepath.Rel(ts.basePath, finalPath)
 		if relErr != nil {
 			ts.logger.WarnContext(ctx, "failed to get relative path for inode registration",

@@ -8,207 +8,104 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestServer_Healthz(t *testing.T) {
-	logger := slog.Default()
-	s := NewServer(Config{Addr: ":0"}, logger)
+// newTestServer constructs a server with default test config and a default logger.
+func newTestServer() *Server {
+	return NewServer(Config{Addr: ":0"}, slog.Default())
+}
 
-	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+// callHandler invokes a handler with a fresh recorder and unmarshals the JSON body.
+func callHandler(t *testing.T, h http.HandlerFunc, path string) (*httptest.ResponseRecorder, Response) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
 	w := httptest.NewRecorder()
-
-	s.handleHealthz(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("expected status %d, got %d", http.StatusOK, w.Code)
-	}
-
+	h(w, req)
 	var resp Response
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("failed to unmarshal response: %v", err)
+	if w.Body.Len() > 0 {
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	}
+	return w, resp
+}
 
-	if resp.Status != "ok" {
-		t.Errorf("expected status 'ok', got %q", resp.Status)
-	}
+func TestServer_Healthz(t *testing.T) {
+	s := newTestServer()
+	w, resp := callHandler(t, s.handleHealthz, "/healthz")
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "ok", resp.Status)
 }
 
 func TestServer_Livez_NoChecks(t *testing.T) {
-	logger := slog.Default()
-	s := NewServer(Config{Addr: ":0"}, logger)
-
-	req := httptest.NewRequest(http.MethodGet, "/livez", nil)
-	w := httptest.NewRecorder()
-
-	s.handleLivez(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("expected status %d, got %d", http.StatusOK, w.Code)
-	}
+	s := newTestServer()
+	w, _ := callHandler(t, s.handleLivez, "/livez")
+	assert.Equal(t, http.StatusOK, w.Code)
 }
 
 func TestServer_Livez_WithHealthyCheck(t *testing.T) {
-	logger := slog.Default()
-	s := NewServer(Config{Addr: ":0"}, logger)
+	s := newTestServer()
+	s.RegisterCheck("test", func(_ context.Context) error { return nil })
 
-	s.RegisterCheck("test", func(_ context.Context) error {
-		return nil
-	})
-
-	req := httptest.NewRequest(http.MethodGet, "/livez", nil)
-	w := httptest.NewRecorder()
-
-	s.handleLivez(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("expected status %d, got %d", http.StatusOK, w.Code)
-	}
-
-	var resp Response
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("failed to unmarshal response: %v", err)
-	}
-
-	if resp.Checks["test"] != "ok" {
-		t.Errorf("expected check 'test' to be 'ok', got %q", resp.Checks["test"])
-	}
+	w, resp := callHandler(t, s.handleLivez, "/livez")
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "ok", resp.Checks["test"])
 }
 
 func TestServer_Livez_WithUnhealthyCheck(t *testing.T) {
-	logger := slog.Default()
-	s := NewServer(Config{Addr: ":0"}, logger)
+	s := newTestServer()
+	s.RegisterCheck("failing", func(_ context.Context) error { return errors.New("connection refused") })
 
-	s.RegisterCheck("failing", func(_ context.Context) error {
-		return errors.New("connection refused")
-	})
-
-	req := httptest.NewRequest(http.MethodGet, "/livez", nil)
-	w := httptest.NewRecorder()
-
-	s.handleLivez(w, req)
-
-	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("expected status %d, got %d", http.StatusServiceUnavailable, w.Code)
-	}
-
-	var resp Response
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("failed to unmarshal response: %v", err)
-	}
-
-	if resp.Status != "unhealthy" {
-		t.Errorf("expected status 'unhealthy', got %q", resp.Status)
-	}
+	w, resp := callHandler(t, s.handleLivez, "/livez")
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.Equal(t, "unhealthy", resp.Status)
 }
 
 func TestServer_Readyz_NotReady(t *testing.T) {
-	logger := slog.Default()
-	s := NewServer(Config{Addr: ":0"}, logger)
-
-	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
-	w := httptest.NewRecorder()
-
-	s.handleReadyz(w, req)
-
-	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("expected status %d, got %d", http.StatusServiceUnavailable, w.Code)
-	}
-
-	var resp Response
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("failed to unmarshal response: %v", err)
-	}
-
-	if resp.Status != "not ready" {
-		t.Errorf("expected status 'not ready', got %q", resp.Status)
-	}
+	s := newTestServer()
+	w, resp := callHandler(t, s.handleReadyz, "/readyz")
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.Equal(t, "not ready", resp.Status)
 }
 
 func TestServer_Readyz_Ready(t *testing.T) {
-	logger := slog.Default()
-	s := NewServer(Config{Addr: ":0"}, logger)
+	s := newTestServer()
 	s.SetReady(true)
-
-	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
-	w := httptest.NewRecorder()
-
-	s.handleReadyz(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("expected status %d, got %d", http.StatusOK, w.Code)
-	}
+	w, _ := callHandler(t, s.handleReadyz, "/readyz")
+	assert.Equal(t, http.StatusOK, w.Code)
 }
 
 func TestServer_Readyz_ReadyButUnhealthy(t *testing.T) {
-	logger := slog.Default()
-	s := NewServer(Config{Addr: ":0"}, logger)
+	s := newTestServer()
 	s.SetReady(true)
+	s.RegisterCheck("failing", func(_ context.Context) error { return errors.New("database down") })
 
-	s.RegisterCheck("failing", func(_ context.Context) error {
-		return errors.New("database down")
-	})
-
-	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
-	w := httptest.NewRecorder()
-
-	s.handleReadyz(w, req)
-
-	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("expected status %d, got %d", http.StatusServiceUnavailable, w.Code)
-	}
-
-	var resp Response
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("failed to unmarshal response: %v", err)
-	}
-
-	if resp.Status != "not ready" {
-		t.Errorf("expected status 'not ready', got %q", resp.Status)
-	}
+	w, resp := callHandler(t, s.handleReadyz, "/readyz")
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.Equal(t, "not ready", resp.Status)
 }
 
 func TestQBHealthCheck(t *testing.T) {
 	t.Run("healthy", func(t *testing.T) {
-		check := QBHealthCheck(func(_ context.Context) error {
-			return nil
-		})
-
-		if err := check(context.Background()); err != nil {
-			t.Errorf("expected nil error, got %v", err)
-		}
+		check := QBHealthCheck(func(_ context.Context) error { return nil })
+		assert.NoError(t, check(context.Background()))
 	})
 
 	t.Run("unhealthy", func(t *testing.T) {
-		check := QBHealthCheck(func(_ context.Context) error {
-			return errors.New("auth failed")
-		})
-
-		err := check(context.Background())
-		if err == nil {
-			t.Error("expected error, got nil")
-		}
+		check := QBHealthCheck(func(_ context.Context) error { return errors.New("auth failed") })
+		assert.Error(t, check(context.Background()))
 	})
 }
 
 func TestGRPCHealthCheck(t *testing.T) {
 	t.Run("healthy", func(t *testing.T) {
-		check := GRPCHealthCheck(func(_ context.Context) error {
-			return nil
-		})
-
-		if err := check(context.Background()); err != nil {
-			t.Errorf("expected nil error, got %v", err)
-		}
+		check := GRPCHealthCheck(func(_ context.Context) error { return nil })
+		assert.NoError(t, check(context.Background()))
 	})
 
 	t.Run("unhealthy", func(t *testing.T) {
-		check := GRPCHealthCheck(func(_ context.Context) error {
-			return errors.New("connection refused")
-		})
-
-		err := check(context.Background())
-		if err == nil {
-			t.Error("expected error, got nil")
-		}
+		check := GRPCHealthCheck(func(_ context.Context) error { return errors.New("connection refused") })
+		assert.Error(t, check(context.Background()))
 	})
 }

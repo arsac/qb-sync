@@ -60,7 +60,7 @@ func (t *QBTask) handleTorrentRemoval(ctx context.Context, hash string) {
 	}
 
 	if wasCompletedOnDest {
-		startCtx, cancel := context.WithTimeout(ctx, destRPCTimeout)
+		startCtx, cancel := withDestRPCTimeout(ctx)
 		defer cancel()
 		if startErr := t.grpcDest.StartTorrent(startCtx, hash, t.cfg.SourceRemovedTag); startErr != nil {
 			t.logger.WarnContext(ctx, "failed to start/tag torrent on destination after removal (will retry via prune)",
@@ -85,7 +85,7 @@ func (t *QBTask) handleTorrentRemoval(ctx context.Context, hash string) {
 		return
 	}
 
-	abortCtx, cancel := context.WithTimeout(ctx, destRPCTimeout)
+	abortCtx, cancel := withDestRPCTimeout(ctx)
 	defer cancel()
 
 	filesDeleted, err := t.grpcDest.AbortTorrent(abortCtx, hash, true)
@@ -113,7 +113,7 @@ func (t *QBTask) handleTorrentRemoval(ctx context.Context, hash string) {
 // if we instead finalize and then start, the destination retains the torrent
 // tagged as source-removed.
 func (t *QBTask) tryFinalizeFullyStreamed(ctx context.Context, hash string) bool {
-	checkCtx, checkCancel := context.WithTimeout(ctx, destRPCTimeout)
+	checkCtx, checkCancel := withDestRPCTimeout(ctx)
 	result, checkErr := t.grpcDest.CheckTorrentStatus(checkCtx, hash)
 	checkCancel()
 
@@ -129,7 +129,7 @@ func (t *QBTask) tryFinalizeFullyStreamed(ctx context.Context, hash string) bool
 	// torrent is already gone from source (the common case once the user
 	// has deleted it), the call fails and the .partial files remain on
 	// destination for the orphan cleaner to handle.
-	finalizeCtx, finalizeCancel := context.WithTimeout(ctx, destRPCTimeout)
+	finalizeCtx, finalizeCancel := withDestRPCTimeout(ctx)
 	finalizeErr := t.finalizeTorrent(finalizeCtx, hash)
 	finalizeCancel()
 	if finalizeErr != nil {
@@ -139,7 +139,7 @@ func (t *QBTask) tryFinalizeFullyStreamed(ctx context.Context, hash string) bool
 		return true
 	}
 
-	startCtx, startCancel := context.WithTimeout(ctx, destRPCTimeout)
+	startCtx, startCancel := withDestRPCTimeout(ctx)
 	defer startCancel()
 	if startErr := t.grpcDest.StartTorrent(startCtx, hash, t.cfg.SourceRemovedTag); startErr != nil {
 		t.logger.WarnContext(ctx, "failed to start fully-streamed torrent on destination (will retry via prune)",
