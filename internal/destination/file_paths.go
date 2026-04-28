@@ -11,17 +11,14 @@ func targetPath(fi *serverFileInfo) string {
 }
 
 // checkPathCollisions checks if any selected file's target path is already
-// owned by another active torrent. Caller must hold s.mu.
-func (s *Server) checkPathCollisions(hash string, files []*serverFileInfo) error {
-	if s.filePaths == nil {
-		return nil
-	}
+// owned by another active torrent. Caller must hold the map's protecting lock.
+func checkPathCollisions(filePaths map[string]string, hash string, files []*serverFileInfo) error {
 	for _, fi := range files {
 		if !fi.selected {
 			continue
 		}
 		tp := targetPath(fi)
-		if owner, exists := s.filePaths[tp]; exists && owner != hash {
+		if owner, exists := filePaths[tp]; exists && owner != hash {
 			return fmt.Errorf("file path %s already owned by torrent %s", tp, owner)
 		}
 	}
@@ -29,29 +26,47 @@ func (s *Server) checkPathCollisions(hash string, files []*serverFileInfo) error
 }
 
 // registerFilePaths records ownership of all selected file paths for a torrent.
-// Caller must hold s.mu.
-func (s *Server) registerFilePaths(hash string, files []*serverFileInfo) {
-	if s.filePaths == nil {
-		return
-	}
+// Caller must hold the map's protecting lock.
+func registerFilePaths(filePaths map[string]string, hash string, files []*serverFileInfo) {
 	for _, fi := range files {
 		if !fi.selected {
 			continue
 		}
-		s.filePaths[targetPath(fi)] = hash
+		filePaths[targetPath(fi)] = hash
 	}
 }
 
 // unregisterFilePaths removes ownership records for a torrent's file paths.
-// Caller must hold s.mu.
+// Caller must hold the map's protecting lock.
+func unregisterFilePaths(filePaths map[string]string, hash string, files []*serverFileInfo) {
+	for _, fi := range files {
+		tp := targetPath(fi)
+		if owner, exists := filePaths[tp]; exists && owner == hash {
+			delete(filePaths, tp)
+		}
+	}
+}
+
+// Server method delegates — keep existing callers compiling until Task 5 migrates them.
+// Nil guards are retained here because some tests construct Server without initializing filePaths.
+
+func (s *Server) checkPathCollisions(hash string, files []*serverFileInfo) error {
+	if s.filePaths == nil {
+		return nil
+	}
+	return checkPathCollisions(s.filePaths, hash, files)
+}
+
+func (s *Server) registerFilePaths(hash string, files []*serverFileInfo) {
+	if s.filePaths == nil {
+		return
+	}
+	registerFilePaths(s.filePaths, hash, files)
+}
+
 func (s *Server) unregisterFilePaths(hash string, files []*serverFileInfo) {
 	if s.filePaths == nil {
 		return
 	}
-	for _, fi := range files {
-		tp := targetPath(fi)
-		if owner, exists := s.filePaths[tp]; exists && owner == hash {
-			delete(s.filePaths, tp)
-		}
-	}
+	unregisterFilePaths(s.filePaths, hash, files)
 }

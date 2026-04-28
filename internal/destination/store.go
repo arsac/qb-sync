@@ -1,6 +1,7 @@
 package destination
 
 import (
+	"fmt"
 	"log/slog"
 	"sync"
 )
@@ -64,4 +65,42 @@ func (ts *torrentStore) Len() int {
 	n := len(ts.entries)
 	ts.mu.RUnlock()
 	return n
+}
+
+// Reserve inserts a sentinel to prevent concurrent initialization.
+// Returns error if hash is already tracked or initializing.
+func (ts *torrentStore) Reserve(hash string) error {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if state, exists := ts.entries[hash]; exists {
+		if state.initializing {
+			return fmt.Errorf("torrent %s initialization already in progress", hash)
+		}
+		return fmt.Errorf("torrent %s already tracked", hash)
+	}
+	ts.entries[hash] = &serverTorrentState{initializing: true}
+	return nil
+}
+
+// Commit replaces the sentinel with real state. Checks file path collisions
+// and registers paths atomically. On collision, removes the sentinel.
+func (ts *torrentStore) Commit(hash string, state *serverTorrentState) error {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if err := checkPathCollisions(ts.filePaths, hash, state.files); err != nil {
+		delete(ts.entries, hash)
+		return err
+	}
+	ts.entries[hash] = state
+	registerFilePaths(ts.filePaths, hash, state.files)
+	return nil
+}
+
+// Unreserve removes the sentinel on initialization failure.
+func (ts *torrentStore) Unreserve(hash string) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if state, exists := ts.entries[hash]; exists && state.initializing {
+		delete(ts.entries, hash)
+	}
 }
