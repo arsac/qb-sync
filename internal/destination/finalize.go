@@ -45,7 +45,7 @@ func (s *Server) FinalizeTorrent(
 		return &pb.FinalizeTorrentResponse{
 			Success:   false,
 			Error:     "torrent initialization in progress",
-			ErrorCode: pb.FinalizeErrorCode_FINALIZE_ERROR_NONE,
+			ErrorCode: pb.FinalizeErrorCode_FINALIZE_ERROR_NOT_FOUND,
 		}, nil
 	}
 
