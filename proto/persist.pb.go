@@ -144,14 +144,15 @@ func (x *PersistedTorrentMeta) GetSaveSubPath() string {
 }
 
 // PersistedFileInfo is the per-file metadata within a persisted torrent.
-// Inode is deliberately omitted — it is a runtime property of the source
-// filesystem, only meaningful during the initial InitTorrent handshake.
+// source_device and source_inode are persisted for cross-device hardlink detection.
 type PersistedFileInfo struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Path          string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
 	Size          int64                  `protobuf:"varint,2,opt,name=size,proto3" json:"size,omitempty"`
 	Offset        int64                  `protobuf:"varint,3,opt,name=offset,proto3" json:"offset,omitempty"`
 	Selected      bool                   `protobuf:"varint,4,opt,name=selected,proto3" json:"selected,omitempty"`
+	SourceDevice  uint64                 `protobuf:"varint,5,opt,name=source_device,json=sourceDevice,proto3" json:"source_device,omitempty"` // Source filesystem device ID
+	SourceInode   uint64                 `protobuf:"varint,6,opt,name=source_inode,json=sourceInode,proto3" json:"source_inode,omitempty"`    // Source filesystem inode number
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -214,6 +215,20 @@ func (x *PersistedFileInfo) GetSelected() bool {
 	return false
 }
 
+func (x *PersistedFileInfo) GetSourceDevice() uint64 {
+	if x != nil {
+		return x.SourceDevice
+	}
+	return 0
+}
+
+func (x *PersistedFileInfo) GetSourceInode() uint64 {
+	if x != nil {
+		return x.SourceInode
+	}
+	return 0
+}
+
 var File_persist_proto protoreflect.FileDescriptor
 
 const file_persist_proto_rawDesc = "" +
@@ -233,12 +248,14 @@ const file_persist_proto_rawDesc = "" +
 	"\ftorrent_file\x18\b \x01(\fR\vtorrentFile\x12!\n" +
 	"\fpiece_hashes\x18\t \x03(\tR\vpieceHashes\x12\"\n" +
 	"\rsave_sub_path\x18\n" +
-	" \x01(\tR\vsaveSubPath\"o\n" +
+	" \x01(\tR\vsaveSubPath\"\xb7\x01\n" +
 	"\x11PersistedFileInfo\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x12\n" +
 	"\x04size\x18\x02 \x01(\x03R\x04size\x12\x16\n" +
 	"\x06offset\x18\x03 \x01(\x03R\x06offset\x12\x1a\n" +
-	"\bselected\x18\x04 \x01(\bR\bselectedB Z\x1egithub.com/arsac/qb-sync/protob\x06proto3"
+	"\bselected\x18\x04 \x01(\bR\bselected\x12#\n" +
+	"\rsource_device\x18\x05 \x01(\x04R\fsourceDevice\x12!\n" +
+	"\fsource_inode\x18\x06 \x01(\x04R\vsourceInodeB Z\x1egithub.com/arsac/qb-sync/protob\x06proto3"
 
 var (
 	file_persist_proto_rawDescOnce sync.Once

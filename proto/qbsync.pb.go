@@ -467,6 +467,7 @@ type FileInfo struct {
 	Offset        int64                  `protobuf:"varint,3,opt,name=offset,proto3" json:"offset,omitempty"`
 	Inode         uint64                 `protobuf:"varint,4,opt,name=inode,proto3" json:"inode,omitempty"`       // Source filesystem inode for hardlink detection
 	Selected      bool                   `protobuf:"varint,5,opt,name=selected,proto3" json:"selected,omitempty"` // True if file is selected for download (priority > 0)
+	Device        uint64                 `protobuf:"varint,6,opt,name=device,proto3" json:"device,omitempty"`     // Source filesystem device ID for cross-device detection
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -534,6 +535,13 @@ func (x *FileInfo) GetSelected() bool {
 		return x.Selected
 	}
 	return false
+}
+
+func (x *FileInfo) GetDevice() uint64 {
+	if x != nil {
+		return x.Device
+	}
+	return 0
 }
 
 type InitTorrentResponse struct {
@@ -833,6 +841,7 @@ type GetFileByInodeRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Inode from the source filesystem (used as unique file identifier)
 	Inode         uint64 `protobuf:"varint,1,opt,name=inode,proto3" json:"inode,omitempty"`
+	Device        uint64 `protobuf:"varint,2,opt,name=device,proto3" json:"device,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -870,6 +879,13 @@ func (*GetFileByInodeRequest) Descriptor() ([]byte, []int) {
 func (x *GetFileByInodeRequest) GetInode() uint64 {
 	if x != nil {
 		return x.Inode
+	}
+	return 0
+}
+
+func (x *GetFileByInodeRequest) GetDevice() uint64 {
+	if x != nil {
+		return x.Device
 	}
 	return 0
 }
@@ -935,7 +951,8 @@ type RegisterFileRequest struct {
 	// Path where the file was written (relative to base path)
 	Path string `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
 	// File size for verification
-	Size          int64 `protobuf:"varint,3,opt,name=size,proto3" json:"size,omitempty"`
+	Size          int64  `protobuf:"varint,3,opt,name=size,proto3" json:"size,omitempty"`
+	Device        uint64 `protobuf:"varint,4,opt,name=device,proto3" json:"device,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -987,6 +1004,13 @@ func (x *RegisterFileRequest) GetPath() string {
 func (x *RegisterFileRequest) GetSize() int64 {
 	if x != nil {
 		return x.Size
+	}
+	return 0
+}
+
+func (x *RegisterFileRequest) GetDevice() uint64 {
+	if x != nil {
+		return x.Device
 	}
 	return 0
 }
@@ -1525,13 +1549,14 @@ const file_qbsync_proto_rawDesc = "" +
 	"\fpiece_hashes\x18\b \x03(\tR\vpieceHashes\x12\"\n" +
 	"\rsave_sub_path\x18\t \x01(\tR\vsaveSubPath\x12\x16\n" +
 	"\x06resync\x18\n" +
-	" \x01(\bR\x06resync\"|\n" +
+	" \x01(\bR\x06resync\"\x94\x01\n" +
 	"\bFileInfo\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x12\n" +
 	"\x04size\x18\x02 \x01(\x03R\x04size\x12\x16\n" +
 	"\x06offset\x18\x03 \x01(\x03R\x06offset\x12\x14\n" +
 	"\x05inode\x18\x04 \x01(\x04R\x05inode\x12\x1a\n" +
-	"\bselected\x18\x05 \x01(\bR\bselected\"\xbc\x02\n" +
+	"\bselected\x18\x05 \x01(\bR\bselected\x12\x16\n" +
+	"\x06device\x18\x06 \x01(\x04R\x06device\"\xbc\x02\n" +
 	"\x13InitTorrentResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\x121\n" +
@@ -1558,16 +1583,18 @@ const file_qbsync_proto_rawDesc = "" +
 	"targetPath\"H\n" +
 	"\x16CreateHardlinkResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\tR\x05error\"-\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error\"E\n" +
 	"\x15GetFileByInodeRequest\x12\x14\n" +
-	"\x05inode\x18\x01 \x01(\x04R\x05inode\"B\n" +
+	"\x05inode\x18\x01 \x01(\x04R\x05inode\x12\x16\n" +
+	"\x06device\x18\x02 \x01(\x04R\x06device\"B\n" +
 	"\x16GetFileByInodeResponse\x12\x14\n" +
 	"\x05found\x18\x01 \x01(\bR\x05found\x12\x12\n" +
-	"\x04path\x18\x02 \x01(\tR\x04path\"S\n" +
+	"\x04path\x18\x02 \x01(\tR\x04path\"k\n" +
 	"\x13RegisterFileRequest\x12\x14\n" +
 	"\x05inode\x18\x01 \x01(\x04R\x05inode\x12\x12\n" +
 	"\x04path\x18\x02 \x01(\tR\x04path\x12\x12\n" +
-	"\x04size\x18\x03 \x01(\x03R\x04size\"F\n" +
+	"\x04size\x18\x03 \x01(\x03R\x04size\x12\x16\n" +
+	"\x06device\x18\x04 \x01(\x04R\x06device\"F\n" +
 	"\x14RegisterFileResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\"\xe1\x01\n" +

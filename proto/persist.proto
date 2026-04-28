@@ -24,11 +24,12 @@ message PersistedTorrentMeta {
 }
 
 // PersistedFileInfo is the per-file metadata within a persisted torrent.
-// Inode is deliberately omitted — it is a runtime property of the source
-// filesystem, only meaningful during the initial InitTorrent handshake.
+// source_device and source_inode are persisted for cross-device hardlink detection.
 message PersistedFileInfo {
   string path     = 1;
   int64  size     = 2;
   int64  offset   = 3;
   bool   selected = 4;
+  uint64 source_device = 5; // Source filesystem device ID
+  uint64 source_inode  = 6; // Source filesystem inode number
 }

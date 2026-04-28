@@ -100,6 +100,7 @@ message FileInfo {
   int64 offset = 3;
   uint64 inode = 4;  // Source filesystem inode for hardlink detection
   bool selected = 5; // True if file is selected for download (priority > 0)
+  uint64 device = 6; // Source filesystem device ID for cross-device detection
 }
 
 // TorrentSyncStatus indicates the current state of a torrent on destination.
@@ -169,6 +170,7 @@ message CreateHardlinkResponse {
 message GetFileByInodeRequest {
   // Inode from the source filesystem (used as unique file identifier)
   uint64 inode = 1;
+  uint64 device = 2;
 }
 
 message GetFileByInodeResponse {
@@ -185,6 +187,7 @@ message RegisterFileRequest {
   string path = 2;
   // File size for verification
   int64 size = 3;
+  uint64 device = 4;
 }
 
 message RegisterFileResponse {
