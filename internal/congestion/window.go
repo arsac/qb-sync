@@ -70,12 +70,15 @@ type AdaptiveWindow struct {
 	nowFunc func() time.Time
 }
 
-// Config configures the adaptive window.
+// Config configures the adaptive window. Defaults are tuned for high-latency
+// links (WireGuard tunnels at ~550ms RTT). On a lossy WAN with
+// loss rate >0.5%, consider lowering InitialWindow so slow-start ramps
+// instead of saturating immediately.
 type Config struct {
-	MinWindow     int           // Minimum window size (default: 4)
-	MaxWindow     int           // Maximum window size (default: 500)
-	InitialWindow int           // Starting window size (default: 16)
-	PieceTimeout  time.Duration // Timeout for stale in-flight pieces (default: 60s)
+	MinWindow     int           // Minimum window size (default: DefaultMinWindow = 8)
+	MaxWindow     int           // Maximum window size (default: DefaultMaxWindow = 2000)
+	InitialWindow int           // Starting window size (default: DefaultInitialWindow = 512)
+	PieceTimeout  time.Duration // Timeout for stale in-flight pieces (default: DefaultPieceTimeout = 60s)
 }
 
 // DefaultConfig returns sensible defaults.
