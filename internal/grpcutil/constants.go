@@ -9,8 +9,8 @@ const (
 	MaxPieceDataSize = 32 * 1024 * 1024 // 32 MB
 
 	// MaxGRPCMessageSize is the maximum gRPC message size for piece transfers.
-	// Must exceed MaxPieceDataSize by enough to cover WritePieceRequest proto overhead
-	// (torrent_hash, piece_index, offset, size, piece_hash fields add ~200 bytes).
+	// Must exceed MaxPieceDataSize by enough to cover WritePieceRequest proto
+	// overhead (torrent_hash, piece_index, offset, size fields add ~150 bytes).
 	MaxGRPCMessageSize = MaxPieceDataSize + 4*1024 // 32 MB + 4 KB proto overhead
 
 	// InitialStreamWindowSize is the HTTP/2 per-stream flow control window.
