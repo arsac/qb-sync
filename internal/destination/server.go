@@ -146,6 +146,12 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 
+	// Recover in-flight torrents from persisted metadata before accepting
+	// any gRPC requests or starting background goroutines.
+	if recoverErr := s.recoverInFlightTorrents(ctx); recoverErr != nil {
+		s.logger.ErrorContext(ctx, "failed to recover torrents", "error", recoverErr)
+	}
+
 	s.server = grpc.NewServer(
 		grpc.MaxRecvMsgSize(grpcutil.MaxGRPCMessageSize),
 		grpc.MaxSendMsgSize(grpcutil.MaxGRPCMessageSize),
