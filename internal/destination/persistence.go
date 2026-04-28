@@ -76,10 +76,12 @@ func buildPersistedMeta(req *pb.InitTorrentRequest) *pb.PersistedTorrentMeta {
 	files := make([]*pb.PersistedFileInfo, len(req.GetFiles()))
 	for i, f := range req.GetFiles() {
 		files[i] = &pb.PersistedFileInfo{
-			Path:     f.GetPath(),
-			Size:     f.GetSize(),
-			Offset:   f.GetOffset(),
-			Selected: f.GetSelected(),
+			Path:         f.GetPath(),
+			Size:         f.GetSize(),
+			Offset:       f.GetOffset(),
+			Selected:     f.GetSelected(),
+			SourceDevice: f.GetDevice(),
+			SourceInode:  f.GetInode(),
 		}
 	}
 	return &pb.PersistedTorrentMeta{
@@ -104,6 +106,8 @@ func persistedMetaToRequest(meta *pb.PersistedTorrentMeta) *pb.InitTorrentReques
 			Size:     f.GetSize(),
 			Offset:   f.GetOffset(),
 			Selected: f.GetSelected(),
+			Device:   f.GetSourceDevice(),
+			Inode:    f.GetSourceInode(),
 		}
 	}
 	return &pb.InitTorrentRequest{

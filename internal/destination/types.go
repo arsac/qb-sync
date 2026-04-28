@@ -10,8 +10,17 @@ import (
 	pb "github.com/arsac/qb-sync/proto"
 )
 
-// Inode represents a filesystem inode number.
-type Inode uint64
+// FileID uniquely identifies a file across filesystems using the (device, inode) pair.
+// Comparable — usable as a map key without allocation.
+type FileID struct {
+	Dev uint64
+	Ino uint64
+}
+
+// IsZero returns true if the FileID is uninitialized.
+func (f FileID) IsZero() bool {
+	return f.Dev == 0 && f.Ino == 0
+}
 
 // hardlinkState represents the state of hardlink resolution for a file.
 // States are ordered by typical progression: None -> InProgress/Pending -> Complete.
@@ -50,7 +59,7 @@ func (i *inProgressInode) close() {
 // Immutable per-file (set during init, never modified):
 //
 //	offset, size, selected, firstPiece, lastPiece, piecesTotal,
-//	hardlink.sourceInode, hardlink.sourcePath, hardlink.doneCh
+//	hardlink.sourceFileID, hardlink.sourcePath, hardlink.doneCh
 //
 // Mutable per-file (require state.mu):
 //
@@ -191,14 +200,14 @@ type finalizeResult struct {
 // hardlinkInfo tracks the hardlink resolution state for a single file.
 // State machine: None -> InProgress (first writer) or Pending (wait for another) -> Complete.
 //
-// sourceInode, sourcePath, and doneCh are immutable after init.
+// sourceFileID, sourcePath, and doneCh are immutable after init.
 // state is mutable and requires the parent serverTorrentState.mu.
 // Use applyOutcome() during init and markComplete() during finalization.
 type hardlinkInfo struct {
-	state       hardlinkState // Current state in the hardlink state machine
-	sourceInode Inode         // Source inode for registration (immutable after init)
-	sourcePath  string        // Relative path to hardlink from (immutable after init)
-	doneCh      chan struct{} // Wait on this before hardlinking (immutable after init)
+	state        hardlinkState // Current state in the hardlink state machine
+	sourceFileID FileID        // Source file ID for registration (immutable after init)
+	sourcePath   string        // Relative path to hardlink from (immutable after init)
+	doneCh       chan struct{} // Wait on this before hardlinking (immutable after init)
 }
 
 // applyOutcome sets the hardlink state from an init-time resolution outcome.
@@ -223,7 +232,7 @@ func (h *hardlinkInfo) markComplete() {
 // Immutable fields (set during init, safe to read without state.mu):
 //
 //	offset, size, selected, firstPiece, lastPiece, piecesTotal,
-//	hardlink.sourceInode, hardlink.sourcePath, hardlink.doneCh
+//	hardlink.sourceFileID, hardlink.sourcePath, hardlink.doneCh
 //
 // Mutable fields (require state.mu):
 //

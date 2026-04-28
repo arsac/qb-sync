@@ -504,7 +504,7 @@ func (s *Server) setupFile(
 			path:     targetPath,
 			size:     f.GetSize(),
 			offset:   f.GetOffset(),
-			hardlink: hardlinkInfo{sourceInode: Inode(f.GetInode())},
+			hardlink: hardlinkInfo{sourceFileID: FileID{Dev: f.GetDevice(), Ino: f.GetInode()}},
 			selected: false,
 		}, result, nil
 	}
@@ -520,7 +520,7 @@ func (s *Server) setupFile(
 			path:     targetPath,
 			size:     f.GetSize(),
 			offset:   f.GetOffset(),
-			hardlink: hardlinkInfo{sourceInode: Inode(f.GetInode()), state: hlStateComplete},
+			hardlink: hardlinkInfo{sourceFileID: FileID{Dev: f.GetDevice(), Ino: f.GetInode()}, state: hlStateComplete},
 			selected: true,
 		}
 		result.PreExisting = true
@@ -536,23 +536,23 @@ func (s *Server) setupFile(
 			path:     partialPath,
 			size:     f.GetSize(),
 			offset:   f.GetOffset(),
-			hardlink: hardlinkInfo{sourceInode: Inode(f.GetInode())},
+			hardlink: hardlinkInfo{sourceFileID: FileID{Dev: f.GetDevice(), Ino: f.GetInode()}},
 			selected: true,
 		}, result, nil
 	}
 
-	sourceInode := Inode(f.GetInode())
+	sourceFileID := FileID{Dev: f.GetDevice(), Ino: f.GetInode()}
 	fileInfo := &serverFileInfo{
 		path:     partialPath,
 		size:     f.GetSize(),
 		offset:   f.GetOffset(),
-		hardlink: hardlinkInfo{sourceInode: sourceInode},
+		hardlink: hardlinkInfo{sourceFileID: sourceFileID},
 		selected: true,
 	}
 
-	// Check for hardlink opportunities if inode is provided
-	if sourceInode != 0 {
-		outcome := s.resolveHardlink(ctx, hash, f.GetPath(), targetPath, sourceInode, f.GetSize())
+	// Check for hardlink opportunities if file ID is provided
+	if !sourceFileID.IsZero() {
+		outcome := s.resolveHardlink(ctx, hash, f.GetPath(), targetPath, sourceFileID, f.GetSize())
 		s.applyHardlinkOutcome(fileInfo, result, targetPath, outcome)
 	}
 
@@ -563,16 +563,16 @@ func (s *Server) setupFile(
 func (s *Server) resolveHardlink(
 	ctx context.Context,
 	hash, filePath, targetPath string,
-	sourceInode Inode,
+	sourceFileID FileID,
 	expectedSize int64,
 ) hardlinkOutcome {
 	// Case 1: Check if inode is already registered (completed file from previous torrent)
-	if outcome, ok := s.tryHardlinkFromRegistered(ctx, hash, filePath, targetPath, sourceInode, expectedSize); ok {
+	if outcome, ok := s.tryHardlinkFromRegistered(ctx, hash, filePath, targetPath, sourceFileID, expectedSize); ok {
 		return outcome
 	}
 
 	// Case 2: Check if another torrent is currently writing this inode
-	if outcome, ok := s.tryHardlinkFromInProgress(ctx, hash, filePath, sourceInode); ok {
+	if outcome, ok := s.tryHardlinkFromInProgress(ctx, hash, filePath, sourceFileID); ok {
 		return outcome
 	}
 
@@ -580,8 +580,8 @@ func (s *Server) resolveHardlink(
 	// RegisterInProgress returns false if another torrent raced us between
 	// Case 2 (GetInProgress) and now. In that case, retry Case 2 to pick
 	// up the winner's doneCh and become pending instead of duplicating work.
-	if !s.registerInodeInProgress(ctx, hash, filePath, targetPath, sourceInode) {
-		if outcome, ok := s.tryHardlinkFromInProgress(ctx, hash, filePath, sourceInode); ok {
+	if !s.registerInodeInProgress(ctx, hash, filePath, targetPath, sourceFileID) {
+		if outcome, ok := s.tryHardlinkFromInProgress(ctx, hash, filePath, sourceFileID); ok {
 			return outcome
 		}
 		// Winner already completed between our two checks — write from scratch.
@@ -625,10 +625,10 @@ func (s *Server) applyHardlinkOutcome(
 func (s *Server) tryHardlinkFromRegistered(
 	ctx context.Context,
 	hash, filePath, targetPath string,
-	sourceInode Inode,
+	sourceFileID FileID,
 	expectedSize int64,
 ) (hardlinkOutcome, bool) {
-	existingPath, found := s.store.Inodes().GetRegistered(sourceInode)
+	existingPath, found := s.store.Inodes().GetRegistered(sourceFileID)
 	if !found {
 		return hardlinkOutcome{}, false
 	}
@@ -638,11 +638,11 @@ func (s *Server) tryHardlinkFromRegistered(
 	// Guard against stale inode entries from recycled inodes.
 	sourceInfo, statErr := os.Stat(sourcePath)
 	if statErr != nil || sourceInfo.Size() != expectedSize {
-		s.store.Inodes().Evict(sourceInode)
+		s.store.Inodes().Evict(sourceFileID)
 		s.logger.InfoContext(ctx, "evicted stale inode registry entry",
 			"torrent", hash,
 			"file", filePath,
-			"inode", sourceInode,
+			"fileID", sourceFileID,
 			"registeredPath", existingPath,
 			"statErr", statErr,
 		)
@@ -681,9 +681,9 @@ func (s *Server) tryHardlinkFromRegistered(
 func (s *Server) tryHardlinkFromInProgress(
 	ctx context.Context,
 	hash, filePath string,
-	sourceInode Inode,
+	sourceFileID FileID,
 ) (hardlinkOutcome, bool) {
-	targetPath, doneCh, sourceTorrent, found := s.store.Inodes().GetInProgress(sourceInode)
+	targetPath, doneCh, sourceTorrent, found := s.store.Inodes().GetInProgress(sourceFileID)
 	if !found {
 		return hardlinkOutcome{}, false
 	}
@@ -706,7 +706,7 @@ func (s *Server) tryHardlinkFromInProgress(
 func (s *Server) registerInodeInProgress(
 	ctx context.Context,
 	hash, filePath, targetPath string,
-	sourceInode Inode,
+	sourceFileID FileID,
 ) bool {
 	relTargetPath, err := filepath.Rel(s.config.BasePath, targetPath)
 	if err != nil {
@@ -719,5 +719,5 @@ func (s *Server) registerInodeInProgress(
 		relTargetPath = filePath
 	}
 
-	return s.store.Inodes().RegisterInProgress(sourceInode, hash, relTargetPath)
+	return s.store.Inodes().RegisterInProgress(sourceFileID, hash, relTargetPath)
 }

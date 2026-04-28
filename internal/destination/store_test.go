@@ -313,7 +313,7 @@ func TestTorrentStore_InodeDelegation(t *testing.T) {
 		t.Fatal("expected non-nil InodeRegistry")
 	}
 
-	inode := Inode(12345)
+	inode := FileID{Ino: 12345}
 	basePath := ts.basePath
 	ts.Inodes().RegisterInProgress(inode, "h1", "movies/file.mkv")
 
@@ -323,8 +323,8 @@ func TestTorrentStore_InodeDelegation(t *testing.T) {
 			size:     1024,
 			selected: true,
 			hardlink: hardlinkInfo{
-				sourceInode: inode,
-				state:       hlStateInProgress,
+				sourceFileID: inode,
+				state:        hlStateInProgress,
 			},
 		},
 	}
@@ -415,7 +415,7 @@ func TestTorrentStore_CommitCollisionAbortsInProgressInodes(t *testing.T) {
 	t.Parallel()
 	ts := newTestStore(t)
 
-	inode := Inode(55555)
+	inode := FileID{Ino: 55555}
 
 	// Torrent1 owns the path.
 	_ = ts.Reserve("torrent1")
@@ -444,7 +444,7 @@ func TestTorrentStore_CommitCollisionAbortsInProgressInodes(t *testing.T) {
 				{
 					path:     "shared/file.dat",
 					selected: true,
-					hardlink: hardlinkInfo{sourceInode: inode, state: hlStateInProgress},
+					hardlink: hardlinkInfo{sourceFileID: inode, state: hlStateInProgress},
 				},
 			},
 		},

@@ -111,7 +111,7 @@ func (ts *torrentStore) Commit(hash string, state *serverTorrentState) error {
 		// Clean up in-progress inode registrations made during setupFiles
 		// so pending waiters aren't stuck on a doneCh for a dead torrent.
 		for _, fi := range state.files {
-			ts.inodes.AbortInProgress(context.Background(), fi.hardlink.sourceInode, hash)
+			ts.inodes.AbortInProgress(context.Background(), fi.hardlink.sourceFileID, hash)
 		}
 		return err
 	}
@@ -142,7 +142,7 @@ func (ts *torrentStore) Remove(hash string) *serverTorrentState {
 	ts.mu.Unlock()
 	if exists {
 		for _, fi := range state.files {
-			ts.inodes.AbortInProgress(context.Background(), fi.hardlink.sourceInode, hash)
+			ts.inodes.AbortInProgress(context.Background(), fi.hardlink.sourceFileID, hash)
 		}
 	}
 	return state
@@ -160,7 +160,7 @@ func (ts *torrentStore) Drain() map[string]*serverTorrentState {
 	// Abort in-progress inodes for all drained entries.
 	for hash, state := range old {
 		for _, fi := range state.files {
-			ts.inodes.AbortInProgress(context.Background(), fi.hardlink.sourceInode, hash)
+			ts.inodes.AbortInProgress(context.Background(), fi.hardlink.sourceFileID, hash)
 		}
 	}
 
@@ -187,7 +187,7 @@ func (ts *torrentStore) BeginAbort(hash string, ch chan struct{}) (*serverTorren
 	// Abort in-progress inodes outside the lock (matching Remove behavior).
 	if exists {
 		for _, fi := range state.files {
-			ts.inodes.AbortInProgress(context.Background(), fi.hardlink.sourceInode, hash)
+			ts.inodes.AbortInProgress(context.Background(), fi.hardlink.sourceFileID, hash)
 		}
 	}
 
@@ -234,7 +234,7 @@ func (ts *torrentStore) Inodes() *InodeRegistry {
 func (ts *torrentStore) RegisterInodes(ctx context.Context, hash string, files []*serverFileInfo) {
 	var registered int
 	for _, fi := range files {
-		if fi.skipForWriteData() || fi.hardlink.sourceInode == 0 {
+		if fi.skipForWriteData() || fi.hardlink.sourceFileID.IsZero() {
 			continue
 		}
 
@@ -246,8 +246,8 @@ func (ts *torrentStore) RegisterInodes(ctx context.Context, hash string, files [
 			continue
 		}
 
-		ts.inodes.Register(fi.hardlink.sourceInode, relPath)
-		ts.inodes.CompleteInProgress(fi.hardlink.sourceInode, hash)
+		ts.inodes.Register(fi.hardlink.sourceFileID, relPath)
+		ts.inodes.CompleteInProgress(fi.hardlink.sourceFileID, hash)
 		registered++
 	}
 

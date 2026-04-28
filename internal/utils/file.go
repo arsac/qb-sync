@@ -88,19 +88,21 @@ func AreHardlinked(path1, path2 string) (bool, error) {
 	return os.SameFile(info1, info2), nil
 }
 
-// GetInode returns the inode number for a file.
-func GetInode(path string) (uint64, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return 0, err
+// GetFileID returns the device and inode numbers for a file.
+func GetFileID(path string) (uint64, uint64, error) {
+	info, statErr := os.Stat(path)
+	if statErr != nil {
+		return 0, 0, statErr
 	}
 
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
-		return 0, errInodesUnsupported
+		return 0, 0, errInodesUnsupported
 	}
 
-	return stat.Ino, nil
+	//nolint:gosec // int32->uint64 sign-extends on Darwin; consistent within a single machine.
+	dev := uint64(stat.Dev)
+	return dev, stat.Ino, nil
 }
 
 // AtomicWriteFile writes data to a file atomically using write-to-temp + fsync + rename.

@@ -107,7 +107,7 @@ func TestLoadPersistedMeta_MissingFile(t *testing.T) {
 	}
 }
 
-func TestBuildPersistedMeta_OmitsInode(t *testing.T) {
+func TestBuildPersistedMeta_IncludesSourceInode(t *testing.T) {
 	t.Parallel()
 
 	req := &pb.InitTorrentRequest{
@@ -117,8 +117,8 @@ func TestBuildPersistedMeta_OmitsInode(t *testing.T) {
 		TotalSize:   262144,
 		NumPieces:   2,
 		Files: []*pb.FileInfo{
-			{Path: "a.txt", Size: 131072, Offset: 0, Selected: true, Inode: 999},
-			{Path: "b.txt", Size: 131072, Offset: 131072, Selected: false, Inode: 888},
+			{Path: "a.txt", Size: 131072, Offset: 0, Selected: true, Inode: 999, Device: 42},
+			{Path: "b.txt", Size: 131072, Offset: 131072, Selected: false, Inode: 888, Device: 42},
 		},
 		TorrentFile: []byte("torrent-bytes"),
 		PieceHashes: []string{"h0", "h1"},
@@ -138,8 +138,7 @@ func TestBuildPersistedMeta_OmitsInode(t *testing.T) {
 		t.Fatalf("Files count: got %d, want 2", len(meta.GetFiles()))
 	}
 
-	// PersistedFileInfo has no Inode field — verify the proto message
-	// only contains Path, Size, Offset, Selected.
+	// PersistedFileInfo should include SourceDevice and SourceInode.
 	for i, f := range meta.GetFiles() {
 		orig := req.GetFiles()[i]
 		if f.GetPath() != orig.GetPath() {
@@ -154,6 +153,14 @@ func TestBuildPersistedMeta_OmitsInode(t *testing.T) {
 		if f.GetSelected() != orig.GetSelected() {
 			t.Errorf("Files[%d].Selected: got %v, want %v",
 				i, f.GetSelected(), orig.GetSelected())
+		}
+		if f.GetSourceDevice() != orig.GetDevice() {
+			t.Errorf("Files[%d].SourceDevice: got %d, want %d",
+				i, f.GetSourceDevice(), orig.GetDevice())
+		}
+		if f.GetSourceInode() != orig.GetInode() {
+			t.Errorf("Files[%d].SourceInode: got %d, want %d",
+				i, f.GetSourceInode(), orig.GetInode())
 		}
 	}
 }

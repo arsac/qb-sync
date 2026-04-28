@@ -344,8 +344,9 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 		}
 
 		filePath := filepath.Join(contentDir, f.Name)
-		if inode, inodeErr := utils.GetInode(filePath); inodeErr == nil {
-			files[i].Inode = inode
+		if dev, ino, fileIDErr := utils.GetFileID(filePath); fileIDErr == nil {
+			files[i].Inode = ino
+			files[i].Device = dev
 		}
 
 		offset += f.Size

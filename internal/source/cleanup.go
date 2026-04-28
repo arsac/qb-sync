@@ -264,7 +264,7 @@ func (t *QBTask) groupHardlinkedTorrents(ctx context.Context, torrents []qbittor
 		contentDir := t.source.ResolveContentDir(torrent.SavePath)
 		for _, f := range *filesPtr {
 			path := filepath.Join(contentDir, f.Name)
-			inode, statErr := utils.GetInode(path)
+			_, inode, statErr := utils.GetFileID(path)
 			if statErr != nil || inode == 0 {
 				continue
 			}

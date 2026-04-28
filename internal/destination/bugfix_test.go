@@ -31,7 +31,7 @@ func TestTryHardlinkFromRegistered_SizeMismatchEvicts(t *testing.T) {
 	}
 
 	relSource, _ := filepath.Rel(tmpDir, sourceFile)
-	inode := Inode(9999)
+	inode := FileID{Ino: 9999}
 	s.store.Inodes().Register(inode, relSource)
 
 	targetPath := filepath.Join(tmpDir, "target", "new.mkv")
@@ -49,12 +49,12 @@ func TestTryHardlinkFromRegistered_SizeMismatchEvicts(t *testing.T) {
 		_ = os.WriteFile(srcFile2, make([]byte, 200), 0o644)
 
 		relSrc2, _ := filepath.Rel(tmpDir2, srcFile2)
-		s2.store.Inodes().Register(Inode(1234), relSrc2)
+		s2.store.Inodes().Register(FileID{Ino: 1234}, relSrc2)
 
 		tgt2 := filepath.Join(tmpDir2, "tgt", "file.bin")
 		_ = os.MkdirAll(filepath.Dir(tgt2), 0o755)
 
-		outcome, ok := s2.tryHardlinkFromRegistered(ctx, "h1", "file.bin", tgt2, Inode(1234), 200)
+		outcome, ok := s2.tryHardlinkFromRegistered(ctx, "h1", "file.bin", tgt2, FileID{Ino: 1234}, 200)
 		if !ok {
 			t.Fatal("expected ok=true for matching size")
 		}
@@ -81,7 +81,7 @@ func TestTryHardlinkFromRegistered_SizeMismatchEvicts(t *testing.T) {
 	})
 
 	t.Run("missing source file evicts and returns not-found", func(t *testing.T) {
-		missingInode := Inode(8888)
+		missingInode := FileID{Ino: 8888}
 		s.store.Inodes().Register(missingInode, "nonexistent/file.mkv")
 
 		outcome, ok := s.tryHardlinkFromRegistered(ctx, "hash2", "f.mkv", targetPath, missingInode, 100)
@@ -99,15 +99,15 @@ func TestInodeRegistry_Evict(t *testing.T) {
 	logger := testLogger(t)
 	r := NewInodeRegistry(t.TempDir(), logger)
 
-	r.Register(Inode(1), "path/a")
-	r.Register(Inode(2), "path/b")
+	r.Register(FileID{Ino: 1}, "path/a")
+	r.Register(FileID{Ino: 2}, "path/b")
 
-	r.Evict(Inode(1))
+	r.Evict(FileID{Ino: 1})
 
-	if _, found := r.GetRegistered(Inode(1)); found {
+	if _, found := r.GetRegistered(FileID{Ino: 1}); found {
 		t.Fatal("inode 1 should be evicted")
 	}
-	if _, found := r.GetRegistered(Inode(2)); !found {
+	if _, found := r.GetRegistered(FileID{Ino: 2}); !found {
 		t.Fatal("inode 2 should still exist")
 	}
 	if r.Len() != 1 {
@@ -122,7 +122,7 @@ func TestResolveHardlink_RaceReturnsPending(t *testing.T) {
 	s, tmpDir := newTestDestServer(t)
 	ctx := context.Background()
 
-	inode := Inode(5555)
+	inode := FileID{Ino: 5555}
 	targetA := filepath.Join(tmpDir, "torrentA", "file.mkv")
 	targetB := filepath.Join(tmpDir, "torrentB", "file.mkv")
 	_ = os.MkdirAll(filepath.Dir(targetA), 0o755)
@@ -149,7 +149,7 @@ func TestRegisterInodeInProgress_ReturnsFalseOnRace(t *testing.T) {
 	s, tmpDir := newTestDestServer(t)
 	ctx := context.Background()
 
-	inode := Inode(7777)
+	inode := FileID{Ino: 7777}
 	target := filepath.Join(tmpDir, "t", "f.mkv")
 
 	first := s.registerInodeInProgress(ctx, "h1", "f.mkv", target, inode)
@@ -174,7 +174,7 @@ func TestRecoverVerificationFailure_ClearsInProgressPieces(t *testing.T) {
 	s, tmpDir := newTestDestServer(t)
 	ctx := context.Background()
 
-	inode := Inode(3333)
+	inode := FileID{Ino: 3333}
 	s.store.Inodes().RegisterInProgress(inode, "hashX", "sub/file.mkv")
 
 	filePath := filepath.Join(tmpDir, "sub", "file.mkv")
@@ -192,8 +192,8 @@ func TestRecoverVerificationFailure_ClearsInProgressPieces(t *testing.T) {
 					size:     200,
 					selected: true,
 					hardlink: hardlinkInfo{
-						sourceInode: inode,
-						state:       hlStateInProgress,
+						sourceFileID: inode,
+						state:        hlStateInProgress,
 					},
 					firstPiece:  0,
 					lastPiece:   1,
@@ -223,7 +223,7 @@ func TestAbortInProgress_ClosesDoneCh(t *testing.T) {
 	r := NewInodeRegistry(t.TempDir(), logger)
 	ctx := context.Background()
 
-	inode := Inode(4444)
+	inode := FileID{Ino: 4444}
 	r.RegisterInProgress(inode, "torrentA", "sub/file.mkv")
 
 	// Get the doneCh before abort.
@@ -348,8 +348,8 @@ func TestRecoverAffectedFile_BreaksHardlink(t *testing.T) {
 		size:     200,
 		selected: true,
 		hardlink: hardlinkInfo{
-			state:       hlStateComplete,
-			sourceInode: 12345,
+			state:        hlStateComplete,
+			sourceFileID: FileID{Ino: 12345},
 		},
 		firstPiece:    0,
 		lastPiece:     1,
@@ -478,7 +478,7 @@ func TestResolveHardlink_ConcurrentRace(t *testing.T) {
 	s, tmpDir := newTestDestServer(t)
 	ctx := context.Background()
 
-	inode := Inode(6666)
+	inode := FileID{Ino: 6666}
 	const numGoroutines = 10
 
 	var wg sync.WaitGroup

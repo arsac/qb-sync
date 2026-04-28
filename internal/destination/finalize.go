@@ -767,7 +767,7 @@ func (s *Server) recoverVerificationFailure(
 // instead of timing out.
 func (s *Server) abortInProgressInodes(ctx context.Context, hash string, state *serverTorrentState) {
 	for _, fi := range state.files {
-		s.store.Inodes().AbortInProgress(ctx, fi.hardlink.sourceInode, hash)
+		s.store.Inodes().AbortInProgress(ctx, fi.hardlink.sourceFileID, hash)
 	}
 }
 

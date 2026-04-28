@@ -1041,9 +1041,9 @@ func TestE2E_HardlinkDetection(t *testing.T) {
 	assert.True(t, linked, "files should be detected as hardlinked")
 
 	// Verify inodes match
-	inode1, err := utils.GetInode(originalPath)
+	_, inode1, err := utils.GetFileID(originalPath)
 	require.NoError(t, err)
-	inode2, err := utils.GetInode(hardlinkPath)
+	_, inode2, err := utils.GetFileID(hardlinkPath)
 	require.NoError(t, err)
 	assert.Equal(t, inode1, inode2, "inodes should match for hardlinked files")
 
@@ -1151,9 +1151,9 @@ func TestE2E_HardlinkGroupDeletion(t *testing.T) {
 	t.Logf("Wired CD file: %s", wiredCDFilePath)
 
 	// Verify the original files exist and have different inodes
-	bbbInode, err := utils.GetInode(bbbFilePath)
+	_, bbbInode, err := utils.GetFileID(bbbFilePath)
 	require.NoError(t, err, "BBB file should exist")
-	wiredCDInode, err := utils.GetInode(wiredCDFilePath)
+	_, wiredCDInode, err := utils.GetFileID(wiredCDFilePath)
 	require.NoError(t, err, "Wired CD file should exist")
 	t.Logf("Original inodes - BBB: %d, Wired CD: %d", bbbInode, wiredCDInode)
 	require.NotEqual(t, bbbInode, wiredCDInode, "files should have different inodes initially")
@@ -1243,7 +1243,7 @@ func TestE2E_DestinationHardlinkDeduplication(t *testing.T) {
 
 	for _, f := range *sourceFiles {
 		filePath := filepath.Join(env.SourcePath(), f.Name)
-		inode, inodeErr := utils.GetInode(filePath)
+		_, inode, inodeErr := utils.GetFileID(filePath)
 		require.NoError(t, inodeErr, "should be able to get inode for %s", filePath)
 		sourceFileInodes = append(sourceFileInodes, fileWithInode{
 			path:  f.Name,
@@ -1356,9 +1356,9 @@ func TestE2E_DestinationHardlinkDeduplication(t *testing.T) {
 		require.NoError(t, statErr, "hardlinked file should exist: %s", hardlinkPath)
 
 		// Verify they share the same destination inode (are actually hardlinked on destination)
-		originalInode, err := utils.GetInode(originalPath)
+		_, originalInode, err := utils.GetFileID(originalPath)
 		require.NoError(t, err)
-		hardlinkInode, err := utils.GetInode(hardlinkPath)
+		_, hardlinkInode, err := utils.GetFileID(hardlinkPath)
 		require.NoError(t, err)
 
 		assert.Equal(t, originalInode, hardlinkInode,

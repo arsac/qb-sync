@@ -79,7 +79,7 @@ func (s *Server) GetFileByInode(
 	_ context.Context,
 	req *pb.GetFileByInodeRequest,
 ) (*pb.GetFileByInodeResponse, error) {
-	path, found := s.store.Inodes().GetRegistered(Inode(req.GetInode()))
+	path, found := s.store.Inodes().GetRegistered(FileID{Dev: req.GetDevice(), Ino: req.GetInode()})
 	return &pb.GetFileByInodeResponse{
 		Found: found,
 		Path:  path,
@@ -91,7 +91,7 @@ func (s *Server) RegisterFile(
 	ctx context.Context,
 	req *pb.RegisterFileRequest,
 ) (*pb.RegisterFileResponse, error) {
-	inode := Inode(req.GetInode())
+	fileID := FileID{Dev: req.GetDevice(), Ino: req.GetInode()}
 	path := req.GetPath()
 
 	// Verify the file exists and has expected size
@@ -111,7 +111,7 @@ func (s *Server) RegisterFile(
 		}, nil
 	}
 
-	s.store.Inodes().Register(inode, path)
+	s.store.Inodes().Register(fileID, path)
 
 	// Persist inode map after registration
 	if saveErr := s.store.Inodes().Save(); saveErr != nil {
@@ -119,7 +119,7 @@ func (s *Server) RegisterFile(
 	}
 
 	s.logger.DebugContext(ctx, "registered file for hardlink tracking",
-		"inode", inode,
+		"fileID", fileID,
 		"path", path,
 	)
 
