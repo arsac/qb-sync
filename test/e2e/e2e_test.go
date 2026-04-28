@@ -926,6 +926,94 @@ func TestE2E_OrchestratorRestart(t *testing.T) {
 	env.CleanupBothSides(ctx, wiredCDHash)
 }
 
+// TestE2E_DestinationRecoveryResumesProgress tests that the destination server recovers
+// in-memory state from persisted .state files after a restart. A new orchestrator connecting
+// after restart should resume from where it left off, not re-stream everything.
+//
+// Flow:
+//  1. Download torrent on source, wait for completion
+//  2. Start orchestrator, wait for at least 50% streaming progress
+//  3. Stop orchestrator (cancel, wait, close dest connection)
+//  4. Stop destination gRPC server
+//  5. Restart destination gRPC server (triggers recoverInFlightTorrents)
+//  6. Start a NEW orchestrator with a new dest connection
+//  7. Wait for sync to complete
+//  8. Assert torrent is complete on destination
+func TestE2E_DestinationRecoveryResumesProgress(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+
+	t.Parallel()
+
+	env := SetupTestEnv(t)
+	ctx := context.Background()
+
+	env.CleanupBothSides(ctx, wiredCDHash)
+
+	t.Log("Adding Wired CD torrent to source...")
+	env.DownloadTorrentOnSource(ctx, testTorrentURL, wiredCDHash, torrentDownloadTimeout)
+
+	cfg := env.CreateSourceConfig()
+	task, dest, err := env.CreateSourceTask(cfg)
+	require.NoError(t, err)
+
+	orchestratorCtx, cancelOrchestrator := context.WithTimeout(ctx, orchestratorTimeout)
+
+	orchestratorDone := make(chan error, 1)
+	go func() {
+		orchestratorDone <- task.Run(orchestratorCtx)
+	}()
+
+	t.Log("Waiting for streaming to reach 50%...")
+	require.Eventually(t, func() bool {
+		progress, progressErr := task.Progress(ctx, wiredCDHash)
+		if progressErr != nil {
+			return false
+		}
+		t.Logf("Streaming progress: %d/%d pieces", progress.Streamed, progress.TotalPieces)
+		return progress.Streamed > 0 && progress.Streamed >= progress.TotalPieces/2
+	}, 2*time.Minute, time.Second, "streaming should reach 50%")
+
+	t.Log("Stopping first orchestrator...")
+	cancelOrchestrator()
+	<-orchestratorDone
+	dest.Close()
+
+	t.Log("Stopping destination gRPC server...")
+	env.StopDestinationServer()
+	time.Sleep(2 * time.Second)
+
+	t.Log("Restarting destination gRPC server (triggers recoverInFlightTorrents)...")
+	env.StartDestinationServer()
+
+	t.Log("Starting new orchestrator after destination recovery...")
+	task2, dest2, err := env.CreateSourceTask(cfg)
+	require.NoError(t, err)
+	defer dest2.Close()
+
+	orchestratorCtx2, cancelOrchestrator2 := context.WithTimeout(ctx, syncCompleteTimeout)
+	defer cancelOrchestrator2()
+
+	orchestratorDone2 := make(chan error, 1)
+	go func() {
+		orchestratorDone2 <- task2.Run(orchestratorCtx2)
+	}()
+
+	t.Log("Waiting for sync to complete after destination recovery...")
+	env.WaitForTorrentCompleteOnDestination(ctx, wiredCDHash, syncCompleteTimeout,
+		"torrent should complete on destination after recovery")
+
+	cancelOrchestrator2()
+	<-orchestratorDone2
+
+	env.AssertTorrentCompleteOnDestination(ctx, wiredCDHash)
+
+	t.Log("Destination recovery resumes progress test completed successfully!")
+
+	env.CleanupBothSides(ctx, wiredCDHash)
+}
+
 // TestE2E_HardlinkDetection verifies that hardlink detection works in the Docker test environment.
 // This is a prerequisite for the hardlink grouping logic used during space management.
 func TestE2E_HardlinkDetection(t *testing.T) {
