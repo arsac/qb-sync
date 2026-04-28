@@ -66,22 +66,17 @@ func (s *Server) InitTorrent(
 		return resp, nil
 	}
 
-	s.mu.Lock()
-
 	// Check for existing state (resume case).
-	if state, exists := s.torrents[hash]; exists {
+	if state, exists := s.store.Get(hash); exists {
 		if state.initializing {
-			s.mu.Unlock()
 			return initErrorResponse("torrent initialization already in progress"), nil
 		}
-		s.mu.Unlock()
 		return s.resumeTorrent(ctx, hash, state, req), nil
 	}
 
 	// Don't create state for minimal requests (e.g., CheckTorrentStatus sends only hash).
 	// Return -1 to indicate torrent not initialized yet - caller should do full InitTorrent.
 	if len(req.GetFiles()) == 0 {
-		s.mu.Unlock()
 		return &pb.InitTorrentResponse{
 			Success:           true,
 			Status:            pb.TorrentSyncStatus_SYNC_STATUS_READY,
@@ -89,22 +84,25 @@ func (s *Server) InitTorrent(
 		}, nil
 	}
 
-	// Insert sentinel to reserve the hash while we do disk I/O without holding s.mu.
+	// Reserve the hash while we do disk I/O.
 	// This prevents concurrent InitTorrent calls for the same hash from racing.
-	s.torrents[hash] = &serverTorrentState{initializing: true}
-	s.mu.Unlock()
+	if reserveErr := s.store.Reserve(hash); reserveErr != nil {
+		// Another goroutine beat us -- retry the check.
+		if state, exists := s.store.Get(hash); exists {
+			if state.initializing {
+				return initErrorResponse("torrent initialization already in progress"), nil
+			}
+			return s.resumeTorrent(ctx, hash, state, req), nil
+		}
+		return initErrorResponse("reserve failed: %v", reserveErr), nil
+	}
 
-	// Initialize new torrent (disk I/O happens here without s.mu held)
+	// Initialize new torrent (disk I/O happens here without store lock held)
 	resp := s.initNewTorrent(ctx, hash, req)
 
 	// On error, clean up the sentinel
 	if !resp.GetSuccess() {
-		s.mu.Lock()
-		// Only delete if still our sentinel (should always be true)
-		if state, exists := s.torrents[hash]; exists && state.initializing {
-			delete(s.torrents, hash)
-		}
-		s.mu.Unlock()
+		s.store.Unreserve(hash)
 	}
 
 	return resp, nil
@@ -232,25 +230,18 @@ func (s *Server) initNewTorrent(
 		return initErrorResponse("failed to save selection state: %v", saveErr)
 	}
 
-	// Swap sentinel for real state under s.mu
+	// Swap sentinel for real state under store lock.
 	state := &serverTorrentState{
 		torrentMeta:     meta,
-		info:            req,
 		written:         written,
 		torrentPath:     torrentPath,
 		statePath:       statePath,
 		saveSubPath:     saveSubPath,
 		hardlinkResults: hardlinkResults,
 	}
-	s.mu.Lock()
-	if collisionErr := s.checkPathCollisions(hash, files); collisionErr != nil {
-		delete(s.torrents, hash) // remove sentinel
-		s.mu.Unlock()
+	if collisionErr := s.store.Commit(hash, state); collisionErr != nil {
 		return initErrorResponse("path collision: %v", collisionErr)
 	}
-	s.torrents[hash] = state
-	s.registerFilePaths(hash, files)
-	s.mu.Unlock()
 
 	// Log summary
 	hardlinkedCount, pendingCount, preExistingCount := countHardlinkResults(hardlinkResults)
@@ -344,12 +335,7 @@ func (s *Server) cleanupForResync(ctx context.Context, hash string) error {
 	}
 
 	// 2. Delete in-memory state and file path ownership.
-	s.mu.Lock()
-	if state, exists := s.torrents[hash]; exists {
-		s.unregisterFilePaths(hash, state.files)
-	}
-	delete(s.torrents, hash)
-	s.mu.Unlock()
+	s.store.Remove(hash)
 
 	// 3. Delete persisted .state and .finalized marker so buildWrittenBitmap
 	// starts fresh and isFinalized returns false.
@@ -436,9 +422,7 @@ func (s *Server) checkTorrentInQB(ctx context.Context, hash string) qbCheckResul
 // waitForAbortComplete waits for any in-progress abort to complete.
 // This prevents a race where InitTorrent creates files that AbortTorrent then deletes.
 func (s *Server) waitForAbortComplete(ctx context.Context, hash string) error {
-	s.mu.RLock()
-	abortCh, aborting := s.abortingHashes[hash]
-	s.mu.RUnlock()
+	abortCh, aborting := s.store.AbortCh(hash)
 
 	if !aborting {
 		return nil
@@ -675,7 +659,7 @@ func (s *Server) tryHardlinkFromRegistered(
 	sourceInode Inode,
 	expectedSize int64,
 ) (hardlinkOutcome, bool) {
-	existingPath, found := s.inodes.GetRegistered(sourceInode)
+	existingPath, found := s.store.Inodes().GetRegistered(sourceInode)
 	if !found {
 		return hardlinkOutcome{}, false
 	}
@@ -685,7 +669,7 @@ func (s *Server) tryHardlinkFromRegistered(
 	// Guard against stale inode entries from recycled inodes.
 	sourceInfo, statErr := os.Stat(sourcePath)
 	if statErr != nil || sourceInfo.Size() != expectedSize {
-		s.inodes.Evict(sourceInode)
+		s.store.Inodes().Evict(sourceInode)
 		s.logger.InfoContext(ctx, "evicted stale inode registry entry",
 			"torrent", hash,
 			"file", filePath,
@@ -730,7 +714,7 @@ func (s *Server) tryHardlinkFromInProgress(
 	hash, filePath string,
 	sourceInode Inode,
 ) (hardlinkOutcome, bool) {
-	targetPath, doneCh, sourceTorrent, found := s.inodes.GetInProgress(sourceInode)
+	targetPath, doneCh, sourceTorrent, found := s.store.Inodes().GetInProgress(sourceInode)
 	if !found {
 		return hardlinkOutcome{}, false
 	}
@@ -766,5 +750,5 @@ func (s *Server) registerInodeInProgress(
 		relTargetPath = filePath
 	}
 
-	return s.inodes.RegisterInProgress(sourceInode, hash, relTargetPath)
+	return s.store.Inodes().RegisterInProgress(sourceInode, hash, relTargetPath)
 }

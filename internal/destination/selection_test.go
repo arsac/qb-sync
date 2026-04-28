@@ -329,7 +329,7 @@ func TestSetupFile_UnselectedFile(t *testing.T) {
 		s := &Server{
 			config: ServerConfig{BasePath: tmpDir},
 			logger: logger,
-			inodes: NewInodeRegistry(tmpDir, logger),
+			store:  newTorrentStore(tmpDir, logger),
 		}
 
 		fileInfo, result, err := s.setupFile(ctx, "hash1", &pb.FileInfo{
@@ -367,7 +367,7 @@ func TestSetupFile_UnselectedFile(t *testing.T) {
 func TestFinalizeTorrent_PartialSelection(t *testing.T) {
 	t.Parallel()
 	s, tmpDir := newTestDestServer(t)
-	s.inodes = NewInodeRegistry(tmpDir, testLogger(t))
+	// InodeRegistry already initialized by newTorrentStore
 
 	hash := "partial-select-finalize"
 
@@ -400,9 +400,9 @@ func TestFinalizeTorrent_PartialSelection(t *testing.T) {
 	}
 
 	// Register state
-	s.mu.Lock()
-	s.torrents[hash] = state
-	s.mu.Unlock()
+	s.store.mu.Lock()
+	s.store.entries[hash] = state
+	s.store.mu.Unlock()
 
 	ctx := context.Background()
 
@@ -524,7 +524,7 @@ func TestClearStalePieces(t *testing.T) {
 func TestInitTorrent_StaleMetadata_NukedBeforeInit(t *testing.T) {
 	t.Parallel()
 	s, tmpDir := newTestDestServer(t)
-	s.inodes = NewInodeRegistry(tmpDir, testLogger(t))
+	// InodeRegistry already initialized by newTorrentStore
 
 	hash := "stale-init-test"
 
@@ -579,8 +579,7 @@ func TestInitTorrent_StaleMetadata_NukedBeforeInit(t *testing.T) {
 
 func TestInitTorrent_PartialSelection_PiecesCovered(t *testing.T) {
 	t.Parallel()
-	s, tmpDir := newTestDestServer(t)
-	s.inodes = NewInodeRegistry(tmpDir, testLogger(t))
+	s, _ := newTestDestServer(t)
 
 	// 3 files, 3 pieces. File 1 is unselected -> piece 1 should be "covered" (not needed)
 	resp, err := s.InitTorrent(context.Background(), &pb.InitTorrentRequest{

@@ -484,9 +484,9 @@ func TestWritePiece_EarlyFinalizesCompletedFile(t *testing.T) {
 		statePath: filepath.Join(tmpDir, ".state"),
 	}
 
-	s.mu.Lock()
-	s.torrents[hash] = state
-	s.mu.Unlock()
+	s.store.mu.Lock()
+	s.store.entries[hash] = state
+	s.store.mu.Unlock()
 
 	ctx := context.Background()
 	result := s.writePiece(ctx, &pb.WritePieceRequest{

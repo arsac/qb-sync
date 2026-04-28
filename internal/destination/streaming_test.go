@@ -66,12 +66,10 @@ func newTestServer(t *testing.T, budgetBytes int64) *Server {
 			ListenAddr:    ":50051",
 			StreamWorkers: 2,
 		},
-		logger:         logger,
-		torrents:       make(map[string]*serverTorrentState),
-		abortingHashes: make(map[string]chan struct{}),
-		inodes:         NewInodeRegistry(tmpDir, logger),
-		memBudget:      semaphore.NewWeighted(budgetBytes),
-		finalizeSem:    semaphore.NewWeighted(1),
+		logger:      logger,
+		store:       newTorrentStore(tmpDir, logger),
+		memBudget:   semaphore.NewWeighted(budgetBytes),
+		finalizeSem: semaphore.NewWeighted(1),
 	}
 }
 
@@ -301,7 +299,9 @@ func TestStreamWorker_ReleasesBudget(t *testing.T) {
 		},
 		written: bitset.New(10),
 	}
-	s.torrents[hash] = state
+	s.store.mu.Lock()
+	s.store.entries[hash] = state
+	s.store.mu.Unlock()
 
 	ctx := context.Background()
 	workCh := make(chan *pb.WritePieceRequest, 5)
@@ -447,12 +447,14 @@ func TestStreamPiecesBidi_MultipleConcurrentStreams(t *testing.T) {
 
 	// Register a torrent so WritePiece won't fail with "not initialized"
 	hash := "concurrent"
-	s.torrents[hash] = &serverTorrentState{
+	s.store.mu.Lock()
+	s.store.entries[hash] = &serverTorrentState{
 		torrentMeta: torrentMeta{
 			files: []*serverFileInfo{},
 		},
 		written: bitset.New(10),
 	}
+	s.store.mu.Unlock()
 
 	var stream1Done, stream2Done atomic.Bool
 

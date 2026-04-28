@@ -37,7 +37,7 @@ func tryRemoveWithLog(
 // AbortTorrent aborts an in-progress torrent transfer and optionally cleans up partial files.
 // This is called when a torrent is removed from source before streaming completes.
 //
-//nolint:funlen // Complex cleanup with proper lock ordering is clearer as single function
+
 func (s *Server) AbortTorrent(
 	ctx context.Context,
 	req *pb.AbortTorrentRequest,
@@ -53,20 +53,13 @@ func (s *Server) AbortTorrent(
 	// Register this abort to prevent concurrent InitTorrent from racing with cleanup.
 	// Create a channel that InitTorrent can wait on.
 	abortCh := make(chan struct{})
-
-	// cleanupAbort ensures the abort tracking is cleaned up even on panic.
-	// Must be called after registering the abort but before any code that might panic.
-	cleanupAbort := func() {
-		s.mu.Lock()
-		delete(s.abortingHashes, hash)
-		s.mu.Unlock()
+	defer func() {
+		s.store.EndCleanup(hash)
 		close(abortCh) // Signal waiting InitTorrent calls
-	}
+	}()
 
-	s.mu.Lock()
-	// Check if already aborting (shouldn't happen but be safe)
-	if existingCh, alreadyAborting := s.abortingHashes[hash]; alreadyAborting {
-		s.mu.Unlock()
+	state, existingCh := s.store.BeginAbort(hash, abortCh)
+	if existingCh != nil {
 		// Wait for existing abort to complete, then return success
 		<-existingCh
 		return &pb.AbortTorrentResponse{
@@ -74,20 +67,8 @@ func (s *Server) AbortTorrent(
 			FilesDeleted: 0,
 		}, nil
 	}
-	s.abortingHashes[hash] = abortCh
 
-	state, exists := s.torrents[hash]
-	if exists {
-		s.unregisterFilePaths(hash, state.files)
-		delete(s.torrents, hash)
-	}
-	s.mu.Unlock()
-
-	// Register cleanup IMMEDIATELY after releasing lock to minimize panic window.
-	// This ensures the abort tracking is cleaned up even if subsequent code panics.
-	defer cleanupAbort()
-
-	if !exists {
+	if state == nil {
 		s.logger.InfoContext(ctx, "torrent not found for abort (may already be cleaned up)",
 			"hash", hash,
 		)
@@ -106,7 +87,7 @@ func (s *Server) AbortTorrent(
 	for _, fi := range state.files {
 		// Signal waiters so they can handle the abort (their hardlink attempt will fail).
 		// AbortInProgress is idempotent: no-ops for zero inodes, completed, or pending files.
-		s.inodes.AbortInProgress(ctx, fi.hardlink.sourceInode, hash)
+		s.store.Inodes().AbortInProgress(ctx, fi.hardlink.sourceInode, hash)
 
 		// closeFileHandle is idempotent (no-op if fi.file is nil).
 		_ = s.closeFileHandle(ctx, hash, fi)

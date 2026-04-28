@@ -46,27 +46,3 @@ func unregisterFilePaths(filePaths map[string]string, hash string, files []*serv
 		}
 	}
 }
-
-// Server method delegates — keep existing callers compiling until Task 5 migrates them.
-// Nil guards are retained here because some tests construct Server without initializing filePaths.
-
-func (s *Server) checkPathCollisions(hash string, files []*serverFileInfo) error {
-	if s.filePaths == nil {
-		return nil
-	}
-	return checkPathCollisions(s.filePaths, hash, files)
-}
-
-func (s *Server) registerFilePaths(hash string, files []*serverFileInfo) {
-	if s.filePaths == nil {
-		return
-	}
-	registerFilePaths(s.filePaths, hash, files)
-}
-
-func (s *Server) unregisterFilePaths(hash string, files []*serverFileInfo) {
-	if s.filePaths == nil {
-		return
-	}
-	unregisterFilePaths(s.filePaths, hash, files)
-}

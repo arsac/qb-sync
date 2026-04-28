@@ -52,10 +52,8 @@ func (s *Server) writePiece(ctx context.Context, req *pb.WritePieceRequest) writ
 
 	torrentHash := req.GetTorrentHash()
 
-	s.mu.RLock()
-	state, exists := s.torrents[torrentHash]
+	state, exists := s.store.Get(torrentHash)
 	initializing := exists && state.initializing
-	s.mu.RUnlock()
 
 	if !exists || initializing {
 		return writePieceError("torrent not initialized", pb.PieceErrorCode_PIECE_ERROR_NOT_INITIALIZED)

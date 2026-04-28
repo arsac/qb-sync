@@ -98,12 +98,12 @@ func (m *mockQBClient) GetFreeSpaceOnDiskCtx(context.Context) (int64, error)    
 
 func newTestServerWithQB(t *testing.T, mock *mockQBClient) *Server {
 	t.Helper()
+	tmpDir := t.TempDir()
 	return &Server{
-		config:         ServerConfig{BasePath: t.TempDir()},
-		logger:         testLogger(t),
-		torrents:       make(map[string]*serverTorrentState),
-		abortingHashes: make(map[string]chan struct{}),
-		qbClient:       mock,
+		config:   ServerConfig{BasePath: tmpDir},
+		logger:   testLogger(t),
+		store:    newTorrentStore(tmpDir, testLogger(t)),
+		qbClient: mock,
 	}
 }
 
@@ -191,10 +191,9 @@ func TestStartTorrent(t *testing.T) {
 		t.Parallel()
 		logger := testLogger(t)
 		s := &Server{
-			config:         ServerConfig{BasePath: "/tmp"},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
+			config: ServerConfig{BasePath: "/tmp"},
+			logger: logger,
+			store:  newTorrentStore("/tmp", logger),
 		}
 
 		resp, err := s.StartTorrent(context.Background(), &pb.StartTorrentRequest{

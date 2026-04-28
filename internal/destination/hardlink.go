@@ -79,7 +79,7 @@ func (s *Server) GetFileByInode(
 	_ context.Context,
 	req *pb.GetFileByInodeRequest,
 ) (*pb.GetFileByInodeResponse, error) {
-	path, found := s.inodes.GetRegistered(Inode(req.GetInode()))
+	path, found := s.store.Inodes().GetRegistered(Inode(req.GetInode()))
 	return &pb.GetFileByInodeResponse{
 		Found: found,
 		Path:  path,
@@ -111,10 +111,10 @@ func (s *Server) RegisterFile(
 		}, nil
 	}
 
-	s.inodes.Register(inode, path)
+	s.store.Inodes().Register(inode, path)
 
 	// Persist inode map after registration
-	if saveErr := s.inodes.Save(); saveErr != nil {
+	if saveErr := s.store.SaveInodes(); saveErr != nil {
 		s.logger.WarnContext(ctx, "failed to persist inode map", "error", saveErr)
 	}
 

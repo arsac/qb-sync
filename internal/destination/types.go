@@ -124,8 +124,7 @@ type serverTorrentState struct {
 	torrentMeta // Immutable metadata (safe to read without mu)
 
 	// Immutable after init (set once during initNewTorrent):
-	info      *pb.InitTorrentRequest // Original init request
-	statePath string                 // Path to written pieces state file
+	statePath string // Path to written pieces state file
 
 	// Mutable state (require state.mu):
 	torrentPath      string         // Path to stored .torrent file; may be set late during resumeTorrent

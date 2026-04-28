@@ -268,12 +268,7 @@ func (s *Server) storeSuccessResult(
 // background finalization — this just cleans up the in-memory state when the source
 // polls and receives the success response.
 func (s *Server) cleanupFinalizedTorrent(hash string) {
-	s.mu.Lock()
-	if state, exists := s.torrents[hash]; exists {
-		s.unregisterFilePaths(hash, state.files)
-	}
-	delete(s.torrents, hash)
-	s.mu.Unlock()
+	s.store.Remove(hash)
 }
 
 // markFinalized replaces the metadata directory contents with a single
@@ -352,13 +347,10 @@ func (s *Server) relocateForSubPathChange(
 // re-initializes the torrent via InitTorrent. FinalizeTorrent returns
 // FINALIZE_ERROR_NOT_FOUND so the source can untrack and re-initialize.
 func (s *Server) getState(hash string) (*serverTorrentState, error) {
-	s.mu.RLock()
-	state, exists := s.torrents[hash]
-	initializing := exists && state.initializing
-	s.mu.RUnlock()
+	state, exists := s.store.Get(hash)
 
 	if exists {
-		if initializing {
+		if state.initializing {
 			return nil, errors.New("torrent initialization in progress")
 		}
 		return state, nil
@@ -566,45 +558,7 @@ func (s *Server) flushWrittenState(ctx context.Context, hash string, state *serv
 func (s *Server) registerFinalizedInodes(ctx context.Context, hash string, state *serverTorrentState) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
-
-	var registered int
-	for _, fi := range state.files {
-		// Skip files that need no data (hardlinked/pending/unselected) or have no inode
-		if fi.skipForWriteData() || fi.hardlink.sourceInode == 0 {
-			continue
-		}
-
-		// Get final path (remove .partial suffix if present)
-		finalPath, _ := strings.CutSuffix(fi.path, partialSuffix)
-
-		// Get relative path for storage
-		relPath, relErr := filepath.Rel(s.config.BasePath, finalPath)
-		if relErr != nil {
-			s.logger.WarnContext(ctx, "failed to get relative path for inode registration",
-				"hash", hash,
-				"path", finalPath,
-				"error", relErr,
-			)
-			continue
-		}
-
-		// Register in persistent map and signal waiters
-		s.inodes.Register(fi.hardlink.sourceInode, relPath)
-		s.inodes.CompleteInProgress(fi.hardlink.sourceInode, hash)
-		registered++
-	}
-
-	if registered > 0 {
-		s.logger.InfoContext(ctx, "registered finalized inodes",
-			"hash", hash,
-			"count", registered,
-		)
-
-		// Persist inode map
-		if saveErr := s.inodes.Save(); saveErr != nil {
-			s.logger.WarnContext(ctx, "failed to save inode map", "error", saveErr)
-		}
-	}
+	s.store.RegisterInodes(ctx, hash, state.files)
 }
 
 // verifyFinalizedPieces reads back all pieces from finalized files and verifies their hashes.
@@ -834,7 +788,7 @@ func (s *Server) recoverVerificationFailure(
 // instead of timing out.
 func (s *Server) abortInProgressInodes(ctx context.Context, hash string, state *serverTorrentState) {
 	for _, fi := range state.files {
-		s.inodes.AbortInProgress(ctx, fi.hardlink.sourceInode, hash)
+		s.store.Inodes().AbortInProgress(ctx, fi.hardlink.sourceInode, hash)
 	}
 }
 
