@@ -273,7 +273,7 @@ func (f *serverFileInfo) recalcPiecesWritten(written *bitset.BitSet) {
 }
 
 // torrentRef is a reference to a torrent state for safe iteration.
-// Used when collecting torrents under s.mu to process under individual state.mu.
+// Used when collecting torrents under store.mu to process under individual state.mu.
 type torrentRef struct {
 	hash  string
 	state *serverTorrentState
