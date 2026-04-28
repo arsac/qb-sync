@@ -52,6 +52,9 @@ const (
 	// Partial file suffix.
 	partialSuffix = ".partial"
 
+	// metaFileName is the protobuf-encoded PersistedTorrentMeta file name.
+	metaFileName = ".meta"
+
 	// Memory management.
 	defaultMaxStreamBufferMB = 512 // Default global memory budget for buffered piece data
 	maxVerifyConcurrency     = 4   // Limit concurrent piece reads during finalization to cap transient memory

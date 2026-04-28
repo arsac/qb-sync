@@ -261,11 +261,10 @@ func (s *Server) storeSuccessResult(
 	s.markFinalized(metaDir, hash)
 
 	state.mu.Lock()
-	name := strings.TrimSuffix(filepath.Base(state.torrentPath), ".torrent")
 	state.finalization.storeResult(&finalizeResult{success: true, state: stateStr})
 	state.mu.Unlock()
 
-	metrics.TorrentsSyncedTotal.WithLabelValues(metrics.ModeDestination, hash, name).Inc()
+	metrics.TorrentsSyncedTotal.WithLabelValues(metrics.ModeDestination, hash, hash).Inc()
 	s.logger.InfoContext(ctx, "torrent finalized (background)", "hash", hash, "state", stateStr)
 }
 

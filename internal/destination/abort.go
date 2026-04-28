@@ -103,9 +103,6 @@ func (s *Server) AbortTorrent(
 		if state.statePath != "" {
 			tryRemoveWithLog(ctx, s.logger, state.statePath, "state file", hash, &deleteErrors)
 		}
-		if state.torrentPath != "" {
-			tryRemoveWithLog(ctx, s.logger, state.torrentPath, "torrent file", hash, &deleteErrors)
-		}
 		metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
 		if err := os.RemoveAll(metaDir); err != nil && !os.IsNotExist(err) {
 			deleteErrors = append(deleteErrors, fmt.Sprintf("meta directory: %v", err))

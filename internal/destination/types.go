@@ -127,7 +127,7 @@ type serverTorrentState struct {
 	statePath string // Path to written pieces state file
 
 	// Mutable state (require state.mu):
-	torrentPath      string         // Path to stored .torrent file; may be set late during resumeTorrent
+	torrentFile      []byte         // Raw bencode bytes for qBittorrent API; cached in memory
 	saveSubPath      string         // Relative sub-path prefix; may change if category relocates at finalize
 	written          *bitset.BitSet // Bitmap of written pieces (use Count()/Len() instead of separate counter)
 	dirty            bool           // Whether state needs to be flushed

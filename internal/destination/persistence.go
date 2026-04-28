@@ -10,9 +10,14 @@ import (
 
 	"github.com/bits-and-blooms/bitset"
 
+	"google.golang.org/protobuf/proto"
+
 	"github.com/arsac/qb-sync/internal/metrics"
 	"github.com/arsac/qb-sync/internal/utils"
+	pb "github.com/arsac/qb-sync/proto"
 )
+
+const currentSchemaVersion int32 = 3
 
 // loadState loads the written pieces state from disk.
 func (s *Server) loadState(path string, numPieces int) (*bitset.BitSet, error) {
@@ -116,6 +121,73 @@ func findTorrentFile(metaDir string) (string, error) {
 		}
 	}
 	return "", errors.New("torrent file not found")
+}
+
+func savePersistedMeta(path string, meta *pb.PersistedTorrentMeta) error {
+	data, err := proto.Marshal(meta)
+	if err != nil {
+		return fmt.Errorf("marshaling metadata: %w", err)
+	}
+	return atomicWriteFile(path, data)
+}
+
+func loadPersistedMeta(path string) (*pb.PersistedTorrentMeta, error) {
+	data, readErr := os.ReadFile(path)
+	if readErr != nil {
+		return nil, readErr
+	}
+	meta := &pb.PersistedTorrentMeta{}
+	if unmarshalErr := proto.Unmarshal(data, meta); unmarshalErr != nil {
+		return nil, fmt.Errorf("unmarshaling metadata: %w", unmarshalErr)
+	}
+	return meta, nil
+}
+
+func buildPersistedMeta(req *pb.InitTorrentRequest) *pb.PersistedTorrentMeta {
+	files := make([]*pb.PersistedFileInfo, len(req.GetFiles()))
+	for i, f := range req.GetFiles() {
+		files[i] = &pb.PersistedFileInfo{
+			Path:     f.GetPath(),
+			Size:     f.GetSize(),
+			Offset:   f.GetOffset(),
+			Selected: f.GetSelected(),
+		}
+	}
+	return &pb.PersistedTorrentMeta{
+		SchemaVersion: currentSchemaVersion,
+		TorrentHash:   req.GetTorrentHash(),
+		Name:          req.GetName(),
+		PieceSize:     req.GetPieceSize(),
+		TotalSize:     req.GetTotalSize(),
+		NumPieces:     req.GetNumPieces(),
+		Files:         files,
+		TorrentFile:   req.GetTorrentFile(),
+		PieceHashes:   req.GetPieceHashes(),
+		SaveSubPath:   req.GetSaveSubPath(),
+	}
+}
+
+func persistedMetaToRequest(meta *pb.PersistedTorrentMeta) *pb.InitTorrentRequest {
+	files := make([]*pb.FileInfo, len(meta.GetFiles()))
+	for i, f := range meta.GetFiles() {
+		files[i] = &pb.FileInfo{
+			Path:     f.GetPath(),
+			Size:     f.GetSize(),
+			Offset:   f.GetOffset(),
+			Selected: f.GetSelected(),
+		}
+	}
+	return &pb.InitTorrentRequest{
+		TorrentHash: meta.GetTorrentHash(),
+		Name:        meta.GetName(),
+		PieceSize:   meta.GetPieceSize(),
+		TotalSize:   meta.GetTotalSize(),
+		NumPieces:   meta.GetNumPieces(),
+		Files:       files,
+		PieceHashes: meta.GetPieceHashes(),
+		SaveSubPath: meta.GetSaveSubPath(),
+		TorrentFile: meta.GetTorrentFile(),
+	}
 }
 
 // clearStalePieces checks each selected file for existence on disk.

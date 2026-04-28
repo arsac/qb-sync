@@ -174,7 +174,7 @@ func (s *Server) initNewTorrent(
 	name := req.GetName()
 
 	// Create metadata directory and write torrent file
-	metaDir, torrentPath, statePath, err := s.setupMetadataDir(hash, name, req.GetTorrentFile())
+	metaDir, _, statePath, err := s.setupMetadataDir(hash, name, req.GetTorrentFile())
 	if err != nil {
 		return initErrorResponse("%v", err)
 	}
@@ -236,7 +236,7 @@ func (s *Server) initNewTorrent(
 	state := &serverTorrentState{
 		torrentMeta:     meta,
 		written:         written,
-		torrentPath:     torrentPath,
+		torrentFile:     req.GetTorrentFile(),
 		statePath:       statePath,
 		saveSubPath:     saveSubPath,
 		hardlinkResults: hardlinkResults,
@@ -453,39 +453,38 @@ func (s *Server) ensureTorrentFileWritten(
 		return nil
 	}
 
-	// Use existing path if valid, otherwise construct from request.
-	// Read under state.mu: torrentPath can be written concurrently by another
-	// resumeTorrent call for the same hash.
+	// Cache the torrent file bytes on state if not already set.
 	state.mu.Lock()
-	torrentPath := state.torrentPath
+	hasCached := len(state.torrentFile) > 0
 	state.mu.Unlock()
-	if torrentPath == "" {
-		name := req.GetName()
-		if name == "" {
-			return nil
-		}
-		name = filepath.Base(name) // Sanitize to prevent path traversal
-		torrentPath = filepath.Join(s.config.BasePath, metaDirName, hash, name+".torrent")
-	}
-
-	// Check if file already exists
-	if _, err := os.Stat(torrentPath); err == nil {
+	if hasCached {
 		return nil
 	}
 
-	// Ensure directory exists and write file
-	if err := os.MkdirAll(filepath.Dir(torrentPath), serverDirPermissions); err != nil {
-		return fmt.Errorf("creating metadata directory: %w", err)
+	// Use existing path if valid, otherwise construct from request.
+	name := req.GetName()
+	if name == "" {
+		return nil
 	}
+	name = filepath.Base(name) // Sanitize to prevent path traversal
+	torrentPath := filepath.Join(s.config.BasePath, metaDirName, hash, name+".torrent")
 
-	if err := atomicWriteFile(torrentPath, torrentFile); err != nil {
-		return fmt.Errorf("writing torrent file: %w", err)
+	// Check if file already exists on disk
+	if _, err := os.Stat(torrentPath); err != nil {
+		// Ensure directory exists and write file
+		if mkdirErr := os.MkdirAll(filepath.Dir(torrentPath), serverDirPermissions); mkdirErr != nil {
+			return fmt.Errorf("creating metadata directory: %w", mkdirErr)
+		}
+		if writeErr := atomicWriteFile(torrentPath, torrentFile); writeErr != nil {
+			return fmt.Errorf("writing torrent file: %w", writeErr)
+		}
+		s.logger.InfoContext(ctx, "wrote torrent file for existing state",
+			"hash", hash, "path", torrentPath)
 	}
 
 	state.mu.Lock()
-	state.torrentPath = torrentPath
+	state.torrentFile = torrentFile
 	state.mu.Unlock()
-	s.logger.InfoContext(ctx, "wrote torrent file for existing state", "hash", hash, "path", torrentPath)
 	return nil
 }
 

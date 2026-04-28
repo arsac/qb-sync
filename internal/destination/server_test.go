@@ -665,7 +665,7 @@ func TestAbortTorrent_DeletesFiles(t *testing.T) {
 	s.store.entries[hash] = &serverTorrentState{
 		torrentMeta: torrentMeta{files: []*serverFileInfo{{path: partialFile, size: 4, selected: true}}},
 		statePath:   stateFile,
-		torrentPath: torrentFile,
+		torrentFile: []byte("fake-torrent-data"),
 	}
 
 	resp, err := s.AbortTorrent(context.Background(), &pb.AbortTorrentRequest{

@@ -2,8 +2,8 @@ package destination
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -77,13 +77,11 @@ func (s *Server) addAndVerifyTorrent(
 	}
 
 	// Torrent doesn't exist - add it.
-	// Read torrentPath under state.mu: ensureTorrentFileWritten can write it concurrently.
 	state.mu.Lock()
-	torrentPath := state.torrentPath
+	torrentData := state.torrentFile
 	state.mu.Unlock()
-	torrentData, readErr := os.ReadFile(torrentPath)
-	if readErr != nil {
-		return "", fmt.Errorf("reading torrent file: %w", readErr)
+	if len(torrentData) == 0 {
+		return "", errors.New("torrent file bytes not cached on state")
 	}
 
 	// Use the destination-side save path (container mount point, e.g., "/downloads"),

@@ -222,7 +222,7 @@ func TestFinalizeTorrent_PollReturnsCompletedResult(t *testing.T) {
 				state:   "uploading",
 			},
 		},
-		torrentPath: filepath.Join(tmpDir, metaDirName, hash, "test.torrent"),
+		torrentFile: []byte("fake-torrent-data"),
 	}
 
 	// In production, storeSuccessResult writes the .finalized marker during
@@ -442,7 +442,7 @@ func TestRunBackgroundFinalization_SerializesViaSemaphore(t *testing.T) {
 				totalSize:   totalSize,
 				files:       []*serverFileInfo{{path: filePath, offset: 0, size: totalSize, selected: true}},
 			},
-			torrentPath: filepath.Join(dir, metaDirName, hash, "test.torrent"),
+			torrentFile: []byte("fake-torrent-data"),
 		}
 	}
 
