@@ -75,15 +75,6 @@ func (s *Server) recoverTorrent(ctx context.Context, hash, metaDir string) error
 		return fmt.Errorf("init failed: %s", resp.GetError())
 	}
 
-	// Cache torrent file bytes on recovered state.
-	if state, ok := s.store.Get(hash); ok && len(meta.GetTorrentFile()) > 0 {
-		state.mu.Lock()
-		if len(state.torrentFile) == 0 {
-			state.torrentFile = meta.GetTorrentFile()
-		}
-		state.mu.Unlock()
-	}
-
 	s.logger.InfoContext(ctx, "recovered torrent from disk",
 		"hash", hash,
 		"piecesHave", resp.GetPiecesHaveCount(),

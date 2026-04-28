@@ -43,7 +43,7 @@ func (ts *torrentStore) Get(hash string) (*serverTorrentState, bool) {
 	ts.mu.RLock()
 	state, ok := ts.entries[hash]
 	ts.mu.RUnlock()
-	if ok && state.initializing {
+	if ok && state.initializing.Load() {
 		return nil, false
 	}
 	return state, ok
@@ -89,12 +89,14 @@ func (ts *torrentStore) Reserve(hash string) error {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 	if state, exists := ts.entries[hash]; exists {
-		if state.initializing {
+		if state.initializing.Load() {
 			return fmt.Errorf("torrent %s initialization already in progress", hash)
 		}
 		return fmt.Errorf("torrent %s already tracked", hash)
 	}
-	ts.entries[hash] = &serverTorrentState{initializing: true}
+	sentinel := &serverTorrentState{}
+	sentinel.initializing.Store(true)
+	ts.entries[hash] = sentinel
 	return nil
 }
 
@@ -116,7 +118,7 @@ func (ts *torrentStore) Commit(hash string, state *serverTorrentState) error {
 func (ts *torrentStore) Unreserve(hash string) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
-	if state, exists := ts.entries[hash]; exists && state.initializing {
+	if state, exists := ts.entries[hash]; exists && state.initializing.Load() {
 		delete(ts.entries, hash)
 	}
 }
@@ -140,12 +142,21 @@ func (ts *torrentStore) Remove(hash string) *serverTorrentState {
 }
 
 // Drain removes all entries and returns them. Used for shutdown.
+// Aborts in-progress inodes for all drained entries, matching Remove behavior.
 func (ts *torrentStore) Drain() map[string]*serverTorrentState {
 	ts.mu.Lock()
 	old := ts.entries
 	ts.entries = make(map[string]*serverTorrentState)
 	ts.filePaths = make(map[string]string)
 	ts.mu.Unlock()
+
+	// Abort in-progress inodes for all drained entries.
+	for hash, state := range old {
+		for _, fi := range state.files {
+			ts.inodes.AbortInProgress(context.Background(), fi.hardlink.sourceInode, hash)
+		}
+	}
+
 	return old
 }
 

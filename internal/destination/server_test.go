@@ -1221,6 +1221,42 @@ func TestSetupMetadataDir_Idempotent(t *testing.T) {
 	}
 }
 
+func TestSetupMetadataDir_CleansOldFormat(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+
+	hash := "oldformat"
+	metaDir := filepath.Join(tmpDir, metaDirName, hash)
+	_ = os.MkdirAll(metaDir, 0o755)
+	// Write an old-format file that should be cleaned up.
+	_ = os.WriteFile(filepath.Join(metaDir, ".version"), []byte("2"), 0o644)
+
+	req := &pb.InitTorrentRequest{
+		TorrentHash: hash,
+		Name:        "Test",
+		PieceSize:   16384,
+		TotalSize:   32768,
+		NumPieces:   2,
+		Files:       []*pb.FileInfo{{Path: "file.bin", Size: 32768, Selected: true}},
+		TorrentFile: []byte("bencode"),
+	}
+
+	_, _, err := s.setupMetadataDir(hash, req)
+	if err != nil {
+		t.Fatalf("setupMetadataDir: %v", err)
+	}
+
+	// .version should be gone (directory was cleaned).
+	if _, statErr := os.Stat(filepath.Join(metaDir, ".version")); statErr == nil {
+		t.Fatal("old .version file should have been removed")
+	}
+
+	// .meta should exist.
+	if _, statErr := os.Stat(filepath.Join(metaDir, metaFileName)); statErr != nil {
+		t.Fatalf(".meta should exist: %v", statErr)
+	}
+}
+
 // Helper functions
 
 func createTestMetadata(t *testing.T, basePath, hash string, modTime time.Time) {

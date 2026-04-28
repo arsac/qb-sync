@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func commitTestTorrent(t *testing.T, ts *torrentStore, hash, path string) *serverTorrentState {
@@ -114,7 +115,7 @@ func TestTorrentStore_ReserveCommit(t *testing.T) {
 	if !ok || got == nil {
 		t.Fatal("Get after Commit: expected state")
 	}
-	if got.initializing {
+	if got.initializing.Load() {
 		t.Fatal("Get after Commit: state still marked initializing")
 	}
 
@@ -366,5 +367,69 @@ func TestTorrentStore_BeginCleanup(t *testing.T) {
 	commitTestTorrent(t, ts, "tracked", "tracked/file.txt")
 	if ts.BeginCleanup("tracked", make(chan struct{})) {
 		t.Fatal("BeginCleanup: expected false for tracked torrent")
+	}
+}
+
+// TestTorrentStore_AbortThenReAbort verifies that when an abort completes,
+// the channel is closed BEFORE EndCleanup deregisters. This ensures a
+// concurrent caller that sees the existing channel via BeginAbort is
+// guaranteed to unblock before any new BeginAbort can succeed.
+func TestTorrentStore_AbortThenReAbort(t *testing.T) {
+	t.Parallel()
+	ts := newTestStore(t)
+
+	_ = commitTestTorrent(t, ts, "h1", "data/file1.txt")
+
+	ch1 := make(chan struct{})
+	_, _ = ts.BeginAbort("h1", ch1)
+
+	// Simulate concurrent abort arriving just as first abort completes.
+	// After EndCleanup, the channel must already be closed so a waiter
+	// on ch1 is guaranteed to unblock before any new BeginAbort succeeds.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ch2 := make(chan struct{})
+		_, existingCh := ts.BeginAbort("h1", ch2)
+		if existingCh != nil {
+			<-existingCh // Must unblock
+		}
+	}()
+
+	// The correct order: close channel THEN deregister.
+	close(ch1)
+	ts.EndCleanup("h1")
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("concurrent abort should have completed")
+	}
+}
+
+// TestTorrentStore_GetFiltersSentinel verifies that Get returns (nil, false)
+// for sentinel entries (initializing=true). Sentinels are placeholders inserted
+// by Reserve to block concurrent InitTorrent for the same hash while disk I/O
+// is in progress. Callers using Get should never see these half-initialized entries.
+func TestTorrentStore_GetFiltersSentinel(t *testing.T) {
+	t.Parallel()
+	ts := newTestStore(t)
+
+	// Insert a sentinel directly.
+	sentinel := &serverTorrentState{}
+	sentinel.initializing.Store(true)
+	ts.mu.Lock()
+	ts.entries["sentinel"] = sentinel
+	ts.mu.Unlock()
+
+	state, ok := ts.Get("sentinel")
+	if ok || state != nil {
+		t.Fatal("Get should return (nil, false) for sentinel entries")
+	}
+
+	// GetWithSentinel should still return it.
+	state, ok = ts.GetWithSentinel("sentinel")
+	if !ok || state == nil {
+		t.Fatal("GetWithSentinel should return sentinel entries")
 	}
 }

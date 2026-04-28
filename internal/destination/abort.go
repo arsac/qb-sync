@@ -54,8 +54,8 @@ func (s *Server) AbortTorrent(
 	// Create a channel that InitTorrent can wait on.
 	abortCh := make(chan struct{})
 	defer func() {
+		close(abortCh) // Signal waiting InitTorrent calls before deregistering
 		s.store.EndCleanup(hash)
-		close(abortCh) // Signal waiting InitTorrent calls
 	}()
 
 	state, existingCh := s.store.BeginAbort(hash, abortCh)

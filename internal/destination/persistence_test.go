@@ -1,6 +1,7 @@
 package destination
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -101,8 +102,8 @@ func TestLoadPersistedMeta_MissingFile(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for missing file, got nil")
 	}
-	if !os.IsNotExist(err) {
-		t.Errorf("expected os.IsNotExist error, got: %v", err)
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("expected not-exist error, got: %v", err)
 	}
 }
 

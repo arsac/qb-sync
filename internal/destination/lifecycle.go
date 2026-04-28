@@ -241,8 +241,8 @@ func (s *Server) cleanupOrphan(ctx context.Context, hash string) {
 
 	// Ensure we clean up the abort registration when done
 	defer func() {
+		close(cleanupCh) // Signal waiters before deregistering
 		s.store.EndCleanup(hash)
-		close(cleanupCh)
 	}()
 
 	// Final safety check: if the torrent exists in destination qBittorrent,

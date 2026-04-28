@@ -69,7 +69,7 @@ func (s *Server) InitTorrent(
 	// Check for existing state (resume case).
 	// Use GetWithSentinel to distinguish "not found" from "initializing".
 	if state, exists := s.store.GetWithSentinel(hash); exists {
-		if state.initializing {
+		if state.initializing.Load() {
 			return initErrorResponse("torrent initialization already in progress"), nil
 		}
 		return s.resumeTorrent(ctx, hash, state, req), nil
@@ -90,7 +90,7 @@ func (s *Server) InitTorrent(
 	if reserveErr := s.store.Reserve(hash); reserveErr != nil {
 		// Another goroutine beat us -- retry the check.
 		if state, exists := s.store.GetWithSentinel(hash); exists {
-			if state.initializing {
+			if state.initializing.Load() {
 				return initErrorResponse("torrent initialization already in progress"), nil
 			}
 			return s.resumeTorrent(ctx, hash, state, req), nil
@@ -143,25 +143,24 @@ func (s *Server) setupMetadataDir(
 	req *pb.InitTorrentRequest,
 ) (string, string, error) {
 	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
-
-	// Nuke stale metadata directory if .meta is absent (old format or corrupted).
 	metaPath := filepath.Join(metaDir, metaFileName)
-	if _, statErr := os.Stat(metaPath); statErr != nil {
-		_ = os.RemoveAll(metaDir)
+	statePath := filepath.Join(metaDir, ".state")
+
+	// If .meta already exists, this is a recovery/idempotent call — skip all writes.
+	if _, err := os.Stat(metaPath); err == nil {
+		return metaDir, statePath, nil
 	}
 
+	// .meta absent: either fresh init or old-format directory.
+	// Remove any stale directory contents and recreate.
+	_ = os.RemoveAll(metaDir)
 	if err := os.MkdirAll(metaDir, serverDirPermissions); err != nil {
 		return "", "", fmt.Errorf("creating metadata directory: %w", err)
 	}
 
-	statePath := filepath.Join(metaDir, ".state")
-
-	// Skip write if .meta already exists (idempotent for recovery path).
-	if _, statErr := os.Stat(metaPath); statErr != nil {
-		meta := buildPersistedMeta(req)
-		if err := savePersistedMeta(metaPath, meta); err != nil {
-			return "", "", fmt.Errorf("writing metadata: %w", err)
-		}
+	meta := buildPersistedMeta(req)
+	if err := savePersistedMeta(metaPath, meta); err != nil {
+		return "", "", fmt.Errorf("writing metadata: %w", err)
 	}
 
 	return metaDir, statePath, nil

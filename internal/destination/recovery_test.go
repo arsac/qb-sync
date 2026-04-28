@@ -160,9 +160,11 @@ func TestRecoverInFlightTorrents(t *testing.T) {
 		t.Errorf("saveSubPath = %q, want %q", state.saveSubPath, "downloads")
 	}
 
-	// Verify torrent file bytes are cached on state
+	// Verify torrent file bytes are cached on state.
+	// initNewTorrent sets torrentFile directly from the request, so no
+	// separate cache step in recoverTorrent is needed.
 	if len(state.torrentFile) == 0 {
-		t.Error("torrentFile should be cached on recovered state")
+		t.Fatal("expected torrentFile to be cached on state after recovery")
 	}
 }
 

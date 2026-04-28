@@ -3,6 +3,7 @@ package destination
 import (
 	"os"
 	"sync"
+	"sync/atomic"
 
 	"github.com/bits-and-blooms/bitset"
 
@@ -133,7 +134,7 @@ type serverTorrentState struct {
 	dirty            bool           // Whether state needs to be flushed
 	piecesSinceFlush int            // Pieces written since last flush (for count-based trigger)
 	flushGen         uint64         // Monotonic counter incremented on every successful state flush
-	initializing     bool           // True while disk I/O is in progress during InitTorrent
+	initializing     atomic.Bool    // True while disk I/O is in progress; set once before publication, never written again.
 	mu               sync.Mutex
 
 	// Finalization lifecycle (state machine: inactive -> active -> result stored).

@@ -63,7 +63,7 @@ func savePersistedMeta(path string, meta *pb.PersistedTorrentMeta) error {
 func loadPersistedMeta(path string) (*pb.PersistedTorrentMeta, error) {
 	data, readErr := os.ReadFile(path)
 	if readErr != nil {
-		return nil, readErr
+		return nil, fmt.Errorf("reading %s: %w", path, readErr)
 	}
 	meta := &pb.PersistedTorrentMeta{}
 	if unmarshalErr := proto.Unmarshal(data, meta); unmarshalErr != nil {
