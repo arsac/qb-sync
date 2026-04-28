@@ -114,7 +114,7 @@ func (s *Server) RegisterFile(
 	s.store.Inodes().Register(inode, path)
 
 	// Persist inode map after registration
-	if saveErr := s.store.SaveInodes(); saveErr != nil {
+	if saveErr := s.store.Inodes().Save(); saveErr != nil {
 		s.logger.WarnContext(ctx, "failed to persist inode map", "error", saveErr)
 	}
 

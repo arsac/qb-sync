@@ -253,7 +253,7 @@ func (s *Server) cleanup() {
 		state.mu.Unlock()
 	}
 
-	if saveErr := s.store.SaveInodes(); saveErr != nil {
+	if saveErr := s.store.Inodes().Save(); saveErr != nil {
 		s.logger.Warn("failed to save inode map on cleanup", "error", saveErr)
 	}
 }

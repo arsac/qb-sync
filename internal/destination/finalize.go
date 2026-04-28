@@ -33,13 +33,19 @@ func (s *Server) FinalizeTorrent(
 	startTime := time.Now()
 	hash := req.GetTorrentHash()
 
-	state, stateErr := s.getState(hash)
-	if stateErr != nil {
-		//nolint:nilerr // gRPC returns errors in response body
+	state, exists := s.store.Get(hash)
+	if !exists {
 		return &pb.FinalizeTorrentResponse{
 			Success:   false,
-			Error:     stateErr.Error(),
+			Error:     "torrent not found",
 			ErrorCode: pb.FinalizeErrorCode_FINALIZE_ERROR_NOT_FOUND,
+		}, nil
+	}
+	if state.initializing {
+		return &pb.FinalizeTorrentResponse{
+			Success:   false,
+			Error:     "torrent initialization in progress",
+			ErrorCode: pb.FinalizeErrorCode_FINALIZE_ERROR_NONE,
 		}, nil
 	}
 
@@ -263,14 +269,6 @@ func (s *Server) storeSuccessResult(
 	s.logger.InfoContext(ctx, "torrent finalized (background)", "hash", hash, "state", stateStr)
 }
 
-// cleanupFinalizedTorrent removes a successfully finalized torrent from in-memory
-// tracking. The .finalized marker was already written by storeSuccessResult during
-// background finalization — this just cleans up the in-memory state when the source
-// polls and receives the success response.
-func (s *Server) cleanupFinalizedTorrent(hash string) {
-	s.store.Remove(hash)
-}
-
 // markFinalized replaces the metadata directory contents with a single
 // .finalized marker file. Removes .state, .torrent, and other working
 // files but keeps the directory so the marker persists.
@@ -339,24 +337,6 @@ func (s *Server) relocateForSubPathChange(
 	}
 
 	return nil
-}
-
-// getState gets the torrent state from memory.
-// Returns an error if the torrent is not tracked or is still initializing.
-// After a destination restart, state is not in memory until the source
-// re-initializes the torrent via InitTorrent. FinalizeTorrent returns
-// FINALIZE_ERROR_NOT_FOUND so the source can untrack and re-initialize.
-func (s *Server) getState(hash string) (*serverTorrentState, error) {
-	state, exists := s.store.Get(hash)
-
-	if exists {
-		if state.initializing {
-			return nil, errors.New("torrent initialization in progress")
-		}
-		return state, nil
-	}
-
-	return nil, errors.New("torrent not found")
 }
 
 // finalizeFiles syncs all file handles, closes them, and renames from .partial to final.
@@ -872,7 +852,7 @@ func (s *Server) handleExistingFinalization(
 
 	if result.success {
 		// Clean up now that source has received the success response.
-		s.cleanupFinalizedTorrent(hash)
+		s.store.Remove(hash)
 		return &pb.FinalizeTorrentResponse{Success: true, State: result.state}, nil
 	}
 

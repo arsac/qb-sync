@@ -36,8 +36,7 @@ func newTorrentStore(basePath string, logger *slog.Logger) *torrentStore {
 	}
 }
 
-// Get returns a torrent's state. The pointer is safe to use outside the store
-// lock — callers use state.mu for mutable fields.
+// Get returns a torrent's state, safe to use outside the lock.
 func (ts *torrentStore) Get(hash string) (*serverTorrentState, bool) {
 	ts.mu.RLock()
 	state, ok := ts.entries[hash]
@@ -184,8 +183,7 @@ func (ts *torrentStore) AbortCh(hash string) (chan struct{}, bool) {
 	return ch, ok
 }
 
-// Inodes returns the underlying InodeRegistry for fine-grained inode lookups
-// during setupFiles.
+// Inodes returns the underlying InodeRegistry for fine-grained lookups.
 func (ts *torrentStore) Inodes() *InodeRegistry {
 	return ts.inodes
 }
@@ -213,13 +211,12 @@ func (ts *torrentStore) RegisterInodes(ctx context.Context, hash string, files [
 	}
 
 	if registered > 0 {
+		ts.logger.InfoContext(ctx, "registered finalized inodes",
+			"hash", hash,
+			"count", registered,
+		)
 		if saveErr := ts.inodes.Save(); saveErr != nil {
 			ts.logger.WarnContext(ctx, "failed to save inode map", "error", saveErr)
 		}
 	}
-}
-
-// SaveInodes persists the inode registry to disk.
-func (ts *torrentStore) SaveInodes() error {
-	return ts.inodes.Save()
 }
