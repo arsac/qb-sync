@@ -159,7 +159,7 @@ func TestResolveContentBase(t *testing.T) {
 			want:  "/data/movies",
 		},
 		{
-			name:              "rooted: doubled root folder in ContentPath",
+			name:              "rooted: save_path includes root folder (Set Location)",
 			dataPath:          "/data",
 			qbDefaultSavePath: "/downloads",
 			torrent: qbittorrent.Torrent{
@@ -167,7 +167,7 @@ func TestResolveContentBase(t *testing.T) {
 				ContentPath: "/downloads/movies/MyMovie/MyMovie",
 			},
 			files: rootedFiles,
-			want:  "/data/movies",
+			want:  "/data/movies/MyMovie",
 		},
 		{
 			name:              "rooted: temp path with separate mount",

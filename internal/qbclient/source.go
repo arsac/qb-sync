@@ -190,16 +190,20 @@ func (s *Source) ResolveContentDir(torrentSavePath string) string {
 // Uses ContentPath (actual disk location) when available, falling back to SavePath.
 //
 // Rather than blindly calling [filepath.Dir] on ContentPath — which fails when
-// ContentPath has the root folder doubled (e.g. after "Set Location" to the
-// content directory) — this strips the known root folder detected from the file
-// list, following the pattern used by autobrr/qui's actualSavePathFromContentPath.
+// the trailing component isn't what we expect — this strips the known root folder
+// detected from the file list, following the pattern used by autobrr/qui's
+// actualSavePathFromContentPath.
+//
+// [strings.CutSuffix] strips the last occurrence of the root folder, recovering
+// save_path. This is correct even when save_path itself includes the root folder
+// name (e.g. after "Set Location"): qBittorrent physically places files at
+// save_path/f.Name, so the doubled structure on disk is intentional and must be
+// preserved in the read path.
 //
 // Cases handled:
 //   - Rooted multi-file: strip root folder from ContentPath (e.g. /dl/Name → /dl)
 //   - Rootless multi-file: ContentPath IS the base directory
 //   - Single-file: [filepath.Dir] extracts the parent directory
-//   - Doubled ContentPath: [strings.CutSuffix] strips the last occurrence of the
-//     root folder; if the result still ends with the root folder, strip again
 func (s *Source) resolveContentBase(
 	torrent qbittorrent.Torrent,
 	files qbittorrent.TorrentFiles,
@@ -214,16 +218,13 @@ func (s *Source) resolveContentBase(
 	switch {
 	case root != "":
 		// Rooted multi-file: strip the known root folder from ContentPath.
+		// The result is save_path (or its temp-path equivalent), which is
+		// the correct base for filepath.Join(base, f.Name).
 		suffix := string(filepath.Separator) + root
 		base, found := strings.CutSuffix(clean, suffix)
 		if !found {
 			// Root folder not at end of ContentPath — fall back to Dir.
 			return s.resolveQBDir(filepath.Dir(clean))
-		}
-		// Guard against doubled root folder in ContentPath (save_path
-		// included the torrent name, so ContentPath = save_path/name/name).
-		if filepath.Base(base) == root {
-			base = filepath.Dir(base)
 		}
 		return s.resolveQBDir(base)
 
