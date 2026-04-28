@@ -186,46 +186,80 @@ func (s *Source) ResolveContentDir(torrentSavePath string) string {
 	return s.resolveQBDir(filepath.Clean(torrentSavePath))
 }
 
-// resolveReadDir returns the directory for reading pieces.
-// Uses ContentPath (the actual current location on disk) as the authoritative
-// source. On ENOENT (torrent moved mid-read), callers should re-query.
-// Clean before Dir: [filepath.Dir] does not strip the last component when the
-// path has a trailing slash (e.g. Dir("/a/b/") = "/a/b"), which would cause
-// the torrent name to appear twice in the resolved path.
+// resolveContentBase determines the directory to use for reading piece data.
+// Uses ContentPath (actual disk location) when available, falling back to SavePath.
 //
-// Note: this assumes a rooted torrent (ContentPath = SavePath/Name). For rootless
-// multi-file torrents, the caller must correct the result — see [GetTorrentMetadata].
-func (s *Source) resolveReadDir(torrent qbittorrent.Torrent) string {
-	if torrent.ContentPath != "" {
-		return s.resolveQBDir(filepath.Dir(filepath.Clean(torrent.ContentPath)))
+// Rather than blindly calling [filepath.Dir] on ContentPath — which fails when
+// ContentPath has the root folder doubled (e.g. after "Set Location" to the
+// content directory) — this strips the known root folder detected from the file
+// list, following the pattern used by autobrr/qui's actualSavePathFromContentPath.
+//
+// Cases handled:
+//   - Rooted multi-file: strip root folder from ContentPath (e.g. /dl/Name → /dl)
+//   - Rootless multi-file: ContentPath IS the base directory
+//   - Single-file: [filepath.Dir] extracts the parent directory
+//   - Doubled ContentPath: [strings.CutSuffix] strips the last occurrence of the
+//     root folder; if the result still ends with the root folder, strip again
+func (s *Source) resolveContentBase(
+	torrent qbittorrent.Torrent,
+	files qbittorrent.TorrentFiles,
+) string {
+	if torrent.ContentPath == "" {
+		return s.resolveQBDir(filepath.Clean(torrent.SavePath))
 	}
-	return s.resolveQBDir(filepath.Clean(torrent.SavePath))
+
+	clean := filepath.Clean(torrent.ContentPath)
+	root := detectRootFolder(files)
+
+	switch {
+	case root != "":
+		// Rooted multi-file: strip the known root folder from ContentPath.
+		suffix := string(filepath.Separator) + root
+		base, found := strings.CutSuffix(clean, suffix)
+		if !found {
+			// Root folder not at end of ContentPath — fall back to Dir.
+			return s.resolveQBDir(filepath.Dir(clean))
+		}
+		// Guard against doubled root folder in ContentPath (save_path
+		// included the torrent name, so ContentPath = save_path/name/name).
+		if filepath.Base(base) == root {
+			base = filepath.Dir(base)
+		}
+		return s.resolveQBDir(base)
+
+	case len(files) > 1:
+		// Rootless multi-file: ContentPath IS the content directory.
+		return s.resolveQBDir(clean)
+
+	default:
+		// Single-file: ContentPath is the file path; Dir gives the parent.
+		return s.resolveQBDir(filepath.Dir(clean))
+	}
 }
 
-// hasRootFolder reports whether a multi-file torrent's files share a common
-// root directory (e.g. all paths start with "TorrentName/..."). Torrents added
-// with qBittorrent's "No subfolder" content layout have no root folder — their
-// files sit directly in SavePath and ContentPath equals SavePath, so
-// [filepath.Dir](ContentPath) goes one level too high.
-func hasRootFolder(files qbittorrent.TorrentFiles) bool {
+// detectRootFolder returns the common root directory shared by all files in a
+// multi-file torrent (e.g. "TorrentName" when all paths start with
+// "TorrentName/..."). Returns "" for single-file torrents, rootless torrents
+// (added with "No subfolder" layout), or when files have inconsistent roots.
+func detectRootFolder(files qbittorrent.TorrentFiles) string {
 	if len(files) <= 1 {
-		return false
+		return ""
 	}
 	var root string
 	for _, f := range files {
 		first, _, hasSep := strings.Cut(f.Name, "/")
 		if !hasSep {
-			return false // bare filename — no directory prefix
+			return "" // bare filename — no directory prefix
 		}
 		if root == "" {
 			root = first
 			continue
 		}
 		if first != root {
-			return false // different first components
+			return "" // different first components
 		}
 	}
-	return root != ""
+	return root
 }
 
 // GetPieceStates returns the current state of all pieces for a torrent.
@@ -279,8 +313,6 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 	}
 	torrent := torrents[0]
 
-	contentDir := s.resolveReadDir(torrent)
-
 	qbFiles, err := s.client.GetFilesInformationCtx(ctx, hash)
 	if err != nil {
 		return nil, fmt.Errorf("getting torrent files: %w", err)
@@ -296,13 +328,9 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 		return sortedQBFiles[i].Index < sortedQBFiles[j].Index
 	})
 
-	// Rootless multi-file torrents (added with "No subfolder" content layout)
-	// have ContentPath == SavePath. For these, resolveReadDir's filepath.Dir
-	// goes one level too high. Detect via file structure and use ContentPath
-	// directly as the content directory.
-	if len(sortedQBFiles) > 1 && torrent.ContentPath != "" && !hasRootFolder(sortedQBFiles) {
-		contentDir = s.resolveQBDir(filepath.Clean(torrent.ContentPath))
-	}
+	// Resolve content directory using the file list to detect root folder
+	// structure. Must happen after sorting so detectRootFolder sees all files.
+	contentDir := s.resolveContentBase(torrent, sortedQBFiles)
 
 	files := make([]*pb.FileInfo, len(sortedQBFiles))
 	var offset int64

@@ -102,7 +102,19 @@ func TestResolveContentDir(t *testing.T) {
 	}
 }
 
-func TestResolveReadDir(t *testing.T) {
+func TestResolveContentBase(t *testing.T) {
+	rootedFiles := qbittorrent.TorrentFiles{
+		{Name: "MyMovie/video.mkv"},
+		{Name: "MyMovie/subs.srt"},
+	}
+	singleFile := qbittorrent.TorrentFiles{
+		{Name: "movie.mkv"},
+	}
+	rootlessFiles := qbittorrent.TorrentFiles{
+		{Name: "file1.mkv"},
+		{Name: "file2.mkv"},
+	}
+
 	tests := []struct {
 		name              string
 		dataPath          string
@@ -110,54 +122,55 @@ func TestResolveReadDir(t *testing.T) {
 		qbTempPath        string
 		tempDataPath      string
 		torrent           qbittorrent.Torrent
+		files             qbittorrent.TorrentFiles
 		want              string
 	}{
 		{
-			name:              "completed torrent: ContentPath in save dir",
+			name:              "rooted: strips root folder from ContentPath",
 			dataPath:          "/data",
 			qbDefaultSavePath: "/downloads",
 			torrent: qbittorrent.Torrent{
 				SavePath:    "/downloads/movies",
 				ContentPath: "/downloads/movies/MyMovie",
-				Progress:    1.0,
 			},
-			want: "/data/movies",
+			files: rootedFiles,
+			want:  "/data/movies",
 		},
 		{
-			name:              "downloading: ContentPath in download dir",
+			name:              "rooted: ContentPath in temp dir",
 			dataPath:          "/data",
 			qbDefaultSavePath: "/downloads",
 			torrent: qbittorrent.Torrent{
 				SavePath:    "/downloads/movies",
 				ContentPath: "/downloads/incomplete/MyMovie",
-				Progress:    0.5,
 			},
-			want: "/data/incomplete",
+			files: rootedFiles,
+			want:  "/data/incomplete",
 		},
 		{
-			name:              "no DownloadPath: resolves via ContentPath",
+			name:              "rooted: trailing slash on ContentPath",
 			dataPath:          "/data",
 			qbDefaultSavePath: "/downloads",
 			torrent: qbittorrent.Torrent{
 				SavePath:    "/downloads/movies",
-				ContentPath: "/downloads/movies/MyMovie",
-				Progress:    0.3,
+				ContentPath: "/downloads/movies/MyMovie/",
 			},
-			want: "/data/movies",
+			files: rootedFiles,
+			want:  "/data/movies",
 		},
 		{
-			name:              "zero progress: ContentPath in download dir",
+			name:              "rooted: doubled root folder in ContentPath",
 			dataPath:          "/data",
 			qbDefaultSavePath: "/downloads",
 			torrent: qbittorrent.Torrent{
-				SavePath:    "/downloads/movies",
-				ContentPath: "/downloads/incomplete/MyMovie",
-				Progress:    0,
+				SavePath:    "/downloads/movies/MyMovie",
+				ContentPath: "/downloads/movies/MyMovie/MyMovie",
 			},
-			want: "/data/incomplete",
+			files: rootedFiles,
+			want:  "/data/movies",
 		},
 		{
-			name:              "temp path: ContentPath resolves via qbTempPath",
+			name:              "rooted: temp path with separate mount",
 			dataPath:          "/mnt/data/torrents",
 			qbDefaultSavePath: "/data/torrents",
 			qbTempPath:        "/data/incomplete",
@@ -165,12 +178,12 @@ func TestResolveReadDir(t *testing.T) {
 			torrent: qbittorrent.Torrent{
 				SavePath:    "/data/torrents/movies",
 				ContentPath: "/data/incomplete/MyMovie",
-				Progress:    0.5,
 			},
-			want: "/mnt/data/incomplete",
+			files: rootedFiles,
+			want:  "/mnt/data/incomplete",
 		},
 		{
-			name:              "ContentPath reflects temp dir with category subdir",
+			name:              "rooted: temp dir with category subdir",
 			dataPath:          "/mnt/data/torrents",
 			qbDefaultSavePath: "/data/torrents",
 			qbTempPath:        "/data/incomplete",
@@ -178,42 +191,41 @@ func TestResolveReadDir(t *testing.T) {
 			torrent: qbittorrent.Torrent{
 				SavePath:    "/data/torrents/movies",
 				ContentPath: "/data/incomplete/movies/MyMovie",
-				Progress:    0.3,
 			},
-			want: "/mnt/data/incomplete/movies",
+			files: rootedFiles,
+			want:  "/mnt/data/incomplete/movies",
 		},
 		{
-			name:              "ContentPath matches SavePath after completion",
+			name:              "single-file: Dir extracts parent",
 			dataPath:          "/data",
 			qbDefaultSavePath: "/downloads",
-			qbTempPath:        "/temp/incomplete",
-			tempDataPath:      "/data/../temp/incomplete",
 			torrent: qbittorrent.Torrent{
 				SavePath:    "/downloads/movies",
-				ContentPath: "/downloads/movies/MyMovie",
-				Progress:    1.0,
+				ContentPath: "/downloads/movies/movie.mkv",
 			},
-			want: "/data/movies",
+			files: singleFile,
+			want:  "/data/movies",
 		},
 		{
-			name:              "empty ContentPath falls back to save dir",
+			name:              "rootless: ContentPath is the base directory",
+			dataPath:          "/data",
+			qbDefaultSavePath: "/downloads",
+			torrent: qbittorrent.Torrent{
+				SavePath:    "/downloads/movies",
+				ContentPath: "/downloads/movies",
+			},
+			files: rootlessFiles,
+			want:  "/data/movies",
+		},
+		{
+			name:              "empty ContentPath falls back to SavePath",
 			dataPath:          "/data",
 			qbDefaultSavePath: "/downloads",
 			torrent: qbittorrent.Torrent{
 				SavePath: "/downloads/movies",
-				Progress: 0.5,
 			},
-			want: "/data/movies",
-		},
-		{
-			name:              "trailing slash on ContentPath is cleaned before Dir",
-			dataPath:          "/data",
-			qbDefaultSavePath: "/downloads",
-			torrent: qbittorrent.Torrent{
-				SavePath:    "/downloads/movies",
-				ContentPath: "/downloads/movies/MyMovie/",
-			},
-			want: "/data/movies",
+			files: rootedFiles,
+			want:  "/data/movies",
 		},
 	}
 
@@ -225,7 +237,7 @@ func TestResolveReadDir(t *testing.T) {
 				qbTempPath:        tt.qbTempPath,
 				tempDataPath:      tt.tempDataPath,
 			}
-			got := s.resolveReadDir(tt.torrent)
+			got := s.resolveContentBase(tt.torrent, tt.files)
 			if got != tt.want {
 				t.Errorf("got %q, want %q", got, tt.want)
 			}
@@ -233,21 +245,21 @@ func TestResolveReadDir(t *testing.T) {
 	}
 }
 
-func TestHasRootFolder(t *testing.T) {
+func TestDetectRootFolder(t *testing.T) {
 	tests := []struct {
 		name  string
 		files qbittorrent.TorrentFiles
-		want  bool
+		want  string
 	}{
 		{
-			name:  "single file (no root)",
+			name:  "single file",
 			files: qbittorrent.TorrentFiles{{Name: "movie.mkv"}},
-			want:  false,
+			want:  "",
 		},
 		{
 			name:  "empty file list",
 			files: qbittorrent.TorrentFiles{},
-			want:  false,
+			want:  "",
 		},
 		{
 			name: "rooted multi-file",
@@ -255,7 +267,7 @@ func TestHasRootFolder(t *testing.T) {
 				{Name: "MyTorrent/video.mkv"},
 				{Name: "MyTorrent/subs.srt"},
 			},
-			want: true,
+			want: "MyTorrent",
 		},
 		{
 			name: "rooted with nested dirs",
@@ -263,7 +275,7 @@ func TestHasRootFolder(t *testing.T) {
 				{Name: "Show/Season 1/ep1.mkv"},
 				{Name: "Show/Season 2/ep2.mkv"},
 			},
-			want: true,
+			want: "Show",
 		},
 		{
 			name: "rootless bare files",
@@ -271,7 +283,7 @@ func TestHasRootFolder(t *testing.T) {
 				{Name: "file1.mkv"},
 				{Name: "file2.mkv"},
 			},
-			want: false,
+			want: "",
 		},
 		{
 			name: "rootless with different subdirs",
@@ -279,7 +291,7 @@ func TestHasRootFolder(t *testing.T) {
 				{Name: "Season 1/ep1.mkv"},
 				{Name: "Season 2/ep2.mkv"},
 			},
-			want: false,
+			want: "",
 		},
 		{
 			name: "rootless mixed bare and subdir",
@@ -287,15 +299,15 @@ func TestHasRootFolder(t *testing.T) {
 				{Name: "readme.txt"},
 				{Name: "data/file.bin"},
 			},
-			want: false,
+			want: "",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := hasRootFolder(tt.files)
+			got := detectRootFolder(tt.files)
 			if got != tt.want {
-				t.Errorf("hasRootFolder() = %v, want %v", got, tt.want)
+				t.Errorf("detectRootFolder() = %q, want %q", got, tt.want)
 			}
 		})
 	}
