@@ -1,6 +1,8 @@
 package destination
 
 import (
+	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -299,6 +301,46 @@ func TestTorrentStore_BeginAbort(t *testing.T) {
 	ts.EndCleanup("abc")
 	if _, found := ts.AbortCh("abc"); found {
 		t.Fatal("AbortCh after EndCleanup: expected not found")
+	}
+}
+
+func TestTorrentStore_InodeDelegation(t *testing.T) {
+	t.Parallel()
+	ts := newTestStore(t)
+
+	if ts.Inodes() == nil {
+		t.Fatal("expected non-nil InodeRegistry")
+	}
+
+	inode := Inode(12345)
+	basePath := ts.basePath
+	ts.Inodes().RegisterInProgress(inode, "h1", "movies/file.mkv")
+
+	files := []*serverFileInfo{
+		{
+			path:     filepath.Join(basePath, "movies", "file.mkv"),
+			size:     1024,
+			selected: true,
+			hardlink: hardlinkInfo{
+				sourceInode: inode,
+				state:       hlStateInProgress,
+			},
+		},
+	}
+	ts.RegisterInodes(context.Background(), "h1", files)
+
+	regPath, found := ts.Inodes().GetRegistered(inode)
+	if !found {
+		t.Fatal("expected inode registered after RegisterInodes")
+	}
+	wantRelPath := filepath.Join("movies", "file.mkv")
+	if regPath != wantRelPath {
+		t.Fatalf("expected registered path %q, got %q", wantRelPath, regPath)
+	}
+
+	_, _, _, inProg := ts.Inodes().GetInProgress(inode)
+	if inProg {
+		t.Fatal("expected in-progress cleared after RegisterInodes")
 	}
 }
 

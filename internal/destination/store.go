@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -180,4 +182,44 @@ func (ts *torrentStore) AbortCh(hash string) (chan struct{}, bool) {
 	ch, ok := ts.aborting[hash]
 	ts.mu.RUnlock()
 	return ch, ok
+}
+
+// Inodes returns the underlying InodeRegistry for fine-grained inode lookups
+// during setupFiles.
+func (ts *torrentStore) Inodes() *InodeRegistry {
+	return ts.inodes
+}
+
+// RegisterInodes registers finalized file inodes in the persistent registry
+// and signals any in-progress waiters.
+func (ts *torrentStore) RegisterInodes(ctx context.Context, hash string, files []*serverFileInfo) {
+	var registered int
+	for _, fi := range files {
+		if fi.skipForWriteData() || fi.hardlink.sourceInode == 0 {
+			continue
+		}
+
+		finalPath, _ := strings.CutSuffix(fi.path, partialSuffix)
+		relPath, relErr := filepath.Rel(ts.basePath, finalPath)
+		if relErr != nil {
+			ts.logger.WarnContext(ctx, "failed to get relative path for inode registration",
+				"hash", hash, "path", finalPath, "error", relErr)
+			continue
+		}
+
+		ts.inodes.Register(fi.hardlink.sourceInode, relPath)
+		ts.inodes.CompleteInProgress(fi.hardlink.sourceInode, hash)
+		registered++
+	}
+
+	if registered > 0 {
+		if saveErr := ts.inodes.Save(); saveErr != nil {
+			ts.logger.WarnContext(ctx, "failed to save inode map", "error", saveErr)
+		}
+	}
+}
+
+// SaveInodes persists the inode registry to disk.
+func (ts *torrentStore) SaveInodes() error {
+	return ts.inodes.Save()
 }
