@@ -348,7 +348,6 @@ func TestFinalizeTorrent_PartialSelection(t *testing.T) {
 		Offset:      0,
 		Size:        16,
 		Data:        pieceData0,
-		PieceHash:   pieceHash0,
 	})
 	if !result.success {
 		t.Fatalf("writePiece 0 failed: %s", result.errMsg)
@@ -361,7 +360,6 @@ func TestFinalizeTorrent_PartialSelection(t *testing.T) {
 		Offset:      32,
 		Size:        16,
 		Data:        pieceData2,
-		PieceHash:   pieceHash2,
 	})
 	if !result.success {
 		t.Fatalf("writePiece 2 failed: %s", result.errMsg)

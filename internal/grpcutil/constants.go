@@ -23,4 +23,10 @@ const (
 	// BytesPerMB is the number of bytes in a megabyte (binary, 1 MiB).
 	// Shared across packages for unit conversions (buffer sizes, throughput logging).
 	BytesPerMB = 1024 * 1024
+
+	// TransportBufferSize is the gRPC read/write buffer size on both client and
+	// server. Default (32 KiB) fragments large pieces into many syscalls; 1 MiB
+	// matches typical piece sizes and reduces syscall and TCP send-coalescing
+	// overhead for bulk streaming.
+	TransportBufferSize = 1 * 1024 * 1024 // 1 MiB
 )

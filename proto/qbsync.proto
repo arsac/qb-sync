@@ -57,7 +57,8 @@ message WritePieceRequest {
   int32 piece_index = 2;
   int64 offset = 3;
   int64 size = 4;
-  string piece_hash = 5;  // SHA1 hash for verification
+  reserved 5;             // formerly piece_hash; destination now uses InitTorrentRequest.piece_hashes
+  reserved "piece_hash";
   bytes data = 6;
 }
 

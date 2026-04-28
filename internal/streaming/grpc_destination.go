@@ -141,6 +141,8 @@ func NewGRPCDestination(addr string, minConns, maxConns int) (*GRPCDestination, 
 		}),
 		grpc.WithInitialWindowSize(grpcutil.InitialStreamWindowSize),
 		grpc.WithInitialConnWindowSize(grpcutil.InitialConnWindowSize),
+		grpc.WithReadBufferSize(grpcutil.TransportBufferSize),
+		grpc.WithWriteBufferSize(grpcutil.TransportBufferSize),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(grpcutil.MaxGRPCMessageSize),
 			grpc.MaxCallSendMsgSize(grpcutil.MaxGRPCMessageSize),

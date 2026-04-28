@@ -189,7 +189,6 @@ type WritePieceRequest struct {
 	PieceIndex    int32                  `protobuf:"varint,2,opt,name=piece_index,json=pieceIndex,proto3" json:"piece_index,omitempty"`
 	Offset        int64                  `protobuf:"varint,3,opt,name=offset,proto3" json:"offset,omitempty"`
 	Size          int64                  `protobuf:"varint,4,opt,name=size,proto3" json:"size,omitempty"`
-	PieceHash     string                 `protobuf:"bytes,5,opt,name=piece_hash,json=pieceHash,proto3" json:"piece_hash,omitempty"` // SHA1 hash for verification
 	Data          []byte                 `protobuf:"bytes,6,opt,name=data,proto3" json:"data,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -251,13 +250,6 @@ func (x *WritePieceRequest) GetSize() int64 {
 		return x.Size
 	}
 	return 0
-}
-
-func (x *WritePieceRequest) GetPieceHash() string {
-	if x != nil {
-		return x.PieceHash
-	}
-	return ""
 }
 
 func (x *WritePieceRequest) GetData() []byte {
@@ -1181,16 +1173,15 @@ var File_qbsync_proto protoreflect.FileDescriptor
 
 const file_qbsync_proto_rawDesc = "" +
 	"\n" +
-	"\fqbsync.proto\x12\x06qbsync\"\xb6\x01\n" +
+	"\fqbsync.proto\x12\x06qbsync\"\xa9\x01\n" +
 	"\x11WritePieceRequest\x12!\n" +
 	"\ftorrent_hash\x18\x01 \x01(\tR\vtorrentHash\x12\x1f\n" +
 	"\vpiece_index\x18\x02 \x01(\x05R\n" +
 	"pieceIndex\x12\x16\n" +
 	"\x06offset\x18\x03 \x01(\x03R\x06offset\x12\x12\n" +
-	"\x04size\x18\x04 \x01(\x03R\x04size\x12\x1d\n" +
-	"\n" +
-	"piece_hash\x18\x05 \x01(\tR\tpieceHash\x12\x12\n" +
-	"\x04data\x18\x06 \x01(\fR\x04data\"\xb5\x01\n" +
+	"\x04size\x18\x04 \x01(\x03R\x04size\x12\x12\n" +
+	"\x04data\x18\x06 \x01(\fR\x04dataJ\x04\b\x05\x10\x06R\n" +
+	"piece_hash\"\xb5\x01\n" +
 	"\bPieceAck\x12!\n" +
 	"\ftorrent_hash\x18\x01 \x01(\tR\vtorrentHash\x12\x1f\n" +
 	"\vpiece_index\x18\x02 \x01(\x05R\n" +

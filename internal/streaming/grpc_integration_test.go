@@ -342,7 +342,7 @@ func newTestPool(t *testing.T, ps *PieceStream, id int) (*StreamPool, func()) {
 		ctx:      poolCtx,
 		cancel:   poolCancel,
 		errs:     make(chan error, 10),
-		acks:     make(chan *pb.PieceAck, 100),
+		acks:     make(chan AckEnvelope, 100),
 		ackReady: make(chan struct{}, 10),
 		logger:   slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}

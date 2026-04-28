@@ -153,6 +153,8 @@ func (s *Server) Run(ctx context.Context) error {
 		grpc.MaxSendMsgSize(grpcutil.MaxGRPCMessageSize),
 		grpc.InitialWindowSize(grpcutil.InitialStreamWindowSize),
 		grpc.InitialConnWindowSize(grpcutil.InitialConnWindowSize),
+		grpc.ReadBufferSize(grpcutil.TransportBufferSize),
+		grpc.WriteBufferSize(grpcutil.TransportBufferSize),
 		grpc.KeepaliveParams(keepalive.ServerParameters{
 			Time:    keepalivePingInterval, // Send pings every 30s if no activity
 			Timeout: keepalivePingTimeout,  // Wait 10s for ping ack

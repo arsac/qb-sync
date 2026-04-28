@@ -494,7 +494,6 @@ func TestWritePiece_EarlyFinalizesCompletedFile(t *testing.T) {
 		PieceIndex:  0,
 		Offset:      0,
 		Data:        pieceData,
-		PieceHash:   pieceHash,
 	})
 	if !result.success {
 		t.Fatalf("writePiece failed: %s", result.errMsg)
