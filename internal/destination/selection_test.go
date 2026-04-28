@@ -564,14 +564,10 @@ func TestInitTorrent_StaleMetadata_NukedBeforeInit(t *testing.T) {
 		t.Errorf("expected 3 pieces needed (stale state nuked), got %d", resp.GetPiecesNeededCount())
 	}
 
-	// Version file should exist now.
-	versionPath := filepath.Join(metaDir, versionFileName)
-	data, readErr := os.ReadFile(versionPath)
-	if readErr != nil {
-		t.Fatalf("version file missing after init: %v", readErr)
-	}
-	if string(data) != metaVersion {
-		t.Errorf("version = %q, want %q", string(data), metaVersion)
+	// .meta file should exist now.
+	metaPath := filepath.Join(metaDir, metaFileName)
+	if _, statErr := os.Stat(metaPath); statErr != nil {
+		t.Fatalf(".meta file missing after init: %v", statErr)
 	}
 }
 

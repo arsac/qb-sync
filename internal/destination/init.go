@@ -110,14 +110,18 @@ func (s *Server) InitTorrent(
 
 // resumeTorrent handles resuming an existing torrent sync.
 func (s *Server) resumeTorrent(
-	ctx context.Context,
-	hash string,
+	_ context.Context,
+	_ string,
 	state *serverTorrentState,
 	req *pb.InitTorrentRequest,
 ) *pb.InitTorrentResponse {
-	// Ensure torrent file is written (may have been missed by CheckTorrentStatus)
-	if err := s.ensureTorrentFileWritten(ctx, hash, state, req); err != nil {
-		return initErrorResponse("ensuring torrent file: %v", err)
+	// Cache torrent file bytes on state if not already set.
+	if len(req.GetTorrentFile()) > 0 {
+		state.mu.Lock()
+		if len(state.torrentFile) == 0 {
+			state.torrentFile = req.GetTorrentFile()
+		}
+		state.mu.Unlock()
 	}
 
 	// Acquire state.mu to read written/hardlinkResults safely — a concurrent
@@ -128,41 +132,41 @@ func (s *Server) resumeTorrent(
 	return resp
 }
 
-// setupMetadataDir creates the metadata directory and writes the torrent file.
-// If the directory exists with a stale or missing version, it is removed first
-// to prevent loading incompatible state files.
-// Returns metaDir, torrentPath, statePath, and error.
+// setupMetadataDir creates the metadata directory and writes the .meta file
+// (serialized PersistedTorrentMeta). If the directory exists with stale metadata
+// (no .meta and old .version check fails), it is removed first.
+// Skips .meta write if it already exists (idempotent for recovery path).
+// Returns metaDir, statePath, and error.
 func (s *Server) setupMetadataDir(
-	hash, name string,
-	torrentFile []byte,
-) (string, string, string, error) {
+	hash string,
+	req *pb.InitTorrentRequest,
+) (string, string, error) {
 	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
 
-	// Nuke stale metadata directory before re-creating.
-	if !checkMetaVersion(metaDir) {
-		_ = os.RemoveAll(metaDir)
-	}
-
-	if err := os.MkdirAll(metaDir, serverDirPermissions); err != nil {
-		return "", "", "", fmt.Errorf("creating metadata directory: %w", err)
-	}
-
-	torrentPath := filepath.Join(metaDir, filepath.Base(name)+".torrent")
-	statePath := filepath.Join(metaDir, ".state")
-
-	if len(torrentFile) > 0 {
-		if info, statErr := os.Stat(torrentPath); statErr != nil || info.Size() != int64(len(torrentFile)) {
-			if err := atomicWriteFile(torrentPath, torrentFile); err != nil {
-				return "", "", "", fmt.Errorf("writing .torrent file: %w", err)
-			}
+	// Nuke stale metadata directory before re-creating:
+	// only if .meta is absent AND old .version check fails.
+	metaPath := filepath.Join(metaDir, metaFileName)
+	if _, statErr := os.Stat(metaPath); statErr != nil {
+		if !checkMetaVersion(metaDir) {
+			_ = os.RemoveAll(metaDir)
 		}
 	}
 
-	if err := atomicWriteFile(filepath.Join(metaDir, versionFileName), []byte(metaVersion)); err != nil {
-		return "", "", "", fmt.Errorf("writing version file: %w", err)
+	if err := os.MkdirAll(metaDir, serverDirPermissions); err != nil {
+		return "", "", fmt.Errorf("creating metadata directory: %w", err)
 	}
 
-	return metaDir, torrentPath, statePath, nil
+	statePath := filepath.Join(metaDir, ".state")
+
+	// Skip write if .meta already exists (idempotent for recovery path).
+	if _, statErr := os.Stat(metaPath); statErr != nil {
+		meta := buildPersistedMeta(req)
+		if err := savePersistedMeta(metaPath, meta); err != nil {
+			return "", "", fmt.Errorf("writing metadata: %w", err)
+		}
+	}
+
+	return metaDir, statePath, nil
 }
 
 // initNewTorrent handles initializing a fresh torrent sync.
@@ -173,8 +177,8 @@ func (s *Server) initNewTorrent(
 ) *pb.InitTorrentResponse {
 	name := req.GetName()
 
-	// Create metadata directory and write torrent file
-	metaDir, _, statePath, err := s.setupMetadataDir(hash, name, req.GetTorrentFile())
+	// Create metadata directory and write .meta file.
+	metaDir, statePath, err := s.setupMetadataDir(hash, req)
 	if err != nil {
 		return initErrorResponse("%v", err)
 	}
@@ -183,16 +187,8 @@ func (s *Server) initNewTorrent(
 	// This handles destination restart: persisted state may have files at the old path
 	// (e.g., no category prefix), while source now sends the correct sub-path.
 	saveSubPath := req.GetSaveSubPath()
-	if oldSubPath := loadSubPathFile(metaDir); oldSubPath != saveSubPath {
-		relPaths := make([]string, len(req.GetFiles()))
-		for i, f := range req.GetFiles() {
-			relPaths[i] = f.GetPath()
-		}
-		if _, relocErr := s.relocateFiles(ctx, hash, relPaths, oldSubPath, saveSubPath); relocErr != nil {
-			s.logger.WarnContext(ctx, "failed to relocate files, continuing with fresh setup",
-				"hash", hash, "error", relocErr)
-		}
-	}
+	metaPath := filepath.Join(metaDir, metaFileName)
+	s.maybeRelocateSubPath(ctx, hash, req, metaPath, saveSubPath)
 
 	// Set up files and check for hardlink opportunities
 	files, hardlinkResults, err := s.setupFiles(ctx, hash, req.GetFiles(), saveSubPath)
@@ -221,15 +217,6 @@ func (s *Server) initNewTorrent(
 			s.logger.WarnContext(ctx, "failed to persist initial state",
 				"hash", hash, "error", saveErr)
 		}
-	}
-
-	// Persist save sub-path and file selection for recovery after restart.
-	// The .torrent file (already written above) provides all other metadata.
-	if saveErr := saveSubPathFile(metaDir, saveSubPath); saveErr != nil {
-		return initErrorResponse("failed to save sub-path for recovery: %v", saveErr)
-	}
-	if saveErr := saveSelectedFile(metaDir, files); saveErr != nil {
-		return initErrorResponse("failed to save selection state: %v", saveErr)
 	}
 
 	// Swap sentinel for real state under store lock.
@@ -265,6 +252,38 @@ func (s *Server) initNewTorrent(
 	)
 
 	return state.buildReadyResponse()
+}
+
+// maybeRelocateSubPath checks whether the persisted sub-path differs from the
+// requested one and relocates data files if needed. After a successful
+// relocation the .meta file is updated so recovery picks up the new path.
+func (s *Server) maybeRelocateSubPath(
+	ctx context.Context,
+	hash string,
+	req *pb.InitTorrentRequest,
+	metaPath, saveSubPath string,
+) {
+	existingMeta, loadErr := loadPersistedMeta(metaPath)
+	if loadErr != nil || existingMeta.GetSaveSubPath() == saveSubPath {
+		return
+	}
+
+	relPaths := make([]string, len(req.GetFiles()))
+	for i, f := range req.GetFiles() {
+		relPaths[i] = f.GetPath()
+	}
+	if _, relocErr := s.relocateFiles(
+		ctx, hash, relPaths, existingMeta.GetSaveSubPath(), saveSubPath,
+	); relocErr != nil {
+		s.logger.WarnContext(ctx, "failed to relocate files, continuing with fresh setup",
+			"hash", hash, "error", relocErr)
+	}
+	// Update .meta to reflect the new sub-path so recovery uses the correct path.
+	updatedMeta := buildPersistedMeta(req)
+	if saveErr := savePersistedMeta(metaPath, updatedMeta); saveErr != nil {
+		s.logger.WarnContext(ctx, "failed to update .meta after relocation",
+			"hash", hash, "error", saveErr)
+	}
 }
 
 // buildWrittenBitmap constructs the written bitmap from persisted state and hardlink
@@ -438,54 +457,6 @@ func (s *Server) waitForAbortComplete(ctx context.Context, hash string) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-}
-
-// ensureTorrentFileWritten writes the torrent file if it doesn't exist on disk.
-// This handles the case where CheckTorrentStatus created state without the file.
-func (s *Server) ensureTorrentFileWritten(
-	ctx context.Context,
-	hash string,
-	state *serverTorrentState,
-	req *pb.InitTorrentRequest,
-) error {
-	torrentFile := req.GetTorrentFile()
-	if len(torrentFile) == 0 {
-		return nil
-	}
-
-	// Cache the torrent file bytes on state if not already set.
-	state.mu.Lock()
-	hasCached := len(state.torrentFile) > 0
-	state.mu.Unlock()
-	if hasCached {
-		return nil
-	}
-
-	// Use existing path if valid, otherwise construct from request.
-	name := req.GetName()
-	if name == "" {
-		return nil
-	}
-	name = filepath.Base(name) // Sanitize to prevent path traversal
-	torrentPath := filepath.Join(s.config.BasePath, metaDirName, hash, name+".torrent")
-
-	// Check if file already exists on disk
-	if _, err := os.Stat(torrentPath); err != nil {
-		// Ensure directory exists and write file
-		if mkdirErr := os.MkdirAll(filepath.Dir(torrentPath), serverDirPermissions); mkdirErr != nil {
-			return fmt.Errorf("creating metadata directory: %w", mkdirErr)
-		}
-		if writeErr := atomicWriteFile(torrentPath, torrentFile); writeErr != nil {
-			return fmt.Errorf("writing torrent file: %w", writeErr)
-		}
-		s.logger.InfoContext(ctx, "wrote torrent file for existing state",
-			"hash", hash, "path", torrentPath)
-	}
-
-	state.mu.Lock()
-	state.torrentFile = torrentFile
-	state.mu.Unlock()
-	return nil
 }
 
 // hardlinkOutcome represents the result of hardlink resolution.

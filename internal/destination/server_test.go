@@ -1177,31 +1177,50 @@ func TestCountHardlinkResults_PreExisting(t *testing.T) {
 
 func TestSetupMetadataDir_Idempotent(t *testing.T) {
 	t.Parallel()
-	s, _ := newTestDestServer(t)
+	s, tmpDir := newTestDestServer(t)
 
 	torrentData := []byte("d4:infod4:name4:test12:piece lengthi16384e6:pieces20:" +
 		strings.Repeat("A", 20) + "6:lengthi1024eee")
 
-	metaDir1, torrentPath1, statePath1, err := s.setupMetadataDir("abc", "TestTorrent", torrentData)
+	req := &pb.InitTorrentRequest{
+		TorrentHash: "abc",
+		Name:        "TestTorrent",
+		PieceSize:   16384,
+		TotalSize:   1024,
+		NumPieces:   1,
+		TorrentFile: torrentData,
+		Files: []*pb.FileInfo{{
+			Path:     "test",
+			Size:     1024,
+			Offset:   0,
+			Selected: true,
+		}},
+	}
+
+	metaDir1, statePath1, err := s.setupMetadataDir("abc", req)
 	if err != nil {
 		t.Fatalf("first call failed: %v", err)
 	}
-	if _, statErr := os.Stat(torrentPath1); statErr != nil {
-		t.Fatalf("torrent file not created: %v", statErr)
+	metaPath := filepath.Join(tmpDir, metaDirName, "abc", metaFileName)
+	if _, statErr := os.Stat(metaPath); statErr != nil {
+		t.Fatalf(".meta file not created: %v", statErr)
 	}
 
-	metaDir2, torrentPath2, statePath2, err := s.setupMetadataDir("abc", "TestTorrent", torrentData)
+	metaDir2, statePath2, err := s.setupMetadataDir("abc", req)
 	if err != nil {
 		t.Fatalf("second call failed: %v", err)
 	}
-	if metaDir1 != metaDir2 || torrentPath1 != torrentPath2 || statePath1 != statePath2 {
+	if metaDir1 != metaDir2 || statePath1 != statePath2 {
 		t.Fatal("paths should be identical on idempotent call")
 	}
 
-	// Recovery path: nil torrent data must not error when file already exists.
-	_, _, _, err = s.setupMetadataDir("abc", "TestTorrent", nil)
+	// Recovery path: .meta already exists, second call must not overwrite.
+	metaDir3, statePath3, err := s.setupMetadataDir("abc", req)
 	if err != nil {
-		t.Fatalf("nil torrent data call failed: %v", err)
+		t.Fatalf("third call failed: %v", err)
+	}
+	if metaDir1 != metaDir3 || statePath1 != statePath3 {
+		t.Fatal("paths should be identical on repeated call")
 	}
 }
 
@@ -1538,11 +1557,15 @@ func TestInitTorrent_RelocatesOnSubPathChange(t *testing.T) {
 		assertFileExists(t, newPartialPath, "partial file should exist at new sub-path after re-init")
 		assertFileNotExists(t, oldPartialPath, "partial file should not exist at old path after relocation")
 
-		// Verify persisted sub-path was updated
+		// Verify persisted sub-path was updated in .meta
 		metaDir := filepath.Join(tmpDir, metaDirName, hash)
-		subPath := loadSubPathFile(metaDir)
-		if subPath != "movies" {
-			t.Errorf("persisted subPath = %q, want %q", subPath, "movies")
+		metaPath := filepath.Join(metaDir, metaFileName)
+		persisted, loadErr := loadPersistedMeta(metaPath)
+		if loadErr != nil {
+			t.Fatalf("failed to load .meta: %v", loadErr)
+		}
+		if persisted.GetSaveSubPath() != "movies" {
+			t.Errorf("persisted subPath = %q, want %q", persisted.GetSaveSubPath(), "movies")
 		}
 	})
 

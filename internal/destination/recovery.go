@@ -49,7 +49,8 @@ func (s *Server) recoverInFlightTorrents(ctx context.Context) error {
 }
 
 // recoverTorrent rebuilds state for a single torrent from its persisted
-// metadata.
+// metadata. Tries .meta (new format) first, then falls back to old files
+// (.torrent + .subpath + .selected) for migration.
 func (s *Server) recoverTorrent(
 	ctx context.Context,
 	hash, metaDir string,
@@ -58,21 +59,69 @@ func (s *Server) recoverTorrent(
 		return errors.New("already finalized")
 	}
 
+	metaPath := filepath.Join(metaDir, metaFileName)
+	req, recoverErr := s.loadOrMigrateMeta(ctx, hash, metaDir, metaPath)
+	if recoverErr != nil {
+		return recoverErr
+	}
+
+	if reserveErr := s.store.Reserve(hash); reserveErr != nil {
+		return fmt.Errorf("reserve failed: %w", reserveErr)
+	}
+
+	resp := s.initNewTorrent(ctx, hash, req)
+	if !resp.GetSuccess() {
+		s.store.Unreserve(hash)
+		return fmt.Errorf("init failed: %s", resp.GetError())
+	}
+
+	// Cache torrent file bytes on recovered state.
+	if state, ok := s.store.Get(hash); ok && len(req.GetTorrentFile()) > 0 {
+		state.mu.Lock()
+		if len(state.torrentFile) == 0 {
+			state.torrentFile = req.GetTorrentFile()
+		}
+		state.mu.Unlock()
+	}
+
+	s.logger.InfoContext(ctx, "recovered torrent from disk",
+		"hash", hash,
+		"piecesHave", resp.GetPiecesHaveCount(),
+	)
+	return nil
+}
+
+// loadOrMigrateMeta loads metadata from .meta (new format) or falls back to
+// old files (bencode + .subpath + .selected). On successful fallback, writes
+// .meta for self-healing migration.
+func (s *Server) loadOrMigrateMeta(
+	ctx context.Context,
+	hash, metaDir, metaPath string,
+) (*pb.InitTorrentRequest, error) {
+	// Try new format first.
+	if meta, err := loadPersistedMeta(metaPath); err == nil {
+		if meta.GetSchemaVersion() < currentSchemaVersion {
+			return nil, fmt.Errorf("unknown schema version: %d", meta.GetSchemaVersion())
+		}
+		return persistedMetaToRequest(meta), nil
+	}
+
+	// Fall back to old format (migration path).
 	if !checkMetaVersion(metaDir) {
-		return errors.New("stale metadata version")
+		return nil, errors.New("stale metadata version")
 	}
 
 	torrentPath, err := findTorrentFile(metaDir)
 	if err != nil {
-		return fmt.Errorf("finding torrent file: %w", err)
+		return nil, fmt.Errorf("finding torrent file: %w", err)
 	}
 	torrentData, err := os.ReadFile(torrentPath)
 	if err != nil {
-		return fmt.Errorf("reading torrent file: %w", err)
+		return nil, fmt.Errorf("reading torrent file: %w", err)
 	}
 	parsed, err := parseTorrentFile(torrentData)
 	if err != nil {
-		return fmt.Errorf("parsing torrent file: %w", err)
+		return nil, fmt.Errorf("parsing torrent file: %w", err)
 	}
 
 	saveSubPath := loadSubPathFile(metaDir)
@@ -102,23 +151,15 @@ func (s *Server) recoverTorrent(
 		Files:       files,
 		PieceHashes: parsed.PieceHashes,
 		SaveSubPath: saveSubPath,
+		TorrentFile: torrentData,
 	}
 
-	// Reserve the hash before initializing to prevent concurrent access.
-	if reserveErr := s.store.Reserve(hash); reserveErr != nil {
-		return fmt.Errorf("reserve failed: %w", reserveErr)
+	// Self-healing: write .meta so next restart uses new path.
+	meta := buildPersistedMeta(req)
+	if saveErr := savePersistedMeta(metaPath, meta); saveErr != nil {
+		s.logger.WarnContext(ctx, "failed to write .meta during migration",
+			"hash", hash, "error", saveErr)
 	}
 
-	resp := s.initNewTorrent(ctx, hash, req)
-	if !resp.GetSuccess() {
-		s.store.Unreserve(hash)
-		return fmt.Errorf("init failed: %s", resp.GetError())
-	}
-
-	s.logger.InfoContext(ctx, "recovered torrent from disk",
-		"hash", hash,
-		"name", parsed.Name,
-		"piecesHave", resp.GetPiecesHaveCount(),
-	)
-	return nil
+	return req, nil
 }
