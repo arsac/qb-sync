@@ -89,6 +89,9 @@ func AreHardlinked(path1, path2 string) (bool, error) {
 }
 
 // GetFileID returns the device and inode numbers for a file.
+// statDev wraps the platform-specific Stat_t.Dev conversion so the wire-format
+// device ID is stable: Linux Stat_t.Dev is already uint64, Darwin's int32 is
+// zero-extended (not sign-extended) into uint64.
 func GetFileID(path string) (uint64, uint64, error) {
 	info, statErr := os.Stat(path)
 	if statErr != nil {
@@ -100,9 +103,7 @@ func GetFileID(path string) (uint64, uint64, error) {
 		return 0, 0, errInodesUnsupported
 	}
 
-	//nolint:gosec // int32->uint64 sign-extends on Darwin; consistent within a single machine.
-	dev := uint64(stat.Dev)
-	return dev, stat.Ino, nil
+	return statDev(stat), stat.Ino, nil
 }
 
 // AtomicWriteFile writes data to a file atomically using write-to-temp + fsync + rename.
