@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"github.com/bits-and-blooms/bitset"
 
@@ -647,6 +648,23 @@ func (s *Server) tryHardlinkFromRegistered(
 			"statErr", statErr,
 		)
 		metrics.StaleInodeEvictionsTotal.Inc()
+		return hardlinkOutcome{}, false
+	}
+
+	// Same-filesystem guard: hardlinks only work within one filesystem.
+	// If source and target are on different devices, skip hardlink and fall
+	// through to normal streaming. On overlayfs destinations this fires for
+	// all files, safely disabling hardlinks.
+	targetDirInfo, targetStatErr := os.Stat(filepath.Dir(targetPath))
+	if targetStatErr != nil {
+		return hardlinkOutcome{}, false
+	}
+	targetStat, targetOk := targetDirInfo.Sys().(*syscall.Stat_t)
+	sourceStat, sourceOk := sourceInfo.Sys().(*syscall.Stat_t)
+	if !targetOk || !sourceOk {
+		return hardlinkOutcome{}, false
+	}
+	if uint64(sourceStat.Dev) != uint64(targetStat.Dev) {
 		return hardlinkOutcome{}, false
 	}
 
