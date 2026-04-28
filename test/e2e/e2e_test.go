@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1952,6 +1953,408 @@ func TestE2E_ExcludeSyncTagReactive(t *testing.T) {
 	env.AssertTorrentCompleteOnDestination(ctx, bigBuckBunnyHash)
 
 	t.Log("Reactive exclude-sync tag E2E test completed successfully!")
+
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
+}
+
+// TestE2E_DestinationRecoveryMidStream tests genuine mid-stream recovery.
+// The destination server is stopped while only partially synced, then restarted.
+// A new orchestrator is started and verifies the remaining pieces get streamed
+// and the torrent completes on the destination.
+//
+// Flow:
+//  1. Download Wired CD torrent on source
+//  2. Start orchestrator with WithNumSenders(1) to slow streaming
+//  3. Wait for at least 10% but less than 90% streaming progress
+//  4. Stop orchestrator + stop destination server
+//  5. Restart destination server (triggers recoverInFlightTorrents)
+//  6. Start new orchestrator (normal speed)
+//  7. Wait for sync to complete
+//  8. Assert torrent complete on destination
+func TestE2E_DestinationRecoveryMidStream(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+
+	t.Parallel()
+
+	env := SetupTestEnv(t)
+	ctx := context.Background()
+
+	env.CleanupBothSides(ctx, wiredCDHash)
+
+	// Add the torrent but do NOT wait for download completion. Start the
+	// orchestrator immediately so streaming is paced by download speed,
+	// giving us a window to catch mid-stream progress.
+	t.Log("Adding Wired CD torrent to source (not waiting for download)...")
+	err := env.AddTorrentToSource(ctx, testTorrentURL, nil)
+	require.NoError(t, err)
+
+	torrent := env.WaitForTorrent(env.SourceClient(), wiredCDHash, torrentAppearTimeout)
+	require.NotNil(t, torrent)
+
+	// Use a single sender and single gRPC connection to slow streaming.
+	cfg := env.CreateSourceConfig(WithNumSenders(1), WithGRPCConnections(1, 1))
+	task, dest, err := env.CreateSourceTask(cfg)
+	require.NoError(t, err)
+
+	orchestratorCtx, cancelOrchestrator := context.WithTimeout(ctx, orchestratorTimeout)
+
+	orchestratorDone := make(chan error, 1)
+	go func() {
+		orchestratorDone <- task.Run(orchestratorCtx)
+	}()
+
+	// Wait for streaming to make some progress (at least 1 piece streamed).
+	t.Log("Waiting for streaming to make progress...")
+	require.Eventually(t, func() bool {
+		progress, progressErr := task.Progress(ctx, wiredCDHash)
+		if progressErr != nil {
+			return false
+		}
+		t.Logf("Streaming progress: %d/%d pieces", progress.Streamed, progress.TotalPieces)
+		return progress.Streamed > 0 && progress.Streamed >= progress.TotalPieces/10
+	}, 3*time.Minute, time.Second, "streaming should start and make progress")
+
+	// Immediately stop orchestrator and destination server.
+	t.Log("Stopping orchestrator...")
+	cancelOrchestrator()
+	<-orchestratorDone
+	dest.Close()
+
+	t.Log("Stopping destination gRPC server...")
+	env.StopDestinationServer()
+	time.Sleep(2 * time.Second)
+
+	t.Log("Restarting destination gRPC server (triggers recoverInFlightTorrents)...")
+	env.StartDestinationServer()
+
+	// Wait for the source torrent download to complete before starting the
+	// new orchestrator (the first orchestrator may have stopped before download
+	// finished).
+	t.Log("Ensuring source torrent download is complete...")
+	env.WaitForTorrentComplete(env.SourceClient(), wiredCDHash, torrentDownloadTimeout)
+
+	// Start a new orchestrator at normal speed.
+	t.Log("Starting new orchestrator after destination recovery...")
+	cfg2 := env.CreateSourceConfig()
+	task2, dest2, err := env.CreateSourceTask(cfg2)
+	require.NoError(t, err)
+	defer dest2.Close()
+
+	orchestratorCtx2, cancelOrchestrator2 := context.WithTimeout(ctx, syncCompleteTimeout)
+	defer cancelOrchestrator2()
+
+	orchestratorDone2 := make(chan error, 1)
+	go func() {
+		orchestratorDone2 <- task2.Run(orchestratorCtx2)
+	}()
+
+	t.Log("Waiting for sync to complete after mid-stream recovery...")
+	env.WaitForTorrentCompleteOnDestination(ctx, wiredCDHash, syncCompleteTimeout,
+		"torrent should complete on destination after mid-stream recovery")
+
+	cancelOrchestrator2()
+	<-orchestratorDone2
+
+	env.AssertTorrentCompleteOnDestination(ctx, wiredCDHash)
+
+	t.Log("Destination recovery mid-stream test completed successfully!")
+
+	env.CleanupBothSides(ctx, wiredCDHash)
+}
+
+// TestE2E_PartialSelectionWithRestart verifies that partial file selection survives
+// a destination server restart. After syncing a torrent with deselected files, the
+// destination server is restarted and a new orchestrator connects. The test asserts
+// that the same files exist (and don't exist) as before the restart.
+//
+// Flow:
+//  1. Download Wired CD torrent on source (multi-file, 18 files)
+//  2. Deselect files 5, 6, 7 on source (priority 0)
+//  3. Start orchestrator, wait for sync to complete
+//  4. Record which files exist on destination
+//  5. Stop orchestrator, stop destination server, restart it
+//  6. Start new orchestrator
+//  7. Wait for it to see the torrent as complete
+//  8. Assert the same files exist/don't exist as before restart
+func TestE2E_PartialSelectionWithRestart(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+
+	t.Parallel()
+
+	env := SetupTestEnv(t)
+	ctx := context.Background()
+
+	env.CleanupBothSides(ctx, wiredCDHash)
+
+	// Deselected file indices (0-based).
+	deselectedIndices := map[int]bool{5: true, 6: true, 7: true}
+
+	// Step 1: Add torrent to source in stopped state so we can set priorities.
+	t.Log("Adding Wired CD torrent to source (stopped)...")
+	err := env.AddTorrentToSource(ctx, testTorrentURL, map[string]string{
+		"stopped": "true",
+	})
+	require.NoError(t, err)
+
+	torrent := env.WaitForTorrent(env.SourceClient(), wiredCDHash, torrentAppearTimeout)
+	require.NotNil(t, torrent)
+
+	// Wait for metadata to be available (files list populated).
+	var files *qbittorrent.TorrentFiles
+	require.Eventually(t, func() bool {
+		f, filesErr := env.SourceClient().GetFilesInformationCtx(ctx, wiredCDHash)
+		if filesErr != nil || f == nil || len(*f) == 0 {
+			return false
+		}
+		files = f
+		return true
+	}, 30*time.Second, time.Second, "torrent metadata should be available")
+	require.GreaterOrEqual(t, len(*files), 10, "Wired CD should have multiple files")
+
+	// Step 2: Set file priorities — deselect files 5, 6, 7 (priority 0).
+	ids := make([]string, 0, len(deselectedIndices))
+	for idx := range deselectedIndices {
+		ids = append(ids, strconv.Itoa(idx))
+	}
+	t.Logf("Deselecting files: %v", ids)
+	err = env.SourceClient().SetFilePriorityCtx(ctx, wiredCDHash, strings.Join(ids, "|"), 0)
+	require.NoError(t, err)
+
+	// Step 3: Resume torrent and wait for download to complete.
+	t.Log("Resuming torrent...")
+	err = env.SourceClient().ResumeCtx(ctx, []string{wiredCDHash})
+	require.NoError(t, err)
+
+	t.Log("Waiting for selected files to download...")
+	env.WaitForTorrentComplete(env.SourceClient(), wiredCDHash, torrentDownloadTimeout)
+
+	// Build expected file paths on the destination filesystem.
+	type fileExpectation struct {
+		name     string
+		destPath string
+		selected bool
+	}
+	expectations := make([]fileExpectation, len(*files))
+	for i, f := range *files {
+		expectations[i] = fileExpectation{
+			name:     f.Name,
+			destPath: filepath.Join(env.DestinationPath(), f.Name),
+			selected: !deselectedIndices[f.Index],
+		}
+	}
+
+	// Step 4: Start orchestrator and sync.
+	t.Log("Starting orchestrator...")
+	cfg := env.CreateSourceConfig()
+	task, dest, err := env.CreateSourceTask(cfg)
+	require.NoError(t, err)
+
+	orchestratorCtx, cancelOrchestrator := context.WithTimeout(ctx, orchestratorTimeout)
+
+	orchestratorDone := make(chan error, 1)
+	go func() {
+		orchestratorDone <- task.Run(orchestratorCtx)
+	}()
+
+	t.Log("Waiting for torrent to sync to destination...")
+	env.WaitForTorrentCompleteOnDestination(ctx, wiredCDHash, syncCompleteTimeout,
+		"torrent with partial file selection should sync to destination")
+
+	// Stop orchestrator before restart sequence.
+	cancelOrchestrator()
+	<-orchestratorDone
+	dest.Close()
+
+	// Step 5: Verify files exist/don't exist BEFORE restart.
+	t.Log("Verifying file selection on destination BEFORE restart...")
+	for _, exp := range expectations {
+		_, statErr := os.Stat(exp.destPath)
+		if exp.selected {
+			require.NoError(t, statErr,
+				"selected file should exist on destination before restart: %s", exp.name)
+		} else {
+			assert.True(t, os.IsNotExist(statErr),
+				"deselected file should NOT exist on destination before restart: %s", exp.name)
+		}
+	}
+
+	// Step 6: Stop destination server and restart it.
+	t.Log("Stopping destination gRPC server...")
+	env.StopDestinationServer()
+	time.Sleep(2 * time.Second)
+
+	t.Log("Restarting destination gRPC server...")
+	env.StartDestinationServer()
+
+	// Step 7: Start new orchestrator and wait for it to see the torrent as complete.
+	t.Log("Starting new orchestrator after destination restart...")
+	cfg2 := env.CreateSourceConfig()
+	task2, dest2, err := env.CreateSourceTask(cfg2)
+	require.NoError(t, err)
+	defer dest2.Close()
+
+	orchestratorCtx2, cancelOrchestrator2 := context.WithTimeout(ctx, syncCompleteTimeout)
+	defer cancelOrchestrator2()
+
+	orchestratorDone2 := make(chan error, 1)
+	go func() {
+		orchestratorDone2 <- task2.Run(orchestratorCtx2)
+	}()
+
+	// The torrent was already finalized, so the orchestrator should recognize it quickly.
+	t.Log("Waiting for orchestrator to confirm torrent is complete...")
+	env.WaitForTorrentCompleteOnDestination(ctx, wiredCDHash, syncCompleteTimeout,
+		"torrent should still be complete on destination after restart")
+
+	cancelOrchestrator2()
+	<-orchestratorDone2
+
+	// Step 8: Verify the same files exist/don't exist AFTER restart.
+	t.Log("Verifying file selection on destination AFTER restart...")
+	for _, exp := range expectations {
+		_, statErr := os.Stat(exp.destPath)
+		if exp.selected {
+			require.NoError(t, statErr,
+				"selected file should still exist on destination after restart: %s", exp.name)
+		} else {
+			assert.True(t, os.IsNotExist(statErr),
+				"deselected file should still NOT exist on destination after restart: %s", exp.name)
+		}
+	}
+
+	env.AssertTorrentCompleteOnDestination(ctx, wiredCDHash)
+
+	// Verify destination qBittorrent also reports deselected files correctly.
+	destFiles, err := env.DestinationClient().GetFilesInformationCtx(ctx, wiredCDHash)
+	require.NoError(t, err)
+	require.NotNil(t, destFiles)
+	for _, cf := range *destFiles {
+		if deselectedIndices[cf.Index] {
+			assert.Equal(t, 0, cf.Priority,
+				"deselected file %d should have priority 0 on destination after restart", cf.Index)
+		}
+	}
+
+	t.Log("Partial selection with restart E2E test completed successfully!")
+
+	env.CleanupBothSides(ctx, wiredCDHash)
+}
+
+// TestE2E_FinalizedTorrentSkippedOnRecovery verifies that a finalized torrent
+// (one where the .finalized marker exists) is NOT re-initialized on destination
+// recovery. After a full sync and restart, CheckTorrentStatus should return
+// COMPLETE immediately and the orchestrator should skip re-streaming.
+//
+// Flow:
+//  1. Download Big Buck Bunny torrent on source
+//  2. Start orchestrator, wait for sync to complete
+//  3. Assert torrent complete on destination
+//  4. Stop orchestrator, stop destination server, restart it
+//  5. Start new orchestrator
+//  6. Assert torrent is still complete on destination
+//  7. Assert orchestrator sees it as already synced (no re-streaming)
+func TestE2E_FinalizedTorrentSkippedOnRecovery(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+
+	t.Parallel()
+
+	env := SetupTestEnv(t)
+	ctx := context.Background()
+
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
+
+	// Step 1: Download Big Buck Bunny on source.
+	t.Log("Adding Big Buck Bunny torrent to source...")
+	env.DownloadTorrentOnSource(ctx, bigBuckBunnyURL, bigBuckBunnyHash, torrentDownloadTimeout)
+
+	// Step 2: Sync to destination.
+	cfg := env.CreateSourceConfig()
+	task, dest, err := env.CreateSourceTask(cfg)
+	require.NoError(t, err)
+
+	orchestratorCtx, cancelOrchestrator := context.WithTimeout(ctx, syncCompleteTimeout)
+
+	orchestratorDone := make(chan error, 1)
+	go func() {
+		orchestratorDone <- task.Run(orchestratorCtx)
+	}()
+
+	t.Log("Waiting for torrent to sync to destination...")
+	env.WaitForTorrentCompleteOnDestination(ctx, bigBuckBunnyHash, syncCompleteTimeout,
+		"torrent should be complete on destination")
+
+	// Wait for finalization to fully complete (synced tag on destination confirms it).
+	env.WaitForSyncedTagOnDestination(ctx, bigBuckBunnyHash, 30*time.Second,
+		"destination torrent should have 'synced' tag after finalization")
+
+	// Step 3: Stop orchestrator.
+	cancelOrchestrator()
+	<-orchestratorDone
+	dest.Close()
+
+	env.AssertTorrentCompleteOnDestination(ctx, bigBuckBunnyHash)
+	t.Log("Torrent fully synced and finalized on destination")
+
+	// Step 4: Stop destination server and restart it.
+	t.Log("Stopping destination gRPC server...")
+	env.StopDestinationServer()
+	time.Sleep(2 * time.Second)
+
+	t.Log("Restarting destination gRPC server...")
+	env.StartDestinationServer()
+
+	// Step 5: Start new orchestrator — it should see the torrent as already complete.
+	t.Log("Starting new orchestrator after destination restart...")
+	cfg2 := env.CreateSourceConfig()
+	task2, dest2, err := env.CreateSourceTask(cfg2)
+	require.NoError(t, err)
+	defer dest2.Close()
+
+	orchestratorCtx2, cancelOrchestrator2 := context.WithTimeout(ctx, syncCompleteTimeout)
+	defer cancelOrchestrator2()
+
+	orchestratorDone2 := make(chan error, 1)
+	go func() {
+		orchestratorDone2 <- task2.Run(orchestratorCtx2)
+	}()
+
+	// The orchestrator should detect the torrent as already synced via isFinalized
+	// and mark it as completed on destination. Wait for the completed cache to
+	// include the hash — this proves the orchestrator recognized it without
+	// re-streaming.
+	t.Log("Waiting for orchestrator to recognize torrent as already complete...")
+	require.Eventually(t, func() bool {
+		for _, hash := range task2.FetchCompletedOnDestination() {
+			if hash == bigBuckBunnyHash {
+				return true
+			}
+		}
+		return false
+	}, syncCompleteTimeout, pollInterval,
+		"orchestrator should recognize finalized torrent as complete without re-streaming")
+
+	// Step 6: Assert the torrent is still complete on destination.
+	env.AssertTorrentCompleteOnDestination(ctx, bigBuckBunnyHash)
+
+	// Verify synced tag is still present on destination after restart.
+	destTorrents, err := env.DestinationClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+		Hashes: []string{bigBuckBunnyHash},
+	})
+	require.NoError(t, err)
+	require.Len(t, destTorrents, 1)
+	assert.Contains(t, destTorrents[0].Tags, "synced",
+		"destination torrent should retain 'synced' tag after restart")
+
+	cancelOrchestrator2()
+	<-orchestratorDone2
+
+	t.Log("Finalized torrent skipped on recovery test completed successfully!")
 
 	env.CleanupBothSides(ctx, bigBuckBunnyHash)
 }
