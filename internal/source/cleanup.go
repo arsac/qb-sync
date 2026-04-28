@@ -249,8 +249,11 @@ func (t *QBTask) groupHardlinkedTorrents(ctx context.Context, torrents []qbittor
 		return nil
 	}
 
-	// Phase 1: stat each file, build inode -> []torrentHash map
-	inodeToHashes := make(map[uint64][]string)
+	// Phase 1: stat each file, build (device,inode) -> []torrentHash map.
+	// Keying on inode alone would falsely group files that share an inode number
+	// across different filesystems (e.g., separate volumes mounted under the same root).
+	type fileKey struct{ dev, ino uint64 }
+	fileKeyToHashes := make(map[fileKey][]string)
 	for _, torrent := range torrents {
 		filesPtr, err := t.srcClient.GetFilesInformationCtx(ctx, torrent.Hash)
 		if err != nil {
@@ -264,18 +267,19 @@ func (t *QBTask) groupHardlinkedTorrents(ctx context.Context, torrents []qbittor
 		contentDir := t.source.ResolveContentDir(torrent.SavePath)
 		for _, f := range *filesPtr {
 			path := filepath.Join(contentDir, f.Name)
-			_, inode, statErr := utils.GetFileID(path)
-			if statErr != nil || inode == 0 {
+			dev, ino, statErr := utils.GetFileID(path)
+			if statErr != nil || ino == 0 {
 				continue
 			}
-			inodeToHashes[inode] = append(inodeToHashes[inode], torrent.Hash)
+			key := fileKey{dev: dev, ino: ino}
+			fileKeyToHashes[key] = append(fileKeyToHashes[key], torrent.Hash)
 		}
 	}
 
-	// Phase 2: Union-find — for each inode shared by multiple torrents, union their groups
+	// Phase 2: Union-find — for each file shared by multiple torrents, union their groups
 	uf := newUnionFind()
-	for _, hashes := range inodeToHashes {
-		if len(hashes) < 2 { //nolint:mnd // minimum count for a shared inode
+	for _, hashes := range fileKeyToHashes {
+		if len(hashes) < 2 { //nolint:mnd // minimum count for a shared file
 			continue
 		}
 		for i := 1; i < len(hashes); i++ {
