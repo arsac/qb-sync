@@ -259,9 +259,18 @@ func withDestRPCTimeout(parent context.Context) (context.Context, context.Cancel
 	return context.WithTimeout(parent, destRPCTimeout)
 }
 
-// pruneCompletedOnDest removes entries from the completed cache that are
-// no longer present in source qBittorrent. This prevents unbounded growth when
-// torrents are deleted from source after being synced to destination.
+// pruneCompletedOnDest hands off completed torrents whose source-side copy has
+// been removed (so the destination picks up seeding with the source-removed
+// tag) and removes their entries from the completed cache.
+//
+// PieceMonitor.removeAndNotify only fires the tracker.Removed channel for
+// *tracked* torrents; once a torrent finishes syncing it gets untracked, so a
+// later removal from source qB never reaches handleTorrentRemoval. Without
+// this path the destination would silently stay stopped indefinitely, even
+// though the user clearly expects it to take over seeding once source is gone.
+//
+// On handoff failure the cache entry is left in place so the next cycle
+// retries; on success (or in dry-run) the entry is pruned to bound cache size.
 func (t *QBTask) pruneCompletedOnDest(ctx context.Context) {
 	torrents, err := t.srcClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{})
 	if err != nil {
@@ -274,14 +283,51 @@ func (t *QBTask) pruneCompletedOnDest(ctx context.Context) {
 		sourceHashes[torrent.Hash] = struct{}{}
 	}
 
-	pruned := t.completed.Prune(sourceHashes)
-	if pruned > 0 {
-		t.logger.InfoContext(ctx, "pruned completed-on-destination cache",
-			"pruned", pruned,
-			"remaining", t.completed.Count(),
-		)
-		t.completed.Save()
+	var prunable []string
+	for hash := range t.completed.Snapshot() {
+		if _, stillInSource := sourceHashes[hash]; stillInSource {
+			continue
+		}
+		if t.cfg.DryRun {
+			t.logger.InfoContext(ctx, "[dry-run] would hand off removed-from-source torrent",
+				"hash", hash, "tag", t.cfg.SourceRemovedTag)
+			prunable = append(prunable, hash)
+			continue
+		}
+		if t.handoffRemovedCompleted(ctx, hash) {
+			prunable = append(prunable, hash)
+		}
 	}
+
+	if len(prunable) == 0 {
+		return
+	}
+
+	t.completed.RemoveAll(prunable)
+	t.completed.Save()
+	t.logger.InfoContext(ctx, "pruned completed-on-destination cache",
+		"pruned", len(prunable),
+		"remaining", t.completed.Count(),
+	)
+}
+
+// handoffRemovedCompleted starts the torrent on destination qBittorrent with
+// the source-removed tag. Returns true on success (caller should prune the
+// cache entry); false on failure (caller should leave the entry so the next
+// cycle retries).
+func (t *QBTask) handoffRemovedCompleted(ctx context.Context, hash string) bool {
+	startCtx, cancel := withDestRPCTimeout(ctx)
+	defer cancel()
+	if startErr := t.grpcDest.StartTorrent(startCtx, hash, t.cfg.SourceRemovedTag); startErr != nil {
+		t.logger.WarnContext(ctx, "failed to hand off removed-from-source torrent to destination, will retry",
+			"hash", hash, "error", startErr,
+		)
+		return false
+	}
+	t.logger.InfoContext(ctx, "handed off removed-from-source torrent to destination",
+		"hash", hash, "tag", t.cfg.SourceRemovedTag,
+	)
+	return true
 }
 
 // pruneStaleMonitorEntries removes PieceMonitor entries for torrents that the

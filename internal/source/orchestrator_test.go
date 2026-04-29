@@ -1492,6 +1492,99 @@ func TestQueryDestStatus(t *testing.T) {
 	})
 }
 
+func TestPruneCompletedOnDest(t *testing.T) {
+	logger := testLogger(t)
+
+	newTask := func(t *testing.T, dest *mockDest, srcTorrents []qbittorrent.Torrent, dryRun bool) (*QBTask, *CompletionCache) {
+		t.Helper()
+		mockClient := &mockQBClient{getTorrentsResult: srcTorrents}
+		completed := NewCompletionCache("", logger)
+		return &QBTask{
+			cfg: &config.SourceConfig{
+				BaseConfig:       config.BaseConfig{DryRun: dryRun},
+				SourceRemovedTag: "source-removed",
+			},
+			logger:    logger,
+			srcClient: mockClient,
+			grpcDest:  dest,
+			completed: completed,
+		}, completed
+	}
+
+	t.Run("hands off and prunes when source torrent is gone", func(t *testing.T) {
+		dest := &mockDest{}
+		task, completed := newTask(t, dest, []qbittorrent.Torrent{
+			{Hash: "still-present"},
+		}, false)
+		completed.Mark("still-present")
+		completed.Mark("removed-from-source")
+
+		task.pruneCompletedOnDest(context.Background())
+
+		if !dest.startCalled {
+			t.Fatal("StartTorrent should be called for the removed-from-source torrent")
+		}
+		if dest.startHash != "removed-from-source" {
+			t.Errorf("StartTorrent hash = %q, want %q", dest.startHash, "removed-from-source")
+		}
+		if dest.startTag != "source-removed" {
+			t.Errorf("StartTorrent tag = %q, want %q", dest.startTag, "source-removed")
+		}
+		if completed.IsComplete("removed-from-source") {
+			t.Error("removed-from-source should be pruned from cache after handoff")
+		}
+		if !completed.IsComplete("still-present") {
+			t.Error("still-present should remain in cache")
+		}
+	})
+
+	t.Run("retains cache entry when handoff fails", func(t *testing.T) {
+		dest := &mockDest{startErr: errors.New("destination unreachable")}
+		task, completed := newTask(t, dest, nil, false)
+		completed.Mark("removed-from-source")
+
+		task.pruneCompletedOnDest(context.Background())
+
+		if !completed.IsComplete("removed-from-source") {
+			t.Error("cache entry must be retained on handoff failure so the next cycle retries")
+		}
+	})
+
+	t.Run("dry-run skips StartTorrent but still prunes", func(t *testing.T) {
+		dest := &mockDest{}
+		task, completed := newTask(t, dest, nil, true)
+		completed.Mark("removed-from-source")
+
+		task.pruneCompletedOnDest(context.Background())
+
+		if dest.startCalled {
+			t.Error("StartTorrent must not be called in dry-run")
+		}
+		if completed.IsComplete("removed-from-source") {
+			t.Error("dry-run should still prune the cache")
+		}
+	})
+
+	t.Run("no-op when all completed entries are still in source", func(t *testing.T) {
+		dest := &mockDest{}
+		task, completed := newTask(t, dest, []qbittorrent.Torrent{
+			{Hash: "abc"},
+			{Hash: "def"},
+		}, false)
+		completed.Mark("abc")
+		completed.Mark("def")
+
+		task.pruneCompletedOnDest(context.Background())
+
+		if dest.startCalled {
+			t.Error("StartTorrent must not fire when no entries are stale")
+		}
+		if !completed.IsComplete("abc") || !completed.IsComplete("def") {
+			t.Error("non-stale entries must be retained")
+		}
+	})
+}
+
 func TestCompletedCachePersistence(t *testing.T) {
 	logger := testLogger(t)
 
