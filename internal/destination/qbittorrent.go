@@ -245,18 +245,12 @@ func (s *Server) waitForTorrentReady(
 		torrent := torrents[0]
 		finalState = torrent.State
 
-		// Hard error state — fail immediately.
-		if torrent.State == qbittorrent.TorrentStateError {
-			return false, fmt.Errorf("torrent entered error state: %s", torrent.State)
-		}
-
-		// missingFiles may be transient after partial file selection: we set
-		// deselected priorities to 0 and resume, so keep polling until
-		// qBittorrent re-evaluates (or the overall timeout expires).
-		if torrent.State == qbittorrent.TorrentStateMissingFiles {
-			s.logger.DebugContext(pollCtx, "torrent in missingFiles state, waiting for recovery",
-				"hash", hash)
-			return false, nil
+		// Terminal qB-reported failures. missingFiles persists once qB lands in
+		// it (priority-0 update lost a race, files truly absent, etc.) — polling
+		// until the multi-hour budget expires hides the failure. Fail fast so the
+		// source can re-sync via FINALIZE_ERROR_INCOMPLETE.
+		if isErrorState(torrent.State) {
+			return false, fmt.Errorf("torrent in error state: %s", torrent.State)
 		}
 
 		// Still checking - keep waiting
@@ -424,7 +418,8 @@ func isReadyState(state qbittorrent.TorrentState) bool {
 		qbittorrent.TorrentStateStalledUp,
 		qbittorrent.TorrentStateForcedUp,
 		qbittorrent.TorrentStatePausedUp,
-		qbittorrent.TorrentStateStoppedUp:
+		qbittorrent.TorrentStateStoppedUp,
+		qbittorrent.TorrentStateQueuedUp:
 		return true
 	default:
 		return false
