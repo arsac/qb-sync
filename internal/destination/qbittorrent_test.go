@@ -267,6 +267,109 @@ func TestStartTorrent(t *testing.T) {
 	})
 }
 
+// TestCheckTorrentInQB_OnlyAcceptsReadyStateAt100 pins the contract introduced
+// in commit b35a5da. The pre-fix code returned qbCheckComplete for any
+// non-error state at progress=1.0, including pausedDL/stoppedDL. With partial
+// selection on qB v5 (or after a user manually deletes unselected file dirs),
+// progress can hit 1.0 in a download-side state — and trusting it would let
+// source mark the torrent synced and delete its data with nothing actually
+// seeding. Post-fix, only seeding-side states (uploading, stalledUp, forcedUp,
+// pausedUp, stoppedUp) at 100% return COMPLETE.
+func TestCheckTorrentInQB_OnlyAcceptsReadyStateAt100(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		state   qbittorrent.TorrentState
+		want    qbCheckResult
+		comment string
+	}{
+		// Seeding-side states at 100% — must return COMPLETE.
+		{qbittorrent.TorrentStateUploading, qbCheckComplete, "actively seeding"},
+		{qbittorrent.TorrentStateStalledUp, qbCheckComplete, "seeding without peers"},
+		{qbittorrent.TorrentStateForcedUp, qbCheckComplete, "force-uploading"},
+		{qbittorrent.TorrentStatePausedUp, qbCheckComplete, "paused while seeding (qB v4)"},
+		{qbittorrent.TorrentStateStoppedUp, qbCheckComplete, "stopped while seeding (qB v5)"},
+
+		// Download-side states at 100% — must NOT return COMPLETE even though
+		// progress is 1.0. This is the data-loss path the fix closes: with
+		// partial selection or external file deletion, qB can report 1.0
+		// progress in these states.
+		{qbittorrent.TorrentStateStoppedDl, qbCheckNotFound, "stopped mid-download must not be trusted as complete"},
+		{qbittorrent.TorrentStatePausedDl, qbCheckNotFound, "paused mid-download must not be trusted as complete"},
+		{qbittorrent.TorrentStateDownloading, qbCheckNotFound, "actively downloading"},
+		{qbittorrent.TorrentStateStalledDl, qbCheckNotFound, "stalled while downloading"},
+		{qbittorrent.TorrentStateQueuedDl, qbCheckNotFound, "queued for download"},
+
+		// Error states — must NOT return COMPLETE.
+		{qbittorrent.TorrentStateError, qbCheckNotFound, "error state"},
+		{qbittorrent.TorrentStateMissingFiles, qbCheckNotFound, "files missing on disk"},
+	}
+
+	for _, tc := range cases {
+		t.Run(string(tc.state)+"/"+tc.comment, func(t *testing.T) {
+			t.Parallel()
+			mock := &mockQBClient{
+				torrents: []qbittorrent.Torrent{{
+					Hash:     "abc",
+					State:    tc.state,
+					Progress: 1.0,
+				}},
+			}
+			s := newTestServerWithQB(t, mock)
+			got := s.checkTorrentInQB(context.Background(), "abc")
+			if got != tc.want {
+				t.Errorf("state=%s progress=1.0: got %v, want %v (%s)",
+					tc.state, got, tc.want, tc.comment)
+			}
+		})
+	}
+}
+
+// TestCheckTorrentInQB_RejectsLessThan100Progress documents that even
+// seeding-side states at <100% progress are not treated as COMPLETE — the
+// progress floor is load-bearing.
+func TestCheckTorrentInQB_RejectsLessThan100Progress(t *testing.T) {
+	t.Parallel()
+	mock := &mockQBClient{
+		torrents: []qbittorrent.Torrent{{
+			Hash:     "abc",
+			State:    qbittorrent.TorrentStateUploading,
+			Progress: 0.99,
+		}},
+	}
+	s := newTestServerWithQB(t, mock)
+	if got := s.checkTorrentInQB(context.Background(), "abc"); got != qbCheckNotFound {
+		t.Errorf("state=uploading progress=0.99: got %v, want qbCheckNotFound", got)
+	}
+}
+
+// TestCheckTorrentInQB_VerifyingDuringChecking maps qB's checking states to
+// qbCheckVerifying so the source side waits instead of writing concurrently.
+func TestCheckTorrentInQB_VerifyingDuringChecking(t *testing.T) {
+	t.Parallel()
+	checkingStates := []qbittorrent.TorrentState{
+		qbittorrent.TorrentStateCheckingUp,
+		qbittorrent.TorrentStateCheckingDl,
+		qbittorrent.TorrentStateCheckingResumeData,
+	}
+	for _, state := range checkingStates {
+		t.Run(string(state), func(t *testing.T) {
+			t.Parallel()
+			mock := &mockQBClient{
+				torrents: []qbittorrent.Torrent{{
+					Hash:     "abc",
+					State:    state,
+					Progress: 1.0,
+				}},
+			}
+			s := newTestServerWithQB(t, mock)
+			if got := s.checkTorrentInQB(context.Background(), "abc"); got != qbCheckVerifying {
+				t.Errorf("state=%s: got %v, want qbCheckVerifying", state, got)
+			}
+		})
+	}
+}
+
 // TestAddAndVerifyTorrent_StopsFoundReadyTorrent regression-tests the autobrr
 // Tier-1 fix: when addAndVerifyTorrent finds the torrent already in qB at 100%
 // in a ready state (the path hit during recovery from a destination crash mid-

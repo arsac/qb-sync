@@ -633,6 +633,125 @@ func TestHandleTorrentRemoval(t *testing.T) {
 	})
 }
 
+// TestTryFinalizeFullyStreamed pins the contract introduced in commit fa89587:
+// when streaming has finished on destination but finalization hasn't run, and
+// the torrent has just been removed from source — try to finalize so the data
+// migrates cleanly. If finalize fails (whether because source is gone or for
+// any other reason) fall through to abort, so the partial files don't orphan.
+func TestTryFinalizeFullyStreamed(t *testing.T) {
+	logger := testLogger(t)
+
+	newTask := func(t *testing.T, dest *mockDest, src *mockQBClient) *QBTask {
+		t.Helper()
+		return &QBTask{
+			cfg:       &config.SourceConfig{},
+			logger:    logger,
+			srcClient: src,
+			grpcDest:  dest,
+			source:    qbclient.NewSource(nil, ""),
+		}
+	}
+
+	t.Run("not fully streamed: returns false so caller proceeds with abort", func(t *testing.T) {
+		dest := &mockDest{
+			checkStatusResults: map[string]*streaming.InitTorrentResult{
+				"abc": {PiecesNeededCount: 5},
+			},
+		}
+		task := newTask(t, dest, &mockQBClient{})
+
+		if took := task.tryFinalizeFullyStreamed(context.Background(), "abc"); took {
+			t.Fatal("must return false when there are pieces still needed (caller should abort)")
+		}
+		if dest.finalizeCalled {
+			t.Error("FinalizeTorrent must not be called when not fully streamed")
+		}
+	})
+
+	t.Run("fully streamed and finalize succeeds: starts on destination", func(t *testing.T) {
+		dest := &mockDest{
+			checkStatusResults: map[string]*streaming.InitTorrentResult{
+				"abc": {PiecesNeededCount: 0},
+			},
+		}
+		src := &mockQBClient{
+			getTorrentsResult: []qbittorrent.Torrent{{Hash: "abc"}},
+		}
+		task := newTask(t, dest, src)
+		task.cfg.SourceRemovedTag = "source-removed"
+
+		if took := task.tryFinalizeFullyStreamed(context.Background(), "abc"); !took {
+			t.Fatal("must return true (path was taken) on successful finalize")
+		}
+		if !dest.finalizeCalled {
+			t.Error("FinalizeTorrent must be called")
+		}
+		if !dest.startCalled || dest.startTag != "source-removed" {
+			t.Error("StartTorrent must be called with the source-removed tag")
+		}
+	})
+
+	t.Run("source-gone finalize failure: falls through to abort", func(t *testing.T) {
+		dest := &mockDest{
+			checkStatusResults: map[string]*streaming.InitTorrentResult{
+				"abc": {PiecesNeededCount: 0},
+			},
+		}
+		// Empty getTorrentsResult → finalizeTorrent returns "torrent not found".
+		src := &mockQBClient{getTorrentsResult: []qbittorrent.Torrent{}}
+		task := newTask(t, dest, src)
+
+		if took := task.tryFinalizeFullyStreamed(context.Background(), "abc"); took {
+			t.Fatal("must return false on finalize failure so caller falls through to abort " +
+				"and cleans up the .partial files")
+		}
+		if dest.startCalled {
+			t.Error("StartTorrent must NOT be called when finalize fails")
+		}
+	})
+
+	t.Run("transient finalize failure: also falls through to abort", func(t *testing.T) {
+		// Source torrent IS present, but the destination's FinalizeTorrent
+		// returns a transient error (e.g., destination briefly unreachable
+		// after a restart). The pre-fa89587 behavior was to leave .partial
+		// files for the orphan cleaner; the post-fix behavior is to abort
+		// immediately. The data isn't recoverable as-is (no source qB →
+		// nothing will retry the finalize), so cleanup-now is correct.
+		dest := &mockDest{
+			checkStatusResults: map[string]*streaming.InitTorrentResult{
+				"abc": {PiecesNeededCount: 0},
+			},
+			finalizeErr: errors.New("destination briefly unreachable"),
+		}
+		src := &mockQBClient{
+			getTorrentsResult: []qbittorrent.Torrent{{Hash: "abc"}},
+		}
+		task := newTask(t, dest, src)
+
+		if took := task.tryFinalizeFullyStreamed(context.Background(), "abc"); took {
+			t.Fatal("transient finalize failure must also fall through to abort — " +
+				"leaving for the orphan cleaner gave no recovery path and just delayed cleanup")
+		}
+		if !dest.finalizeCalled {
+			t.Error("FinalizeTorrent must have been attempted")
+		}
+		if dest.startCalled {
+			t.Error("StartTorrent must NOT be called when finalize fails")
+		}
+	})
+
+	t.Run("CheckTorrentStatus error: returns false so caller proceeds with abort", func(t *testing.T) {
+		dest := &mockDest{
+			checkStatusErr: errors.New("destination unreachable"),
+		}
+		task := newTask(t, dest, &mockQBClient{})
+
+		if took := task.tryFinalizeFullyStreamed(context.Background(), "abc"); took {
+			t.Fatal("status-check failure must return false (caller proceeds with abort)")
+		}
+	})
+}
+
 func makeTestGroup(hashes ...string) torrentGroup {
 	torrents := make([]qbittorrent.Torrent, len(hashes))
 	for i, h := range hashes {

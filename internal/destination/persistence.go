@@ -16,18 +16,47 @@ import (
 
 const currentSchemaVersion int32 = 3
 
-// loadState loads the written pieces state from disk.
+// loadState loads the written pieces state from disk. Panics from
+// bitset.UnmarshalBinary on truncated or malformed payloads (the underlying
+// library indexes blindly into the byte slice on some inputs) are recovered
+// as errors so a torn .state from the no-sync fast path can't crash the
+// server on startup — the caller treats any error as "no prior state" and
+// re-streams.
 func (s *Server) loadState(path string, numPieces int) (*bitset.BitSet, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
 
-	written := bitset.New(0)
-	if unmarshalErr := written.UnmarshalBinary(data); unmarshalErr != nil {
+	written, unmarshalErr := safeUnmarshalBitset(data)
+	if unmarshalErr != nil {
 		return nil, fmt.Errorf("unmarshaling bitset: %w", unmarshalErr)
 	}
 	return ensureBitSetLength(written, uint(numPieces)), nil
+}
+
+// safeUnmarshalBitset wraps bitset.UnmarshalBinary with panic recovery.
+// Returns nil + error on any panic or unmarshal error.
+func safeUnmarshalBitset(data []byte) (*bitset.BitSet, error) {
+	var (
+		out    *bitset.BitSet
+		outErr error
+	)
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				out = nil
+				outErr = fmt.Errorf("bitset unmarshal panic: %v", r)
+			}
+		}()
+		b := bitset.New(0)
+		if err := b.UnmarshalBinary(data); err != nil {
+			outErr = err
+			return
+		}
+		out = b
+	}()
+	return out, outErr
 }
 
 // atomicWriteFile writes data atomically using standard server permissions.

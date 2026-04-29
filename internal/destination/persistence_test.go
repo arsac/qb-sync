@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/bits-and-blooms/bitset"
+
 	pb "github.com/arsac/qb-sync/proto"
 )
 
@@ -92,6 +94,109 @@ func TestSaveLoadPersistedMeta_RoundTrip(t *testing.T) {
 		t.Errorf("SaveSubPath: got %q, want %q",
 			loaded.GetSaveSubPath(), original.GetSaveSubPath())
 	}
+}
+
+// TestLoadState_TornWriteRecovery validates the .state torn-write recovery
+// claim made by the AtomicWriteFileNoSync optimization (commit f64de92).
+// .state writes drop the fsync to save NFS round-trips; the safety claim is
+// "torn writes fail loadState's UnmarshalBinary cleanly, buildWrittenBitmap
+// falls back to an empty bitset, and we re-stream rather than ship
+// corruption from stale bits."
+//
+// This pins that contract: corrupt or truncated .state files surface an
+// error from loadState (no panic, no silent acceptance of stale bits).
+func TestLoadState_TornWriteRecovery(t *testing.T) {
+	t.Parallel()
+
+	const numPieces = 64
+
+	// Establish what a *valid* .state file looks like for the size we're
+	// asserting against, so the corruption cases are clearly distinguished.
+	t.Run("valid state file round-trips correctly", func(t *testing.T) {
+		t.Parallel()
+		s := &Server{logger: testLogger(t)}
+		dir := t.TempDir()
+		path := filepath.Join(dir, ".state")
+
+		written := bitset.New(numPieces)
+		written.Set(3)
+		written.Set(17)
+		if err := s.saveState(path, written); err != nil {
+			t.Fatalf("saveState: %v", err)
+		}
+		loaded, err := s.loadState(path, numPieces)
+		if err != nil {
+			t.Fatalf("loadState valid file: %v", err)
+		}
+		if !loaded.Test(3) || !loaded.Test(17) {
+			t.Fatal("valid round-trip lost bits")
+		}
+	})
+
+	t.Run("truncated state file fails loadState cleanly", func(t *testing.T) {
+		t.Parallel()
+		s := &Server{logger: testLogger(t)}
+		dir := t.TempDir()
+		path := filepath.Join(dir, ".state")
+
+		written := bitset.New(numPieces)
+		written.Set(3)
+		written.Set(17)
+		if err := s.saveState(path, written); err != nil {
+			t.Fatalf("saveState: %v", err)
+		}
+
+		// Simulate a torn write by truncating the file mid-payload.
+		full, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(full) < 4 {
+			t.Fatalf("baseline state file too small to truncate (%d bytes)", len(full))
+		}
+		if writeErr := os.WriteFile(path, full[:len(full)/2], 0o644); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+
+		_, loadErr := s.loadState(path, numPieces)
+		if loadErr == nil {
+			t.Fatal("loadState must reject torn .state — silently accepting it would let " +
+				"buildWrittenBitmap claim pieces written that are actually stale")
+		}
+	})
+
+	t.Run("garbage state file fails loadState cleanly", func(t *testing.T) {
+		t.Parallel()
+		s := &Server{logger: testLogger(t)}
+		dir := t.TempDir()
+		path := filepath.Join(dir, ".state")
+
+		// Random bytes that almost certainly don't deserialize as a bitset.
+		if writeErr := os.WriteFile(path, []byte("not a bitset payload"), 0o644); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+
+		_, loadErr := s.loadState(path, numPieces)
+		if loadErr == nil {
+			t.Fatal("loadState must reject garbage .state")
+		}
+	})
+
+	t.Run("zero-length state file fails loadState cleanly", func(t *testing.T) {
+		t.Parallel()
+		s := &Server{logger: testLogger(t)}
+		dir := t.TempDir()
+		path := filepath.Join(dir, ".state")
+
+		if writeErr := os.WriteFile(path, nil, 0o644); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+
+		_, loadErr := s.loadState(path, numPieces)
+		if loadErr == nil {
+			t.Fatal("loadState must reject empty .state")
+		}
+	})
 }
 
 func TestLoadPersistedMeta_MissingFile(t *testing.T) {
