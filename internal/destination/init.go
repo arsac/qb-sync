@@ -428,16 +428,18 @@ func (s *Server) checkTorrentInQB(ctx context.Context, hash string) qbCheckResul
 		return qbCheckVerifying
 	}
 
-	// Accept 100% progress in any non-error state as complete. With partial
-	// file selection, qBittorrent may classify the torrent as a download
-	// variant (StoppedDl/PausedDl) when deselected files are absent on disk,
-	// even though all selected files are fully synced.
-	//
-	// We keep the progress >= 1.0 requirement to avoid returning COMPLETE
-	// for torrents that were added to QB but failed verification, or that
-	// qBittorrent is actively downloading (which would conflict with our
-	// piece writers).
-	if torrent.Progress >= 1.0 && !isErrorState(torrent.State) {
+	// Only return COMPLETE when the torrent is unambiguously seeding-side at
+	// 100%. Accepting any non-error state at progress=1.0 is dangerous: with
+	// partial file selection on qB v5 a torrent can report progress=1.0 in
+	// pausedDL/stoppedDL even when files are missing on disk (e.g., the user
+	// manually deleted unselected dirs). Trusting that would let source mark
+	// the torrent synced and delete its data with nothing actually seeding.
+	// Our own finalization path explicitly transitions to a stoppedUp/pausedUp
+	// state via StopCtx after waitForTorrentReady, so the legitimate
+	// already-finalized case lands in isReadyState. The local .finalized
+	// marker check upstream (isFinalized) is the fast path for our own
+	// finalizations; this RPC check is only for externally-added torrents.
+	if torrent.Progress >= 1.0 && isReadyState(torrent.State) {
 		s.logger.InfoContext(ctx, "torrent already complete in destination qBittorrent",
 			"hash", hash,
 			"state", torrent.State,
