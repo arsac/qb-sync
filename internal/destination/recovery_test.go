@@ -220,3 +220,116 @@ func TestRecoverInFlightTorrents_NoMetaRoot(t *testing.T) {
 		t.Fatalf("expected nil error when meta root missing, got: %v", err)
 	}
 }
+
+// TestRebuildInodeMap_SkipsZeroFileID covers the legacy-metadata path:
+// .meta files written before the FileID change have source_device=0 and
+// source_inode=0 (proto3 zero defaults). collectInodeEntries skips those
+// so the registry stays empty rather than registering a hash-collision
+// magnet at FileID{0,0}.
+func TestRebuildInodeMap_SkipsZeroFileID(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+	ctx := context.Background()
+
+	hash := "legacy_torrent_hash"
+	// Build a request with NO source device/inode (legacy default).
+	req := &pb.InitTorrentRequest{
+		TorrentHash: hash,
+		Name:        "legacy",
+		PieceSize:   testPieceLen,
+		TotalSize:   2048,
+		NumPieces:   2,
+		Files: []*pb.FileInfo{
+			{Path: "legacy.bin", Size: 2048, Selected: true /* Device=0, Inode=0 */},
+		},
+		PieceHashes: buildTestPieceHashes(t, 2048),
+		TorrentFile: buildTestTorrentBytes(t, "legacy", 2048),
+	}
+	setupRecoveryMetaDir(t, tmpDir, hash, req, nil)
+
+	// Write the file on disk so the rebuild's stat passes.
+	dataPath := filepath.Join(tmpDir, "legacy.bin")
+	if err := os.WriteFile(dataPath, make([]byte, 2048), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s.rebuildInodeMap(ctx)
+
+	if got := s.store.Inodes().Len(); got != 0 {
+		t.Errorf("legacy .meta with zero source FileID must NOT register an inode entry; got %d entries", got)
+	}
+}
+
+// TestRecoverInFlightTorrents_StateWithoutMeta covers the partial-corruption
+// case where a torrent directory has .state but no .meta. recoverTorrent
+// should skip the directory rather than crash, because there's no metadata
+// to rebuild from.
+func TestRecoverInFlightTorrents_StateWithoutMeta(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+	ctx := context.Background()
+
+	hash := "orphan_state_hash"
+	metaDir := filepath.Join(tmpDir, metaDirName, hash)
+	if err := os.MkdirAll(metaDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Write a .state but no .meta.
+	written := bitset.New(8)
+	written.Set(0)
+	written.Set(3)
+	stateData, _ := written.MarshalBinary()
+	if err := os.WriteFile(filepath.Join(metaDir, ".state"), stateData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Should not crash — skip the malformed directory and continue.
+	if err := s.recoverInFlightTorrents(ctx); err != nil {
+		t.Fatalf("recovery must tolerate orphan .state without .meta: %v", err)
+	}
+	// Torrent should NOT be in the store (nothing to recover from).
+	if _, exists := s.store.GetWithSentinel(hash); exists {
+		t.Error("orphan .state without .meta should not produce a recovered torrent state")
+	}
+}
+
+// TestRecoverInFlightTorrents_MetaWithoutState covers the case where the
+// torrent's .meta exists but no .state was ever flushed (init crashed before
+// the first flush). recoverTorrent should rebuild from .meta with an empty
+// written bitmap, so streaming starts fresh.
+func TestRecoverInFlightTorrents_MetaWithoutState(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+	ctx := context.Background()
+
+	hash := "fresh_torrent_hash"
+	req := &pb.InitTorrentRequest{
+		TorrentHash: hash,
+		Name:        "fresh",
+		PieceSize:   testPieceLen,
+		TotalSize:   2048,
+		NumPieces:   2,
+		Files: []*pb.FileInfo{
+			{Path: "fresh.bin", Size: 2048, Selected: true},
+		},
+		PieceHashes: buildTestPieceHashes(t, 2048),
+		TorrentFile: buildTestTorrentBytes(t, "fresh", 2048),
+	}
+	// Write .meta but no .state.
+	setupRecoveryMetaDir(t, tmpDir, hash, req, nil)
+
+	if err := s.recoverInFlightTorrents(ctx); err != nil {
+		t.Fatalf("recovery must succeed with .meta but no .state: %v", err)
+	}
+
+	state, exists := s.store.GetWithSentinel(hash)
+	if !exists {
+		t.Fatal("torrent must be recovered into the store")
+	}
+	if state.written == nil {
+		t.Fatal("recovered state must have a non-nil written bitset")
+	}
+	if state.written.Count() != 0 {
+		t.Errorf("recovered written bitmap must be empty (no .state on disk), got %d bits set", state.written.Count())
+	}
+}

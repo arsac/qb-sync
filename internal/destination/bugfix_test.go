@@ -115,6 +115,61 @@ func TestInodeRegistry_Evict(t *testing.T) {
 	}
 }
 
+// TestSameFilesystem documents the hardlink-safety guard. If sameFilesystem
+// returns false at the wrong time we either miss valid hardlink optimizations
+// or attempt cross-device [os.Link] calls that fail with EXDEV.
+func TestSameFilesystem(t *testing.T) {
+	t.Parallel()
+
+	t.Run("two paths on the same temp fs return true", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		a := filepath.Join(dir, "a.bin")
+		b := filepath.Join(dir, "b.bin")
+		if err := os.WriteFile(a, []byte("a"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(b, []byte("b"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if !sameFilesystem(a, b) {
+			t.Error("two files in the same TempDir must report same filesystem")
+		}
+	})
+
+	t.Run("one missing path returns false (fail-safe)", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		a := filepath.Join(dir, "exists.bin")
+		if err := os.WriteFile(a, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		missing := filepath.Join(dir, "does-not-exist.bin")
+		if sameFilesystem(a, missing) {
+			t.Error("missing path must yield false so the caller falls back to streaming, not os.Link")
+		}
+	})
+
+	t.Run("both missing paths return false", func(t *testing.T) {
+		t.Parallel()
+		if sameFilesystem("/nope/a", "/nope/b") {
+			t.Error("two missing paths must yield false")
+		}
+	})
+
+	t.Run("self-comparison returns true", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		a := filepath.Join(dir, "a.bin")
+		if err := os.WriteFile(a, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if !sameFilesystem(a, a) {
+			t.Error("a path compared to itself must report same filesystem")
+		}
+	})
+}
+
 // ---------- Bug B: RegisterInProgress return value ----------
 
 func TestResolveHardlink_RaceReturnsPending(t *testing.T) {
