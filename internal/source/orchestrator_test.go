@@ -2933,7 +2933,7 @@ func TestExcludeSyncTagReactive(t *testing.T) {
 		}
 	})
 
-	t.Run("forgets completed torrent when tag is added", func(t *testing.T) {
+	t.Run("preserves completed cache entry when tag is added", func(t *testing.T) {
 		mockSource := &mockPieceSource{numPieces: numPieces}
 		tracker := streaming.NewPieceMonitor(nil, mockSource, logger, streaming.DefaultPieceMonitorConfig())
 
@@ -2975,12 +2975,20 @@ func TestExcludeSyncTagReactive(t *testing.T) {
 
 		task.checkExcludedTorrents(context.Background())
 
-		if task.completed.IsComplete("completed-hash") {
-			t.Error("completed-hash should have been removed from completedOnDest")
+		// The completion-cache entry MUST be preserved so a subsequent source-side
+		// removal takes the safe StartTorrent path in handleTorrentRemoval rather
+		// than the AbortTorrent path (which would delete destination data of a
+		// torrent that is already finalized).
+		if !task.completed.IsComplete("completed-hash") {
+			t.Error("completed-hash should remain in completedOnDest as the source of truth for safe handoff")
 		}
 
 		if dest.abortCalled {
 			t.Error("AbortTorrent should NOT be called for completed torrents")
+		}
+
+		if !dest.clearInitCalled {
+			t.Error("ClearInitResult should have been called to release streaming-side caches")
 		}
 	})
 
