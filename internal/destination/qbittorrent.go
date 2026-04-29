@@ -54,6 +54,10 @@ func (s *Server) isTorrentInQB(ctx context.Context, hash string) bool {
 }
 
 // addAndVerifyTorrent adds the torrent to qBittorrent and waits for verification.
+// On exit the torrent is always stopped on destination qB (best-effort): source
+// is the canonical seeder until handoff via StartTorrent. Without this, a crash
+// mid-finalization followed by recovery can leave the torrent already running
+// in destination qB, producing a dual-seeding window.
 func (s *Server) addAndVerifyTorrent(
 	ctx context.Context,
 	hash string,
@@ -69,11 +73,18 @@ func (s *Server) addAndVerifyTorrent(
 		if isErrorState(existingTorrent.State) {
 			return existingTorrent.State, fmt.Errorf("torrent in error state: %s", existingTorrent.State)
 		}
+		var (
+			finalState qbittorrent.TorrentState
+			waitErr    error
+		)
 		if existingTorrent.Progress >= 1.0 && isReadyState(existingTorrent.State) {
-			return existingTorrent.State, nil
+			finalState = existingTorrent.State
+		} else {
+			// Not yet ready (checking, incomplete, moving, etc.) — poll until ready.
+			finalState, waitErr = s.waitForTorrentReady(ctx, hash)
 		}
-		// Not yet ready (checking, incomplete, moving, etc.) — poll until ready.
-		return s.waitForTorrentReady(ctx, hash)
+		s.stopTorrentBestEffort(ctx, hash)
+		return finalState, waitErr
 	}
 
 	// Torrent doesn't exist - add it.
@@ -130,20 +141,22 @@ func (s *Server) addAndVerifyTorrent(
 	}
 
 	finalState, waitErr := s.waitForTorrentReady(ctx, hash)
+	s.stopTorrentBestEffort(ctx, hash)
+	return finalState, waitErr
+}
 
-	// Always stop the torrent after adding, even if waitForTorrentReady was
-	// interrupted by context cancellation. Uses a detached context because the
-	// gRPC caller may cancel before the wait completes, but the stop must succeed
-	// to prevent dual seeding. qBittorrent may also briefly transition through an
-	// active state (e.g. stalledUP) even with stopped=true+skip_checking=true.
+// stopTorrentBestEffort stops the torrent on destination qB. Uses a detached
+// context because the gRPC caller may cancel before the stop completes, but
+// the stop must run to prevent dual seeding (source still believes it is the
+// canonical seeder until handoff). Failure is logged and swallowed — the
+// torrent may already be stopped, or qB may be unreachable at this moment.
+func (s *Server) stopTorrentBestEffort(ctx context.Context, hash string) {
 	stopCtx, stopCancel := context.WithTimeout(context.Background(), stopTorrentTimeout)
 	defer stopCancel()
 	if stopErr := s.qbClient.StopCtx(stopCtx, []string{hash}); stopErr != nil {
-		s.logger.WarnContext(ctx, "failed to stop torrent after add (may already be stopped)",
+		s.logger.WarnContext(ctx, "failed to stop torrent (may already be stopped)",
 			"hash", hash, "error", stopErr)
 	}
-
-	return finalState, waitErr
 }
 
 // waitForTorrentReady polls until the torrent is verified and ready.
