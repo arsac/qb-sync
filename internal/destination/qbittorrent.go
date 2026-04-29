@@ -74,14 +74,11 @@ func (s *Server) addAndVerifyTorrent(
 		if isErrorState(existingTorrent.State) {
 			return existingTorrent.State, fmt.Errorf("torrent in error state: %s", existingTorrent.State)
 		}
-		var (
-			finalState qbittorrent.TorrentState
-			waitErr    error
-		)
-		if existingTorrent.Progress >= 1.0 && isReadyState(existingTorrent.State) {
-			finalState = existingTorrent.State
-		} else {
-			// Not yet ready (checking, incomplete, moving, etc.) — poll until ready.
+		finalState := existingTorrent.State
+		var waitErr error
+		// If already at 100% and seeding-side, accept the current state; otherwise
+		// (checking, incomplete, moving, etc.) poll until ready.
+		if existingTorrent.Progress < 1.0 || !isReadyState(existingTorrent.State) {
 			finalState, waitErr = s.waitForTorrentReady(ctx, hash, state.totalSize)
 		}
 		s.stopTorrentBestEffort(ctx, hash)

@@ -85,7 +85,7 @@ func setupRecoveryMetaDir(
 		if marshalErr != nil {
 			t.Fatal(marshalErr)
 		}
-		if writeErr := os.WriteFile(filepath.Join(metaDir, ".state"), stateData, 0o644); writeErr != nil {
+		if writeErr := os.WriteFile(filepath.Join(metaDir, stateFileName), stateData, 0o644); writeErr != nil {
 			t.Fatal(writeErr)
 		}
 	}
@@ -279,7 +279,7 @@ func TestRecoverInFlightTorrents_StateWithoutMeta(t *testing.T) {
 	written.Set(0)
 	written.Set(3)
 	stateData, _ := written.MarshalBinary()
-	if err := os.WriteFile(filepath.Join(metaDir, ".state"), stateData, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(metaDir, stateFileName), stateData, 0o644); err != nil {
 		t.Fatal(err)
 	}
 

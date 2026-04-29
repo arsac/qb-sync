@@ -421,44 +421,39 @@ func TestComputePollTimeout(t *testing.T) {
 	cases := []struct {
 		name    string
 		bytes   int64
-		minWant time.Duration
-		maxWant time.Duration
-		comment string
+		minWant time.Duration // lower bound (inclusive) for the returned timeout
+		maxWant time.Duration // upper bound (inclusive) for the returned timeout
 	}{
 		{
-			name:    "tiny torrent",
-			bytes:   100 * 1024 * 1024, // 100 MB
+			name:    "tiny torrent: floor governs below 1GB",
+			bytes:   100 * 1024 * 1024,
 			minWant: defaultQBPollTimeoutBase,
 			maxWant: defaultQBPollTimeoutBase,
-			comment: "below 1GB the floor governs",
 		},
 		{
-			name:    "100GB torrent",
+			name:    "100GB torrent: linear scaling kicks in",
 			bytes:   100 * oneGB,
 			minWant: defaultQBPollTimeoutBase + 100*defaultQBPollTimeoutPerGB,
 			maxWant: defaultQBPollTimeoutBase + 100*defaultQBPollTimeoutPerGB,
-			comment: "scaling kicks in linearly",
 		},
 		{
-			name:    "1TB torrent",
+			// 1TB at 1min/GB pre-cap is 17h, well past the 6h max — the cap fires.
+			name:    "1TB torrent: scaling exceeds cap, gets clamped",
 			bytes:   1024 * oneGB,
-			minWant: defaultQBPollTimeoutBase + 1024*defaultQBPollTimeoutPerGB,
+			minWant: defaultQBPollTimeoutMax,
 			maxWant: defaultQBPollTimeoutMax,
-			comment: "still below cap (depends on constants)",
 		},
 		{
-			name:    "10TB torrent",
+			name:    "10TB torrent: hits the hard cap, not unbounded",
 			bytes:   10 * 1024 * oneGB,
 			minWant: defaultQBPollTimeoutMax,
 			maxWant: defaultQBPollTimeoutMax,
-			comment: "must hit the hard cap, not grow unboundedly",
 		},
 		{
-			name:    "negative size (defensive)",
+			name:    "negative size (defensive): doesn't panic, stays at/under base",
 			bytes:   -1,
 			minWant: 0,
 			maxWant: defaultQBPollTimeoutBase,
-			comment: "shouldn't panic; should produce a reasonable value",
 		},
 	}
 
@@ -466,13 +461,9 @@ func TestComputePollTimeout(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			got := computePollTimeout(tc.bytes)
-			// Allow either >= minWant (when calculated value is at or above floor)
-			// or == maxWant when the cap fires.
-			capped := got > defaultQBPollTimeoutMax
-			belowFloor := got < defaultQBPollTimeoutBase && tc.bytes >= 0
-			if capped || belowFloor {
-				t.Errorf("%s: got %v, expected within [%v, %v] (%s)",
-					tc.name, got, defaultQBPollTimeoutBase, defaultQBPollTimeoutMax, tc.comment)
+			if got < tc.minWant || got > tc.maxWant {
+				t.Errorf("computePollTimeout(%d) = %v, want within [%v, %v]",
+					tc.bytes, got, tc.minWant, tc.maxWant)
 			}
 		})
 	}
