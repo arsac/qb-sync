@@ -634,6 +634,15 @@ func WithDryRun(dryRun bool) SourceConfigOption {
 	}
 }
 
+// WithMinSpaceGB sets the minimum free space threshold. Use 0 to disable
+// disk-pressure cleanup entirely (useful for tests that don't want
+// maybeMoveToDest firing in the background).
+func WithMinSpaceGB(gb int64) SourceConfigOption {
+	return func(cfg *config.SourceConfig) {
+		cfg.MinSpaceGB = gb
+	}
+}
+
 // WithMinSeedingTime sets minimum seeding time.
 func WithMinSeedingTime(d time.Duration) SourceConfigOption {
 	return func(cfg *config.SourceConfig) {

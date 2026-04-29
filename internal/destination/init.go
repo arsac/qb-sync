@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"github.com/bits-and-blooms/bitset"
 
@@ -66,22 +67,15 @@ func (s *Server) InitTorrent(
 		return resp, nil
 	}
 
-	s.mu.Lock()
-
 	// Check for existing state (resume case).
-	if state, exists := s.torrents[hash]; exists {
-		if state.initializing {
-			s.mu.Unlock()
-			return initErrorResponse("torrent initialization already in progress"), nil
-		}
-		s.mu.Unlock()
-		return s.resumeTorrent(ctx, hash, state, req), nil
+	// Use GetWithSentinel to distinguish "not found" from "initializing".
+	if resp, found := s.lookupExistingState(hash, req); found {
+		return resp, nil
 	}
 
 	// Don't create state for minimal requests (e.g., CheckTorrentStatus sends only hash).
 	// Return -1 to indicate torrent not initialized yet - caller should do full InitTorrent.
 	if len(req.GetFiles()) == 0 {
-		s.mu.Unlock()
 		return &pb.InitTorrentResponse{
 			Success:           true,
 			Status:            pb.TorrentSyncStatus_SYNC_STATUS_READY,
@@ -89,80 +83,92 @@ func (s *Server) InitTorrent(
 		}, nil
 	}
 
-	// Insert sentinel to reserve the hash while we do disk I/O without holding s.mu.
+	// Reserve the hash while we do disk I/O.
 	// This prevents concurrent InitTorrent calls for the same hash from racing.
-	s.torrents[hash] = &serverTorrentState{initializing: true}
-	s.mu.Unlock()
+	if reserveErr := s.store.Reserve(hash); reserveErr != nil {
+		// Another goroutine beat us -- retry the check.
+		if resp, found := s.lookupExistingState(hash, req); found {
+			return resp, nil
+		}
+		return initErrorResponse("reserve failed: %v", reserveErr), nil
+	}
 
-	// Initialize new torrent (disk I/O happens here without s.mu held)
+	// Initialize new torrent (disk I/O happens here without store lock held)
 	resp := s.initNewTorrent(ctx, hash, req)
 
 	// On error, clean up the sentinel
 	if !resp.GetSuccess() {
-		s.mu.Lock()
-		// Only delete if still our sentinel (should always be true)
-		if state, exists := s.torrents[hash]; exists && state.initializing {
-			delete(s.torrents, hash)
-		}
-		s.mu.Unlock()
+		s.store.Unreserve(hash)
 	}
 
 	return resp, nil
 }
 
+// lookupExistingState returns a response for any pre-existing entry for hash:
+// an "in progress" error if a sentinel is present, or a resume response if
+// real state is present. Returns (nil, false) when no entry exists.
+func (s *Server) lookupExistingState(
+	hash string,
+	req *pb.InitTorrentRequest,
+) (*pb.InitTorrentResponse, bool) {
+	state, exists := s.store.GetWithSentinel(hash)
+	if !exists {
+		return nil, false
+	}
+	if state.initializing.Load() {
+		return initErrorResponse("torrent initialization already in progress"), true
+	}
+	return s.resumeTorrent(state, req), true
+}
+
 // resumeTorrent handles resuming an existing torrent sync.
 func (s *Server) resumeTorrent(
-	ctx context.Context,
-	hash string,
 	state *serverTorrentState,
 	req *pb.InitTorrentRequest,
 ) *pb.InitTorrentResponse {
-	// Ensure torrent file is written (may have been missed by CheckTorrentStatus)
-	if err := s.ensureTorrentFileWritten(ctx, hash, state, req); err != nil {
-		return initErrorResponse("ensuring torrent file: %v", err)
-	}
-
 	// Acquire state.mu to read written/hardlinkResults safely — a concurrent
-	// WritePiece may be modifying state.written under this lock.
+	// WritePiece may be modifying state.written under this lock. Cache the
+	// torrent file bytes under the same lock when missing to avoid two
+	// lock/unlock cycles.
 	state.mu.Lock()
-	resp := state.buildReadyResponse()
-	state.mu.Unlock()
-	return resp
+	defer state.mu.Unlock()
+	if len(state.torrentFile) == 0 && len(req.GetTorrentFile()) > 0 {
+		state.torrentFile = req.GetTorrentFile()
+	}
+	return state.buildReadyResponse()
 }
 
-// setupMetadataDir creates the metadata directory and writes the torrent file.
-// If the directory exists with a stale or missing version, it is removed first
-// to prevent loading incompatible state files.
-// Returns metaDir, torrentPath, statePath, and error.
+// setupMetadataDir creates the metadata directory and writes the .meta file
+// (serialized PersistedTorrentMeta). If the directory exists without .meta
+// (old format or corrupted), it is removed first.
+// Skips .meta write if it already exists (idempotent for recovery path).
+// Returns metaDir, statePath, and error.
 func (s *Server) setupMetadataDir(
-	hash, name string,
-	torrentFile []byte,
-) (string, string, string, error) {
+	hash string,
+	req *pb.InitTorrentRequest,
+) (string, string, error) {
 	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
+	metaPath := filepath.Join(metaDir, metaFileName)
+	statePath := filepath.Join(metaDir, stateFileName)
 
-	// Nuke stale metadata directory before re-creating.
-	if !checkMetaVersion(metaDir) {
-		_ = os.RemoveAll(metaDir)
+	// If .meta already exists, this is a recovery/idempotent call — skip all writes.
+	if _, err := os.Stat(metaPath); err == nil {
+		return metaDir, statePath, nil
 	}
 
+	// .meta absent: either fresh init or old-format directory.
+	// Remove any stale directory contents and recreate.
+	_ = os.RemoveAll(metaDir)
 	if err := os.MkdirAll(metaDir, serverDirPermissions); err != nil {
-		return "", "", "", fmt.Errorf("creating metadata directory: %w", err)
+		return "", "", fmt.Errorf("creating metadata directory: %w", err)
 	}
 
-	torrentPath := filepath.Join(metaDir, filepath.Base(name)+".torrent")
-	statePath := filepath.Join(metaDir, ".state")
-
-	if len(torrentFile) > 0 {
-		if err := atomicWriteFile(torrentPath, torrentFile); err != nil {
-			return "", "", "", fmt.Errorf("writing .torrent file: %w", err)
-		}
+	meta := buildPersistedMeta(req)
+	if err := savePersistedMeta(metaPath, meta); err != nil {
+		return "", "", fmt.Errorf("writing metadata: %w", err)
 	}
 
-	if err := atomicWriteFile(filepath.Join(metaDir, versionFileName), []byte(metaVersion)); err != nil {
-		return "", "", "", fmt.Errorf("writing version file: %w", err)
-	}
-
-	return metaDir, torrentPath, statePath, nil
+	return metaDir, statePath, nil
 }
 
 // initNewTorrent handles initializing a fresh torrent sync.
@@ -173,8 +179,8 @@ func (s *Server) initNewTorrent(
 ) *pb.InitTorrentResponse {
 	name := req.GetName()
 
-	// Create metadata directory and write torrent file
-	metaDir, torrentPath, statePath, err := s.setupMetadataDir(hash, name, req.GetTorrentFile())
+	// Create metadata directory and write .meta file.
+	metaDir, statePath, err := s.setupMetadataDir(hash, req)
 	if err != nil {
 		return initErrorResponse("%v", err)
 	}
@@ -183,16 +189,8 @@ func (s *Server) initNewTorrent(
 	// This handles destination restart: persisted state may have files at the old path
 	// (e.g., no category prefix), while source now sends the correct sub-path.
 	saveSubPath := req.GetSaveSubPath()
-	if oldSubPath := loadSubPathFile(metaDir); oldSubPath != saveSubPath {
-		relPaths := make([]string, len(req.GetFiles()))
-		for i, f := range req.GetFiles() {
-			relPaths[i] = f.GetPath()
-		}
-		if _, relocErr := s.relocateFiles(ctx, hash, relPaths, oldSubPath, saveSubPath); relocErr != nil {
-			s.logger.WarnContext(ctx, "failed to relocate files, continuing with fresh setup",
-				"hash", hash, "error", relocErr)
-		}
-	}
+	metaPath := filepath.Join(metaDir, metaFileName)
+	s.maybeRelocateSubPath(ctx, hash, req, metaPath, saveSubPath)
 
 	// Set up files and check for hardlink opportunities
 	files, hardlinkResults, err := s.setupFiles(ctx, hash, req.GetFiles(), saveSubPath)
@@ -223,34 +221,19 @@ func (s *Server) initNewTorrent(
 		}
 	}
 
-	// Persist save sub-path and file selection for recovery after restart.
-	// The .torrent file (already written above) provides all other metadata.
-	if saveErr := saveSubPathFile(metaDir, saveSubPath); saveErr != nil {
-		return initErrorResponse("failed to save sub-path for recovery: %v", saveErr)
-	}
-	if saveErr := saveSelectedFile(metaDir, files); saveErr != nil {
-		return initErrorResponse("failed to save selection state: %v", saveErr)
-	}
-
-	// Swap sentinel for real state under s.mu
+	// Swap sentinel for real state under store lock.
 	state := &serverTorrentState{
 		torrentMeta:     meta,
-		info:            req,
 		written:         written,
-		torrentPath:     torrentPath,
+		verified:        bitset.New(uint(meta.numPieces())),
+		torrentFile:     req.GetTorrentFile(),
 		statePath:       statePath,
 		saveSubPath:     saveSubPath,
 		hardlinkResults: hardlinkResults,
 	}
-	s.mu.Lock()
-	if collisionErr := s.checkPathCollisions(hash, files); collisionErr != nil {
-		delete(s.torrents, hash) // remove sentinel
-		s.mu.Unlock()
+	if collisionErr := s.store.Commit(hash, state); collisionErr != nil {
 		return initErrorResponse("path collision: %v", collisionErr)
 	}
-	s.torrents[hash] = state
-	s.registerFilePaths(hash, files)
-	s.mu.Unlock()
 
 	// Log summary
 	hardlinkedCount, pendingCount, preExistingCount := countHardlinkResults(hardlinkResults)
@@ -272,6 +255,38 @@ func (s *Server) initNewTorrent(
 	)
 
 	return state.buildReadyResponse()
+}
+
+// maybeRelocateSubPath checks whether the persisted sub-path differs from the
+// requested one and relocates data files if needed. After a successful
+// relocation the .meta file is updated so recovery picks up the new path.
+func (s *Server) maybeRelocateSubPath(
+	ctx context.Context,
+	hash string,
+	req *pb.InitTorrentRequest,
+	metaPath, saveSubPath string,
+) {
+	existingMeta, loadErr := loadPersistedMeta(metaPath)
+	if loadErr != nil || existingMeta.GetSaveSubPath() == saveSubPath {
+		return
+	}
+
+	relPaths := make([]string, len(req.GetFiles()))
+	for i, f := range req.GetFiles() {
+		relPaths[i] = f.GetPath()
+	}
+	if _, relocErr := s.relocateFiles(
+		ctx, hash, relPaths, existingMeta.GetSaveSubPath(), saveSubPath,
+	); relocErr != nil {
+		s.logger.WarnContext(ctx, "failed to relocate files, continuing with fresh setup",
+			"hash", hash, "error", relocErr)
+	}
+	// Update .meta to reflect the new sub-path so recovery uses the correct path.
+	updatedMeta := buildPersistedMeta(req)
+	if saveErr := savePersistedMeta(metaPath, updatedMeta); saveErr != nil {
+		s.logger.WarnContext(ctx, "failed to update .meta after relocation",
+			"hash", hash, "error", saveErr)
+	}
 }
 
 // buildWrittenBitmap constructs the written bitmap from persisted state and hardlink
@@ -344,22 +359,22 @@ func (s *Server) cleanupForResync(ctx context.Context, hash string) error {
 	}
 
 	// 2. Delete in-memory state and file path ownership.
-	s.mu.Lock()
-	if state, exists := s.torrents[hash]; exists {
-		s.unregisterFilePaths(hash, state.files)
-	}
-	delete(s.torrents, hash)
-	s.mu.Unlock()
+	s.store.Remove(hash)
 
-	// 3. Delete persisted .state and .finalized marker so buildWrittenBitmap
-	// starts fresh and isFinalized returns false.
+	// 3. Delete persisted .state, .finalized marker, and .meta so the next
+	// setupMetadataDir writes a fresh .meta from the new request. Without
+	// the .meta removal, setupMetadataDir's idempotent skip would preserve
+	// the stale file selection on disk — and a crash before the new
+	// InitTorrent completes would leave recovery rebuilding state from the
+	// old metadata.
 	// During the first sync with partial selection, boundary pieces spanning
 	// selected + unselected files were marked "written" but only the
 	// selected-file portion was actually written to disk. On re-sync those
 	// pieces must be re-streamed for the newly-selected portions.
 	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
-	_ = os.Remove(filepath.Join(metaDir, ".state"))
+	_ = os.Remove(filepath.Join(metaDir, stateFileName))
 	_ = os.Remove(filepath.Join(metaDir, finalizedFileName))
+	_ = os.Remove(filepath.Join(metaDir, metaFileName))
 
 	s.logger.InfoContext(ctx, "re-sync: cleared all prior state",
 		"hash", hash)
@@ -413,16 +428,18 @@ func (s *Server) checkTorrentInQB(ctx context.Context, hash string) qbCheckResul
 		return qbCheckVerifying
 	}
 
-	// Accept 100% progress in any non-error state as complete. With partial
-	// file selection, qBittorrent may classify the torrent as a download
-	// variant (StoppedDl/PausedDl) when deselected files are absent on disk,
-	// even though all selected files are fully synced.
-	//
-	// We keep the progress >= 1.0 requirement to avoid returning COMPLETE
-	// for torrents that were added to QB but failed verification, or that
-	// qBittorrent is actively downloading (which would conflict with our
-	// piece writers).
-	if torrent.Progress >= 1.0 && !isErrorState(torrent.State) {
+	// Only return COMPLETE when the torrent is unambiguously seeding-side at
+	// 100%. Accepting any non-error state at progress=1.0 is dangerous: with
+	// partial file selection on qB v5 a torrent can report progress=1.0 in
+	// pausedDL/stoppedDL even when files are missing on disk (e.g., the user
+	// manually deleted unselected dirs). Trusting that would let source mark
+	// the torrent synced and delete its data with nothing actually seeding.
+	// Our own finalization path explicitly transitions to a stoppedUp/pausedUp
+	// state via StopCtx after waitForTorrentReady, so the legitimate
+	// already-finalized case lands in isReadyState. The local .finalized
+	// marker check upstream (isFinalized) is the fast path for our own
+	// finalizations; this RPC check is only for externally-added torrents.
+	if torrent.Progress >= 1.0 && isReadyState(torrent.State) {
 		s.logger.InfoContext(ctx, "torrent already complete in destination qBittorrent",
 			"hash", hash,
 			"state", torrent.State,
@@ -436,9 +453,7 @@ func (s *Server) checkTorrentInQB(ctx context.Context, hash string) qbCheckResul
 // waitForAbortComplete waits for any in-progress abort to complete.
 // This prevents a race where InitTorrent creates files that AbortTorrent then deletes.
 func (s *Server) waitForAbortComplete(ctx context.Context, hash string) error {
-	s.mu.RLock()
-	abortCh, aborting := s.abortingHashes[hash]
-	s.mu.RUnlock()
+	abortCh, aborting := s.store.AbortCh(hash)
 
 	if !aborting {
 		return nil
@@ -452,55 +467,6 @@ func (s *Server) waitForAbortComplete(ctx context.Context, hash string) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-}
-
-// ensureTorrentFileWritten writes the torrent file if it doesn't exist on disk.
-// This handles the case where CheckTorrentStatus created state without the file.
-func (s *Server) ensureTorrentFileWritten(
-	ctx context.Context,
-	hash string,
-	state *serverTorrentState,
-	req *pb.InitTorrentRequest,
-) error {
-	torrentFile := req.GetTorrentFile()
-	if len(torrentFile) == 0 {
-		return nil
-	}
-
-	// Use existing path if valid, otherwise construct from request.
-	// Read under state.mu: torrentPath can be written concurrently by another
-	// resumeTorrent call for the same hash.
-	state.mu.Lock()
-	torrentPath := state.torrentPath
-	state.mu.Unlock()
-	if torrentPath == "" {
-		name := req.GetName()
-		if name == "" {
-			return nil
-		}
-		name = filepath.Base(name) // Sanitize to prevent path traversal
-		torrentPath = filepath.Join(s.config.BasePath, metaDirName, hash, name+".torrent")
-	}
-
-	// Check if file already exists
-	if _, err := os.Stat(torrentPath); err == nil {
-		return nil
-	}
-
-	// Ensure directory exists and write file
-	if err := os.MkdirAll(filepath.Dir(torrentPath), serverDirPermissions); err != nil {
-		return fmt.Errorf("creating metadata directory: %w", err)
-	}
-
-	if err := atomicWriteFile(torrentPath, torrentFile); err != nil {
-		return fmt.Errorf("writing torrent file: %w", err)
-	}
-
-	state.mu.Lock()
-	state.torrentPath = torrentPath
-	state.mu.Unlock()
-	s.logger.InfoContext(ctx, "wrote torrent file for existing state", "hash", hash, "path", torrentPath)
-	return nil
 }
 
 // hardlinkOutcome represents the result of hardlink resolution.
@@ -543,17 +509,20 @@ func (s *Server) setupFile(
 ) (*serverFileInfo, *pb.HardlinkResult, error) {
 	result := &pb.HardlinkResult{FileIndex: int32(fileIndex)}
 	targetPath := filepath.Join(s.config.BasePath, saveSubPath, f.GetPath())
+	sourceFileID := FileID{Dev: f.GetDevice(), Ino: f.GetInode()}
+
+	fileInfo := &serverFileInfo{
+		path:     targetPath,
+		size:     f.GetSize(),
+		offset:   f.GetOffset(),
+		hardlink: hardlinkInfo{sourceFileID: sourceFileID},
+		selected: f.GetSelected(),
+	}
 
 	// Unselected files: no .partial, no directory creation, no hardlink resolution.
 	// The serverFileInfo entry is still needed for offset tracking in writePieceData.
 	if !f.GetSelected() {
-		return &serverFileInfo{
-			path:     targetPath,
-			size:     f.GetSize(),
-			offset:   f.GetOffset(),
-			hardlink: hardlinkInfo{sourceInode: Inode(f.GetInode())},
-			selected: false,
-		}, result, nil
+		return fileInfo, result, nil
 	}
 
 	// Ensure parent directory exists
@@ -563,13 +532,7 @@ func (s *Server) setupFile(
 
 	// Check if file already exists with correct size (pre-existing data)
 	if info, statErr := os.Stat(targetPath); statErr == nil && info.Size() == f.GetSize() {
-		fileInfo := &serverFileInfo{
-			path:     targetPath,
-			size:     f.GetSize(),
-			offset:   f.GetOffset(),
-			hardlink: hardlinkInfo{sourceInode: Inode(f.GetInode()), state: hlStateComplete},
-			selected: true,
-		}
+		fileInfo.hardlink.state = hlStateComplete
 		result.PreExisting = true
 		return fileInfo, result, nil
 	}
@@ -577,29 +540,15 @@ func (s *Server) setupFile(
 	// Check if .partial file exists from a previous interrupted sync.
 	// Piece-level progress is recovered from .state in buildWrittenBitmap;
 	// skip hardlink resolution since the file already has data on disk.
-	partialPath := targetPath + ".partial"
+	partialPath := targetPath + partialSuffix
+	fileInfo.path = partialPath
 	if info, statErr := os.Stat(partialPath); statErr == nil && info.Size() == f.GetSize() {
-		return &serverFileInfo{
-			path:     partialPath,
-			size:     f.GetSize(),
-			offset:   f.GetOffset(),
-			hardlink: hardlinkInfo{sourceInode: Inode(f.GetInode())},
-			selected: true,
-		}, result, nil
+		return fileInfo, result, nil
 	}
 
-	sourceInode := Inode(f.GetInode())
-	fileInfo := &serverFileInfo{
-		path:     partialPath,
-		size:     f.GetSize(),
-		offset:   f.GetOffset(),
-		hardlink: hardlinkInfo{sourceInode: sourceInode},
-		selected: true,
-	}
-
-	// Check for hardlink opportunities if inode is provided
-	if sourceInode != 0 {
-		outcome := s.resolveHardlink(ctx, hash, f.GetPath(), targetPath, sourceInode, f.GetSize())
+	// Check for hardlink opportunities if file ID is provided
+	if !sourceFileID.IsZero() {
+		outcome := s.resolveHardlink(ctx, hash, f.GetPath(), targetPath, sourceFileID, f.GetSize())
 		s.applyHardlinkOutcome(fileInfo, result, targetPath, outcome)
 	}
 
@@ -610,16 +559,16 @@ func (s *Server) setupFile(
 func (s *Server) resolveHardlink(
 	ctx context.Context,
 	hash, filePath, targetPath string,
-	sourceInode Inode,
+	sourceFileID FileID,
 	expectedSize int64,
 ) hardlinkOutcome {
 	// Case 1: Check if inode is already registered (completed file from previous torrent)
-	if outcome, ok := s.tryHardlinkFromRegistered(ctx, hash, filePath, targetPath, sourceInode, expectedSize); ok {
+	if outcome, ok := s.tryHardlinkFromRegistered(ctx, hash, filePath, targetPath, sourceFileID, expectedSize); ok {
 		return outcome
 	}
 
 	// Case 2: Check if another torrent is currently writing this inode
-	if outcome, ok := s.tryHardlinkFromInProgress(ctx, hash, filePath, sourceInode); ok {
+	if outcome, ok := s.tryHardlinkFromInProgress(ctx, hash, filePath, targetPath, sourceFileID); ok {
 		return outcome
 	}
 
@@ -627,8 +576,8 @@ func (s *Server) resolveHardlink(
 	// RegisterInProgress returns false if another torrent raced us between
 	// Case 2 (GetInProgress) and now. In that case, retry Case 2 to pick
 	// up the winner's doneCh and become pending instead of duplicating work.
-	if !s.registerInodeInProgress(ctx, hash, filePath, targetPath, sourceInode) {
-		if outcome, ok := s.tryHardlinkFromInProgress(ctx, hash, filePath, sourceInode); ok {
+	if !s.registerInodeInProgress(ctx, hash, filePath, targetPath, sourceFileID) {
+		if outcome, ok := s.tryHardlinkFromInProgress(ctx, hash, filePath, targetPath, sourceFileID); ok {
 			return outcome
 		}
 		// Winner already completed between our two checks — write from scratch.
@@ -672,10 +621,10 @@ func (s *Server) applyHardlinkOutcome(
 func (s *Server) tryHardlinkFromRegistered(
 	ctx context.Context,
 	hash, filePath, targetPath string,
-	sourceInode Inode,
+	sourceFileID FileID,
 	expectedSize int64,
 ) (hardlinkOutcome, bool) {
-	existingPath, found := s.inodes.GetRegistered(sourceInode)
+	existingPath, found := s.store.Inodes().GetRegistered(sourceFileID)
 	if !found {
 		return hardlinkOutcome{}, false
 	}
@@ -685,15 +634,21 @@ func (s *Server) tryHardlinkFromRegistered(
 	// Guard against stale inode entries from recycled inodes.
 	sourceInfo, statErr := os.Stat(sourcePath)
 	if statErr != nil || sourceInfo.Size() != expectedSize {
-		s.inodes.Evict(sourceInode)
+		s.store.Inodes().Evict(sourceFileID)
 		s.logger.InfoContext(ctx, "evicted stale inode registry entry",
 			"torrent", hash,
 			"file", filePath,
-			"inode", sourceInode,
+			"fileID", sourceFileID,
 			"registeredPath", existingPath,
 			"statErr", statErr,
 		)
 		metrics.StaleInodeEvictionsTotal.Inc()
+		return hardlinkOutcome{}, false
+	}
+
+	// Same-filesystem guard: hardlinks only work within one filesystem.
+	// On overlayfs destinations this fires for all files, safely disabling hardlinks.
+	if !sameFilesystem(sourcePath, filepath.Dir(targetPath)) {
 		return hardlinkOutcome{}, false
 	}
 
@@ -727,11 +682,20 @@ func (s *Server) tryHardlinkFromRegistered(
 // Returns the outcome and true if the inode is being written by another torrent.
 func (s *Server) tryHardlinkFromInProgress(
 	ctx context.Context,
-	hash, filePath string,
-	sourceInode Inode,
+	hash, filePath, targetPath string,
+	sourceFileID FileID,
 ) (hardlinkOutcome, bool) {
-	targetPath, doneCh, sourceTorrent, found := s.inodes.GetInProgress(sourceInode)
+	sourceRelPath, doneCh, sourceTorrent, found := s.store.Inodes().GetInProgress(sourceFileID)
 	if !found {
+		return hardlinkOutcome{}, false
+	}
+
+	// Same-filesystem guard: if the in-progress writer's target lives on a
+	// different filesystem from this file's target, the eventual hardlink at
+	// finalize would fail with EXDEV. Skip pending and fall through so the
+	// data gets streamed independently.
+	sourceDir := filepath.Dir(filepath.Join(s.config.BasePath, sourceRelPath))
+	if !sameFilesystem(sourceDir, filepath.Dir(targetPath)) {
 		return hardlinkOutcome{}, false
 	}
 
@@ -743,9 +707,31 @@ func (s *Server) tryHardlinkFromInProgress(
 
 	return hardlinkOutcome{
 		state:      hlStatePending,
-		sourcePath: targetPath,
+		sourcePath: sourceRelPath,
 		doneCh:     doneCh,
 	}, true
+}
+
+// sameFilesystem reports whether two paths reside on the same filesystem
+// by comparing the device IDs of their stat results. Returns false on any
+// stat error or if device IDs cannot be obtained — callers treat that as
+// "not safe to hardlink". The actual Dev comparison is platform-specific
+// (sameDev): Linux Stat_t.Dev is uint64, Darwin's int32.
+func sameFilesystem(pathA, pathB string) bool {
+	infoA, errA := os.Stat(pathA)
+	if errA != nil {
+		return false
+	}
+	infoB, errB := os.Stat(pathB)
+	if errB != nil {
+		return false
+	}
+	statA, okA := infoA.Sys().(*syscall.Stat_t)
+	statB, okB := infoB.Sys().(*syscall.Stat_t)
+	if !okA || !okB {
+		return false
+	}
+	return sameDev(statA, statB)
 }
 
 // registerInodeInProgress registers this torrent as the first writer for an inode.
@@ -753,7 +739,7 @@ func (s *Server) tryHardlinkFromInProgress(
 func (s *Server) registerInodeInProgress(
 	ctx context.Context,
 	hash, filePath, targetPath string,
-	sourceInode Inode,
+	sourceFileID FileID,
 ) bool {
 	relTargetPath, err := filepath.Rel(s.config.BasePath, targetPath)
 	if err != nil {
@@ -766,5 +752,5 @@ func (s *Server) registerInodeInProgress(
 		relTargetPath = filePath
 	}
 
-	return s.inodes.RegisterInProgress(sourceInode, hash, relTargetPath)
+	return s.store.Inodes().RegisterInProgress(sourceFileID, hash, relTargetPath)
 }

@@ -2,30 +2,61 @@ package destination
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
-	"strings"
 
 	"github.com/bits-and-blooms/bitset"
 
+	"google.golang.org/protobuf/proto"
+
 	"github.com/arsac/qb-sync/internal/metrics"
 	"github.com/arsac/qb-sync/internal/utils"
+	pb "github.com/arsac/qb-sync/proto"
 )
 
-// loadState loads the written pieces state from disk.
+const currentSchemaVersion int32 = 3
+
+// loadState loads the written pieces state from disk. Panics from
+// bitset.UnmarshalBinary on truncated or malformed payloads (the underlying
+// library indexes blindly into the byte slice on some inputs) are recovered
+// as errors so a torn .state from the no-sync fast path can't crash the
+// server on startup — the caller treats any error as "no prior state" and
+// re-streams.
 func (s *Server) loadState(path string, numPieces int) (*bitset.BitSet, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
 
-	written := bitset.New(0)
-	if unmarshalErr := written.UnmarshalBinary(data); unmarshalErr != nil {
+	written, unmarshalErr := safeUnmarshalBitset(data)
+	if unmarshalErr != nil {
 		return nil, fmt.Errorf("unmarshaling bitset: %w", unmarshalErr)
 	}
 	return ensureBitSetLength(written, uint(numPieces)), nil
+}
+
+// safeUnmarshalBitset wraps bitset.UnmarshalBinary with panic recovery.
+// Returns nil + error on any panic or unmarshal error.
+func safeUnmarshalBitset(data []byte) (*bitset.BitSet, error) {
+	var (
+		out    *bitset.BitSet
+		outErr error
+	)
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				out = nil
+				outErr = fmt.Errorf("bitset unmarshal panic: %v", r)
+			}
+		}()
+		b := bitset.New(0)
+		if err := b.UnmarshalBinary(data); err != nil {
+			outErr = err
+			return
+		}
+		out = b
+	}()
+	return out, outErr
 }
 
 // atomicWriteFile writes data atomically using standard server permissions.
@@ -33,13 +64,16 @@ func atomicWriteFile(path string, data []byte) error {
 	return utils.AtomicWriteFile(path, data, serverFilePermissions)
 }
 
-// saveState persists the written pieces state to disk.
+// saveState persists the written pieces state to disk. Uses the no-sync
+// fast path: .state is a regenerable checkpoint, and a torn write at crash
+// time is recovered automatically via clearStalePieces (any piece whose
+// data file is missing on disk has its bit cleared on next init).
 func (s *Server) saveState(path string, written *bitset.BitSet) error {
 	data, marshalErr := written.MarshalBinary()
 	if marshalErr != nil {
 		return fmt.Errorf("marshaling bitset: %w", marshalErr)
 	}
-	return atomicWriteFile(path, data)
+	return utils.AtomicWriteFileNoSync(path, data)
 }
 
 // doSaveState persists state using saveStateFunc (injected for tests) or the default saveState.
@@ -50,72 +84,75 @@ func (s *Server) doSaveState(path string, written *bitset.BitSet) error {
 	return s.saveState(path, written)
 }
 
-// saveSubPathFile persists the save sub-path to a .subpath file in the metadata directory.
-func saveSubPathFile(metaDir, subPath string) error {
-	if subPath == "" {
-		return nil
-	}
-	path := filepath.Join(metaDir, subPathFileName)
-	return atomicWriteFile(path, []byte(subPath))
-}
-
-// loadSubPathFile reads the save sub-path from the .subpath file.
-// Returns "" if the file is missing or unreadable.
-func loadSubPathFile(metaDir string) string {
-	path := filepath.Join(metaDir, subPathFileName)
-	data, err := os.ReadFile(path)
+func savePersistedMeta(path string, meta *pb.PersistedTorrentMeta) error {
+	data, err := proto.Marshal(meta)
 	if err != nil {
-		return ""
+		return fmt.Errorf("marshaling metadata: %w", err)
 	}
-	return strings.TrimSpace(string(data))
+	return atomicWriteFile(path, data)
 }
 
-// saveSelectedFile persists the file selection bitmap to a .selected file.
-func saveSelectedFile(metaDir string, files []*serverFileInfo) error {
-	data := make([]byte, len(files))
-	for i, fi := range files {
-		if fi.selected {
-			data[i] = 1
-		}
-	}
-	return atomicWriteFile(filepath.Join(metaDir, selectedFileName), data)
-}
-
-// loadSelectedFile reads the file selection bitmap from the .selected file.
-// Returns nil if the file is missing (callers default to all-selected).
-func loadSelectedFile(metaDir string, numFiles int) []bool {
-	data, err := os.ReadFile(filepath.Join(metaDir, selectedFileName))
-	if err != nil {
-		return nil
-	}
-	selected := make([]bool, numFiles)
-	for i := range min(numFiles, len(data)) {
-		selected[i] = data[i] == 1
-	}
-	return selected
-}
-
-// checkMetaVersion returns true if the metadata directory has the current version.
-func checkMetaVersion(metaDir string) bool {
-	data, err := os.ReadFile(filepath.Join(metaDir, versionFileName))
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(string(data)) == metaVersion
-}
-
-// findTorrentFile locates the .torrent file in metaDir.
-func findTorrentFile(metaDir string) (string, error) {
-	entries, readErr := os.ReadDir(metaDir)
+func loadPersistedMeta(path string) (*pb.PersistedTorrentMeta, error) {
+	data, readErr := os.ReadFile(path)
 	if readErr != nil {
-		return "", fmt.Errorf("reading meta dir: %w", readErr)
+		return nil, fmt.Errorf("reading %s: %w", path, readErr)
 	}
-	for _, entry := range entries {
-		if strings.HasSuffix(entry.Name(), ".torrent") {
-			return filepath.Join(metaDir, entry.Name()), nil
+	meta := &pb.PersistedTorrentMeta{}
+	if unmarshalErr := proto.Unmarshal(data, meta); unmarshalErr != nil {
+		return nil, fmt.Errorf("unmarshaling metadata: %w", unmarshalErr)
+	}
+	return meta, nil
+}
+
+func buildPersistedMeta(req *pb.InitTorrentRequest) *pb.PersistedTorrentMeta {
+	files := make([]*pb.PersistedFileInfo, len(req.GetFiles()))
+	for i, f := range req.GetFiles() {
+		files[i] = &pb.PersistedFileInfo{
+			Path:         f.GetPath(),
+			Size:         f.GetSize(),
+			Offset:       f.GetOffset(),
+			Selected:     f.GetSelected(),
+			SourceDevice: f.GetDevice(),
+			SourceInode:  f.GetInode(),
 		}
 	}
-	return "", errors.New("torrent file not found")
+	return &pb.PersistedTorrentMeta{
+		SchemaVersion: currentSchemaVersion,
+		TorrentHash:   req.GetTorrentHash(),
+		Name:          req.GetName(),
+		PieceSize:     req.GetPieceSize(),
+		TotalSize:     req.GetTotalSize(),
+		NumPieces:     req.GetNumPieces(),
+		Files:         files,
+		TorrentFile:   req.GetTorrentFile(),
+		PieceHashes:   req.GetPieceHashes(),
+		SaveSubPath:   req.GetSaveSubPath(),
+	}
+}
+
+func persistedMetaToRequest(meta *pb.PersistedTorrentMeta) *pb.InitTorrentRequest {
+	files := make([]*pb.FileInfo, len(meta.GetFiles()))
+	for i, f := range meta.GetFiles() {
+		files[i] = &pb.FileInfo{
+			Path:     f.GetPath(),
+			Size:     f.GetSize(),
+			Offset:   f.GetOffset(),
+			Selected: f.GetSelected(),
+			Device:   f.GetSourceDevice(),
+			Inode:    f.GetSourceInode(),
+		}
+	}
+	return &pb.InitTorrentRequest{
+		TorrentHash: meta.GetTorrentHash(),
+		Name:        meta.GetName(),
+		PieceSize:   meta.GetPieceSize(),
+		TotalSize:   meta.GetTotalSize(),
+		NumPieces:   meta.GetNumPieces(),
+		Files:       files,
+		PieceHashes: meta.GetPieceHashes(),
+		SaveSubPath: meta.GetSaveSubPath(),
+		TorrentFile: meta.GetTorrentFile(),
+	}
 }
 
 // clearStalePieces checks each selected file for existence on disk.
@@ -131,10 +168,11 @@ func (s *Server) clearStalePieces(
 	files []*serverFileInfo,
 ) {
 	for _, fi := range files {
-		if !fi.selected || fi.earlyFinalized {
-			continue
-		}
-		if fi.hardlink.state == hlStatePending || fi.hardlink.state == hlStateComplete {
+		// skipForWriteData covers unselected files and files whose data is
+		// supplied via hardlinks (pending/complete). Those are created at
+		// finalize time, not by streaming, so the bitmap may legitimately
+		// claim coverage even though the file isn't on disk yet.
+		if fi.skipForWriteData() || fi.earlyFinalized {
 			continue
 		}
 		if _, err := os.Stat(fi.path); err == nil {

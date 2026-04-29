@@ -58,23 +58,6 @@ type PieceDestination interface {
 	Close() error
 }
 
-// HardlinkDestination extends PieceDestination with hardlink support.
-// Used to avoid re-transferring files that are hardlinked on the source.
-type HardlinkDestination interface {
-	PieceDestination
-
-	// GetFileByInode checks if a file with the given inode exists on the destination.
-	// Returns the path if found, allowing the caller to create a hardlink instead of transferring.
-	GetFileByInode(ctx context.Context, inode uint64) (path string, found bool, err error)
-
-	// CreateHardlink creates a hardlink from an existing file to a new path.
-	// This operation should be idempotent.
-	CreateHardlink(ctx context.Context, sourcePath, targetPath string) error
-
-	// RegisterFile registers a completed file's inode for future hardlink lookups.
-	RegisterFile(ctx context.Context, inode uint64, path string, size int64) error
-}
-
 // StreamProgress tracks streaming progress for a torrent.
 type StreamProgress struct {
 	TorrentHash  string

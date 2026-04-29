@@ -369,25 +369,43 @@ func (t *PieceMonitor) pollMainData(ctx context.Context) error {
 
 	// Handle removed torrents
 	for _, hash := range t.mainData.TorrentsRemoved {
-		t.mu.Lock()
-		_, wasTracked := t.torrents[hash]
-		if wasTracked {
-			t.logger.InfoContext(ctx, "torrent removed from qBittorrent, stopping tracking", "hash", hash)
-			delete(t.torrents, hash)
-		}
-		t.mu.Unlock()
-
-		// Notify orchestrator about the removal so it can clean up destination
-		if wasTracked {
-			if t.trySendRemoved(ctx, hash) {
-				t.logger.InfoContext(ctx, "notified orchestrator of torrent removal", "hash", hash)
-			} else if ctx.Err() != nil {
-				return ctx.Err()
-			}
+		ok := t.removeAndNotify(
+			ctx, hash,
+			"torrent removed from qBittorrent, stopping tracking",
+			"notified orchestrator of torrent removal",
+		)
+		if !ok && ctx.Err() != nil {
+			return ctx.Err()
 		}
 	}
 
 	return nil
+}
+
+// removeAndNotify deletes a torrent from the tracking map and (if it was
+// tracked) sends a removal notification on the removed channel. notifyMsg is
+// the log line emitted after the orchestrator is successfully notified.
+// Returns false when the notification could not be delivered (closed channel
+// or context cancelled); the torrent being already untracked is treated as
+// success (no notification needed).
+func (t *PieceMonitor) removeAndNotify(ctx context.Context, hash, removeReason, notifyMsg string) bool {
+	t.mu.Lock()
+	_, wasTracked := t.torrents[hash]
+	if wasTracked {
+		t.logger.InfoContext(ctx, removeReason, "hash", hash)
+		delete(t.torrents, hash)
+	}
+	t.mu.Unlock()
+
+	if !wasTracked {
+		return true
+	}
+
+	if t.trySendRemoved(ctx, hash) {
+		t.logger.InfoContext(ctx, notifyMsg, "hash", hash)
+		return true
+	}
+	return false
 }
 
 // processTorrentUpdate handles a torrent update from maindata.
@@ -578,20 +596,11 @@ func (t *PieceMonitor) shouldSkipIdleTorrent(hash string) bool {
 // handleTorrentNotFound handles detection of a removed torrent via 404 error.
 // This is a fallback detection path when maindata sync misses the removal.
 func (t *PieceMonitor) handleTorrentNotFound(ctx context.Context, hash string) {
-	t.mu.Lock()
-	_, wasTracked := t.torrents[hash]
-	if wasTracked {
-		t.logger.InfoContext(ctx, "torrent not found (404), treating as removed", "hash", hash)
-		delete(t.torrents, hash)
-	}
-	t.mu.Unlock()
-
-	// Notify orchestrator about the removal so it can clean up destination
-	if wasTracked {
-		if t.trySendRemoved(ctx, hash) {
-			t.logger.InfoContext(ctx, "notified orchestrator of torrent removal (via 404)", "hash", hash)
-		}
-	}
+	t.removeAndNotify(
+		ctx, hash,
+		"torrent not found (404), treating as removed",
+		"notified orchestrator of torrent removal (via 404)",
+	)
 }
 
 func (t *PieceMonitor) pollTorrentPieces(ctx context.Context, hash string) error {

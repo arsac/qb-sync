@@ -31,13 +31,11 @@ func TestVerifyFinalizedPieces_ConcurrencyLimit(t *testing.T) {
 	logger := testLogger(t)
 
 	s := &Server{
-		config:         ServerConfig{BasePath: tmpDir},
-		logger:         logger,
-		torrents:       make(map[string]*serverTorrentState),
-		abortingHashes: make(map[string]chan struct{}),
-		inodes:         NewInodeRegistry(tmpDir, logger),
-		memBudget:      semaphore.NewWeighted(512 * 1024 * 1024),
-		finalizeSem:    semaphore.NewWeighted(1),
+		config:      ServerConfig{BasePath: tmpDir},
+		logger:      logger,
+		store:       newTorrentStore(tmpDir, logger),
+		memBudget:   semaphore.NewWeighted(512 * 1024 * 1024),
+		finalizeSem: semaphore.NewWeighted(1),
 	}
 
 	// Create file data and compute piece hashes
@@ -99,13 +97,11 @@ func TestVerifyFinalizedPieces_FailsOnHashMismatch(t *testing.T) {
 	logger := testLogger(t)
 
 	s := &Server{
-		config:         ServerConfig{BasePath: tmpDir},
-		logger:         logger,
-		torrents:       make(map[string]*serverTorrentState),
-		abortingHashes: make(map[string]chan struct{}),
-		inodes:         NewInodeRegistry(tmpDir, logger),
-		memBudget:      semaphore.NewWeighted(512 * 1024 * 1024),
-		finalizeSem:    semaphore.NewWeighted(1),
+		config:      ServerConfig{BasePath: tmpDir},
+		logger:      logger,
+		store:       newTorrentStore(tmpDir, logger),
+		memBudget:   semaphore.NewWeighted(512 * 1024 * 1024),
+		finalizeSem: semaphore.NewWeighted(1),
 	}
 
 	fileData := make([]byte, totalSize)
@@ -147,6 +143,135 @@ func TestVerifyFinalizedPieces_FailsOnHashMismatch(t *testing.T) {
 	}
 }
 
+// TestVerifyFinalizedPieces_RespectsVerifiedBitset is the regression test for
+// the verified-bitset optimization in commit f64de92. Pieces that have been
+// hash-verified post-flush during earlyFinalizeFile (via markInteriorVerified)
+// are skipped at finalize time. Pieces NOT in the bitset (hardlinked-file
+// pieces, late-arriving pieces in files that didn't go through
+// earlyFinalizeFile) must still be re-verified.
+//
+// If markInteriorVerified ever sets a bit that isn't actually verified,
+// verifyFinalizedPieces would skip a hash check and we'd silently ship
+// corrupted data. The two sub-tests pin the bit-honoring contract from both
+// sides: bit set → skip even when corrupt; bit clear → catch corrupt.
+func TestVerifyFinalizedPieces_RespectsVerifiedBitset(t *testing.T) {
+	t.Parallel()
+
+	// Helper: build a state with two pieces, the second one corrupted on disk.
+	// Caller can mark piece 1 as verified or not.
+	const pieceSize = 256
+	const numPieces = 2
+	const totalSize = pieceSize * numPieces
+
+	buildState := func(t *testing.T, tmpDir string) *serverTorrentState {
+		t.Helper()
+		fileData := make([]byte, totalSize)
+		for i := range fileData {
+			fileData[i] = byte(i % 251)
+		}
+
+		// Compute hashes from the original (correct) data, then corrupt piece 1
+		// on disk. verifyFinalizedPieces reads back from disk and computes
+		// SHA1; with the disk corrupted, the read-back hash won't match the
+		// stored hash unless the verified bit short-circuits the check.
+		pieceHashes := make([]string, numPieces)
+		for i := range numPieces {
+			offset := i * pieceSize
+			pieceHashes[i] = utils.ComputeSHA1(fileData[offset : offset+pieceSize])
+		}
+
+		corrupted := make([]byte, totalSize)
+		copy(corrupted, fileData)
+		// Flip a byte in the second piece's region.
+		corrupted[pieceSize] ^= 0xFF
+
+		filePath := filepath.Join(tmpDir, "test.bin")
+		if err := os.WriteFile(filePath, corrupted, 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		written := bitset.New(numPieces)
+		written.Set(0)
+		written.Set(1)
+
+		return &serverTorrentState{
+			torrentMeta: torrentMeta{
+				pieceHashes: pieceHashes,
+				pieceLength: pieceSize,
+				totalSize:   totalSize,
+				files: []*serverFileInfo{
+					{path: filePath, offset: 0, size: totalSize, selected: true},
+				},
+			},
+			written:  written,
+			verified: bitset.New(numPieces),
+		}
+	}
+
+	newServer := func(t *testing.T, tmpDir string) *Server {
+		t.Helper()
+		logger := testLogger(t)
+		return &Server{
+			config:      ServerConfig{BasePath: tmpDir},
+			logger:      logger,
+			store:       newTorrentStore(tmpDir, logger),
+			memBudget:   semaphore.NewWeighted(512 * 1024 * 1024),
+			finalizeSem: semaphore.NewWeighted(1),
+		}
+	}
+
+	t.Run("piece marked verified is skipped even when corrupt on disk", func(t *testing.T) {
+		t.Parallel()
+		tmpDir := t.TempDir()
+		state := buildState(t, tmpDir)
+		state.verified.Set(1) // claim piece 1 was already verified
+
+		s := newServer(t, tmpDir)
+		failed, err := s.verifyFinalizedPieces(context.Background(), "h", state)
+		if err != nil {
+			t.Fatalf("unexpected system error: %v", err)
+		}
+		if len(failed) != 0 {
+			t.Fatalf("verified piece must be skipped — got failed=%v "+
+				"(this means the bitset isn't being honored, "+
+				"which is fine for correctness here but breaks the perf optimization)", failed)
+		}
+	})
+
+	t.Run("piece NOT marked verified is checked and corruption surfaces", func(t *testing.T) {
+		t.Parallel()
+		tmpDir := t.TempDir()
+		state := buildState(t, tmpDir)
+		// Don't set state.verified.Set(1) — emulates a hardlinked-file piece
+		// or a piece whose file never went through earlyFinalizeFile.
+
+		s := newServer(t, tmpDir)
+		failed, err := s.verifyFinalizedPieces(context.Background(), "h", state)
+		if err != nil {
+			t.Fatalf("unexpected system error: %v", err)
+		}
+		if len(failed) != 1 || failed[0] != 1 {
+			t.Fatalf("unverified corrupt piece must be detected — got failed=%v", failed)
+		}
+	})
+
+	t.Run("nil verified bitset still verifies all pieces", func(t *testing.T) {
+		t.Parallel()
+		tmpDir := t.TempDir()
+		state := buildState(t, tmpDir)
+		state.verified = nil // older state from before the bitset was introduced
+
+		s := newServer(t, tmpDir)
+		failed, err := s.verifyFinalizedPieces(context.Background(), "h", state)
+		if err != nil {
+			t.Fatalf("unexpected system error: %v", err)
+		}
+		if len(failed) != 1 || failed[0] != 1 {
+			t.Fatalf("with nil bitset all pieces must be checked — got failed=%v", failed)
+		}
+	})
+}
+
 func TestFinalizeTorrent_PollReturnsVerifying(t *testing.T) {
 	t.Parallel()
 
@@ -154,13 +279,11 @@ func TestFinalizeTorrent_PollReturnsVerifying(t *testing.T) {
 	logger := testLogger(t)
 
 	s := &Server{
-		config:         ServerConfig{BasePath: tmpDir},
-		logger:         logger,
-		torrents:       make(map[string]*serverTorrentState),
-		abortingHashes: make(map[string]chan struct{}),
-		inodes:         NewInodeRegistry(tmpDir, logger),
-		memBudget:      semaphore.NewWeighted(512 * 1024 * 1024),
-		finalizeSem:    semaphore.NewWeighted(1),
+		config:      ServerConfig{BasePath: tmpDir},
+		logger:      logger,
+		store:       newTorrentStore(tmpDir, logger),
+		memBudget:   semaphore.NewWeighted(512 * 1024 * 1024),
+		finalizeSem: semaphore.NewWeighted(1),
 	}
 
 	hash := "poll-verify-test"
@@ -178,9 +301,9 @@ func TestFinalizeTorrent_PollReturnsVerifying(t *testing.T) {
 		},
 	}
 
-	s.mu.Lock()
-	s.torrents[hash] = state
-	s.mu.Unlock()
+	s.store.mu.Lock()
+	s.store.entries[hash] = state
+	s.store.mu.Unlock()
 
 	resp, err := s.FinalizeTorrent(context.Background(), &pb.FinalizeTorrentRequest{
 		TorrentHash: hash,
@@ -203,13 +326,11 @@ func TestFinalizeTorrent_PollReturnsCompletedResult(t *testing.T) {
 	logger := testLogger(t)
 
 	s := &Server{
-		config:         ServerConfig{BasePath: tmpDir},
-		logger:         logger,
-		torrents:       make(map[string]*serverTorrentState),
-		abortingHashes: make(map[string]chan struct{}),
-		inodes:         NewInodeRegistry(tmpDir, logger),
-		memBudget:      semaphore.NewWeighted(512 * 1024 * 1024),
-		finalizeSem:    semaphore.NewWeighted(1),
+		config:      ServerConfig{BasePath: tmpDir},
+		logger:      logger,
+		store:       newTorrentStore(tmpDir, logger),
+		memBudget:   semaphore.NewWeighted(512 * 1024 * 1024),
+		finalizeSem: semaphore.NewWeighted(1),
 	}
 
 	hash := "poll-complete-test"
@@ -230,7 +351,7 @@ func TestFinalizeTorrent_PollReturnsCompletedResult(t *testing.T) {
 				state:   "uploading",
 			},
 		},
-		torrentPath: filepath.Join(tmpDir, metaDirName, hash, "test.torrent"),
+		torrentFile: []byte("fake-torrent-data"),
 	}
 
 	// In production, storeSuccessResult writes the .finalized marker during
@@ -244,9 +365,9 @@ func TestFinalizeTorrent_PollReturnsCompletedResult(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s.mu.Lock()
-	s.torrents[hash] = state
-	s.mu.Unlock()
+	s.store.mu.Lock()
+	s.store.entries[hash] = state
+	s.store.mu.Unlock()
 
 	resp, err := s.FinalizeTorrent(context.Background(), &pb.FinalizeTorrentRequest{
 		TorrentHash: hash,
@@ -262,9 +383,9 @@ func TestFinalizeTorrent_PollReturnsCompletedResult(t *testing.T) {
 	}
 
 	// Torrent should be cleaned up after returning success
-	s.mu.RLock()
-	_, exists := s.torrents[hash]
-	s.mu.RUnlock()
+	s.store.mu.RLock()
+	_, exists := s.store.entries[hash]
+	s.store.mu.RUnlock()
 	if exists {
 		t.Error("torrent should be removed from tracking after successful finalize poll")
 	}
@@ -287,13 +408,11 @@ func TestFinalizeTorrent_PollReturnsFailedResult(t *testing.T) {
 	logger := testLogger(t)
 
 	s := &Server{
-		config:         ServerConfig{BasePath: tmpDir},
-		logger:         logger,
-		torrents:       make(map[string]*serverTorrentState),
-		abortingHashes: make(map[string]chan struct{}),
-		inodes:         NewInodeRegistry(tmpDir, logger),
-		memBudget:      semaphore.NewWeighted(512 * 1024 * 1024),
-		finalizeSem:    semaphore.NewWeighted(1),
+		config:      ServerConfig{BasePath: tmpDir},
+		logger:      logger,
+		store:       newTorrentStore(tmpDir, logger),
+		memBudget:   semaphore.NewWeighted(512 * 1024 * 1024),
+		finalizeSem: semaphore.NewWeighted(1),
 	}
 
 	hash := "poll-fail-test"
@@ -318,9 +437,9 @@ func TestFinalizeTorrent_PollReturnsFailedResult(t *testing.T) {
 		},
 	}
 
-	s.mu.Lock()
-	s.torrents[hash] = state
-	s.mu.Unlock()
+	s.store.mu.Lock()
+	s.store.entries[hash] = state
+	s.store.mu.Unlock()
 
 	// First poll returns the error
 	resp, err := s.FinalizeTorrent(context.Background(), &pb.FinalizeTorrentRequest{
@@ -374,13 +493,11 @@ func TestFinalizeTorrent_ConcurrentPollDuringSetup(t *testing.T) {
 	logger := testLogger(t)
 
 	s := &Server{
-		config:         ServerConfig{BasePath: tmpDir},
-		logger:         logger,
-		torrents:       make(map[string]*serverTorrentState),
-		abortingHashes: make(map[string]chan struct{}),
-		inodes:         NewInodeRegistry(tmpDir, logger),
-		memBudget:      semaphore.NewWeighted(512 * 1024 * 1024),
-		finalizeSem:    semaphore.NewWeighted(1),
+		config:      ServerConfig{BasePath: tmpDir},
+		logger:      logger,
+		store:       newTorrentStore(tmpDir, logger),
+		memBudget:   semaphore.NewWeighted(512 * 1024 * 1024),
+		finalizeSem: semaphore.NewWeighted(1),
 	}
 
 	hash := "concurrent-setup-test"
@@ -400,9 +517,9 @@ func TestFinalizeTorrent_ConcurrentPollDuringSetup(t *testing.T) {
 		},
 	}
 
-	s.mu.Lock()
-	s.torrents[hash] = state
-	s.mu.Unlock()
+	s.store.mu.Lock()
+	s.store.entries[hash] = state
+	s.store.mu.Unlock()
 
 	resp, err := s.FinalizeTorrent(context.Background(), &pb.FinalizeTorrentRequest{
 		TorrentHash: hash,
@@ -454,22 +571,20 @@ func TestRunBackgroundFinalization_SerializesViaSemaphore(t *testing.T) {
 				totalSize:   totalSize,
 				files:       []*serverFileInfo{{path: filePath, offset: 0, size: totalSize, selected: true}},
 			},
-			torrentPath: filepath.Join(dir, metaDirName, hash, "test.torrent"),
+			torrentFile: []byte("fake-torrent-data"),
 		}
 	}
 
 	newServer := func() *Server {
 		bgCtx, bgCancel := context.WithCancel(context.Background())
 		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
-			inodes:         NewInodeRegistry(tmpDir, logger),
-			memBudget:      semaphore.NewWeighted(512 * 1024 * 1024),
-			finalizeSem:    semaphore.NewWeighted(1),
-			bgCtx:          bgCtx,
-			bgCancel:       bgCancel,
+			config:      ServerConfig{BasePath: tmpDir},
+			logger:      logger,
+			store:       newTorrentStore(tmpDir, logger),
+			memBudget:   semaphore.NewWeighted(512 * 1024 * 1024),
+			finalizeSem: semaphore.NewWeighted(1),
+			bgCtx:       bgCtx,
+			bgCancel:    bgCancel,
 		}
 		t.Cleanup(func() {
 			bgCancel()
@@ -487,9 +602,9 @@ func TestRunBackgroundFinalization_SerializesViaSemaphore(t *testing.T) {
 		hash := "sem-block-test"
 		state := createTorrentState(t, tmpDir, hash, 1, 256)
 
-		s.mu.Lock()
-		s.torrents[hash] = state
-		s.mu.Unlock()
+		s.store.mu.Lock()
+		s.store.entries[hash] = state
+		s.store.mu.Unlock()
 
 		done := make(chan struct{})
 		go s.runBackgroundFinalization(
@@ -536,9 +651,9 @@ func TestRunBackgroundFinalization_SerializesViaSemaphore(t *testing.T) {
 			hash := fmt.Sprintf("serial-test-%d", i)
 			state := createTorrentState(t, tmpDir, hash, 10, 1024)
 
-			s.mu.Lock()
-			s.torrents[hash] = state
-			s.mu.Unlock()
+			s.store.mu.Lock()
+			s.store.entries[hash] = state
+			s.store.mu.Unlock()
 
 			wg.Go(func() {
 				origSem.Acquire(context.Background(), 1)
@@ -575,13 +690,11 @@ func TestVerifyFinalizedPieces_RequiresPieceHashes(t *testing.T) {
 	logger := testLogger(t)
 
 	s := &Server{
-		config:         ServerConfig{BasePath: tmpDir},
-		logger:         logger,
-		torrents:       make(map[string]*serverTorrentState),
-		abortingHashes: make(map[string]chan struct{}),
-		inodes:         NewInodeRegistry(tmpDir, logger),
-		memBudget:      semaphore.NewWeighted(512 * 1024 * 1024),
-		finalizeSem:    semaphore.NewWeighted(1),
+		config:      ServerConfig{BasePath: tmpDir},
+		logger:      logger,
+		store:       newTorrentStore(tmpDir, logger),
+		memBudget:   semaphore.NewWeighted(512 * 1024 * 1024),
+		finalizeSem: semaphore.NewWeighted(1),
 	}
 
 	state := &serverTorrentState{
@@ -613,13 +726,11 @@ func TestRecoverVerificationFailure(t *testing.T) {
 	var stateSaved atomic.Bool
 
 	s := &Server{
-		config:         ServerConfig{BasePath: tmpDir},
-		logger:         logger,
-		torrents:       make(map[string]*serverTorrentState),
-		abortingHashes: make(map[string]chan struct{}),
-		inodes:         NewInodeRegistry(tmpDir, logger),
-		memBudget:      semaphore.NewWeighted(512 * 1024 * 1024),
-		finalizeSem:    semaphore.NewWeighted(1),
+		config:      ServerConfig{BasePath: tmpDir},
+		logger:      logger,
+		store:       newTorrentStore(tmpDir, logger),
+		memBudget:   semaphore.NewWeighted(512 * 1024 * 1024),
+		finalizeSem: semaphore.NewWeighted(1),
 		saveStateFunc: func(_ string, _ *bitset.BitSet) error {
 			stateSaved.Store(true)
 			return nil
@@ -733,13 +844,11 @@ func TestVerifyFinalizedPieces_CollectsAllFailures(t *testing.T) {
 	logger := testLogger(t)
 
 	s := &Server{
-		config:         ServerConfig{BasePath: tmpDir},
-		logger:         logger,
-		torrents:       make(map[string]*serverTorrentState),
-		abortingHashes: make(map[string]chan struct{}),
-		inodes:         NewInodeRegistry(tmpDir, logger),
-		memBudget:      semaphore.NewWeighted(512 * 1024 * 1024),
-		finalizeSem:    semaphore.NewWeighted(1),
+		config:      ServerConfig{BasePath: tmpDir},
+		logger:      logger,
+		store:       newTorrentStore(tmpDir, logger),
+		memBudget:   semaphore.NewWeighted(512 * 1024 * 1024),
+		finalizeSem: semaphore.NewWeighted(1),
 	}
 
 	fileData := make([]byte, totalSize)

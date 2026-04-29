@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/arsac/qb-sync/internal/metrics"
@@ -34,7 +33,7 @@ func writePieceError(msg string, code pb.PieceErrorCode) writeResult {
 
 // markPieceWritten updates state tracking after a piece is written.
 // Caller must hold state.mu.
-func (s *Server) markPieceWritten(_ context.Context, _ string, state *serverTorrentState, pieceIndex int32) {
+func markPieceWritten(state *serverTorrentState, pieceIndex int32) {
 	if pieceIndex < 0 || uint(pieceIndex) >= state.written.Len() {
 		return
 	}
@@ -52,12 +51,8 @@ func (s *Server) writePiece(ctx context.Context, req *pb.WritePieceRequest) writ
 
 	torrentHash := req.GetTorrentHash()
 
-	s.mu.RLock()
-	state, exists := s.torrents[torrentHash]
-	initializing := exists && state.initializing
-	s.mu.RUnlock()
-
-	if !exists || initializing {
+	state, exists := s.store.Get(torrentHash)
+	if !exists {
 		return writePieceError("torrent not initialized", pb.PieceErrorCode_PIECE_ERROR_NOT_INITIALIZED)
 	}
 
@@ -90,10 +85,11 @@ func (s *Server) writePiece(ctx context.Context, req *pb.WritePieceRequest) writ
 	// changing the hash. writePieceData skips deselected files, so only
 	// the selected file data is actually written.
 	writeStart := time.Now()
-	if state.classifyPiece(int(pieceIndex)) == pieceFullySelected {
-		if hashErr := state.verifyPieceHash(pieceIndex, data, req.GetPieceHash()); hashErr != "" {
+	if state.classifyPiece(int(pieceIndex)) == pieceFullySelected &&
+		int(pieceIndex) < len(state.pieceHashes) && state.pieceHashes[pieceIndex] != "" {
+		if hashErr := utils.VerifyPieceHash(data, state.pieceHashes[pieceIndex]); hashErr != nil {
 			metrics.PieceWriteDuration.Observe(time.Since(writeStart).Seconds())
-			return writePieceError(hashErr, pb.PieceErrorCode_PIECE_ERROR_HASH_MISMATCH)
+			return writePieceError(hashErr.Error(), pb.PieceErrorCode_PIECE_ERROR_HASH_MISMATCH)
 		}
 	}
 
@@ -120,7 +116,7 @@ func (s *Server) writePiece(ctx context.Context, req *pb.WritePieceRequest) writ
 		return writePieceOK()
 	}
 
-	s.markPieceWritten(ctx, torrentHash, state, pieceIndex)
+	markPieceWritten(state, pieceIndex)
 	s.checkFileCompletions(ctx, torrentHash, state, pieceIndex)
 	metrics.PieceWriteDuration.Observe(time.Since(writeStart).Seconds())
 
@@ -140,17 +136,37 @@ func (s *Server) writePiece(ctx context.Context, req *pb.WritePieceRequest) writ
 
 // verifyFilePieces reads back interior pieces from a synced .partial file and
 // verifies their hashes. Returns indices of pieces that failed verification.
-// Boundary pieces (spanning adjacent files) are skipped — they are deferred to
-// verifyFinalizedPieces.
+// Boundary pieces (spanning adjacent files) are skipped — they are deferred
+// to verifyFinalizedPieces.
+//
+// If fh is non-nil, reads go through it directly (saves NFS open round-trips
+// per piece). If fh is nil, opens fi.path for the duration of the verify pass.
 //
 // Safe to call without state.mu: all accessed fields (pieceHashes, pieceLength,
 // totalSize, fi geometry) are immutable after initialization.
 func (s *Server) verifyFilePieces(
 	state *serverTorrentState,
 	fi *serverFileInfo,
+	fh *os.File,
 ) []int {
 	if len(state.pieceHashes) == 0 {
 		return nil
+	}
+
+	if fh == nil {
+		f, openErr := os.Open(fi.path)
+		if openErr != nil {
+			// Can't read anything — treat every interior piece as failed so
+			// the caller re-streams them. Boundary pieces are deferred to
+			// verifyFinalizedPieces regardless.
+			var failed []int
+			forEachInteriorPiece(state, fi, func(p int) {
+				failed = append(failed, p)
+			})
+			return failed
+		}
+		defer f.Close()
+		fh = f
 	}
 
 	var failed []int
@@ -171,18 +187,45 @@ func (s *Server) verifyFilePieces(
 		pieceSize := pieceEnd - pieceStart
 		fileOffset := pieceStart - fi.offset
 
-		data, readErr := utils.ReadChunkFromFile(fi.path, fileOffset, pieceSize)
-		if readErr != nil {
+		buf := make([]byte, pieceSize)
+		n, readErr := fh.ReadAt(buf, fileOffset)
+		if readErr != nil || int64(n) != pieceSize {
 			failed = append(failed, p)
 			continue
 		}
 
-		if err := utils.VerifyPieceHash(data, state.pieceHashes[p]); err != nil {
+		if err := utils.VerifyPieceHash(buf, state.pieceHashes[p]); err != nil {
 			failed = append(failed, p)
 		}
 	}
 
 	return failed
+}
+
+// markInteriorVerified marks every interior piece of fi as verified post-flush
+// so verifyFinalizedPieces can skip them. Boundary pieces span adjacent files
+// and remain unverified — they'll be checked at finalize. Caller must hold
+// state.mu.
+func markInteriorVerified(state *serverTorrentState, fi *serverFileInfo) {
+	if state.verified == nil {
+		return
+	}
+	forEachInteriorPiece(state, fi, func(p int) {
+		state.verified.Set(uint(p))
+	})
+}
+
+// forEachInteriorPiece invokes fn for each piece fully contained within fi
+// (i.e., not spanning into an adjacent file).
+func forEachInteriorPiece(state *serverTorrentState, fi *serverFileInfo, fn func(p int)) {
+	for p := fi.firstPiece; p <= fi.lastPiece; p++ {
+		pieceStart := int64(p) * state.pieceLength
+		pieceEnd := min(pieceStart+state.pieceLength, state.totalSize)
+		if pieceStart < fi.offset || pieceEnd > fi.offset+fi.size {
+			continue
+		}
+		fn(p)
+	}
 }
 
 // checkFileCompletions checks if the just-written piece completes any file's
@@ -230,14 +273,12 @@ func (s *Server) earlyFinalizeFile(
 	fi.file = nil
 	fi.earlyFinalized = true // Block re-entry from concurrent checkFileCompletions
 
-	// Release lock for I/O: fsync, close, and piece verification.
+	// Release lock for I/O: fsync, verify (via the same fd), then close.
+	// Verifying through the still-open fd skips re-opening the file per piece,
+	// which on NFS saves two round-trips (LOOKUP + OPEN) per piece.
 	state.mu.Unlock()
 
-	syncCloseErr := s.syncAndCloseHandle(ctx, hash, fi.path, fh)
-	var failedPieces []int
-	if syncCloseErr == nil {
-		failedPieces = s.verifyFilePieces(state, fi)
-	}
+	failedPieces, syncCloseErr := s.syncVerifyClose(ctx, hash, state, fi, fh)
 
 	state.mu.Lock()
 
@@ -294,35 +335,56 @@ func (s *Server) earlyFinalizeFile(
 		return
 	}
 
-	fi.path = strings.TrimSuffix(fi.path, partialSuffix)
+	markInteriorVerified(state, fi)
+
+	fi.path = targetPath(fi)
 	metrics.FilesEarlyFinalizedTotal.Inc()
 	s.logger.InfoContext(ctx, "file early-finalized",
 		"hash", hash, "file", fi.path, "fileIndex", fileIndex)
 }
 
-// syncAndCloseHandle syncs and closes a snapshotted file handle outside the state lock.
-// Always attempts close even on sync error. Returns the first error encountered.
-func (s *Server) syncAndCloseHandle(ctx context.Context, hash, path string, fh *os.File) error {
-	if fh == nil {
-		return nil
-	}
-
+// syncVerifyClose syncs the supplied handle (if any), verifies the file's
+// interior pieces, then closes the handle. Always attempts close even on
+// sync error. Returns the first sync/close error and the list of failed
+// piece indices (only meaningful when the returned error is nil).
+//
+// When fh is non-nil, the verify reads use it directly, which saves NFS
+// LOOKUP+OPEN round-trips per piece compared to verifyFilePieces opening
+// fresh. When fh is nil (e.g., test setup that bypasses openForWrite),
+// verifyFilePieces opens fi.path itself.
+func (s *Server) syncVerifyClose(
+	ctx context.Context,
+	hash string,
+	state *serverTorrentState,
+	fi *serverFileInfo,
+	fh *os.File,
+) ([]int, error) {
 	var firstErr error
-	if syncErr := fh.Sync(); syncErr != nil {
-		metrics.FileSyncErrorsTotal.WithLabelValues(metrics.ModeDestination).Inc()
-		s.logger.WarnContext(ctx, "failed to sync file",
-			"hash", hash, "path", path, "error", syncErr)
-		firstErr = fmt.Errorf("syncing %s: %w", path, syncErr)
-	}
+	var failedPieces []int
 
-	if closeErr := fh.Close(); closeErr != nil {
-		metrics.FileSyncErrorsTotal.WithLabelValues(metrics.ModeDestination).Inc()
-		s.logger.WarnContext(ctx, "failed to close file",
-			"hash", hash, "path", path, "error", closeErr)
-		if firstErr == nil {
-			firstErr = fmt.Errorf("closing %s: %w", path, closeErr)
+	if fh != nil {
+		if syncErr := fh.Sync(); syncErr != nil {
+			metrics.FileSyncErrorsTotal.WithLabelValues(metrics.ModeDestination).Inc()
+			s.logger.WarnContext(ctx, "failed to sync file",
+				"hash", hash, "path", fi.path, "error", syncErr)
+			firstErr = fmt.Errorf("syncing %s: %w", fi.path, syncErr)
 		}
 	}
 
-	return firstErr
+	if firstErr == nil {
+		failedPieces = s.verifyFilePieces(state, fi, fh)
+	}
+
+	if fh != nil {
+		if closeErr := fh.Close(); closeErr != nil {
+			metrics.FileSyncErrorsTotal.WithLabelValues(metrics.ModeDestination).Inc()
+			s.logger.WarnContext(ctx, "failed to close file",
+				"hash", hash, "path", fi.path, "error", closeErr)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("closing %s: %w", fi.path, closeErr)
+			}
+		}
+	}
+
+	return failedPieces, firstErr
 }

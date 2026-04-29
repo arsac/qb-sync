@@ -15,24 +15,22 @@ const (
 
 	// Metadata directory and file names for recovery after restart.
 	metaDirName       = ".qbsync"
-	subPathFileName   = ".subpath"
-	selectedFileName  = ".selected"
-	versionFileName   = ".version"
 	finalizedFileName = ".finalized"
-
-	// metaVersion is bumped when the metadata format changes.
-	// If a metadata directory has a missing or different version,
-	// it is nuked and re-initialized from scratch on next InitTorrent.
-	metaVersion = "2"
+	stateFileName     = ".state"
 
 	// Concurrent streaming settings.
 	defaultStreamWorkers = 8   // Number of concurrent piece writers (tuned for NFS/ZFS)
 	workChBufferMultiple = 2   // Work channel is N*workers; memory bounded by memBudget semaphore
 	ackQueueSize         = 100 // Buffer size for outbound acks (small messages, larger buffer is fine)
 
-	// Default polling settings for waitForTorrentReady.
-	defaultQBPollInterval = 2 * time.Second
-	defaultQBPollTimeout  = 5 * time.Minute
+	// Default polling settings for waitForTorrentReady. The timeout is sized
+	// from the torrent's totalSize since qBittorrent's recheck of large
+	// torrents can take well over the historical 5-minute fixed budget on
+	// spinning rust or NFS — see computePollTimeout.
+	defaultQBPollInterval     = 2 * time.Second
+	defaultQBPollTimeoutBase  = 10 * time.Minute // floor for any torrent, regardless of size
+	defaultQBPollTimeoutPerGB = 1 * time.Minute  // added per GB of torrent data
+	defaultQBPollTimeoutMax   = 6 * time.Hour    // hard cap to prevent unbounded waits
 
 	// stopTorrentTimeout is how long to wait when stopping a torrent after adding to qBittorrent.
 	// Uses a detached context because the gRPC caller may cancel before the stop completes.
@@ -45,6 +43,7 @@ const (
 
 	// Default inode cleanup settings.
 	defaultInodeCleanupInterval = 6 * time.Hour // How often to check for stale inode entries
+	inodeRebuildWorkers         = 32            // Concurrent workers for startup inode rebuild from .meta (sized to hide NFS RTT)
 
 	// Default hardlink wait timeout.
 	defaultHardlinkWaitTimeout = 30 * time.Minute // Max time to wait for pending hardlink source
@@ -52,9 +51,13 @@ const (
 	// Partial file suffix.
 	partialSuffix = ".partial"
 
+	// metaFileName is the protobuf-encoded PersistedTorrentMeta file name.
+	metaFileName = ".meta"
+
 	// Memory management.
 	defaultMaxStreamBufferMB = 512 // Default global memory budget for buffered piece data
 	maxVerifyConcurrency     = 4   // Limit concurrent piece reads during finalization to cap transient memory
+	parentDirSyncConcurrency = 8   // Concurrent fsyncs of unique parent dirs during finalize (each is a separate NFS commit RTT)
 
 	// verifyIdleTimeout is how long verification can go without verifying a piece
 	// before it is considered stalled. Resets on each successfully verified piece.

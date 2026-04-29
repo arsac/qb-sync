@@ -47,39 +47,23 @@ const (
 // Server receives pieces over gRPC and writes them to disk.
 //
 // Lock ordering (to prevent deadlocks):
-//  1. s.mu - server-level lock for torrents map, abortingHashes, filePaths
+//  1. store.mu - store-level lock for torrents map, aborting, filePaths
 //  2. state.mu - per-torrent lock for torrent state
 //  3. fi.fileMu - per-file lock for file handle open/close/write
-//  4. s.inodes.registeredMu - lock for inode-to-path mapping
-//  5. s.inodes.inProgressMu - lock for in-progress inode tracking
+//  4. store.inodes.registeredMu - lock for inode-to-path mapping
+//  5. store.inodes.inProgressMu - lock for in-progress inode tracking
 //
-// Always acquire locks in the order above. Release s.mu before acquiring
+// Always acquire locks in the order above. Release store.mu before acquiring
 // state.mu when possible to reduce contention. The inode locks (4, 5) may
-// be acquired independently when s.mu and state.mu are not held.
+// be acquired independently when store.mu and state.mu are not held.
 // fileMu (3) may be acquired with or without state.mu held.
 type Server struct {
 	pb.UnimplementedQBSyncServiceServer
 
-	config   ServerConfig
-	logger   *slog.Logger
-	server   *grpc.Server
-	torrents map[string]*serverTorrentState
-	mu       sync.RWMutex // Protects torrents, abortingHashes, and filePaths
-
-	// Abort tracking: prevents race between AbortTorrent and InitTorrent.
-	// When a hash is being aborted, the channel is present and open.
-	// InitTorrent waits for the channel to close before proceeding.
-	// AbortTorrent closes the channel when cleanup is complete.
-	abortingHashes map[string]chan struct{}
-
-	// filePaths tracks which target file paths are owned by active torrents.
-	// Maps absolute target path (without .partial suffix) to torrent hash.
-	// Prevents two concurrent torrents with the same file path from
-	// corrupting each other's .partial file.
-	filePaths map[string]string
-
-	// Inode registry for hardlink deduplication
-	inodes *InodeRegistry
+	config ServerConfig
+	logger *slog.Logger
+	server *grpc.Server
+	store  *torrentStore
 
 	// qBittorrent client for adding verified torrents (destination server only)
 	qbClient qbclient.Client
@@ -113,21 +97,18 @@ func NewServer(config ServerConfig, logger *slog.Logger) *Server {
 		bufferBytes = defaultMaxStreamBufferMB * grpcutil.BytesPerMB
 	}
 
-	bgCtx, bgCancel := context.WithCancel( //nolint:gosec // G118: cancel stored on struct, called in Server.Stop
+	bgCtx, bgCancel := context.WithCancel(
 		context.Background(),
 	)
 
 	s := &Server{
-		config:         config,
-		logger:         logger,
-		torrents:       make(map[string]*serverTorrentState),
-		abortingHashes: make(map[string]chan struct{}),
-		filePaths:      make(map[string]string),
-		inodes:         NewInodeRegistry(config.BasePath, logger),
-		memBudget:      semaphore.NewWeighted(bufferBytes),
-		finalizeSem:    semaphore.NewWeighted(1),
-		bgCtx:          bgCtx,
-		bgCancel:       bgCancel,
+		config:      config,
+		logger:      logger,
+		store:       newTorrentStore(config.BasePath, logger),
+		memBudget:   semaphore.NewWeighted(bufferBytes),
+		finalizeSem: semaphore.NewWeighted(1),
+		bgCtx:       bgCtx,
+		bgCancel:    bgCancel,
 	}
 
 	if config.QB != nil && config.QB.URL != "" {
@@ -145,22 +126,7 @@ func NewServer(config ServerConfig, logger *slog.Logger) *Server {
 		)
 	}
 
-	if loadErr := s.inodes.Load(); loadErr != nil {
-		logger.Warn("failed to load inode map, starting fresh", "error", loadErr)
-	}
-
 	return s
-}
-
-// collectTorrents returns a snapshot of all torrents for safe iteration.
-// The caller should acquire s.mu.RLock() or s.mu.Lock() before calling.
-// Returns a slice that can be iterated after releasing s.mu.
-func (s *Server) collectTorrents() []torrentRef {
-	refs := make([]torrentRef, 0, len(s.torrents))
-	for hash, state := range s.torrents {
-		refs = append(refs, torrentRef{hash: hash, state: state})
-	}
-	return refs
 }
 
 // SetHealthServer sets the health server for registering health checks.
@@ -176,11 +142,19 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 
+	// Recover in-flight torrents from persisted metadata before accepting
+	// any gRPC requests or starting background goroutines.
+	if recoverErr := s.recoverInFlightTorrents(ctx); recoverErr != nil {
+		s.logger.ErrorContext(ctx, "failed to recover torrents", "error", recoverErr)
+	}
+
 	s.server = grpc.NewServer(
 		grpc.MaxRecvMsgSize(grpcutil.MaxGRPCMessageSize),
 		grpc.MaxSendMsgSize(grpcutil.MaxGRPCMessageSize),
 		grpc.InitialWindowSize(grpcutil.InitialStreamWindowSize),
 		grpc.InitialConnWindowSize(grpcutil.InitialConnWindowSize),
+		grpc.ReadBufferSize(grpcutil.TransportBufferSize),
+		grpc.WriteBufferSize(grpcutil.TransportBufferSize),
 		grpc.KeepaliveParams(keepalive.ServerParameters{
 			Time:    keepalivePingInterval, // Send pings every 30s if no activity
 			Timeout: keepalivePingTimeout,  // Wait 10s for ping ack
@@ -257,31 +231,23 @@ func (s *Server) Run(ctx context.Context) error {
 
 // cleanup closes all file handles and saves state before shutdown.
 func (s *Server) cleanup() {
-	s.mu.Lock()
-	torrents := s.collectTorrents()
-	s.torrents = make(map[string]*serverTorrentState)
-	s.filePaths = make(map[string]string)
-	s.mu.Unlock()
+	torrents := s.store.Drain()
 
-	for _, t := range torrents {
-		t.state.mu.Lock()
-		if t.state.dirty && t.state.statePath != "" {
-			if saveErr := s.saveState(t.state.statePath, t.state.written); saveErr != nil {
+	for hash, state := range torrents {
+		state.mu.Lock()
+		if state.dirty && state.statePath != "" {
+			if saveErr := s.saveState(state.statePath, state.written); saveErr != nil {
 				s.logger.Warn("failed to save state on cleanup",
-					"hash", t.hash,
+					"hash", hash,
 					"error", saveErr,
 				)
 			} else {
-				t.state.flushGen++
+				state.flushGen++
 			}
 		}
-		for _, fi := range t.state.files {
-			_ = s.closeFileHandle(context.Background(), t.hash, fi)
+		for _, fi := range state.files {
+			_ = s.closeFileHandle(context.Background(), hash, fi)
 		}
-		t.state.mu.Unlock()
-	}
-
-	if saveErr := s.inodes.Save(); saveErr != nil {
-		s.logger.Warn("failed to save inode map on cleanup", "error", saveErr)
+		state.mu.Unlock()
 	}
 }

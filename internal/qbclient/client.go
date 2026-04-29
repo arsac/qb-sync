@@ -33,6 +33,10 @@ type Client interface {
 	SetFilePriorityCtx(ctx context.Context, hash string, ids string, priority int) error
 	RecheckCtx(ctx context.Context, hashes []string) error
 	GetFreeSpaceOnDiskCtx(ctx context.Context) (int64, error)
+	GetCategoriesCtx(ctx context.Context) (map[string]qbittorrent.Category, error)
+	CreateCategoryCtx(ctx context.Context, category, path string) error
+	SetTorrentUploadLimitCtx(ctx context.Context, hashes []string, limit int64) error
+	SetTorrentDownloadLimitCtx(ctx context.Context, hashes []string, limit int64) error
 }
 
 // Default circuit breaker configuration values.
@@ -81,15 +85,12 @@ func NewResilientClient(
 	// Wrap the retriable checker to explicitly reject circuitbreaker.ErrOpen,
 	// so retry aborts immediately when the circuit breaker is open.
 	retryConfig := config.Retry
-	originalChecker := retryConfig.RetriableChecker
-	if originalChecker == nil {
-		originalChecker = utils.IsRetriableError
+	baseChecker := retryConfig.RetriableChecker
+	if baseChecker == nil {
+		baseChecker = utils.IsRetriableError
 	}
 	retryConfig.RetriableChecker = func(err error) bool {
-		if errors.Is(err, circuitbreaker.ErrOpen) {
-			return false
-		}
-		return originalChecker(err)
+		return !errors.Is(err, circuitbreaker.ErrOpen) && baseChecker(err)
 	}
 
 	retryPolicy := utils.NewRetryPolicy(retryConfig, logger, func() {
@@ -301,6 +302,36 @@ func (r *ResilientClient) GetFreeSpaceOnDiskCtx(ctx context.Context) (int64, err
 		func(ctx context.Context) (int64, error) {
 			return r.client.GetFreeSpaceOnDiskCtx(ctx)
 		})
+}
+
+// GetCategoriesCtx returns the categories defined on the qBittorrent server.
+func (r *ResilientClient) GetCategoriesCtx(ctx context.Context) (map[string]qbittorrent.Category, error) {
+	return run(ctx, r, "GetCategories",
+		func(ctx context.Context) (map[string]qbittorrent.Category, error) {
+			return r.client.GetCategoriesCtx(ctx)
+		})
+}
+
+// CreateCategoryCtx creates a category on the qBittorrent server. Idempotent
+// for the case where the category already exists (qB returns success).
+func (r *ResilientClient) CreateCategoryCtx(ctx context.Context, category, path string) error {
+	return r.runVoid(ctx, "CreateCategory", func(ctx context.Context) error {
+		return r.client.CreateCategoryCtx(ctx, category, path)
+	})
+}
+
+// SetTorrentUploadLimitCtx sets the per-torrent upload limit. Pass -1 to clear.
+func (r *ResilientClient) SetTorrentUploadLimitCtx(ctx context.Context, hashes []string, limit int64) error {
+	return r.runVoid(ctx, "SetTorrentUploadLimit", func(ctx context.Context) error {
+		return r.client.SetTorrentUploadLimitCtx(ctx, hashes, limit)
+	})
+}
+
+// SetTorrentDownloadLimitCtx sets the per-torrent download limit. Pass -1 to clear.
+func (r *ResilientClient) SetTorrentDownloadLimitCtx(ctx context.Context, hashes []string, limit int64) error {
+	return r.runVoid(ctx, "SetTorrentDownloadLimit", func(ctx context.Context) error {
+		return r.client.SetTorrentDownloadLimitCtx(ctx, hashes, limit)
+	})
 }
 
 // runVoid executes a void operation through the executor with retry and metrics.

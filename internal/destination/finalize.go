@@ -33,12 +33,11 @@ func (s *Server) FinalizeTorrent(
 	startTime := time.Now()
 	hash := req.GetTorrentHash()
 
-	state, stateErr := s.getState(hash)
-	if stateErr != nil {
-		//nolint:nilerr // gRPC returns errors in response body
+	state, exists := s.store.Get(hash)
+	if !exists {
 		return &pb.FinalizeTorrentResponse{
 			Success:   false,
-			Error:     stateErr.Error(),
+			Error:     "torrent not found",
 			ErrorCode: pb.FinalizeErrorCode_FINALIZE_ERROR_NOT_FOUND,
 		}, nil
 	}
@@ -255,25 +254,11 @@ func (s *Server) storeSuccessResult(
 	s.markFinalized(metaDir, hash)
 
 	state.mu.Lock()
-	name := strings.TrimSuffix(filepath.Base(state.torrentPath), ".torrent")
 	state.finalization.storeResult(&finalizeResult{success: true, state: stateStr})
 	state.mu.Unlock()
 
-	metrics.TorrentsSyncedTotal.WithLabelValues(metrics.ModeDestination, hash, name).Inc()
+	metrics.TorrentsSyncedTotal.WithLabelValues(metrics.ModeDestination, hash, hash).Inc()
 	s.logger.InfoContext(ctx, "torrent finalized (background)", "hash", hash, "state", stateStr)
-}
-
-// cleanupFinalizedTorrent removes a successfully finalized torrent from in-memory
-// tracking. The .finalized marker was already written by storeSuccessResult during
-// background finalization — this just cleans up the in-memory state when the source
-// polls and receives the success response.
-func (s *Server) cleanupFinalizedTorrent(hash string) {
-	s.mu.Lock()
-	if state, exists := s.torrents[hash]; exists {
-		s.unregisterFilePaths(hash, state.files)
-	}
-	delete(s.torrents, hash)
-	s.mu.Unlock()
 }
 
 // markFinalized replaces the metadata directory contents with a single
@@ -320,7 +305,7 @@ func (s *Server) relocateForSubPathChange(
 
 	relPaths := make([]string, len(state.files))
 	for i, fi := range state.files {
-		rel, relErr := filepath.Rel(oldBase, strings.TrimSuffix(fi.path, partialSuffix))
+		rel, relErr := filepath.Rel(oldBase, targetPath(fi))
 		if relErr != nil {
 			return fmt.Errorf("computing relative path: %w", relErr)
 		}
@@ -339,32 +324,18 @@ func (s *Server) relocateForSubPathChange(
 	}
 
 	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
-	if subPathErr := saveSubPathFile(metaDir, newSubPath); subPathErr != nil {
-		return fmt.Errorf("persisting sub-path after relocation: %w", subPathErr)
+	metaPath := filepath.Join(metaDir, metaFileName)
+	if existingMeta, loadErr := loadPersistedMeta(metaPath); loadErr == nil {
+		existingMeta.SaveSubPath = newSubPath
+		if saveErr := savePersistedMeta(metaPath, existingMeta); saveErr != nil {
+			return fmt.Errorf("persisting sub-path after relocation: %w", saveErr)
+		}
+	} else {
+		s.logger.WarnContext(ctx, "could not update .meta after relocation",
+			"hash", hash, "error", loadErr)
 	}
 
 	return nil
-}
-
-// getState gets the torrent state from memory.
-// Returns an error if the torrent is not tracked or is still initializing.
-// After a destination restart, state is not in memory until the source
-// re-initializes the torrent via InitTorrent. FinalizeTorrent returns
-// FINALIZE_ERROR_NOT_FOUND so the source can untrack and re-initialize.
-func (s *Server) getState(hash string) (*serverTorrentState, error) {
-	s.mu.RLock()
-	state, exists := s.torrents[hash]
-	initializing := exists && state.initializing
-	s.mu.RUnlock()
-
-	if exists {
-		if initializing {
-			return nil, errors.New("torrent initialization in progress")
-		}
-		return state, nil
-	}
-
-	return nil, errors.New("torrent not found")
 }
 
 // finalizeFiles syncs all file handles, closes them, and renames from .partial to final.
@@ -398,6 +369,15 @@ func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTo
 		}
 
 		sourcePath := filepath.Join(s.config.BasePath, fi.hardlink.sourcePath)
+		// Defense in depth: tryHardlinkFromInProgress already screens for
+		// cross-filesystem cases at init time, but if BasePath layout changed
+		// between init and finalize (rare: bind-mount swap, filesystem remount)
+		// the os.Link below would fail with EXDEV. Detect upfront for a
+		// clearer error.
+		if !sameFilesystem(sourcePath, filepath.Dir(fi.path)) {
+			return fmt.Errorf("pending hardlink %s -> %s spans filesystems (source removed or remounted?)",
+				sourcePath, fi.path)
+		}
 		if linkErr := os.Link(sourcePath, fi.path); linkErr != nil {
 			if os.IsExist(linkErr) {
 				s.logger.DebugContext(ctx, "pending hardlink target already exists",
@@ -443,7 +423,7 @@ func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTo
 		if err := s.renamePartialFile(ctx, hash, fi); err != nil {
 			return err
 		}
-		fi.path = strings.TrimSuffix(fi.path, partialSuffix)
+		fi.path = targetPath(fi)
 	}
 
 	s.flushWrittenState(ctx, hash, state)
@@ -496,7 +476,7 @@ func (s *Server) renamePartialFile(ctx context.Context, hash string, fi *serverF
 		return nil
 	}
 
-	finalPath := strings.TrimSuffix(fi.path, partialSuffix)
+	finalPath := targetPath(fi)
 
 	if renameErr := os.Rename(fi.path, finalPath); renameErr != nil {
 		// .partial is gone but final exists: already renamed (idempotent restart case).
@@ -519,30 +499,38 @@ func (s *Server) renamePartialFile(ctx context.Context, hash string, fi *serverF
 // syncFileParentDirs fsyncs the parent directories of finalized files to ensure
 // NFS has flushed file data and renames to the server before verification reads.
 // Best-effort: sync failures are logged but do not block verification.
+// Each dir fsync is an independent NFS commit RTT; run them in parallel.
 func (s *Server) syncFileParentDirs(ctx context.Context, hash string, state *serverTorrentState) {
-	synced := make(map[string]bool)
+	uniqueDirs := make(map[string]struct{})
 	for _, fi := range state.files {
 		if !fi.selected {
 			continue
 		}
-		dir := filepath.Dir(fi.path)
-		if synced[dir] {
-			continue
-		}
-		synced[dir] = true
-
-		dirFD, openErr := os.Open(dir)
-		if openErr != nil {
-			s.logger.DebugContext(ctx, "failed to open dir for sync",
-				"hash", hash, "dir", dir, "error", openErr)
-			continue
-		}
-		if syncErr := dirFD.Sync(); syncErr != nil {
-			s.logger.DebugContext(ctx, "failed to sync dir",
-				"hash", hash, "dir", dir, "error", syncErr)
-		}
-		_ = dirFD.Close()
+		uniqueDirs[filepath.Dir(fi.path)] = struct{}{}
 	}
+	if len(uniqueDirs) == 0 {
+		return
+	}
+
+	g := new(errgroup.Group)
+	g.SetLimit(parentDirSyncConcurrency)
+	for dir := range uniqueDirs {
+		g.Go(func() error {
+			dirFD, openErr := os.Open(dir)
+			if openErr != nil {
+				s.logger.DebugContext(ctx, "failed to open dir for sync",
+					"hash", hash, "dir", dir, "error", openErr)
+				return nil
+			}
+			if syncErr := dirFD.Sync(); syncErr != nil {
+				s.logger.DebugContext(ctx, "failed to sync dir",
+					"hash", hash, "dir", dir, "error", syncErr)
+			}
+			_ = dirFD.Close()
+			return nil
+		})
+	}
+	_ = g.Wait()
 }
 
 // flushWrittenState persists the written bitmap to disk.
@@ -566,45 +554,7 @@ func (s *Server) flushWrittenState(ctx context.Context, hash string, state *serv
 func (s *Server) registerFinalizedInodes(ctx context.Context, hash string, state *serverTorrentState) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
-
-	var registered int
-	for _, fi := range state.files {
-		// Skip files that need no data (hardlinked/pending/unselected) or have no inode
-		if fi.skipForWriteData() || fi.hardlink.sourceInode == 0 {
-			continue
-		}
-
-		// Get final path (remove .partial suffix if present)
-		finalPath, _ := strings.CutSuffix(fi.path, partialSuffix)
-
-		// Get relative path for storage
-		relPath, relErr := filepath.Rel(s.config.BasePath, finalPath)
-		if relErr != nil {
-			s.logger.WarnContext(ctx, "failed to get relative path for inode registration",
-				"hash", hash,
-				"path", finalPath,
-				"error", relErr,
-			)
-			continue
-		}
-
-		// Register in persistent map and signal waiters
-		s.inodes.Register(fi.hardlink.sourceInode, relPath)
-		s.inodes.CompleteInProgress(fi.hardlink.sourceInode, hash)
-		registered++
-	}
-
-	if registered > 0 {
-		s.logger.InfoContext(ctx, "registered finalized inodes",
-			"hash", hash,
-			"count", registered,
-		)
-
-		// Persist inode map
-		if saveErr := s.inodes.Save(); saveErr != nil {
-			s.logger.WarnContext(ctx, "failed to save inode map", "error", saveErr)
-		}
-	}
+	s.store.RegisterInodes(ctx, hash, state.files)
 }
 
 // verifyFinalizedPieces reads back all pieces from finalized files and verifies their hashes.
@@ -673,6 +623,17 @@ func (s *Server) verifyFinalizedPieces(
 		// unselected file's data doesn't exist on disk. Those were hash-verified
 		// at write time.
 		if state.classifyPiece(i) != pieceFullySelected {
+			continue
+		}
+
+		// Skip pieces already verified post-flush via earlyFinalizeFile. Pieces
+		// not in this set still need a finalize-time read-back: hardlinked-file
+		// pieces (skipForWriteData skipped writePiece's hash check) and pieces in
+		// files that didn't go through earlyFinalizeFile (e.g., the file's last
+		// piece arrived during finalization itself).
+		if state.verified != nil && state.verified.Test(uint(i)) {
+			verified.Add(1)
+			lastProgress.Store(time.Now())
 			continue
 		}
 
@@ -834,7 +795,7 @@ func (s *Server) recoverVerificationFailure(
 // instead of timing out.
 func (s *Server) abortInProgressInodes(ctx context.Context, hash string, state *serverTorrentState) {
 	for _, fi := range state.files {
-		s.inodes.AbortInProgress(ctx, fi.hardlink.sourceInode, hash)
+		s.store.Inodes().AbortInProgress(ctx, fi.hardlink.sourceFileID, hash)
 	}
 }
 
@@ -854,10 +815,14 @@ func (s *Server) recoverAffectedFile(
 	}
 
 	// Check if any failed piece overlaps this file.
-	affected := slices.ContainsFunc(failedPieces, fi.overlaps)
-	if !affected {
+	if !slices.ContainsFunc(failedPieces, fi.overlaps) {
 		return
 	}
+
+	defer func() {
+		fi.earlyFinalized = false
+		fi.recalcPiecesWritten(state.written)
+	}()
 
 	// Hardlinked or pre-existing files with wrong content: break the hardlink
 	// by deleting the file. Writing to a renamed hardlink would corrupt the
@@ -872,30 +837,26 @@ func (s *Server) recoverAffectedFile(
 		}
 
 		fi.hardlink.state = hlStateNone
-		finalPath := strings.TrimSuffix(fi.path, partialSuffix)
-		fi.path = finalPath + partialSuffix
-		fi.earlyFinalized = false
-		fi.recalcPiecesWritten(state.written)
+		fi.path = targetPath(fi) + partialSuffix
 		return
 	}
 
 	// Normal (streamed) files: rename back to .partial (skip if already .partial).
-	// Even if rename fails, we still clear earlyFinalized and recalculate
-	// piecesWritten so bookkeeping stays consistent with state.written.
-	if !strings.HasSuffix(fi.path, partialSuffix) {
-		partialPath := fi.path + partialSuffix
-		if renameErr := os.Rename(fi.path, partialPath); renameErr != nil {
-			s.logger.WarnContext(ctx, "failed to rename file back to partial",
-				"hash", hash,
-				"path", fi.path,
-				"error", renameErr,
-			)
-		} else {
-			fi.path = partialPath
-		}
+	// Even if rename fails, the deferred cleanup keeps earlyFinalized and
+	// piecesWritten consistent with state.written.
+	if strings.HasSuffix(fi.path, partialSuffix) {
+		return
 	}
-	fi.earlyFinalized = false
-	fi.recalcPiecesWritten(state.written)
+	partialPath := fi.path + partialSuffix
+	if renameErr := os.Rename(fi.path, partialPath); renameErr != nil {
+		s.logger.WarnContext(ctx, "failed to rename file back to partial",
+			"hash", hash,
+			"path", fi.path,
+			"error", renameErr,
+		)
+		return
+	}
+	fi.path = partialPath
 }
 
 // handleExistingFinalization handles a FinalizeTorrent call when background
@@ -918,7 +879,7 @@ func (s *Server) handleExistingFinalization(
 
 	if result.success {
 		// Clean up now that source has received the success response.
-		s.cleanupFinalizedTorrent(hash)
+		s.store.Remove(hash)
 		return &pb.FinalizeTorrentResponse{Success: true, State: result.state}, nil
 	}
 
@@ -939,8 +900,7 @@ func (s *Server) handleExistingFinalization(
 func (s *Server) readPieceFromFinalizedFiles(state *serverTorrentState, offset, size int64) ([]byte, error) {
 	regions := make([]utils.FileRegion, len(state.files))
 	for i, fi := range state.files {
-		path, _ := strings.CutSuffix(fi.path, partialSuffix)
-		regions[i] = utils.FileRegion{Path: path, Offset: fi.offset, Size: fi.size}
+		regions[i] = utils.FileRegion{Path: targetPath(fi), Offset: fi.offset, Size: fi.size}
 	}
 	return utils.ReadPieceFromFiles(regions, offset, size)
 }

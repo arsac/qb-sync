@@ -56,77 +56,75 @@ func (s *Server) runStateFlusher(ctx context.Context) {
 }
 
 // flushDirtyStates saves state for all torrents marked as dirty.
-// Uses consistent lock ordering: collect references with s.mu, then acquire state.mu individually.
+// Uses consistent lock ordering: collect references via store.ForEach, then acquire state.mu individually.
 func (s *Server) flushDirtyStates(ctx context.Context) {
-	// Collect all torrent references while holding s.mu (no state locks here)
-	s.mu.RLock()
-	metrics.ActiveTorrents.WithLabelValues(metrics.ModeDestination).Set(float64(len(s.torrents)))
-	torrents := s.collectTorrents()
-	s.mu.RUnlock()
+	metrics.ActiveTorrents.WithLabelValues(metrics.ModeDestination).Set(float64(s.store.Len()))
 
 	// Process each torrent: snapshot state under lock, then do I/O outside it.
 	// This prevents a slow/hung filesystem from holding state.mu and blocking
 	// WritePiece or FinalizeTorrent for the same torrent.
 	var dirtyAfterFlush int
-	for _, t := range torrents {
-		t.state.mu.Lock()
-		if !t.state.dirty || t.state.statePath == "" {
-			if t.state.dirty {
+
+	s.store.ForEach(func(hash string, state *serverTorrentState) bool {
+		state.mu.Lock()
+		if !state.dirty || state.statePath == "" {
+			if state.dirty {
 				dirtyAfterFlush++
 			}
-			t.state.mu.Unlock()
-			continue
+			state.mu.Unlock()
+			return true
 		}
-		statePath := t.state.statePath
-		snapshot := t.state.written.Clone()
-		flushedCount := t.state.piecesSinceFlush
-		snapshotGen := t.state.flushGen
-		t.state.mu.Unlock()
+		statePath := state.statePath
+		snapshot := state.written.Clone()
+		flushedCount := state.piecesSinceFlush
+		snapshotGen := state.flushGen
+		state.mu.Unlock()
 
 		flushStart := time.Now()
 		if saveErr := s.doSaveState(statePath, snapshot); saveErr != nil {
 			metrics.StateSaveErrorsTotal.WithLabelValues(metrics.ModeDestination).Inc()
 			s.logger.WarnContext(ctx, "failed to flush state",
-				"hash", t.hash,
+				"hash", hash,
 				"error", saveErr,
 			)
 			dirtyAfterFlush++
-			continue
+			return true
 		}
 
 		metrics.StateFlushDuration.Observe(time.Since(flushStart).Seconds())
 
-		t.state.mu.Lock()
+		state.mu.Lock()
 		// If an inline flush occurred while we were writing, our snapshot is stale.
-		// The inline flush already wrote a newer state to disk — skip bookkeeping
+		// The inline flush already wrote a newer state to disk -- skip bookkeeping
 		// to avoid clearing dirty/piecesSinceFlush for pieces not in our snapshot.
-		if t.state.flushGen != snapshotGen {
+		if state.flushGen != snapshotGen {
 			// Still dirty from the inline flush's perspective; recount next cycle.
 			dirtyAfterFlush++
-			t.state.mu.Unlock()
-			continue
+			state.mu.Unlock()
+			return true
 		}
-		t.state.flushGen++
-		t.state.piecesSinceFlush -= flushedCount
-		if t.state.piecesSinceFlush <= 0 {
-			t.state.dirty = false
-			t.state.piecesSinceFlush = 0
+		state.flushGen++
+		state.piecesSinceFlush -= flushedCount
+		if state.piecesSinceFlush <= 0 {
+			state.dirty = false
+			state.piecesSinceFlush = 0
 		} else {
 			dirtyAfterFlush++
 		}
-		t.state.mu.Unlock()
+		state.mu.Unlock()
 
 		s.logger.DebugContext(ctx, "flushed state",
-			"hash", t.hash,
+			"hash", hash,
 			"written", snapshot.Count(),
 		)
-	}
+		return true
+	})
 	metrics.TorrentsWithDirtyState.Set(float64(dirtyAfterFlush))
 }
 
 // runOrphanCleaner periodically scans for and cleans up orphaned torrents.
 // A torrent is considered orphaned if:
-// 1. It's not actively tracked in memory (not in s.torrents)
+// 1. It's not actively tracked in memory (not in the torrent store)
 // 2. Its state file hasn't been modified for longer than OrphanTimeout
 // This handles cases where source crashes or loses connection unexpectedly.
 func (s *Server) runOrphanCleaner(ctx context.Context) {
@@ -172,9 +170,7 @@ func (s *Server) cleanupOrphanedTorrents(ctx context.Context) {
 // isOrphanedTorrent checks if a torrent should be considered orphaned.
 func (s *Server) isOrphanedTorrent(ctx context.Context, hash string, timeout time.Duration) bool {
 	// Check if actively tracked in memory
-	s.mu.RLock()
-	_, tracked := s.torrents[hash]
-	s.mu.RUnlock()
+	_, tracked := s.store.Get(hash)
 
 	if tracked {
 		return false
@@ -214,10 +210,10 @@ func (s *Server) isOrphanedTorrent(ctx context.Context, hash string, timeout tim
 }
 
 // statOrphanMetadata returns FileInfo for the torrent's metadata, checking
-// .state first and falling back to the .torrent file. Returns [os.ErrNotExist]
-// when neither file exists.
+// .state first, then .meta. Returns [os.ErrNotExist] when no metadata file
+// is found.
 func (s *Server) statOrphanMetadata(metaDir string) (os.FileInfo, error) {
-	statePath := filepath.Join(metaDir, ".state")
+	statePath := filepath.Join(metaDir, stateFileName)
 	info, err := os.Stat(statePath)
 	if err == nil {
 		return info, nil
@@ -226,12 +222,8 @@ func (s *Server) statOrphanMetadata(metaDir string) (os.FileInfo, error) {
 		return nil, err
 	}
 
-	// No state file - check for .torrent file as fallback timestamp
-	torrentPath, findErr := findTorrentFile(metaDir)
-	if findErr != nil {
-		return nil, os.ErrNotExist
-	}
-	return os.Stat(torrentPath)
+	metaPath := filepath.Join(metaDir, metaFileName)
+	return os.Stat(metaPath)
 }
 
 // cleanupOrphan removes all data associated with an orphaned torrent.
@@ -240,34 +232,17 @@ func (s *Server) cleanupOrphan(ctx context.Context, hash string) {
 	// Register cleanup to prevent concurrent InitTorrent from creating files
 	// that we're about to delete. Uses same pattern as AbortTorrent.
 	cleanupCh := make(chan struct{})
-
-	s.mu.Lock()
-	// Check if actively tracked
-	if _, tracked := s.torrents[hash]; tracked {
-		s.mu.Unlock()
-		s.logger.DebugContext(ctx, "skipping orphan cleanup, torrent now tracked",
+	if !s.store.BeginCleanup(hash, cleanupCh) {
+		s.logger.DebugContext(ctx, "skipping orphan cleanup, torrent tracked or already cleaning",
 			"hash", hash,
 		)
 		return
 	}
-	// Check if already being cleaned up or aborted
-	if _, cleaning := s.abortingHashes[hash]; cleaning {
-		s.mu.Unlock()
-		s.logger.DebugContext(ctx, "skipping orphan cleanup, cleanup already in progress",
-			"hash", hash,
-		)
-		return
-	}
-	// Register that we're cleaning up this hash
-	s.abortingHashes[hash] = cleanupCh
-	s.mu.Unlock()
 
 	// Ensure we clean up the abort registration when done
 	defer func() {
-		s.mu.Lock()
-		delete(s.abortingHashes, hash)
-		close(cleanupCh)
-		s.mu.Unlock()
+		close(cleanupCh) // Signal waiters before deregistering
+		s.store.EndCleanup(hash)
 	}()
 
 	// Final safety check: if the torrent exists in destination qBittorrent,
@@ -303,34 +278,21 @@ func (s *Server) cleanupOrphan(ctx context.Context, hash string) {
 	)
 }
 
-// deleteOrphanFiles parses the .torrent file in metaDir to locate and remove
+// deleteOrphanFiles loads the .meta file in metaDir to locate and remove
 // data files (both .partial and finalized versions). Returns the number of files deleted.
 func (s *Server) deleteOrphanFiles(ctx context.Context, hash, metaDir string) int {
-	torrentPath, findErr := findTorrentFile(metaDir)
-	if findErr != nil {
-		s.logger.WarnContext(ctx, "orphan cleanup without torrent file, .partial files may remain on disk",
-			"hash", hash, "metaDir", metaDir, "error", findErr)
-		return 0
-	}
-
-	torrentData, readErr := os.ReadFile(torrentPath)
-	if readErr != nil {
-		s.logger.WarnContext(ctx, "orphan cleanup: failed to read torrent file",
-			"hash", hash, "error", readErr)
-		return 0
-	}
-
-	parsed, parseErr := parseTorrentFile(torrentData)
-	if parseErr != nil {
-		s.logger.WarnContext(ctx, "orphan cleanup: failed to parse torrent file",
-			"hash", hash, "error", parseErr)
+	metaPath := filepath.Join(metaDir, metaFileName)
+	meta, loadErr := loadPersistedMeta(metaPath)
+	if loadErr != nil {
+		s.logger.WarnContext(ctx, "cannot load metadata for orphan cleanup",
+			"hash", hash, "error", loadErr)
 		return 0
 	}
 
 	var deleted int
-	subPath := loadSubPathFile(metaDir)
-	for _, f := range parsed.Files {
-		filePath := filepath.Join(s.config.BasePath, subPath, f.Path)
+	subPath := meta.GetSaveSubPath()
+	for _, f := range meta.GetFiles() {
+		filePath := filepath.Join(s.config.BasePath, subPath, f.GetPath())
 
 		// Try to remove .partial version
 		partialPath := filePath + partialSuffix
@@ -360,9 +322,6 @@ func (s *Server) runInodeCleaner(ctx context.Context) {
 	}
 
 	runPeriodic(ctx, interval, s.logger, "inode-cleaner", func(ctx context.Context) {
-		s.inodes.CleanupStale(ctx)
-		if saveErr := s.inodes.Save(); saveErr != nil {
-			s.logger.WarnContext(ctx, "failed to persist inode map after cleanup", "error", saveErr)
-		}
+		s.store.Inodes().CleanupStale(ctx)
 	})
 }

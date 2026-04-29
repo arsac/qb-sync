@@ -83,12 +83,10 @@ func (t *QBTask) maybeMoveToDest(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("getting free space: %w", err)
 		}
-
 		t.logger.InfoContext(ctx, "checking free space",
 			"freeGB", freeSpaceGB,
 			"minGB", t.cfg.MinSpaceGB,
 		)
-
 		if freeSpaceGB >= t.cfg.MinSpaceGB {
 			return nil
 		}
@@ -98,13 +96,11 @@ func (t *QBTask) maybeMoveToDest(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("fetching torrents completed on destination: %w", err)
 	}
-
 	if len(torrents) == 0 {
 		return nil
 	}
 
-	groups := t.groupHardlinkedTorrents(ctx, torrents)
-	sortedGroups := sortGroupsByPriority(groups)
+	sortedGroups := sortGroupsByPriority(t.groupHardlinkedTorrents(ctx, torrents))
 
 	var freeSpaceBefore int64
 	if !isDraining {
@@ -115,7 +111,26 @@ func (t *QBTask) maybeMoveToDest(ctx context.Context) error {
 		}
 	}
 
-	var groupsDeleted, groupsSkippedSeeding, groupsFailed, torrentsHandedOff int
+	stats := t.processGroups(ctx, sortedGroups, isDraining, freeSpaceBefore)
+	t.recordCleanupMetrics(ctx, stats)
+	return nil
+}
+
+// processGroups iterates the prioritized groups and performs the per-group
+// handoff, returning a populated cleanupStats. It honors the seeding threshold
+// (unless draining) and stops early once the estimated free space passes the
+// configured minimum.
+func (t *QBTask) processGroups(
+	ctx context.Context,
+	sortedGroups []torrentGroup,
+	isDraining bool,
+	freeSpaceBefore int64,
+) cleanupStats {
+	stats := cleanupStats{
+		groupsEvaluated: len(sortedGroups),
+		isDraining:      isDraining,
+		freeSpaceBefore: freeSpaceBefore,
+	}
 	minSeedingSeconds := int64(t.cfg.MinSeedingTime.Seconds())
 
 	// Track estimated freed bytes instead of re-querying after each deletion.
@@ -131,17 +146,17 @@ func (t *QBTask) maybeMoveToDest(ctx context.Context) error {
 				"minSeeding", group.minSeeding,
 				"required", minSeedingSeconds,
 			)
-			groupsSkippedSeeding++
+			stats.groupsSkippedSeed++
 			continue
 		}
 
 		handed, moveErr := t.deleteGroupFromHot(ctx, group)
-		torrentsHandedOff += handed
+		stats.torrentsHandedOff += handed
 		if moveErr != nil {
 			t.logger.ErrorContext(ctx, "failed to delete group", "error", moveErr)
-			groupsFailed++
+			stats.groupsFailed++
 		} else {
-			groupsDeleted++
+			stats.groupsDeleted++
 			estimatedFreedBytes += group.maxSize
 		}
 
@@ -154,18 +169,7 @@ func (t *QBTask) maybeMoveToDest(ctx context.Context) error {
 			break
 		}
 	}
-
-	t.recordCleanupMetrics(ctx, cleanupStats{
-		groupsEvaluated:   len(sortedGroups),
-		groupsDeleted:     groupsDeleted,
-		groupsSkippedSeed: groupsSkippedSeeding,
-		groupsFailed:      groupsFailed,
-		torrentsHandedOff: torrentsHandedOff,
-		isDraining:        isDraining,
-		freeSpaceBefore:   freeSpaceBefore,
-	})
-
-	return nil
+	return stats
 }
 
 // recordCleanupMetrics records Prometheus counters and logs a summary for a cleanup cycle.
@@ -249,8 +253,11 @@ func (t *QBTask) groupHardlinkedTorrents(ctx context.Context, torrents []qbittor
 		return nil
 	}
 
-	// Phase 1: stat each file, build inode -> []torrentHash map
-	inodeToHashes := make(map[uint64][]string)
+	// Phase 1: stat each file, build (device,inode) -> []torrentHash map.
+	// Keying on inode alone would falsely group files that share an inode number
+	// across different filesystems (e.g., separate volumes mounted under the same root).
+	type fileKey struct{ dev, ino uint64 }
+	fileKeyToHashes := make(map[fileKey][]string)
 	for _, torrent := range torrents {
 		filesPtr, err := t.srcClient.GetFilesInformationCtx(ctx, torrent.Hash)
 		if err != nil {
@@ -264,18 +271,19 @@ func (t *QBTask) groupHardlinkedTorrents(ctx context.Context, torrents []qbittor
 		contentDir := t.source.ResolveContentDir(torrent.SavePath)
 		for _, f := range *filesPtr {
 			path := filepath.Join(contentDir, f.Name)
-			inode, statErr := utils.GetInode(path)
-			if statErr != nil || inode == 0 {
+			dev, ino, statErr := utils.GetFileID(path)
+			if statErr != nil || ino == 0 {
 				continue
 			}
-			inodeToHashes[inode] = append(inodeToHashes[inode], torrent.Hash)
+			key := fileKey{dev: dev, ino: ino}
+			fileKeyToHashes[key] = append(fileKeyToHashes[key], torrent.Hash)
 		}
 	}
 
-	// Phase 2: Union-find — for each inode shared by multiple torrents, union their groups
+	// Phase 2: Union-find — for each file shared by multiple torrents, union their groups
 	uf := newUnionFind()
-	for _, hashes := range inodeToHashes {
-		if len(hashes) < 2 { //nolint:mnd // minimum count for a shared inode
+	for _, hashes := range fileKeyToHashes {
+		if len(hashes) < 2 { //nolint:mnd // minimum count for a shared file
 			continue
 		}
 		for i := 1; i < len(hashes); i++ {

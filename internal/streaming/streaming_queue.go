@@ -94,11 +94,6 @@ type BidiQueue struct {
 
 	limiter *rate.Limiter
 
-	// Track which stream each piece was sent on for correct window updates.
-	// Key: pieceKey(hash, index), Value: pointer to the PooledStream
-	pieceStreams   map[string]*PooledStream
-	pieceStreamsMu sync.RWMutex
-
 	// Track per-piece hash mismatch failures to prevent infinite retry loops.
 	// Key: pieceKey(hash, index), Value: consecutive mismatch count.
 	pieceHashMismatches   map[string]int
@@ -144,7 +139,6 @@ func NewBidiQueue(
 		tracker:             tracker,
 		logger:              logger,
 		config:              config,
-		pieceStreams:        make(map[string]*PooledStream),
 		pieceHashMismatches: make(map[string]int),
 	}
 
@@ -175,48 +169,15 @@ func (q *BidiQueue) Stats() BidiQueueStats {
 	}
 }
 
-// setPieceStream records which stream a piece was sent on.
-func (q *BidiQueue) setPieceStream(key string, ps *PooledStream) {
-	q.pieceStreamsMu.Lock()
-	q.pieceStreams[key] = ps
-	q.pieceStreamsMu.Unlock()
-}
+// (piece-to-stream mapping was previously here; acks now carry their source
+// stream via AckEnvelope so no external lookup is needed.)
 
-// getPieceStream retrieves and removes the stream a piece was sent on.
-// Returns nil if the piece is not tracked.
-func (q *BidiQueue) getPieceStream(key string) *PooledStream {
-	q.pieceStreamsMu.Lock()
-	ps := q.pieceStreams[key]
-	delete(q.pieceStreams, key)
-	q.pieceStreamsMu.Unlock()
-	return ps
-}
-
-// deletePieceStream removes a piece from stream tracking without returning it.
-func (q *BidiQueue) deletePieceStream(key string) {
-	q.pieceStreamsMu.Lock()
-	delete(q.pieceStreams, key)
-	q.pieceStreamsMu.Unlock()
-}
-
-// removePieceStreamIfMatch removes a piece from stream tracking only if it
-// still points to the given stream. If a retry overwrote the mapping to a
-// different stream, the mapping is preserved.
-func (q *BidiQueue) removePieceStreamIfMatch(key string, ps *PooledStream) {
-	q.pieceStreamsMu.Lock()
-	if q.pieceStreams[key] == ps {
-		delete(q.pieceStreams, key)
-	}
-	q.pieceStreamsMu.Unlock()
-}
-
-// clearPieceStreams removes multiple pieces from stream tracking.
-func (q *BidiQueue) clearPieceStreams(keys []string) {
-	q.pieceStreamsMu.Lock()
-	for _, key := range keys {
-		delete(q.pieceStreams, key)
-	}
-	q.pieceStreamsMu.Unlock()
+// clearHashMismatch removes any tracked hash-mismatch counter for a piece.
+// Called when an ack comes back successful or when the mismatch limit is hit.
+func (q *BidiQueue) clearHashMismatch(key string) {
+	q.pieceHashMismatchesMu.Lock()
+	delete(q.pieceHashMismatches, key)
+	q.pieceHashMismatchesMu.Unlock()
 }
 
 // Run processes pieces from the tracker using bidirectional streaming.
@@ -499,20 +460,15 @@ func (q *BidiQueue) sendPiecePool(ctx context.Context, pool *StreamPool, piece *
 		return errors.New("window full")
 	}
 
-	// Track which stream this piece was sent on for correct ack handling
-	q.setPieceStream(key, ps)
-
 	data, err := q.source.ReadPiece(ctx, piece)
 	if err != nil {
 		ps.window.OnFail(key)
-		q.deletePieceStream(key)
 		return fmt.Errorf("reading piece: %w", err)
 	}
 
 	if q.limiter != nil {
 		if waitErr := q.waitForRateLimit(ctx, len(data)); waitErr != nil {
 			ps.window.OnFail(key)
-			q.deletePieceStream(key)
 			return fmt.Errorf("rate limit: %w", waitErr)
 		}
 	}
@@ -522,13 +478,11 @@ func (q *BidiQueue) sendPiecePool(ctx context.Context, pool *StreamPool, piece *
 		PieceIndex:  index,
 		Offset:      piece.GetOffset(),
 		Size:        piece.GetSize(),
-		PieceHash:   piece.GetHash(),
 		Data:        data,
 	}
 
 	if sendErr := ps.stream.Send(req); sendErr != nil {
 		ps.window.OnFail(key)
-		q.deletePieceStream(key)
 		return fmt.Errorf("sending: %w", sendErr)
 	}
 
@@ -584,8 +538,8 @@ func (q *BidiQueue) runAckProcessorPool(
 		case <-staleTicker.C:
 			q.handleStalePiecesPool(ctx, pool)
 
-		case ack := <-pool.Acks():
-			q.processAck(ctx, ack)
+		case env := <-pool.Acks():
+			q.processAck(ctx, env)
 			pool.NotifyAckProcessed()
 		}
 	}
@@ -604,11 +558,8 @@ func (q *BidiQueue) handleStalePiecesPool(ctx context.Context, pool *StreamPool)
 	)
 
 	for _, sk := range staleKeys {
-		// OnFail on the stream that actually owns the key in its window,
-		// bypassing the pieceStreams map to avoid the TOCTOU race where a
-		// retry overwrites the mapping to a different stream.
+		// OnFail on the stream that actually owns the key in its window.
 		sk.Stream.window.OnFail(sk.Key)
-		q.removePieceStreamIfMatch(sk.Key, sk.Stream)
 		q.requeuePieceByKey(ctx, sk.Key)
 	}
 }
@@ -635,22 +586,21 @@ func (q *BidiQueue) markInFlightAsFailedPool(ctx context.Context, pool *StreamPo
 		"count", len(keys),
 	)
 
-	// Clear piece-to-stream mapping in batch
-	q.clearPieceStreams(keys)
-
 	for _, key := range keys {
 		q.requeuePieceByKey(ctx, key)
 	}
 }
 
 // processAck handles a single acknowledgment using the correct stream's window.
-func (q *BidiQueue) processAck(ctx context.Context, ack *pb.PieceAck) {
+// The envelope carries the source stream so no external piece-to-stream
+// lookup is needed.
+func (q *BidiQueue) processAck(ctx context.Context, env AckEnvelope) {
+	ack := env.Ack
+	ps := env.Stream
 	hash := ack.GetTorrentHash()
 	index := int(ack.GetPieceIndex())
 	key := pieceKey(hash, int32(index))
 
-	// Find which stream this piece was sent on and remove from tracking
-	ps := q.getPieceStream(key)
 	streamID := -1
 	if ps != nil {
 		streamID = ps.id
@@ -668,9 +618,7 @@ func (q *BidiQueue) processAck(ctx context.Context, ack *pb.PieceAck) {
 		q.piecesOK.Add(1)
 
 		// Clear any accumulated hash mismatch failures on success.
-		q.pieceHashMismatchesMu.Lock()
-		delete(q.pieceHashMismatches, key)
-		q.pieceHashMismatchesMu.Unlock()
+		q.clearHashMismatch(key)
 
 		q.logger.DebugContext(ctx, "piece acknowledged",
 			"hash", hash,
@@ -796,8 +744,8 @@ func (q *BidiQueue) drainInFlightPool(ctx context.Context, pool *StreamPool) {
 			q.markInFlightAsFailedPool(ctx, pool)
 			return
 
-		case ack := <-pool.Acks():
-			q.processAck(ctx, ack)
+		case env := <-pool.Acks():
+			q.processAck(ctx, env)
 		}
 	}
 

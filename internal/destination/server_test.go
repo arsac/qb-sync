@@ -1,9 +1,7 @@
 package destination
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha1"
 	"errors"
 	"os"
 	"path/filepath"
@@ -189,14 +187,13 @@ func TestIsOrphanedTorrent(t *testing.T) {
 	t.Run("tracked torrent is not orphaned", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
+			config: ServerConfig{BasePath: tmpDir},
+			logger: logger,
+			store:  newTorrentStore(tmpDir, logger),
 		}
 
 		hash := "abc123"
-		s.torrents[hash] = &serverTorrentState{}
+		s.store.entries[hash] = &serverTorrentState{}
 
 		// Create metadata even though it shouldn't be checked
 		createTestMetadata(t, tmpDir, hash, time.Now().Add(-48*time.Hour))
@@ -209,10 +206,9 @@ func TestIsOrphanedTorrent(t *testing.T) {
 	t.Run("untracked torrent with recent state file is not orphaned", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
+			config: ServerConfig{BasePath: tmpDir},
+			logger: logger,
+			store:  newTorrentStore(tmpDir, logger),
 		}
 
 		hash := "abc123"
@@ -226,10 +222,9 @@ func TestIsOrphanedTorrent(t *testing.T) {
 	t.Run("untracked torrent with old state file is orphaned", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
+			config: ServerConfig{BasePath: tmpDir},
+			logger: logger,
+			store:  newTorrentStore(tmpDir, logger),
 		}
 
 		hash := "abc123"
@@ -240,31 +235,29 @@ func TestIsOrphanedTorrent(t *testing.T) {
 		}
 	})
 
-	t.Run("falls back to torrent file when state file missing", func(t *testing.T) {
+	t.Run("falls back to meta file when state file missing", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
+			config: ServerConfig{BasePath: tmpDir},
+			logger: logger,
+			store:  newTorrentStore(tmpDir, logger),
 		}
 
 		hash := "abc123"
-		// Create only .torrent file (no .state file)
+		// Create only .meta file (no .state file)
 		createTestTorrentFile(t, tmpDir, hash, time.Now().Add(-48*time.Hour))
 
 		if !s.isOrphanedTorrent(ctx, hash, 24*time.Hour) {
-			t.Error("torrent with old .torrent file should be orphaned")
+			t.Error("torrent with old .meta file should be orphaned")
 		}
 	})
 
 	t.Run("no metadata returns not orphaned", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
+			config: ServerConfig{BasePath: tmpDir},
+			logger: logger,
+			store:  newTorrentStore(tmpDir, logger),
 		}
 
 		hash := "nonexistent"
@@ -282,10 +275,9 @@ func TestCleanupOrphan(t *testing.T) {
 	t.Run("skips cleanup if torrent becomes tracked", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
+			config: ServerConfig{BasePath: tmpDir},
+			logger: logger,
+			store:  newTorrentStore(tmpDir, logger),
 		}
 
 		hash := "abc123"
@@ -302,7 +294,7 @@ func TestCleanupOrphan(t *testing.T) {
 		}
 
 		// Add to tracked torrents (simulating race with InitTorrent)
-		s.torrents[hash] = &serverTorrentState{}
+		s.store.entries[hash] = &serverTorrentState{}
 
 		s.cleanupOrphan(ctx, hash)
 
@@ -318,10 +310,9 @@ func TestCleanupOrphan(t *testing.T) {
 	t.Run("deletes partial files and metadata", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
+			config: ServerConfig{BasePath: tmpDir},
+			logger: logger,
+			store:  newTorrentStore(tmpDir, logger),
 		}
 
 		hash := "abc123"
@@ -354,10 +345,9 @@ func TestCleanupOrphan(t *testing.T) {
 	t.Run("also deletes non-partial version of files", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
+			config: ServerConfig{BasePath: tmpDir},
+			logger: logger,
+			store:  newTorrentStore(tmpDir, logger),
 		}
 
 		hash := "abc123"
@@ -391,10 +381,9 @@ func TestCleanupOrphan(t *testing.T) {
 	t.Run("cleans up metadata directory even when torrent file is missing", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
+			config: ServerConfig{BasePath: tmpDir},
+			logger: logger,
+			store:  newTorrentStore(tmpDir, logger),
 		}
 
 		hash := "abc123"
@@ -425,11 +414,10 @@ func TestCleanupOrphan(t *testing.T) {
 			},
 		}
 		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
-			qbClient:       mock,
+			config:   ServerConfig{BasePath: tmpDir},
+			logger:   logger,
+			store:    newTorrentStore(tmpDir, logger),
+			qbClient: mock,
 		}
 
 		hash := "abc123"
@@ -471,11 +459,10 @@ func TestCleanupOrphan(t *testing.T) {
 			loginErr: errors.New("connection refused"),
 		}
 		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
-			qbClient:       mock,
+			config:   ServerConfig{BasePath: tmpDir},
+			logger:   logger,
+			store:    newTorrentStore(tmpDir, logger),
+			qbClient: mock,
 		}
 
 		hash := "abc123"
@@ -510,9 +497,8 @@ func TestCleanupOrphanedTorrents(t *testing.T) {
 				BasePath:      tmpDir,
 				OrphanTimeout: 1 * time.Hour,
 			},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
+			logger: logger,
+			store:  newTorrentStore(tmpDir, logger),
 		}
 
 		// Create an orphaned torrent (old metadata)
@@ -525,10 +511,9 @@ func TestCleanupOrphanedTorrents(t *testing.T) {
 			t.Fatal(err)
 		}
 		createTestTorrentFileWithPaths(t, tmpDir, orphanHash, []string{"orphan"})
-		// Backdate the torrent file to make it appear orphaned
+		// Backdate the .meta file to make it appear orphaned
 		metaDir := filepath.Join(tmpDir, metaDirName, orphanHash)
-		torrentPath, _ := findTorrentFile(metaDir)
-		setModTime(t, torrentPath, time.Now().Add(-2*time.Hour))
+		setModTime(t, filepath.Join(metaDir, metaFileName), time.Now().Add(-2*time.Hour))
 
 		// Create a fresh torrent (recent metadata)
 		freshHash := "fresh456"
@@ -560,10 +545,9 @@ func TestCleanupOrphanedTorrents(t *testing.T) {
 	t.Run("handles missing meta directory", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
+			config: ServerConfig{BasePath: tmpDir},
+			logger: logger,
+			store:  newTorrentStore(tmpDir, logger),
 		}
 
 		// Should not panic when meta directory doesn't exist
@@ -577,8 +561,8 @@ func TestCleanupOrphanedTorrents(t *testing.T) {
 				BasePath:      tmpDir,
 				OrphanTimeout: 1 * time.Hour,
 			},
-			logger:   logger,
-			torrents: make(map[string]*serverTorrentState),
+			logger: logger,
+			store:  newTorrentStore(tmpDir, logger),
 		}
 
 		// Create meta directory with a regular file
@@ -602,11 +586,11 @@ func TestCleanupOrphanedTorrents(t *testing.T) {
 func newAbortTestServer(t *testing.T) *Server {
 	t.Helper()
 	logger := testLogger(t)
+	tmpDir := t.TempDir()
 	return &Server{
-		config:         ServerConfig{BasePath: t.TempDir()},
-		logger:         logger,
-		torrents:       make(map[string]*serverTorrentState),
-		abortingHashes: make(map[string]chan struct{}),
+		config: ServerConfig{BasePath: tmpDir},
+		logger: logger,
+		store:  newTorrentStore(tmpDir, logger),
 	}
 }
 
@@ -632,7 +616,7 @@ func TestAbortTorrent_NonExistent(t *testing.T) {
 func TestAbortTorrent_RemovesFromTracking(t *testing.T) {
 	s := newAbortTestServer(t)
 	hash := "abc123"
-	s.torrents[hash] = &serverTorrentState{torrentMeta: torrentMeta{files: []*serverFileInfo{}}}
+	s.store.entries[hash] = &serverTorrentState{torrentMeta: torrentMeta{files: []*serverFileInfo{}}}
 
 	_, err := s.AbortTorrent(context.Background(), &pb.AbortTorrentRequest{
 		TorrentHash: hash,
@@ -642,9 +626,9 @@ func TestAbortTorrent_RemovesFromTracking(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	s.mu.RLock()
-	_, exists := s.torrents[hash]
-	s.mu.RUnlock()
+	s.store.mu.RLock()
+	_, exists := s.store.entries[hash]
+	s.store.mu.RUnlock()
 
 	if exists {
 		t.Error("torrent should be removed from tracking")
@@ -675,10 +659,10 @@ func TestAbortTorrent_DeletesFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s.torrents[hash] = &serverTorrentState{
+	s.store.entries[hash] = &serverTorrentState{
 		torrentMeta: torrentMeta{files: []*serverFileInfo{{path: partialFile, size: 4, selected: true}}},
 		statePath:   stateFile,
-		torrentPath: torrentFile,
+		torrentFile: []byte("fake-torrent-data"),
 	}
 
 	resp, err := s.AbortTorrent(context.Background(), &pb.AbortTorrentRequest{
@@ -718,7 +702,7 @@ func TestAbortTorrent_PreservesFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s.torrents[hash] = &serverTorrentState{
+	s.store.entries[hash] = &serverTorrentState{
 		torrentMeta: torrentMeta{files: []*serverFileInfo{{path: partialFile, size: 4, selected: true}}},
 	}
 
@@ -754,7 +738,7 @@ func TestAbortTorrent_ClosesFileHandles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s.torrents[hash] = &serverTorrentState{
+	s.store.entries[hash] = &serverTorrentState{
 		torrentMeta: torrentMeta{files: []*serverFileInfo{{path: partialFile, size: 0, file: f, selected: true}}},
 	}
 
@@ -778,7 +762,7 @@ func TestAbortTorrent_ConcurrentRequests(t *testing.T) {
 	s := newAbortTestServer(t)
 	ctx := context.Background()
 	hash := "abc123"
-	s.torrents[hash] = &serverTorrentState{torrentMeta: torrentMeta{files: []*serverFileInfo{}}}
+	s.store.entries[hash] = &serverTorrentState{torrentMeta: torrentMeta{files: []*serverFileInfo{}}}
 
 	var wg sync.WaitGroup
 	results := make(chan *pb.AbortTorrentResponse, 10)
@@ -806,9 +790,9 @@ func TestAbortTorrent_ConcurrentRequests(t *testing.T) {
 		}
 	}
 
-	s.mu.RLock()
-	_, exists := s.torrents[hash]
-	s.mu.RUnlock()
+	s.store.mu.RLock()
+	_, exists := s.store.entries[hash]
+	s.store.mu.RUnlock()
 
 	if exists {
 		t.Error("torrent should be removed after concurrent aborts")
@@ -825,7 +809,7 @@ func TestAbortTorrent_InitWaitsForAbort(t *testing.T) {
 		t.Fatalf("failed to create partial file: %v", err)
 	}
 
-	s.torrents[hash] = &serverTorrentState{
+	s.store.entries[hash] = &serverTorrentState{
 		torrentMeta: torrentMeta{files: []*serverFileInfo{{path: partialPath, size: 9, selected: true}}},
 	}
 
@@ -836,12 +820,12 @@ func TestAbortTorrent_InitWaitsForAbort(t *testing.T) {
 	var wg sync.WaitGroup
 
 	wg.Go(func() {
-		s.mu.Lock()
+		s.store.mu.Lock()
 		abortCh := make(chan struct{})
-		s.abortingHashes[hash] = abortCh
-		state := s.torrents[hash]
-		delete(s.torrents, hash)
-		s.mu.Unlock()
+		s.store.aborting[hash] = abortCh
+		state := s.store.entries[hash]
+		delete(s.store.entries, hash)
+		s.store.mu.Unlock()
 
 		close(abortStartedCh)
 
@@ -853,9 +837,9 @@ func TestAbortTorrent_InitWaitsForAbort(t *testing.T) {
 		}
 		state.mu.Unlock()
 
-		s.mu.Lock()
-		delete(s.abortingHashes, hash)
-		s.mu.Unlock()
+		s.store.mu.Lock()
+		delete(s.store.aborting, hash)
+		s.store.mu.Unlock()
 		close(abortCh)
 
 		abortFinished = time.Now()
@@ -890,9 +874,9 @@ func TestAbortTorrent_InitWaitsForAbort(t *testing.T) {
 		)
 	}
 
-	s.mu.RLock()
-	_, exists := s.torrents[hash]
-	s.mu.RUnlock()
+	s.store.mu.RLock()
+	_, exists := s.store.entries[hash]
+	s.store.mu.RUnlock()
 
 	if !exists {
 		t.Error("torrent should be tracked after InitTorrent")
@@ -908,7 +892,7 @@ func TestSetupFile_PreExisting(t *testing.T) {
 		s := &Server{
 			config: ServerConfig{BasePath: tmpDir},
 			logger: logger,
-			inodes: NewInodeRegistry(tmpDir, logger),
+			store:  newTorrentStore(tmpDir, logger),
 		}
 
 		// Create a file at the target path with the expected size
@@ -952,7 +936,7 @@ func TestSetupFile_PreExisting(t *testing.T) {
 		s := &Server{
 			config: ServerConfig{BasePath: tmpDir},
 			logger: logger,
-			inodes: NewInodeRegistry(tmpDir, logger),
+			store:  newTorrentStore(tmpDir, logger),
 		}
 
 		// Create a file with the wrong size
@@ -991,7 +975,7 @@ func TestSetupFile_PreExisting(t *testing.T) {
 		s := &Server{
 			config: ServerConfig{BasePath: tmpDir},
 			logger: logger,
-			inodes: NewInodeRegistry(tmpDir, logger),
+			store:  newTorrentStore(tmpDir, logger),
 		}
 
 		fileInfo, result, err := s.setupFile(ctx, "abc123", &pb.FileInfo{
@@ -1023,11 +1007,9 @@ func TestInitTorrent_PreExistingFiles(t *testing.T) {
 	t.Run("all files pre-existing yields zero pieces needed", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
-			inodes:         NewInodeRegistry(tmpDir, logger),
+			config: ServerConfig{BasePath: tmpDir},
+			logger: logger,
+			store:  newTorrentStore(tmpDir, logger),
 		}
 
 		// Pre-create both files at their final paths with correct sizes
@@ -1079,11 +1061,9 @@ func TestInitTorrent_PreExistingFiles(t *testing.T) {
 	t.Run("mix of pre-existing and missing files", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
-			inodes:         NewInodeRegistry(tmpDir, logger),
+			config: ServerConfig{BasePath: tmpDir},
+			logger: logger,
+			store:  newTorrentStore(tmpDir, logger),
 		}
 
 		// Only pre-create the first file
@@ -1132,11 +1112,9 @@ func TestInitTorrent_PreExistingFiles(t *testing.T) {
 	t.Run("wrong size file is not treated as pre-existing", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
-			inodes:         NewInodeRegistry(tmpDir, logger),
+			config: ServerConfig{BasePath: tmpDir},
+			logger: logger,
+			store:  newTorrentStore(tmpDir, logger),
 		}
 
 		// Create file with wrong size
@@ -1194,6 +1172,91 @@ func TestCountHardlinkResults_PreExisting(t *testing.T) {
 	}
 }
 
+func TestSetupMetadataDir_Idempotent(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+
+	torrentData := []byte("d4:infod4:name4:test12:piece lengthi16384e6:pieces20:" +
+		strings.Repeat("A", 20) + "6:lengthi1024eee")
+
+	req := &pb.InitTorrentRequest{
+		TorrentHash: "abc",
+		Name:        "TestTorrent",
+		PieceSize:   16384,
+		TotalSize:   1024,
+		NumPieces:   1,
+		TorrentFile: torrentData,
+		Files: []*pb.FileInfo{{
+			Path:     "test",
+			Size:     1024,
+			Offset:   0,
+			Selected: true,
+		}},
+	}
+
+	metaDir1, statePath1, err := s.setupMetadataDir("abc", req)
+	if err != nil {
+		t.Fatalf("first call failed: %v", err)
+	}
+	metaPath := filepath.Join(tmpDir, metaDirName, "abc", metaFileName)
+	if _, statErr := os.Stat(metaPath); statErr != nil {
+		t.Fatalf(".meta file not created: %v", statErr)
+	}
+
+	metaDir2, statePath2, err := s.setupMetadataDir("abc", req)
+	if err != nil {
+		t.Fatalf("second call failed: %v", err)
+	}
+	if metaDir1 != metaDir2 || statePath1 != statePath2 {
+		t.Fatal("paths should be identical on idempotent call")
+	}
+
+	// Recovery path: .meta already exists, second call must not overwrite.
+	metaDir3, statePath3, err := s.setupMetadataDir("abc", req)
+	if err != nil {
+		t.Fatalf("third call failed: %v", err)
+	}
+	if metaDir1 != metaDir3 || statePath1 != statePath3 {
+		t.Fatal("paths should be identical on repeated call")
+	}
+}
+
+func TestSetupMetadataDir_CleansOldFormat(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+
+	hash := "oldformat"
+	metaDir := filepath.Join(tmpDir, metaDirName, hash)
+	_ = os.MkdirAll(metaDir, 0o755)
+	// Write an old-format file that should be cleaned up.
+	_ = os.WriteFile(filepath.Join(metaDir, ".version"), []byte("2"), 0o644)
+
+	req := &pb.InitTorrentRequest{
+		TorrentHash: hash,
+		Name:        "Test",
+		PieceSize:   16384,
+		TotalSize:   32768,
+		NumPieces:   2,
+		Files:       []*pb.FileInfo{{Path: "file.bin", Size: 32768, Selected: true}},
+		TorrentFile: []byte("bencode"),
+	}
+
+	_, _, err := s.setupMetadataDir(hash, req)
+	if err != nil {
+		t.Fatalf("setupMetadataDir: %v", err)
+	}
+
+	// .version should be gone (directory was cleaned).
+	if _, statErr := os.Stat(filepath.Join(metaDir, ".version")); statErr == nil {
+		t.Fatal("old .version file should have been removed")
+	}
+
+	// .meta should exist.
+	if _, statErr := os.Stat(filepath.Join(metaDir, metaFileName)); statErr != nil {
+		t.Fatalf(".meta should exist: %v", statErr)
+	}
+}
+
 // Helper functions
 
 func createTestMetadata(t *testing.T, basePath, hash string, modTime time.Time) {
@@ -1215,20 +1278,17 @@ func createTestStateFile(t *testing.T, basePath, hash string, modTime time.Time)
 	setModTime(t, statePath, modTime)
 }
 
-// createTestTorrentFile creates a .torrent file in the metaDir with the given modTime.
+// createTestTorrentFile creates a .meta file in the metaDir with the given modTime.
 // If no file paths are provided, uses a single dummy file.
 func createTestTorrentFile(t *testing.T, basePath, hash string, modTime time.Time) {
 	t.Helper()
 	createTestTorrentFileWithPaths(t, basePath, hash, nil)
-	torrentPath, err := findTorrentFile(filepath.Join(basePath, metaDirName, hash))
-	if err != nil {
-		t.Fatal(err)
-	}
-	setModTime(t, torrentPath, modTime)
+	metaPath := filepath.Join(basePath, metaDirName, hash, metaFileName)
+	setModTime(t, metaPath, modTime)
 }
 
-// createTestTorrentFileWithPaths creates a .torrent file in the metaDir.
-// relPaths are torrent-relative paths (e.g., "data/test.txt"). If empty, uses a dummy file.
+// createTestTorrentFileWithPaths creates a .meta file in the metaDir.
+// relPaths are torrent-relative paths (e.g., "data/test.txt"). If empty, uses a single dummy file.
 func createTestTorrentFileWithPaths(t *testing.T, basePath, hash string, relPaths []string) {
 	t.Helper()
 	metaDir := filepath.Join(basePath, metaDirName, hash)
@@ -1236,39 +1296,41 @@ func createTestTorrentFileWithPaths(t *testing.T, basePath, hash string, relPath
 		t.Fatal(err)
 	}
 
-	// Build pieces (10 fake piece hashes)
-	numPieces := 10
-	var piecesBuf bytes.Buffer
-	for range numPieces {
-		h := sha1.Sum([]byte("fake-piece"))
-		piecesBuf.Write(h[:])
-	}
+	numPieces := int32(10)
+	pieceSize := int64(1024)
 
-	bt := bencodeTorrent{
-		Info: bencodeInfo{
-			Name:        "test",
-			PieceLength: 1024,
-			Pieces:      piecesBuf.String(),
-		},
-	}
+	var files []*pb.FileInfo
 	if len(relPaths) == 0 {
-		bt.Info.Length = int64(numPieces) * 1024
+		files = []*pb.FileInfo{{
+			Path:     "test",
+			Size:     int64(numPieces) * pieceSize,
+			Offset:   0,
+			Selected: true,
+		}}
 	} else {
-		files := make([]bencodeFile, len(relPaths))
+		files = make([]*pb.FileInfo, len(relPaths))
 		for i, p := range relPaths {
-			files[i] = bencodeFile{
-				Length: 1024,
-				Path:   strings.Split(p, "/"),
+			files[i] = &pb.FileInfo{
+				Path:     p,
+				Size:     pieceSize,
+				Offset:   int64(i) * pieceSize,
+				Selected: true,
 			}
 		}
-		bt.Info.Files = files
 	}
 
-	torrentPath := filepath.Join(metaDir, "test.torrent")
-	if err := os.WriteFile(torrentPath, encodeTorrent(t, bt), 0o644); err != nil {
-		t.Fatal(err)
+	req := &pb.InitTorrentRequest{
+		TorrentHash: hash,
+		Name:        "test",
+		PieceSize:   pieceSize,
+		TotalSize:   int64(numPieces) * pieceSize,
+		NumPieces:   numPieces,
+		Files:       files,
+		SaveSubPath: "test",
 	}
-	if err := os.WriteFile(filepath.Join(metaDir, versionFileName), []byte(metaVersion), 0o644); err != nil {
+	meta := buildPersistedMeta(req)
+	metaPath := filepath.Join(metaDir, metaFileName)
+	if err := savePersistedMeta(metaPath, meta); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1492,19 +1554,17 @@ func TestInitTorrent_RelocatesOnSubPathChange(t *testing.T) {
 		if !resp.GetSuccess() {
 			t.Fatalf("InitTorrent not successful: %s", resp.GetError())
 		}
-		s.mu.Lock()
-		delete(s.torrents, req.GetTorrentHash())
-		s.mu.Unlock()
+		s.store.mu.Lock()
+		delete(s.store.entries, req.GetTorrentHash())
+		s.store.mu.Unlock()
 	}
 
 	t.Run("relocates files from empty to category sub-path", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
-			inodes:         NewInodeRegistry(tmpDir, logger),
+			config: ServerConfig{BasePath: tmpDir},
+			logger: logger,
+			store:  newTorrentStore(tmpDir, logger),
 		}
 
 		hash := "relocinit1"
@@ -1529,22 +1589,24 @@ func TestInitTorrent_RelocatesOnSubPathChange(t *testing.T) {
 		assertFileExists(t, newPartialPath, "partial file should exist at new sub-path after re-init")
 		assertFileNotExists(t, oldPartialPath, "partial file should not exist at old path after relocation")
 
-		// Verify persisted sub-path was updated
+		// Verify persisted sub-path was updated in .meta
 		metaDir := filepath.Join(tmpDir, metaDirName, hash)
-		subPath := loadSubPathFile(metaDir)
-		if subPath != "movies" {
-			t.Errorf("persisted subPath = %q, want %q", subPath, "movies")
+		metaPath := filepath.Join(metaDir, metaFileName)
+		persisted, loadErr := loadPersistedMeta(metaPath)
+		if loadErr != nil {
+			t.Fatalf("failed to load .meta: %v", loadErr)
+		}
+		if persisted.GetSaveSubPath() != "movies" {
+			t.Errorf("persisted subPath = %q, want %q", persisted.GetSaveSubPath(), "movies")
 		}
 	})
 
 	t.Run("no relocation when sub-path unchanged", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
-			inodes:         NewInodeRegistry(tmpDir, logger),
+			config: ServerConfig{BasePath: tmpDir},
+			logger: logger,
+			store:  newTorrentStore(tmpDir, logger),
 		}
 
 		hash := "relocinit2"
@@ -1592,11 +1654,9 @@ func TestFinalizeTorrent_RelocatesOnSubPathChange(t *testing.T) {
 	t.Run("relocates files before finalization", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
-			inodes:         NewInodeRegistry(tmpDir, logger),
+			config: ServerConfig{BasePath: tmpDir},
+			logger: logger,
+			store:  newTorrentStore(tmpDir, logger),
 		}
 
 		hash := "relocfin1"
@@ -1604,9 +1664,9 @@ func TestFinalizeTorrent_RelocatesOnSubPathChange(t *testing.T) {
 		writeTestFile(t, oldFilePath, []byte("file content"))
 
 		state := newIncompleteState(oldFilePath, "")
-		s.mu.Lock()
-		s.torrents[hash] = state
-		s.mu.Unlock()
+		s.store.mu.Lock()
+		s.store.entries[hash] = state
+		s.store.mu.Unlock()
 
 		resp, err := s.FinalizeTorrent(ctx, &pb.FinalizeTorrentRequest{
 			TorrentHash:         hash,
@@ -1642,11 +1702,9 @@ func TestFinalizeTorrent_RelocatesOnSubPathChange(t *testing.T) {
 	t.Run("no relocation when request sub-path is empty", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
-			inodes:         NewInodeRegistry(tmpDir, logger),
+			config: ServerConfig{BasePath: tmpDir},
+			logger: logger,
+			store:  newTorrentStore(tmpDir, logger),
 		}
 
 		hash := "relocfin2"
@@ -1654,9 +1712,9 @@ func TestFinalizeTorrent_RelocatesOnSubPathChange(t *testing.T) {
 		writeTestFile(t, filePath, []byte("file content"))
 
 		state := newIncompleteState(filePath, "movies")
-		s.mu.Lock()
-		s.torrents[hash] = state
-		s.mu.Unlock()
+		s.store.mu.Lock()
+		s.store.entries[hash] = state
+		s.store.mu.Unlock()
 
 		resp, err := s.FinalizeTorrent(ctx, &pb.FinalizeTorrentRequest{
 			TorrentHash: hash,
@@ -1704,12 +1762,10 @@ func TestInitTorrentResync(t *testing.T) {
 			},
 		}
 		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
-			inodes:         NewInodeRegistry(tmpDir, logger),
-			qbClient:       mock,
+			config:   ServerConfig{BasePath: tmpDir},
+			logger:   logger,
+			store:    newTorrentStore(tmpDir, logger),
+			qbClient: mock,
 		}
 
 		resp, err := s.InitTorrent(ctx, &pb.InitTorrentRequest{
@@ -1749,9 +1805,9 @@ func TestInitTorrentResync(t *testing.T) {
 		}
 
 		// Should be tracked in server state
-		s.mu.RLock()
-		_, exists := s.torrents["resync1"]
-		s.mu.RUnlock()
+		s.store.mu.RLock()
+		_, exists := s.store.entries["resync1"]
+		s.store.mu.RUnlock()
 		if !exists {
 			t.Error("torrent should be tracked after re-sync init")
 		}
@@ -1770,12 +1826,10 @@ func TestInitTorrentResync(t *testing.T) {
 			},
 		}
 		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
-			inodes:         NewInodeRegistry(tmpDir, logger),
-			qbClient:       mock,
+			config:   ServerConfig{BasePath: tmpDir},
+			logger:   logger,
+			store:    newTorrentStore(tmpDir, logger),
+			qbClient: mock,
 		}
 
 		resp, err := s.InitTorrent(ctx, &pb.InitTorrentRequest{
@@ -1807,9 +1861,9 @@ func TestInitTorrentResync(t *testing.T) {
 		}
 
 		// Should NOT be tracked (still complete)
-		s.mu.RLock()
-		_, exists := s.torrents["noresync1"]
-		s.mu.RUnlock()
+		s.store.mu.RLock()
+		_, exists := s.store.entries["noresync1"]
+		s.store.mu.RUnlock()
 		if exists {
 			t.Error("torrent should NOT be tracked when returning COMPLETE")
 		}
@@ -1828,12 +1882,10 @@ func TestInitTorrentResync(t *testing.T) {
 			},
 		}
 		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
-			inodes:         NewInodeRegistry(tmpDir, logger),
-			qbClient:       mock,
+			config:   ServerConfig{BasePath: tmpDir},
+			logger:   logger,
+			store:    newTorrentStore(tmpDir, logger),
+			qbClient: mock,
 		}
 
 		// Resync=true but no files — the guard is `len(req.GetFiles()) > 0 && req.GetResync()`
@@ -1876,12 +1928,10 @@ func TestInitTorrentResync_PartialRecovery(t *testing.T) {
 			},
 		}
 		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
-			inodes:         NewInodeRegistry(tmpDir, logger),
-			qbClient:       mock,
+			config:   ServerConfig{BasePath: tmpDir},
+			logger:   logger,
+			store:    newTorrentStore(tmpDir, logger),
+			qbClient: mock,
 		}
 
 		// Pre-create file1 at final path (previously synced) and
@@ -1936,9 +1986,9 @@ func TestInitTorrentResync_PartialRecovery(t *testing.T) {
 		}
 
 		// Verify that .partial was reused — the file should still be at the .partial path.
-		s.mu.RLock()
-		state, ok := s.torrents["resyncpartial"]
-		s.mu.RUnlock()
+		s.store.mu.RLock()
+		state, ok := s.store.entries["resyncpartial"]
+		s.store.mu.RUnlock()
 		if !ok {
 			t.Fatal("torrent state should exist")
 		}
@@ -1959,12 +2009,10 @@ func TestInitTorrentResync_PartialRecovery(t *testing.T) {
 		var savedPath string
 		var savedWritten *bitset.BitSet
 		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
-			inodes:         NewInodeRegistry(tmpDir, logger),
-			qbClient:       mock,
+			config:   ServerConfig{BasePath: tmpDir},
+			logger:   logger,
+			store:    newTorrentStore(tmpDir, logger),
+			qbClient: mock,
 			saveStateFunc: func(path string, written *bitset.BitSet) error {
 				savedPath = path
 				savedWritten = written.Clone()
@@ -2026,22 +2074,14 @@ func TestInitTorrentResync_ExistingState(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
 		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
-			inodes:         NewInodeRegistry(tmpDir, logger),
+			config: ServerConfig{BasePath: tmpDir},
+			logger: logger,
+			store:  newTorrentStore(tmpDir, logger),
 		}
 
 		// Simulate existing state: 2 files, file2 deselected, all pieces "written"
 		// (piece 1 was covered because its only overlapping file is unselected).
-		s.torrents["resyncstate"] = &serverTorrentState{
-			info: &pb.InitTorrentRequest{
-				TorrentHash: "resyncstate",
-				NumPieces:   2,
-				PieceSize:   512,
-				TotalSize:   1024,
-			},
+		s.store.entries["resyncstate"] = &serverTorrentState{
 			written: boolSliceToBitSet([]bool{true, true}), // Both marked written (piece 1 "covered")
 			torrentMeta: torrentMeta{
 				pieceLength: 512,
@@ -2089,9 +2129,9 @@ func TestInitTorrentResync_ExistingState(t *testing.T) {
 		}
 
 		// Verify state was re-initialized with updated selection
-		s.mu.RLock()
-		state, ok := s.torrents["resyncstate"]
-		s.mu.RUnlock()
+		s.store.mu.RLock()
+		state, ok := s.store.entries["resyncstate"]
+		s.store.mu.RUnlock()
 		if !ok {
 			t.Fatal("torrent state should exist after re-sync")
 		}
@@ -2108,11 +2148,9 @@ func TestInitTorrentResync_ExistingState(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
 		s := &Server{
-			config:         ServerConfig{BasePath: tmpDir},
-			logger:         logger,
-			torrents:       make(map[string]*serverTorrentState),
-			abortingHashes: make(map[string]chan struct{}),
-			inodes:         NewInodeRegistry(tmpDir, logger),
+			config: ServerConfig{BasePath: tmpDir},
+			logger: logger,
+			store:  newTorrentStore(tmpDir, logger),
 		}
 
 		// 3 pieces, 1024-byte piece size, 2560 bytes total:
@@ -2126,7 +2164,21 @@ func TestInitTorrentResync_ExistingState(t *testing.T) {
 		if err := os.MkdirAll(metaDir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		writeTestFile(t, filepath.Join(metaDir, versionFileName), []byte(metaVersion))
+		// Write a .meta file so setupMetadataDir doesn't nuke the directory.
+		dummyMeta := buildPersistedMeta(&pb.InitTorrentRequest{
+			TorrentHash: "boundaryhash",
+			Name:        "test-boundary",
+			NumPieces:   3,
+			PieceSize:   1024,
+			TotalSize:   2560,
+			Files: []*pb.FileInfo{
+				{Path: "data/file1.bin", Size: 1536, Offset: 0, Selected: true},
+				{Path: "data/file2.bin", Size: 1024, Offset: 1536, Selected: false},
+			},
+		})
+		if saveErr := savePersistedMeta(filepath.Join(metaDir, metaFileName), dummyMeta); saveErr != nil {
+			t.Fatal(saveErr)
+		}
 
 		// Persist old .state: all 3 pieces "written"
 		// (piece 2 was "covered" because file2 was unselected)
@@ -2142,13 +2194,7 @@ func TestInitTorrentResync_ExistingState(t *testing.T) {
 		}
 
 		// Pre-existing state in memory
-		s.torrents["boundaryhash"] = &serverTorrentState{
-			info: &pb.InitTorrentRequest{
-				TorrentHash: "boundaryhash",
-				NumPieces:   3,
-				PieceSize:   1024,
-				TotalSize:   2560,
-			},
+		s.store.entries["boundaryhash"] = &serverTorrentState{
 			written: boolSliceToBitSet([]bool{true, true, true}),
 			torrentMeta: torrentMeta{
 				pieceLength: 1024,

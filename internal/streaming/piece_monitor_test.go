@@ -12,16 +12,37 @@ import (
 	pb "github.com/arsac/qb-sync/proto"
 )
 
-func TestPieceMonitor_Removed_Channel(t *testing.T) {
-	logger := testLogger
+// newTestMonitor builds a minimal PieceMonitor for unit tests. completedBuf
+// overrides the completed-channel buffer (use 0 to mean "default").
+func newTestMonitor(completedBuf int) *PieceMonitor {
+	if completedBuf == 0 {
+		completedBuf = completedChannelBufSize
+	}
+	return &PieceMonitor{
+		logger:    testLogger,
+		torrents:  make(map[string]*torrentState),
+		completed: make(chan *pb.Piece, completedBuf),
+		removed:   make(chan string, removedChannelBufSize),
+	}
+}
 
+// newTestState builds a torrentState with empty streamed/failed slices.
+// numPieces sets both slice lengths and the meta NumPieces field.
+func newTestState(numPieces int) *torrentState {
+	return &torrentState{
+		meta: &TorrentMetadata{
+			InitTorrentRequest: &pb.InitTorrentRequest{
+				NumPieces: int32(numPieces),
+			},
+		},
+		streamed: make([]bool, numPieces),
+		failed:   make([]bool, numPieces),
+	}
+}
+
+func TestPieceMonitor_Removed_Channel(t *testing.T) {
 	t.Run("channel is created with correct buffer size", func(t *testing.T) {
-		monitor := &PieceMonitor{
-			logger:    logger,
-			torrents:  make(map[string]*torrentState),
-			completed: make(chan *pb.Piece, completedChannelBufSize),
-			removed:   make(chan string, removedChannelBufSize),
-		}
+		monitor := newTestMonitor(0)
 
 		// Channel should be non-nil and readable
 		ch := monitor.Removed()
@@ -39,12 +60,7 @@ func TestPieceMonitor_Removed_Channel(t *testing.T) {
 	})
 
 	t.Run("channel can receive removal notifications", func(t *testing.T) {
-		monitor := &PieceMonitor{
-			logger:    logger,
-			torrents:  make(map[string]*torrentState),
-			completed: make(chan *pb.Piece, completedChannelBufSize),
-			removed:   make(chan string, removedChannelBufSize),
-		}
+		monitor := newTestMonitor(0)
 
 		// Send a test notification
 		testHash := "abc123"
@@ -62,12 +78,7 @@ func TestPieceMonitor_Removed_Channel(t *testing.T) {
 	})
 
 	t.Run("multiple notifications are buffered", func(t *testing.T) {
-		monitor := &PieceMonitor{
-			logger:    logger,
-			torrents:  make(map[string]*torrentState),
-			completed: make(chan *pb.Piece, completedChannelBufSize),
-			removed:   make(chan string, removedChannelBufSize),
-		}
+		monitor := newTestMonitor(0)
 
 		// Send multiple notifications up to buffer size
 		hashes := []string{"hash1", "hash2", "hash3"}
@@ -90,15 +101,8 @@ func TestPieceMonitor_Removed_Channel(t *testing.T) {
 }
 
 func TestPieceMonitor_CloseChannels(t *testing.T) {
-	logger := testLogger
-
 	t.Run("closes channels exactly once", func(t *testing.T) {
-		monitor := &PieceMonitor{
-			logger:    logger,
-			torrents:  make(map[string]*torrentState),
-			completed: make(chan *pb.Piece, completedChannelBufSize),
-			removed:   make(chan string, removedChannelBufSize),
-		}
+		monitor := newTestMonitor(0)
 
 		// First close should succeed
 		monitor.closeChannels()
@@ -123,12 +127,7 @@ func TestPieceMonitor_CloseChannels(t *testing.T) {
 	})
 
 	t.Run("closed flag prevents sends", func(t *testing.T) {
-		monitor := &PieceMonitor{
-			logger:    logger,
-			torrents:  make(map[string]*torrentState),
-			completed: make(chan *pb.Piece, completedChannelBufSize),
-			removed:   make(chan string, removedChannelBufSize),
-		}
+		monitor := newTestMonitor(0)
 
 		// Check the closed flag before closing
 		if monitor.closed.Load() {
@@ -144,12 +143,7 @@ func TestPieceMonitor_CloseChannels(t *testing.T) {
 	})
 
 	t.Run("concurrent closes are safe", func(t *testing.T) {
-		monitor := &PieceMonitor{
-			logger:    logger,
-			torrents:  make(map[string]*torrentState),
-			completed: make(chan *pb.Piece, completedChannelBufSize),
-			removed:   make(chan string, removedChannelBufSize),
-		}
+		monitor := newTestMonitor(0)
 
 		var wg sync.WaitGroup
 		for range 10 {
@@ -167,15 +161,8 @@ func TestPieceMonitor_CloseChannels(t *testing.T) {
 }
 
 func TestPieceMonitor_Untrack(t *testing.T) {
-	logger := testLogger
-
 	t.Run("removes torrent from tracking", func(t *testing.T) {
-		monitor := &PieceMonitor{
-			logger:    logger,
-			torrents:  make(map[string]*torrentState),
-			completed: make(chan *pb.Piece, completedChannelBufSize),
-			removed:   make(chan string, removedChannelBufSize),
-		}
+		monitor := newTestMonitor(0)
 
 		hash := "abc123"
 		monitor.torrents[hash] = &torrentState{}
@@ -201,12 +188,7 @@ func TestPieceMonitor_Untrack(t *testing.T) {
 	})
 
 	t.Run("untracking non-existent torrent is safe", func(_ *testing.T) {
-		monitor := &PieceMonitor{
-			logger:    logger,
-			torrents:  make(map[string]*torrentState),
-			completed: make(chan *pb.Piece, completedChannelBufSize),
-			removed:   make(chan string, removedChannelBufSize),
-		}
+		monitor := newTestMonitor(0)
 
 		// Should not panic
 		monitor.Untrack("nonexistent")
@@ -214,22 +196,12 @@ func TestPieceMonitor_Untrack(t *testing.T) {
 }
 
 func TestPieceMonitor_MarkStreamed(t *testing.T) {
-	logger := testLogger
-
 	t.Run("marks piece as streamed", func(t *testing.T) {
-		monitor := &PieceMonitor{
-			logger:    logger,
-			torrents:  make(map[string]*torrentState),
-			completed: make(chan *pb.Piece, completedChannelBufSize),
-			removed:   make(chan string, removedChannelBufSize),
-		}
+		monitor := newTestMonitor(0)
 
 		hash := "abc123"
 		numPieces := 10
-		monitor.torrents[hash] = &torrentState{
-			streamed: make([]bool, numPieces),
-			failed:   make([]bool, numPieces),
-		}
+		monitor.torrents[hash] = newTestState(numPieces)
 
 		// Mark piece 5 as streamed
 		monitor.MarkStreamed(hash, 5)
@@ -248,19 +220,11 @@ func TestPieceMonitor_MarkStreamed(t *testing.T) {
 	})
 
 	t.Run("clears failed flag when marking streamed", func(t *testing.T) {
-		monitor := &PieceMonitor{
-			logger:    logger,
-			torrents:  make(map[string]*torrentState),
-			completed: make(chan *pb.Piece, completedChannelBufSize),
-			removed:   make(chan string, removedChannelBufSize),
-		}
+		monitor := newTestMonitor(0)
 
 		hash := "abc123"
 		numPieces := 10
-		monitor.torrents[hash] = &torrentState{
-			streamed: make([]bool, numPieces),
-			failed:   make([]bool, numPieces),
-		}
+		monitor.torrents[hash] = newTestState(numPieces)
 
 		// Set failed flag first
 		state := monitor.torrents[hash]
@@ -279,12 +243,7 @@ func TestPieceMonitor_MarkStreamed(t *testing.T) {
 	})
 
 	t.Run("marking untracked torrent is safe", func(_ *testing.T) {
-		monitor := &PieceMonitor{
-			logger:    logger,
-			torrents:  make(map[string]*torrentState),
-			completed: make(chan *pb.Piece, completedChannelBufSize),
-			removed:   make(chan string, removedChannelBufSize),
-		}
+		monitor := newTestMonitor(0)
 
 		// Should not panic
 		monitor.MarkStreamed("nonexistent", 0)
@@ -292,22 +251,12 @@ func TestPieceMonitor_MarkStreamed(t *testing.T) {
 }
 
 func TestPieceMonitor_MarkStreamedBatch(t *testing.T) {
-	logger := testLogger
-
 	t.Run("marks multiple pieces as streamed", func(t *testing.T) {
-		monitor := &PieceMonitor{
-			logger:    logger,
-			torrents:  make(map[string]*torrentState),
-			completed: make(chan *pb.Piece, completedChannelBufSize),
-			removed:   make(chan string, removedChannelBufSize),
-		}
+		monitor := newTestMonitor(0)
 
 		hash := "abc123"
 		numPieces := 10
-		monitor.torrents[hash] = &torrentState{
-			streamed: make([]bool, numPieces),
-			failed:   make([]bool, numPieces),
-		}
+		monitor.torrents[hash] = newTestState(numPieces)
 
 		// Mark pieces 0, 2, 4, 6 as written
 		written := make([]bool, numPieces)
@@ -335,19 +284,11 @@ func TestPieceMonitor_MarkStreamedBatch(t *testing.T) {
 	})
 
 	t.Run("handles mismatched array sizes", func(t *testing.T) {
-		monitor := &PieceMonitor{
-			logger:    logger,
-			torrents:  make(map[string]*torrentState),
-			completed: make(chan *pb.Piece, completedChannelBufSize),
-			removed:   make(chan string, removedChannelBufSize),
-		}
+		monitor := newTestMonitor(0)
 
 		hash := "abc123"
 		numPieces := 5
-		monitor.torrents[hash] = &torrentState{
-			streamed: make([]bool, numPieces),
-			failed:   make([]bool, numPieces),
-		}
+		monitor.torrents[hash] = newTestState(numPieces)
 
 		// Written array is larger than torrent's piece count
 		written := make([]bool, 10)
@@ -364,12 +305,7 @@ func TestPieceMonitor_MarkStreamedBatch(t *testing.T) {
 	})
 
 	t.Run("returns 0 for untracked torrent", func(t *testing.T) {
-		monitor := &PieceMonitor{
-			logger:    logger,
-			torrents:  make(map[string]*torrentState),
-			completed: make(chan *pb.Piece, completedChannelBufSize),
-			removed:   make(chan string, removedChannelBufSize),
-		}
+		monitor := newTestMonitor(0)
 
 		count := monitor.MarkStreamedBatch("nonexistent", []bool{true, true})
 
@@ -380,27 +316,12 @@ func TestPieceMonitor_MarkStreamedBatch(t *testing.T) {
 }
 
 func TestPieceMonitor_GetProgress(t *testing.T) {
-	logger := testLogger
-
 	t.Run("returns progress for tracked torrent", func(t *testing.T) {
-		monitor := &PieceMonitor{
-			logger:    logger,
-			torrents:  make(map[string]*torrentState),
-			completed: make(chan *pb.Piece, completedChannelBufSize),
-			removed:   make(chan string, removedChannelBufSize),
-		}
+		monitor := newTestMonitor(0)
 
 		hash := "abc123"
 		numPieces := 10
-		monitor.torrents[hash] = &torrentState{
-			meta: &TorrentMetadata{
-				InitTorrentRequest: &pb.InitTorrentRequest{
-					NumPieces: int32(numPieces),
-				},
-			},
-			streamed: make([]bool, numPieces),
-			failed:   make([]bool, numPieces),
-		}
+		monitor.torrents[hash] = newTestState(numPieces)
 
 		// Mark some pieces as streamed and failed
 		state := monitor.torrents[hash]
@@ -429,12 +350,7 @@ func TestPieceMonitor_GetProgress(t *testing.T) {
 	})
 
 	t.Run("returns error for untracked torrent", func(t *testing.T) {
-		monitor := &PieceMonitor{
-			logger:    logger,
-			torrents:  make(map[string]*torrentState),
-			completed: make(chan *pb.Piece, completedChannelBufSize),
-			removed:   make(chan string, removedChannelBufSize),
-		}
+		monitor := newTestMonitor(0)
 
 		_, err := monitor.GetProgress("nonexistent")
 		if !errors.Is(err, ErrTorrentNotTracked) {
@@ -443,29 +359,15 @@ func TestPieceMonitor_GetProgress(t *testing.T) {
 	})
 
 	t.Run("reports complete when all pieces streamed", func(t *testing.T) {
-		monitor := &PieceMonitor{
-			logger:    logger,
-			torrents:  make(map[string]*torrentState),
-			completed: make(chan *pb.Piece, completedChannelBufSize),
-			removed:   make(chan string, removedChannelBufSize),
-		}
+		monitor := newTestMonitor(0)
 
 		hash := "abc123"
 		numPieces := 5
-		streamed := make([]bool, numPieces)
-		for i := range streamed {
-			streamed[i] = true
+		state := newTestState(numPieces)
+		for i := range state.streamed {
+			state.streamed[i] = true
 		}
-
-		monitor.torrents[hash] = &torrentState{
-			meta: &TorrentMetadata{
-				InitTorrentRequest: &pb.InitTorrentRequest{
-					NumPieces: int32(numPieces),
-				},
-			},
-			streamed: streamed,
-			failed:   make([]bool, numPieces),
-		}
+		monitor.torrents[hash] = state
 
 		progress, err := monitor.GetProgress(hash)
 		if err != nil {
@@ -482,14 +384,7 @@ func TestPieceMonitor_GetProgress(t *testing.T) {
 }
 
 func TestPieceMonitor_IsDownloadingState(t *testing.T) {
-	logger := testLogger
-
-	monitor := &PieceMonitor{
-		logger:    logger,
-		torrents:  make(map[string]*torrentState),
-		completed: make(chan *pb.Piece, completedChannelBufSize),
-		removed:   make(chan string, removedChannelBufSize),
-	}
+	monitor := newTestMonitor(0)
 
 	// States that should be considered downloading
 	downloadingStates := []struct {
@@ -524,36 +419,20 @@ func TestPieceMonitor_IsDownloadingState(t *testing.T) {
 }
 
 func TestPieceMonitor_RetryFailed(t *testing.T) {
-	logger := testLogger
-
-	newMonitor := func(chanBuf int) *PieceMonitor {
-		return &PieceMonitor{
-			logger:    logger,
-			torrents:  make(map[string]*torrentState),
-			completed: make(chan *pb.Piece, chanBuf),
-			removed:   make(chan string, removedChannelBufSize),
-		}
-	}
-
-	newState := func(numPieces int, pieceSize int64) *torrentState {
-		return &torrentState{
-			meta: &TorrentMetadata{
-				InitTorrentRequest: &pb.InitTorrentRequest{
-					TorrentHash: "abc123",
-					NumPieces:   int32(numPieces),
-					PieceSize:   pieceSize,
-					TotalSize:   int64(numPieces) * pieceSize,
-				},
-			},
-			hashes:   make([]string, numPieces),
-			streamed: make([]bool, numPieces),
-			failed:   make([]bool, numPieces),
-		}
+	// newRetryState extends newTestState with hash + piece-size metadata
+	// needed by buildPiece in the RetryFailed code path.
+	newRetryState := func(numPieces int, pieceSize int64) *torrentState {
+		state := newTestState(numPieces)
+		state.meta.TorrentHash = "abc123"
+		state.meta.PieceSize = pieceSize
+		state.meta.TotalSize = int64(numPieces) * pieceSize
+		state.hashes = make([]string, numPieces)
+		return state
 	}
 
 	t.Run("re-queues failed pieces", func(t *testing.T) {
-		monitor := newMonitor(completedChannelBufSize)
-		state := newState(10, 1024)
+		monitor := newTestMonitor(0)
+		state := newRetryState(10, 1024)
 		state.failed[2] = true
 		state.failed[7] = true
 
@@ -593,8 +472,8 @@ func TestPieceMonitor_RetryFailed(t *testing.T) {
 
 	t.Run("channel full leaves pieces marked failed", func(t *testing.T) {
 		// Buffer of 1 — second piece can't be sent
-		monitor := newMonitor(1)
-		state := newState(10, 1024)
+		monitor := newTestMonitor(1)
+		state := newRetryState(10, 1024)
 		state.failed[1] = true
 		state.failed[3] = true
 		state.failed[5] = true
@@ -630,8 +509,8 @@ func TestPieceMonitor_RetryFailed(t *testing.T) {
 	})
 
 	t.Run("no failed pieces is a no-op", func(t *testing.T) {
-		monitor := newMonitor(completedChannelBufSize)
-		state := newState(5, 1024)
+		monitor := newTestMonitor(0)
+		state := newRetryState(5, 1024)
 
 		hash := "abc123"
 		monitor.torrents[hash] = state
@@ -650,7 +529,7 @@ func TestPieceMonitor_RetryFailed(t *testing.T) {
 	})
 
 	t.Run("returns error for untracked torrent", func(t *testing.T) {
-		monitor := newMonitor(completedChannelBufSize)
+		monitor := newTestMonitor(0)
 
 		err := monitor.RetryFailed(t.Context(), "nonexistent")
 		if !errors.Is(err, ErrTorrentNotTracked) {
@@ -659,8 +538,14 @@ func TestPieceMonitor_RetryFailed(t *testing.T) {
 	})
 
 	t.Run("returns context error on cancellation", func(t *testing.T) {
-		monitor := newMonitor(0) // unbuffered — all sends will fail
-		state := newState(5, 1024)
+		// unbuffered completed channel — all sends will fail
+		monitor := &PieceMonitor{
+			logger:    testLogger,
+			torrents:  make(map[string]*torrentState),
+			completed: make(chan *pb.Piece),
+			removed:   make(chan string, removedChannelBufSize),
+		}
+		state := newRetryState(5, 1024)
 		state.failed[0] = true
 
 		hash := "abc123"
@@ -677,25 +562,11 @@ func TestPieceMonitor_RetryFailed(t *testing.T) {
 }
 
 func TestPieceMonitor_ResyncStreamed(t *testing.T) {
-	logger := testLogger
-
-	newMonitor := func() *PieceMonitor {
-		return &PieceMonitor{
-			logger:    logger,
-			torrents:  make(map[string]*torrentState),
-			completed: make(chan *pb.Piece, completedChannelBufSize),
-			removed:   make(chan string, removedChannelBufSize),
-		}
-	}
-
 	t.Run("resets streamed pieces missing on destination", func(t *testing.T) {
-		monitor := newMonitor()
+		monitor := newTestMonitor(0)
 		hash := "abc123"
 		numPieces := 10
-		monitor.torrents[hash] = &torrentState{
-			streamed: make([]bool, numPieces),
-			failed:   make([]bool, numPieces),
-		}
+		monitor.torrents[hash] = newTestState(numPieces)
 
 		// Simulate: source thinks all 10 are streamed
 		state := monitor.torrents[hash]
@@ -726,13 +597,10 @@ func TestPieceMonitor_ResyncStreamed(t *testing.T) {
 	})
 
 	t.Run("clears failed flag for pieces destination has", func(t *testing.T) {
-		monitor := newMonitor()
+		monitor := newTestMonitor(0)
 		hash := "abc123"
 		numPieces := 5
-		monitor.torrents[hash] = &torrentState{
-			streamed: make([]bool, numPieces),
-			failed:   make([]bool, numPieces),
-		}
+		monitor.torrents[hash] = newTestState(numPieces)
 
 		state := monitor.torrents[hash]
 		// Pieces 2 and 3 are failed
@@ -755,13 +623,10 @@ func TestPieceMonitor_ResyncStreamed(t *testing.T) {
 	})
 
 	t.Run("no-op when already in sync", func(t *testing.T) {
-		monitor := newMonitor()
+		monitor := newTestMonitor(0)
 		hash := "abc123"
 		numPieces := 5
-		monitor.torrents[hash] = &torrentState{
-			streamed: make([]bool, numPieces),
-			failed:   make([]bool, numPieces),
-		}
+		monitor.torrents[hash] = newTestState(numPieces)
 
 		state := monitor.torrents[hash]
 		state.streamed[0] = true
@@ -776,13 +641,10 @@ func TestPieceMonitor_ResyncStreamed(t *testing.T) {
 	})
 
 	t.Run("handles mismatched sizes", func(t *testing.T) {
-		monitor := newMonitor()
+		monitor := newTestMonitor(0)
 		hash := "abc123"
 		numPieces := 5
-		monitor.torrents[hash] = &torrentState{
-			streamed: make([]bool, numPieces),
-			failed:   make([]bool, numPieces),
-		}
+		monitor.torrents[hash] = newTestState(numPieces)
 
 		state := monitor.torrents[hash]
 		for i := range state.streamed {
@@ -800,7 +662,7 @@ func TestPieceMonitor_ResyncStreamed(t *testing.T) {
 	})
 
 	t.Run("returns 0 for untracked torrent", func(t *testing.T) {
-		monitor := newMonitor()
+		monitor := newTestMonitor(0)
 		reset := monitor.ResyncStreamed("nonexistent", []bool{true})
 		if reset != 0 {
 			t.Errorf("expected 0 for untracked torrent, got %d", reset)
@@ -920,15 +782,8 @@ func TestDeselectedPieceMask(t *testing.T) {
 }
 
 func TestPieceMonitor_RemovalNotification_Integration(t *testing.T) {
-	logger := testLogger
-
 	t.Run("removal notification blocks until received", func(t *testing.T) {
-		monitor := &PieceMonitor{
-			logger:    logger,
-			torrents:  make(map[string]*torrentState),
-			completed: make(chan *pb.Piece, completedChannelBufSize),
-			removed:   make(chan string, removedChannelBufSize),
-		}
+		monitor := newTestMonitor(0)
 
 		ctx := t.Context()
 
@@ -959,12 +814,7 @@ func TestPieceMonitor_RemovalNotification_Integration(t *testing.T) {
 	})
 
 	t.Run("closed flag prevents new sends", func(t *testing.T) {
-		monitor := &PieceMonitor{
-			logger:    logger,
-			torrents:  make(map[string]*torrentState),
-			completed: make(chan *pb.Piece, completedChannelBufSize),
-			removed:   make(chan string, removedChannelBufSize),
-		}
+		monitor := newTestMonitor(0)
 
 		// Close channels
 		monitor.closeChannels()

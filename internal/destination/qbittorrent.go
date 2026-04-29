@@ -2,11 +2,12 @@ package destination
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/autobrr/go-qbittorrent"
 
@@ -54,6 +55,10 @@ func (s *Server) isTorrentInQB(ctx context.Context, hash string) bool {
 }
 
 // addAndVerifyTorrent adds the torrent to qBittorrent and waits for verification.
+// On exit the torrent is always stopped on destination qB (best-effort): source
+// is the canonical seeder until handoff via StartTorrent. Without this, a crash
+// mid-finalization followed by recovery can leave the torrent already running
+// in destination qB, producing a dual-seeding window.
 func (s *Server) addAndVerifyTorrent(
 	ctx context.Context,
 	hash string,
@@ -69,21 +74,23 @@ func (s *Server) addAndVerifyTorrent(
 		if isErrorState(existingTorrent.State) {
 			return existingTorrent.State, fmt.Errorf("torrent in error state: %s", existingTorrent.State)
 		}
-		if existingTorrent.Progress >= 1.0 && isReadyState(existingTorrent.State) {
-			return existingTorrent.State, nil
+		finalState := existingTorrent.State
+		var waitErr error
+		// If already at 100% and seeding-side, accept the current state; otherwise
+		// (checking, incomplete, moving, etc.) poll until ready.
+		if existingTorrent.Progress < 1.0 || !isReadyState(existingTorrent.State) {
+			finalState, waitErr = s.waitForTorrentReady(ctx, hash, state.totalSize)
 		}
-		// Not yet ready (checking, incomplete, moving, etc.) — poll until ready.
-		return s.waitForTorrentReady(ctx, hash)
+		s.stopTorrentBestEffort(ctx, hash)
+		return finalState, waitErr
 	}
 
 	// Torrent doesn't exist - add it.
-	// Read torrentPath under state.mu: ensureTorrentFileWritten can write it concurrently.
 	state.mu.Lock()
-	torrentPath := state.torrentPath
+	torrentData := state.torrentFile
 	state.mu.Unlock()
-	torrentData, readErr := os.ReadFile(torrentPath)
-	if readErr != nil {
-		return "", fmt.Errorf("reading torrent file: %w", readErr)
+	if len(torrentData) == 0 {
+		return "", errors.New("torrent file bytes not cached on state")
 	}
 
 	// Use the destination-side save path (container mount point, e.g., "/downloads"),
@@ -98,6 +105,14 @@ func (s *Server) addAndVerifyTorrent(
 		"paused":             "true", // Compat alias for qB v4.x
 		"autoTMM":            "false",
 		"sequentialDownload": "false",
+		// Defense in depth against the brief window between AddTorrent and the
+		// post-add Stop. With stopped=true, qB shouldn't announce or upload —
+		// but autobrr observed qB v5 occasionally announcing during this
+		// window. Pinning bandwidth to 0 prevents any traffic while the
+		// torrent is technically "added" but our explicit StopCtx hasn't
+		// landed yet. StartTorrent re-enables transfer by removing the limits.
+		"upLimit": "0",
+		"dlLimit": "0",
 	}
 
 	// skip_checking is safe only when all files are present on disk. With
@@ -109,6 +124,12 @@ func (s *Server) addAndVerifyTorrent(
 	}
 
 	if req.GetCategory() != "" {
+		// qBittorrent silently drops the category field on AddTorrent if the
+		// category doesn't already exist on the destination instance — autobrr
+		// learned this the hard way. Ensure the category exists first so the
+		// user's directory-layout assumption (savePath joined with sub-path
+		// from category folders) doesn't silently diverge from qB's view.
+		s.ensureCategoryExists(ctx, req.GetCategory())
 		opts["category"] = req.GetCategory()
 	}
 	if req.GetTags() != "" {
@@ -131,27 +152,73 @@ func (s *Server) addAndVerifyTorrent(
 		s.applyDeselectedPriorities(ctx, hash, deselectedIDs)
 	}
 
-	finalState, waitErr := s.waitForTorrentReady(ctx, hash)
-
-	// Always stop the torrent after adding, even if waitForTorrentReady was
-	// interrupted by context cancellation. Uses a detached context because the
-	// gRPC caller may cancel before the wait completes, but the stop must succeed
-	// to prevent dual seeding. qBittorrent may also briefly transition through an
-	// active state (e.g. stalledUP) even with stopped=true+skip_checking=true.
-	stopCtx, stopCancel := context.WithTimeout(context.Background(), stopTorrentTimeout)
-	defer stopCancel()
-	if stopErr := s.qbClient.StopCtx(stopCtx, []string{hash}); stopErr != nil {
-		s.logger.WarnContext(ctx, "failed to stop torrent after add (may already be stopped)",
-			"hash", hash, "error", stopErr)
-	}
-
+	finalState, waitErr := s.waitForTorrentReady(ctx, hash, state.totalSize)
+	s.stopTorrentBestEffort(ctx, hash)
 	return finalState, waitErr
 }
 
+// ensureCategoryExists creates the category on destination qB if it doesn't
+// already exist. Best-effort: failure is logged and swallowed so AddTorrent
+// can still proceed (qB will silently ignore the unknown category, matching
+// pre-fix behavior). With this in place the common "user has 'movies' on
+// source but never created it on dest" case works correctly.
+func (s *Server) ensureCategoryExists(ctx context.Context, category string) {
+	cats, err := s.qbClient.GetCategoriesCtx(ctx)
+	if err != nil {
+		s.logger.WarnContext(ctx, "failed to list categories on destination, will let AddTorrent attempt",
+			"category", category, "error", err)
+		return
+	}
+	if _, exists := cats[category]; exists {
+		return
+	}
+	if createErr := s.qbClient.CreateCategoryCtx(ctx, category, ""); createErr != nil {
+		s.logger.WarnContext(ctx, "failed to create category on destination",
+			"category", category, "error", createErr)
+		return
+	}
+	s.logger.InfoContext(ctx, "created category on destination qBittorrent",
+		"category", category)
+}
+
+// stopTorrentBestEffort stops the torrent on destination qB. Uses a detached
+// context because the gRPC caller may cancel before the stop completes, but
+// the stop must run to prevent dual seeding (source still believes it is the
+// canonical seeder until handoff). Failure is logged and swallowed — the
+// torrent may already be stopped, or qB may be unreachable at this moment.
+func (s *Server) stopTorrentBestEffort(ctx context.Context, hash string) {
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), stopTorrentTimeout)
+	defer stopCancel()
+	if stopErr := s.qbClient.StopCtx(stopCtx, []string{hash}); stopErr != nil {
+		s.logger.WarnContext(ctx, "failed to stop torrent (may already be stopped)",
+			"hash", hash, "error", stopErr)
+	}
+}
+
+// computePollTimeout returns a reasonable wait budget for qBittorrent to
+// finish verifying a torrent of the given size. qB's recheck pass is roughly
+// linear in data volume, so the timeout scales by GB above a small floor and
+// is capped to prevent unbounded waits. Operators can override via the
+// QBConfig.PollTimeout field when they have specific knowledge.
+func computePollTimeout(totalSize int64) time.Duration {
+	const bytesPerGB = 1024 * 1024 * 1024
+	gigabytes := totalSize / bytesPerGB
+	timeout := defaultQBPollTimeoutBase + time.Duration(gigabytes)*defaultQBPollTimeoutPerGB
+	if timeout > defaultQBPollTimeoutMax {
+		return defaultQBPollTimeoutMax
+	}
+	return timeout
+}
+
 // waitForTorrentReady polls until the torrent is verified and ready.
-func (s *Server) waitForTorrentReady(ctx context.Context, hash string) (qbittorrent.TorrentState, error) {
+// totalSize is used to size the poll timeout when QBConfig.PollTimeout is unset.
+func (s *Server) waitForTorrentReady(
+	ctx context.Context,
+	hash string,
+	totalSize int64,
+) (qbittorrent.TorrentState, error) {
 	interval := defaultQBPollInterval
-	timeout := defaultQBPollTimeout
+	timeout := computePollTimeout(totalSize)
 
 	if s.config.QB != nil {
 		if s.config.QB.PollInterval > 0 {
@@ -260,6 +327,12 @@ func (s *Server) StartTorrent(ctx context.Context, req *pb.StartTorrentRequest) 
 		}, nil
 	}
 
+	// Clear the dl/up bandwidth limits we set at AddTorrent time. -1 in the
+	// qB API removes the per-torrent limit and defers to global settings.
+	// Best-effort: a stuck-at-zero limit on a few torrents is recoverable
+	// manually, so we don't fail the StartTorrent call on this.
+	s.clearTorrentRateLimits(ctx, hash)
+
 	if tag := req.GetTag(); tag != "" {
 		if tagErr := s.qbClient.AddTagsCtx(ctx, []string{hash}, tag); tagErr != nil {
 			metrics.TagApplicationErrorsTotal.WithLabelValues(metrics.ModeDestination).Inc()
@@ -272,6 +345,19 @@ func (s *Server) StartTorrent(ctx context.Context, req *pb.StartTorrentRequest) 
 	s.logger.InfoContext(ctx, "started torrent on destination qBittorrent", "hash", hash)
 
 	return &pb.StartTorrentResponse{Success: true}, nil
+}
+
+// clearTorrentRateLimits removes the upLimit/dlLimit set during AddTorrent
+// (the autobrr-pattern defense against the brief announce-before-stop
+// window). Passes -1 to the qB API which defers to global settings.
+// Best-effort.
+func (s *Server) clearTorrentRateLimits(ctx context.Context, hash string) {
+	if upErr := s.qbClient.SetTorrentUploadLimitCtx(ctx, []string{hash}, -1); upErr != nil {
+		s.logger.WarnContext(ctx, "failed to clear upload limit on start", "hash", hash, "error", upErr)
+	}
+	if dlErr := s.qbClient.SetTorrentDownloadLimitCtx(ctx, []string{hash}, -1); dlErr != nil {
+		s.logger.WarnContext(ctx, "failed to clear download limit on start", "hash", hash, "error", dlErr)
+	}
 }
 
 // deleteTorrentFromQB removes a torrent from destination qBittorrent without deleting files.

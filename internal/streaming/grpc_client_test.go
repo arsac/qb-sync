@@ -48,6 +48,83 @@ func (m *mockBidiStream) RecvMsg(any) error            { return nil }
 
 var testLogger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 
+// newClosedDonePooledStream builds a PooledStream whose underlying PieceStream
+// has its done channel pre-closed. Used by forwardAcks tests that simulate a
+// stream that has already exited. errs is the error channel given to the
+// inner PieceStream (caller decides whether to seed it with an error).
+func newClosedDonePooledStream(id int, errs chan error) *PooledStream {
+	streamDone := make(chan struct{})
+	close(streamDone)
+	return &PooledStream{
+		stream: &PieceStream{
+			done:     streamDone,
+			errors:   errs,
+			acks:     make(chan *pb.PieceAck, 10),
+			ackReady: make(chan struct{}, 1),
+		},
+		id: id,
+	}
+}
+
+// newForwardAcksTestPool returns a minimal StreamPool wired up for forwardAcks
+// tests with channel buffers sized for "small but non-blocking" use.
+func newForwardAcksTestPool(ctx context.Context) *StreamPool {
+	return &StreamPool{
+		ctx:      ctx,
+		errs:     make(chan error, 10),
+		acks:     make(chan AckEnvelope, 10),
+		ackReady: make(chan struct{}, 10),
+		logger:   testLogger,
+	}
+}
+
+// newAdaptiveScalingTestPool builds a StreamPool configured with adaptive
+// scaling enabled for handlePlateau / applyScalingDecision tests.
+func newAdaptiveScalingTestPool(
+	ctx context.Context, cancel context.CancelFunc, dest *GRPCDestination, streams []*PooledStream,
+) *StreamPool {
+	return &StreamPool{
+		dest:          dest,
+		ctx:           ctx,
+		cancel:        cancel,
+		logger:        testLogger,
+		adaptive:      true,
+		scaleInterval: defaultScaleInterval,
+		streams:       streams,
+		errs:          make(chan error, 10),
+		acks:          make(chan AckEnvelope, 10),
+		ackReady:      make(chan struct{}, 10),
+		maxStreams:    MaxPoolSize,
+	}
+}
+
+// newDrainTestStream builds a PooledStream wrapping a real test PieceStream,
+// with a small adaptive window and the given id. Used by drainAndRemoveStream
+// tests where the stream is meaningfully exercised but isolation from a real
+// gRPC transport is desired.
+func newDrainTestStream(ctx context.Context, id int) *PooledStream {
+	return &PooledStream{
+		stream: newTestPieceStream(ctx, &mockBidiStream{}),
+		window: congestion.NewAdaptiveWindow(congestion.Config{
+			InitialWindow: 10, MinWindow: 2, MaxWindow: 10,
+		}),
+		id: id,
+	}
+}
+
+// newDrainTestPool builds a minimal StreamPool that owns a single PooledStream
+// for drainAndRemoveStream tests.
+func newDrainTestPool(ctx context.Context, cancel context.CancelFunc, ps *PooledStream) *StreamPool {
+	return &StreamPool{
+		ctx:     ctx,
+		cancel:  cancel,
+		streams: []*PooledStream{ps},
+		logger:  testLogger,
+		errs:    make(chan error, 10),
+		acks:    make(chan AckEnvelope, 10),
+	}
+}
+
 // newTestPieceStream creates a PieceStream with a mock stream for testing.
 // The mock's ctx is set to the derived stream context so its default Recv
 // unblocks when the stream is closed.
@@ -359,28 +436,8 @@ func TestForwardAcks_NotifiesPoolOnSilentStreamDeath(t *testing.T) {
 	t.Parallel()
 
 	// Stream done, no error pending.
-	streamDone := make(chan struct{})
-	close(streamDone)
-
-	ps := &PooledStream{
-		stream: &PieceStream{
-			done:     streamDone,
-			errors:   make(chan error, 1), // empty — no error written
-			acks:     make(chan *pb.PieceAck, 10),
-			ackReady: make(chan struct{}, 1),
-		},
-		id: 42,
-	}
-
-	poolCtx := t.Context()
-
-	pool := &StreamPool{
-		ctx:      poolCtx,
-		errs:     make(chan error, 10),
-		acks:     make(chan *pb.PieceAck, 10),
-		ackReady: make(chan struct{}, 10),
-		logger:   testLogger,
-	}
+	ps := newClosedDonePooledStream(42, make(chan error, 1))
+	pool := newForwardAcksTestPool(t.Context())
 
 	pool.wg.Add(1)
 	go pool.forwardAcks(ps)
@@ -404,30 +461,13 @@ func TestForwardAcks_NoSpuriousErrorOnCleanShutdown(t *testing.T) {
 	t.Parallel()
 
 	// Stream done, no error pending.
-	streamDone := make(chan struct{})
-	close(streamDone)
-
-	ps := &PooledStream{
-		stream: &PieceStream{
-			done:     streamDone,
-			errors:   make(chan error, 1), // empty
-			acks:     make(chan *pb.PieceAck, 10),
-			ackReady: make(chan struct{}, 1),
-		},
-		id: 7,
-	}
+	ps := newClosedDonePooledStream(7, make(chan error, 1))
 
 	// Pool context already cancelled — simulates clean shutdown.
 	poolCtx, poolCancel := context.WithCancel(context.Background())
 	poolCancel()
 
-	pool := &StreamPool{
-		ctx:      poolCtx,
-		errs:     make(chan error, 10),
-		acks:     make(chan *pb.PieceAck, 10),
-		ackReady: make(chan struct{}, 10),
-		logger:   testLogger,
-	}
+	pool := newForwardAcksTestPool(poolCtx)
 
 	pool.wg.Add(1)
 	go pool.forwardAcks(ps)
@@ -460,31 +500,14 @@ func TestForwardAcks_DrainsErrorOnStreamClose(t *testing.T) {
 	for i := range iterations {
 		func() {
 			// Create a PieceStream with a pending error and closed done channel.
-			streamDone := make(chan struct{})
 			streamErrors := make(chan error, 1)
 			streamErrors <- errors.New("stream reset by peer")
-			close(streamDone)
-
-			ps := &PooledStream{
-				stream: &PieceStream{
-					done:     streamDone,
-					errors:   streamErrors,
-					acks:     make(chan *pb.PieceAck, 10),
-					ackReady: make(chan struct{}, 1),
-				},
-				id: i,
-			}
+			ps := newClosedDonePooledStream(i, streamErrors)
 
 			poolCtx, poolCancel := context.WithCancel(context.Background())
 			defer poolCancel()
 
-			pool := &StreamPool{
-				ctx:      poolCtx,
-				errs:     make(chan error, 10),
-				acks:     make(chan *pb.PieceAck, 10),
-				ackReady: make(chan struct{}, 10),
-				logger:   testLogger,
-			}
+			pool := newForwardAcksTestPool(poolCtx)
 
 			pool.wg.Add(1)
 			go pool.forwardAcks(ps)
@@ -523,7 +546,7 @@ func newTestPoolWithWindow(windowCfg congestion.Config) (*StreamPool, *PooledStr
 		ctx:      ctx,
 		cancel:   cancel,
 		errs:     make(chan error, 10),
-		acks:     make(chan *pb.PieceAck, 10),
+		acks:     make(chan AckEnvelope, 10),
 		ackReady: make(chan struct{}, 4),
 		logger:   testLogger,
 		streams:  []*PooledStream{ps},
@@ -531,13 +554,15 @@ func newTestPoolWithWindow(windowCfg congestion.Config) (*StreamPool, *PooledStr
 	return pool, ps, cancel
 }
 
-// TestSenderLoop_PollingFallbackUnblocks verifies that the sender's 1-second
-// polling fallback wakes it up when CanSend() becomes true without any
-// AckReady signal. This is the safety net for missed signals.
+// TestSenderLoop_PollingFallbackUnblocks verifies that the sender's polling
+// fallback wakes it up when CanSend() becomes true without any AckReady
+// signal. This is the safety net for missed signals. The test's replicated
+// wait loop uses a 1s timer (rather than the production senderRetryBackoff)
+// so the wake source is unambiguously the timer rather than scheduling.
 //
 // Setup: window=2, 2 pieces in-flight (CanSend=false). After 200ms, OnFail
-// frees a slot (CanSend=true) but nobody signals ackReady. The sender's wait
-// loop should unblock via the 1s timer, not immediately and not never.
+// frees a slot (CanSend=true) but nobody signals ackReady. The wait loop
+// should unblock via the timer, not immediately and not never.
 func TestSenderLoop_PollingFallbackUnblocks(t *testing.T) {
 	t.Parallel()
 
@@ -756,30 +781,11 @@ func TestSenderLoop_SignalRaceWithoutNotify(t *testing.T) {
 func TestForwardAcks_SilentExitOnRemovedFlag(t *testing.T) {
 	t.Parallel()
 
-	streamDone := make(chan struct{})
-	close(streamDone)
-
-	ps := &PooledStream{
-		stream: &PieceStream{
-			done:     streamDone,
-			errors:   make(chan error, 1),
-			acks:     make(chan *pb.PieceAck, 10),
-			ackReady: make(chan struct{}, 1),
-		},
-		id: 99,
-	}
+	ps := newClosedDonePooledStream(99, make(chan error, 1))
 	// Mark as intentionally removed
 	ps.removed.Store(true)
 
-	poolCtx := t.Context()
-
-	pool := &StreamPool{
-		ctx:      poolCtx,
-		errs:     make(chan error, 10),
-		acks:     make(chan *pb.PieceAck, 10),
-		ackReady: make(chan struct{}, 10),
-		logger:   testLogger,
-	}
+	pool := newForwardAcksTestPool(t.Context())
 
 	pool.wg.Add(1)
 	go pool.forwardAcks(ps)
@@ -825,16 +831,7 @@ func TestDrainAndRemoveStream_HappyPath(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	mock := &mockBidiStream{}
-	pieceStream := newTestPieceStream(ctx, mock)
-
-	ps := &PooledStream{
-		stream: pieceStream,
-		window: congestion.NewAdaptiveWindow(congestion.Config{
-			InitialWindow: 10, MinWindow: 2, MaxWindow: 10,
-		}),
-		id: 1,
-	}
+	ps := newDrainTestStream(ctx, 1)
 
 	// Put one piece in-flight
 	ps.window.TrySend("piece:0")
@@ -842,14 +839,7 @@ func TestDrainAndRemoveStream_HappyPath(t *testing.T) {
 		t.Fatalf("expected 1 in-flight, got %d", ps.window.InFlight())
 	}
 
-	pool := &StreamPool{
-		ctx:     ctx,
-		cancel:  cancel,
-		streams: []*PooledStream{ps},
-		logger:  testLogger,
-		errs:    make(chan error, 10),
-		acks:    make(chan *pb.PieceAck, 10),
-	}
+	pool := newDrainTestPool(ctx, cancel, ps)
 
 	// Start drain in background
 	done := make(chan struct{})
@@ -896,38 +886,17 @@ func TestDrainAndRemoveStream_Timeout(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	mock := &mockBidiStream{}
-	pieceStream := newTestPieceStream(ctx, mock)
-
-	ps := &PooledStream{
-		stream: pieceStream,
-		window: congestion.NewAdaptiveWindow(congestion.Config{
-			InitialWindow: 10, MinWindow: 2, MaxWindow: 10,
-		}),
-		id: 2,
-	}
+	ps := newDrainTestStream(ctx, 2)
 
 	// Put pieces in-flight that will never complete
 	ps.window.TrySend("piece:0")
 	ps.window.TrySend("piece:1")
 
-	pool := &StreamPool{
-		ctx:     ctx,
-		cancel:  cancel,
-		streams: []*PooledStream{ps},
-		logger:  testLogger,
-		errs:    make(chan error, 10),
-		acks:    make(chan *pb.PieceAck, 10),
-	}
+	pool := newDrainTestPool(ctx, cancel, ps)
 
-	// Override the drain timeout for faster test
-	origTimeout := streamDrainTimeout
-	// We can't override const, so we test with the real timeout behavior
-	// by checking that the function returns eventually. With 30s timeout
-	// this would be too slow for a unit test, so instead we verify the
-	// draining flag is set and rely on the happy path test for full coverage.
-
-	// For actual timeout test, verify the drain starts correctly
+	// streamDrainTimeout (30s) is too long to wait for a real timeout in
+	// unit tests, so this test exercises the early-exit-on-context-cancel
+	// path instead. The happy path covers the in-flight=0 path.
 	done := make(chan struct{})
 	go func() {
 		pool.drainAndRemoveStream(ps)
@@ -949,8 +918,6 @@ func TestDrainAndRemoveStream_Timeout(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("drainAndRemoveStream didn't exit on context cancel")
 	}
-
-	_ = origTimeout // Acknowledge we're not modifying the const
 }
 
 // TestDrainAndRemoveStream_AccumulatesBytesSent verifies that bytes from
@@ -961,26 +928,10 @@ func TestDrainAndRemoveStream_AccumulatesBytesSent(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	mock := &mockBidiStream{}
-	pieceStream := newTestPieceStream(ctx, mock)
-
-	ps := &PooledStream{
-		stream: pieceStream,
-		window: congestion.NewAdaptiveWindow(congestion.Config{
-			InitialWindow: 10, MinWindow: 2, MaxWindow: 10,
-		}),
-		id: 3,
-	}
+	ps := newDrainTestStream(ctx, 3)
 	ps.bytesSent.Store(12345)
 
-	pool := &StreamPool{
-		ctx:     ctx,
-		cancel:  cancel,
-		streams: []*PooledStream{ps},
-		logger:  testLogger,
-		errs:    make(chan error, 10),
-		acks:    make(chan *pb.PieceAck, 10),
-	}
+	pool := newDrainTestPool(ctx, cancel, ps)
 
 	// No in-flight pieces — drain completes immediately
 	pool.drainAndRemoveStream(ps)
@@ -1011,19 +962,7 @@ func TestHandlePlateau_TriggersConnectionAdd(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	pool := &StreamPool{
-		dest:          dest,
-		ctx:           ctx,
-		cancel:        cancel,
-		logger:        testLogger,
-		adaptive:      true,
-		scaleInterval: defaultScaleInterval,
-		streams:       make([]*PooledStream, 0),
-		errs:          make(chan error, 10),
-		acks:          make(chan *pb.PieceAck, 10),
-		ackReady:      make(chan struct{}, 10),
-		maxStreams:    MaxPoolSize,
-	}
+	pool := newAdaptiveScalingTestPool(ctx, cancel, dest, make([]*PooledStream, 0))
 
 	if dest.ConnectionCount() != 1 {
 		t.Fatalf("initial connections = %d, want 1", dest.ConnectionCount())
@@ -1096,19 +1035,7 @@ func TestHandlePlateau_FullSaturationPauses(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	pool := &StreamPool{
-		dest:          dest,
-		ctx:           ctx,
-		cancel:        cancel,
-		logger:        testLogger,
-		adaptive:      true,
-		scaleInterval: defaultScaleInterval,
-		streams:       newStubPooledStreams(MinPoolSize),
-		errs:          make(chan error, 10),
-		acks:          make(chan *pb.PieceAck, 10),
-		ackReady:      make(chan struct{}, 10),
-		maxStreams:    MaxPoolSize,
-	}
+	pool := newAdaptiveScalingTestPool(ctx, cancel, dest, newStubPooledStreams(MinPoolSize))
 
 	pool.mu.Lock()
 	pool.plateauCount = defaultPlateauCount // Trigger plateau handling
@@ -1146,19 +1073,7 @@ func TestDiminishingReturns_TriggersScaleDown(t *testing.T) {
 	defer cancel()
 
 	// Create stub streams on connection 0 (not connection 1 which will be removed)
-	pool := &StreamPool{
-		dest:          dest,
-		ctx:           ctx,
-		cancel:        cancel,
-		logger:        testLogger,
-		adaptive:      true,
-		scaleInterval: defaultScaleInterval,
-		streams:       newStubPooledStreams(MinPoolSize),
-		errs:          make(chan error, 10),
-		acks:          make(chan *pb.PieceAck, 10),
-		ackReady:      make(chan struct{}, 10),
-		maxStreams:    MaxPoolSize,
-	}
+	pool := newAdaptiveScalingTestPool(ctx, cancel, dest, newStubPooledStreams(MinPoolSize))
 
 	pool.mu.Lock()
 
@@ -1207,19 +1122,7 @@ func TestDiminishingReturns_GoodImprovement(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	pool := &StreamPool{
-		dest:          dest,
-		ctx:           ctx,
-		cancel:        cancel,
-		logger:        testLogger,
-		adaptive:      true,
-		scaleInterval: defaultScaleInterval,
-		streams:       newStubPooledStreams(MinPoolSize + 1),
-		errs:          make(chan error, 10),
-		acks:          make(chan *pb.PieceAck, 10),
-		ackReady:      make(chan struct{}, 10),
-		maxStreams:    MaxPoolSize,
-	}
+	pool := newAdaptiveScalingTestPool(ctx, cancel, dest, newStubPooledStreams(MinPoolSize+1))
 
 	pool.mu.Lock()
 

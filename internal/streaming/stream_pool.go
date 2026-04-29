@@ -94,8 +94,10 @@ type StreamPool struct {
 	nextID  int // Next stream ID to assign
 	mu      sync.RWMutex
 
-	// Aggregated channels from all streams
-	acks     chan *pb.PieceAck
+	// Aggregated channels from all streams. Each ack carries the source
+	// stream so the consumer can update the right window without an external
+	// piece-to-stream lookup.
+	acks     chan AckEnvelope
 	ackReady chan struct{}
 	errs     chan error // Aggregated errors from all streams
 
@@ -188,7 +190,7 @@ func NewStreamPool(
 		windowConfig:  config.AdaptiveWindow,
 		maxStreams:    maxStreams,
 		streams:       make([]*PooledStream, 0, maxStreams),
-		acks:          make(chan *pb.PieceAck, ackChannelSize*maxStreams),
+		acks:          make(chan AckEnvelope, ackChannelSize*maxStreams),
 		ackReady:      make(chan struct{}, maxStreams),
 		errs:          make(chan error, maxStreams), // Aggregated error channel
 		adaptive:      config.Adaptive,
@@ -325,9 +327,11 @@ func (p *StreamPool) forwardAcks(ps *PooledStream) { //nolint:gocognit // comple
 				return
 			}
 
-			// Forward to pool's aggregated ack channel (blocking with context)
+			// Forward to pool's aggregated ack channel (blocking with context).
+			// Pair the ack with its source stream so processAck can update the
+			// right window without a separate piece-to-stream map.
 			select {
-			case p.acks <- ack:
+			case p.acks <- AckEnvelope{Ack: ack, Stream: ps}:
 				// Signal that an ack is ready (non-blocking)
 				select {
 				case p.ackReady <- struct{}{}:
@@ -835,8 +839,16 @@ func (p *StreamPool) TotalInFlight() int {
 }
 
 // Acks returns the aggregated ack channel from all streams.
-func (p *StreamPool) Acks() <-chan *pb.PieceAck {
+func (p *StreamPool) Acks() <-chan AckEnvelope {
 	return p.acks
+}
+
+// AckEnvelope pairs a PieceAck with the stream that delivered it. The ack
+// processor uses Stream to update the correct congestion window without an
+// external piece-to-stream lookup map.
+type AckEnvelope struct {
+	Ack    *pb.PieceAck
+	Stream *PooledStream
 }
 
 // AckReady returns a channel that signals when acks are available.

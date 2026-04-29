@@ -251,71 +251,6 @@ func TestWritePieceData_SkipsUnselectedFiles(t *testing.T) {
 	}
 }
 
-// --- Persistence tests ---
-
-func TestSaveLoadSelectedFile(t *testing.T) {
-	t.Parallel()
-
-	t.Run("roundtrip", func(t *testing.T) {
-		t.Parallel()
-		tmpDir := t.TempDir()
-
-		files := []*serverFileInfo{
-			{selected: true},
-			{selected: false},
-			{selected: true},
-			{selected: false},
-		}
-
-		if err := saveSelectedFile(tmpDir, files); err != nil {
-			t.Fatalf("saveSelectedFile: %v", err)
-		}
-
-		loaded := loadSelectedFile(tmpDir, 4)
-		if loaded == nil {
-			t.Fatal("loadSelectedFile returned nil")
-		}
-
-		expected := []bool{true, false, true, false}
-		for i, want := range expected {
-			if loaded[i] != want {
-				t.Errorf("file %d: got %v, want %v", i, loaded[i], want)
-			}
-		}
-	})
-
-	t.Run("missing file returns nil", func(t *testing.T) {
-		t.Parallel()
-		tmpDir := t.TempDir()
-		loaded := loadSelectedFile(tmpDir, 3)
-		if loaded != nil {
-			t.Error("expected nil for missing file")
-		}
-	})
-
-	t.Run("file shorter than numFiles pads with false", func(t *testing.T) {
-		t.Parallel()
-		tmpDir := t.TempDir()
-
-		// Save 2 files, then load expecting 4
-		files := []*serverFileInfo{
-			{selected: true},
-			{selected: false},
-		}
-		if err := saveSelectedFile(tmpDir, files); err != nil {
-			t.Fatal(err)
-		}
-
-		loaded := loadSelectedFile(tmpDir, 4)
-		if loaded == nil {
-			t.Fatal("loadSelectedFile returned nil")
-		}
-		if !loaded[0] || loaded[1] || loaded[2] || loaded[3] {
-			t.Errorf("loaded = %v, want [true false false false]", loaded)
-		}
-	})
-}
-
 // --- setupFile tests for unselected files ---
 
 func TestSetupFile_UnselectedFile(t *testing.T) {
@@ -329,7 +264,7 @@ func TestSetupFile_UnselectedFile(t *testing.T) {
 		s := &Server{
 			config: ServerConfig{BasePath: tmpDir},
 			logger: logger,
-			inodes: NewInodeRegistry(tmpDir, logger),
+			store:  newTorrentStore(tmpDir, logger),
 		}
 
 		fileInfo, result, err := s.setupFile(ctx, "hash1", &pb.FileInfo{
@@ -367,7 +302,7 @@ func TestSetupFile_UnselectedFile(t *testing.T) {
 func TestFinalizeTorrent_PartialSelection(t *testing.T) {
 	t.Parallel()
 	s, tmpDir := newTestDestServer(t)
-	s.inodes = NewInodeRegistry(tmpDir, testLogger(t))
+	// InodeRegistry already initialized by newTorrentStore
 
 	hash := "partial-select-finalize"
 
@@ -400,9 +335,9 @@ func TestFinalizeTorrent_PartialSelection(t *testing.T) {
 	}
 
 	// Register state
-	s.mu.Lock()
-	s.torrents[hash] = state
-	s.mu.Unlock()
+	s.store.mu.Lock()
+	s.store.entries[hash] = state
+	s.store.mu.Unlock()
 
 	ctx := context.Background()
 
@@ -413,7 +348,6 @@ func TestFinalizeTorrent_PartialSelection(t *testing.T) {
 		Offset:      0,
 		Size:        16,
 		Data:        pieceData0,
-		PieceHash:   pieceHash0,
 	})
 	if !result.success {
 		t.Fatalf("writePiece 0 failed: %s", result.errMsg)
@@ -426,7 +360,6 @@ func TestFinalizeTorrent_PartialSelection(t *testing.T) {
 		Offset:      32,
 		Size:        16,
 		Data:        pieceData2,
-		PieceHash:   pieceHash2,
 	})
 	if !result.success {
 		t.Fatalf("writePiece 2 failed: %s", result.errMsg)
@@ -524,7 +457,7 @@ func TestClearStalePieces(t *testing.T) {
 func TestInitTorrent_StaleMetadata_NukedBeforeInit(t *testing.T) {
 	t.Parallel()
 	s, tmpDir := newTestDestServer(t)
-	s.inodes = NewInodeRegistry(tmpDir, testLogger(t))
+	// InodeRegistry already initialized by newTorrentStore
 
 	hash := "stale-init-test"
 
@@ -564,14 +497,10 @@ func TestInitTorrent_StaleMetadata_NukedBeforeInit(t *testing.T) {
 		t.Errorf("expected 3 pieces needed (stale state nuked), got %d", resp.GetPiecesNeededCount())
 	}
 
-	// Version file should exist now.
-	versionPath := filepath.Join(metaDir, versionFileName)
-	data, readErr := os.ReadFile(versionPath)
-	if readErr != nil {
-		t.Fatalf("version file missing after init: %v", readErr)
-	}
-	if string(data) != metaVersion {
-		t.Errorf("version = %q, want %q", string(data), metaVersion)
+	// .meta file should exist now.
+	metaPath := filepath.Join(metaDir, metaFileName)
+	if _, statErr := os.Stat(metaPath); statErr != nil {
+		t.Fatalf(".meta file missing after init: %v", statErr)
 	}
 }
 
@@ -579,8 +508,7 @@ func TestInitTorrent_StaleMetadata_NukedBeforeInit(t *testing.T) {
 
 func TestInitTorrent_PartialSelection_PiecesCovered(t *testing.T) {
 	t.Parallel()
-	s, tmpDir := newTestDestServer(t)
-	s.inodes = NewInodeRegistry(tmpDir, testLogger(t))
+	s, _ := newTestDestServer(t)
 
 	// 3 files, 3 pieces. File 1 is unselected -> piece 1 should be "covered" (not needed)
 	resp, err := s.InitTorrent(context.Background(), &pb.InitTorrentRequest{

@@ -33,11 +33,12 @@ func TestFlushDirtyStates_ReleasesLockDuringIO(t *testing.T) {
 		piecesSinceFlush: 1,
 	}
 
+	store := newTorrentStore(tmpDir, logger)
+	store.entries["deadlock-test"] = state
 	s := &Server{
-		config:         ServerConfig{BasePath: tmpDir},
-		logger:         logger,
-		torrents:       map[string]*serverTorrentState{"deadlock-test": state},
-		abortingHashes: make(map[string]chan struct{}),
+		config: ServerConfig{BasePath: tmpDir},
+		logger: logger,
+		store:  store,
 	}
 
 	// saveStateFunc blocks until unblockIO is closed, simulating slow disk I/O.
@@ -115,11 +116,12 @@ func TestFlushDirtyStates_ConcurrentWritesDuringIO(t *testing.T) {
 		piecesSinceFlush: 5,
 	}
 
+	store := newTorrentStore(tmpDir, logger)
+	store.entries["concurrent-test"] = state
 	s := &Server{
-		config:         ServerConfig{BasePath: tmpDir},
-		logger:         logger,
-		torrents:       map[string]*serverTorrentState{"concurrent-test": state},
-		abortingHashes: make(map[string]chan struct{}),
+		config: ServerConfig{BasePath: tmpDir},
+		logger: logger,
+		store:  store,
 	}
 
 	// During the I/O phase, simulate new pieces arriving.

@@ -2,14 +2,14 @@ pre-commit:
   commands:
     lint:
       glob: "*.go"
-      run: golangci-lint run --fix
+      run: mise exec -- golangci-lint run --fix
       stage_fixed: true
 
 pre-push:
   commands:
     test:
       glob: "*.go"
-      run: go test ./internal/... -short -count=1
+      run: mise exec -- go test ./internal/... -short -count=1
     vet-e2e:
       glob: "*.go"
-      run: go vet -tags=e2e ./test/e2e/...
+      run: mise exec -- go vet -tags=e2e ./test/e2e/...

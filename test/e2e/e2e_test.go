@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -926,6 +927,94 @@ func TestE2E_OrchestratorRestart(t *testing.T) {
 	env.CleanupBothSides(ctx, wiredCDHash)
 }
 
+// TestE2E_DestinationRecoveryResumesProgress tests that the destination server recovers
+// in-memory state from persisted .state files after a restart. A new orchestrator connecting
+// after restart should resume from where it left off, not re-stream everything.
+//
+// Flow:
+//  1. Download torrent on source, wait for completion
+//  2. Start orchestrator, wait for at least 50% streaming progress
+//  3. Stop orchestrator (cancel, wait, close dest connection)
+//  4. Stop destination gRPC server
+//  5. Restart destination gRPC server (triggers recoverInFlightTorrents)
+//  6. Start a NEW orchestrator with a new dest connection
+//  7. Wait for sync to complete
+//  8. Assert torrent is complete on destination
+func TestE2E_DestinationRecoveryResumesProgress(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+
+	t.Parallel()
+
+	env := SetupTestEnv(t)
+	ctx := context.Background()
+
+	env.CleanupBothSides(ctx, wiredCDHash)
+
+	t.Log("Adding Wired CD torrent to source...")
+	env.DownloadTorrentOnSource(ctx, testTorrentURL, wiredCDHash, torrentDownloadTimeout)
+
+	cfg := env.CreateSourceConfig()
+	task, dest, err := env.CreateSourceTask(cfg)
+	require.NoError(t, err)
+
+	orchestratorCtx, cancelOrchestrator := context.WithTimeout(ctx, orchestratorTimeout)
+
+	orchestratorDone := make(chan error, 1)
+	go func() {
+		orchestratorDone <- task.Run(orchestratorCtx)
+	}()
+
+	t.Log("Waiting for streaming to reach 50%...")
+	require.Eventually(t, func() bool {
+		progress, progressErr := task.Progress(ctx, wiredCDHash)
+		if progressErr != nil {
+			return false
+		}
+		t.Logf("Streaming progress: %d/%d pieces", progress.Streamed, progress.TotalPieces)
+		return progress.Streamed > 0 && progress.Streamed >= progress.TotalPieces/2
+	}, 2*time.Minute, time.Second, "streaming should reach 50%")
+
+	t.Log("Stopping first orchestrator...")
+	cancelOrchestrator()
+	<-orchestratorDone
+	dest.Close()
+
+	t.Log("Stopping destination gRPC server...")
+	env.StopDestinationServer()
+	time.Sleep(2 * time.Second)
+
+	t.Log("Restarting destination gRPC server (triggers recoverInFlightTorrents)...")
+	env.StartDestinationServer()
+
+	t.Log("Starting new orchestrator after destination recovery...")
+	task2, dest2, err := env.CreateSourceTask(cfg)
+	require.NoError(t, err)
+	defer dest2.Close()
+
+	orchestratorCtx2, cancelOrchestrator2 := context.WithTimeout(ctx, syncCompleteTimeout)
+	defer cancelOrchestrator2()
+
+	orchestratorDone2 := make(chan error, 1)
+	go func() {
+		orchestratorDone2 <- task2.Run(orchestratorCtx2)
+	}()
+
+	t.Log("Waiting for sync to complete after destination recovery...")
+	env.WaitForTorrentCompleteOnDestination(ctx, wiredCDHash, syncCompleteTimeout,
+		"torrent should complete on destination after recovery")
+
+	cancelOrchestrator2()
+	<-orchestratorDone2
+
+	env.AssertTorrentCompleteOnDestination(ctx, wiredCDHash)
+
+	t.Log("Destination recovery resumes progress test completed successfully!")
+
+	env.CleanupBothSides(ctx, wiredCDHash)
+}
+
 // TestE2E_HardlinkDetection verifies that hardlink detection works in the Docker test environment.
 // This is a prerequisite for the hardlink grouping logic used during space management.
 func TestE2E_HardlinkDetection(t *testing.T) {
@@ -952,9 +1041,9 @@ func TestE2E_HardlinkDetection(t *testing.T) {
 	assert.True(t, linked, "files should be detected as hardlinked")
 
 	// Verify inodes match
-	inode1, err := utils.GetInode(originalPath)
+	_, inode1, err := utils.GetFileID(originalPath)
 	require.NoError(t, err)
-	inode2, err := utils.GetInode(hardlinkPath)
+	_, inode2, err := utils.GetFileID(hardlinkPath)
 	require.NoError(t, err)
 	assert.Equal(t, inode1, inode2, "inodes should match for hardlinked files")
 
@@ -1062,9 +1151,9 @@ func TestE2E_HardlinkGroupDeletion(t *testing.T) {
 	t.Logf("Wired CD file: %s", wiredCDFilePath)
 
 	// Verify the original files exist and have different inodes
-	bbbInode, err := utils.GetInode(bbbFilePath)
+	_, bbbInode, err := utils.GetFileID(bbbFilePath)
 	require.NoError(t, err, "BBB file should exist")
-	wiredCDInode, err := utils.GetInode(wiredCDFilePath)
+	_, wiredCDInode, err := utils.GetFileID(wiredCDFilePath)
 	require.NoError(t, err, "Wired CD file should exist")
 	t.Logf("Original inodes - BBB: %d, Wired CD: %d", bbbInode, wiredCDInode)
 	require.NotEqual(t, bbbInode, wiredCDInode, "files should have different inodes initially")
@@ -1146,22 +1235,24 @@ func TestE2E_DestinationHardlinkDeduplication(t *testing.T) {
 
 	t.Log("Getting inodes of files on SOURCE filesystem...")
 	type fileWithInode struct {
-		path  string
-		size  int64
-		inode uint64
+		path   string
+		size   int64
+		device uint64
+		inode  uint64
 	}
 	var sourceFileInodes []fileWithInode
 
 	for _, f := range *sourceFiles {
 		filePath := filepath.Join(env.SourcePath(), f.Name)
-		inode, inodeErr := utils.GetInode(filePath)
+		dev, ino, inodeErr := utils.GetFileID(filePath)
 		require.NoError(t, inodeErr, "should be able to get inode for %s", filePath)
 		sourceFileInodes = append(sourceFileInodes, fileWithInode{
-			path:  f.Name,
-			size:  f.Size,
-			inode: inode,
+			path:   f.Name,
+			size:   f.Size,
+			device: dev,
+			inode:  ino,
 		})
-		t.Logf("  SOURCE File: %s, Size: %d, Inode: %d", f.Name, f.Size, inode)
+		t.Logf("  SOURCE File: %s, Size: %d, Device: %d, Inode: %d", f.Name, f.Size, dev, ino)
 	}
 
 	// Create source task and run orchestrator to sync to destination
@@ -1203,7 +1294,8 @@ func TestE2E_DestinationHardlinkDeduplication(t *testing.T) {
 			Path:     "FakeTorrentB/" + baseName, // Different path, same HOT inode
 			Size:     f.size,
 			Offset:   offset,
-			Inode:    f.inode, // Same SOURCE inode - this triggers hardlink detection!
+			Device:   f.device, // Same SOURCE device+inode - this triggers hardlink detection!
+			Inode:    f.inode,
 			Selected: true,
 		})
 		offset += f.size
@@ -1267,9 +1359,9 @@ func TestE2E_DestinationHardlinkDeduplication(t *testing.T) {
 		require.NoError(t, statErr, "hardlinked file should exist: %s", hardlinkPath)
 
 		// Verify they share the same destination inode (are actually hardlinked on destination)
-		originalInode, err := utils.GetInode(originalPath)
+		_, originalInode, err := utils.GetFileID(originalPath)
 		require.NoError(t, err)
-		hardlinkInode, err := utils.GetInode(hardlinkPath)
+		_, hardlinkInode, err := utils.GetFileID(hardlinkPath)
 		require.NoError(t, err)
 
 		assert.Equal(t, originalInode, hardlinkInode,
@@ -1759,17 +1851,18 @@ func TestE2E_ExcludeSyncTag(t *testing.T) {
 //
 // Note: the in-progress abort path (abortExcludedTracked) is covered by unit tests.
 // Big Buck Bunny syncs too fast (~15s) to reliably catch mid-sync in E2E, so this
-// test exercises the completed-torrent path (forgetExcludedCompleted).
+// test exercises the completed-torrent path (quiesceExcludedCompleted).
 //
 // Strategy:
 //  1. Download Big Buck Bunny on source (no tag)
 //  2. Start the orchestrator — torrent syncs to destination
 //  3. Wait for torrent to be in the source's completedOnDest cache
 //  4. Apply exclude-sync tag
-//  5. Assert: torrent is forgotten from completedOnDest cache
+//  5. Assert: completion-cache entry remains (preserved as authoritative
+//     record for safe-handoff in handleTorrentRemoval)
 //  6. Assert: torrent still exists on destination (files preserved for completed torrents)
 //  7. Remove the tag
-//  8. Assert: orchestrator re-discovers torrent as complete on destination
+//  8. Assert: orchestrator continues to recognize the torrent as complete
 func TestE2E_ExcludeSyncTagReactive(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")
@@ -1819,18 +1912,24 @@ func TestE2E_ExcludeSyncTagReactive(t *testing.T) {
 	err = env.SourceClient().AddTagsCtx(ctx, []string{bigBuckBunnyHash}, "no-sync")
 	require.NoError(t, err)
 
-	// Step 5: Wait for the torrent to be forgotten from completedOnDest cache.
-	t.Log("Waiting for torrent to be forgotten from completedOnDest cache...")
-	require.Eventually(t, func() bool {
-		for _, hash := range task.FetchCompletedOnDestination() {
-			if hash == bigBuckBunnyHash {
-				return false
-			}
+	// Step 5: Confirm the completion-cache entry is preserved. We must keep
+	// the entry so a subsequent source-side removal takes the safe handoff
+	// path instead of deleting destination data of a finalized torrent.
+	// Sleep through a full check-excluded cycle (~10s) and verify the entry
+	// survives.
+	t.Log("Verifying completion-cache entry survives a check-excluded cycle...")
+	time.Sleep(15 * time.Second)
+	stillCached := false
+	for _, hash := range task.FetchCompletedOnDestination() {
+		if hash == bigBuckBunnyHash {
+			stillCached = true
+			break
 		}
-		return true
-	}, 30*time.Second, pollInterval,
-		"torrent should be forgotten from completedOnDest after exclude tag is applied")
-	t.Log("Confirmed: torrent was forgotten from completedOnDest cache")
+	}
+	require.True(t, stillCached,
+		"torrent should remain in completedOnDest after exclude tag is applied "+
+			"(preserved as authoritative record for safe-handoff)")
+	t.Log("Confirmed: completion-cache entry preserved")
 
 	// Step 6: Verify the torrent still exists on destination (files preserved for completed torrents).
 	destTorrents, err := env.DestinationClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
@@ -1841,13 +1940,14 @@ func TestE2E_ExcludeSyncTagReactive(t *testing.T) {
 		"torrent should still exist on destination (completed torrents are preserved)")
 	t.Log("Confirmed: torrent files preserved on destination")
 
-	// Step 7: Remove the tag — orchestrator should re-discover it as complete.
+	// Step 7: Remove the tag — orchestrator continues to recognize the
+	// torrent as complete (entry was never evicted).
 	t.Log("Removing 'no-sync' tag...")
 	err = env.SourceClient().RemoveTagsCtx(ctx, []string{bigBuckBunnyHash}, "no-sync")
 	require.NoError(t, err)
 
-	// Step 8: Wait for the torrent to re-appear in completedOnDest cache.
-	t.Log("Waiting for orchestrator to re-discover torrent as complete...")
+	// Step 8: Confirm the torrent is still in the cache after tag removal.
+	t.Log("Confirming torrent remains complete on destination after tag removal...")
 	require.Eventually(t, func() bool {
 		for _, hash := range task.FetchCompletedOnDestination() {
 			if hash == bigBuckBunnyHash {
@@ -1856,7 +1956,7 @@ func TestE2E_ExcludeSyncTagReactive(t *testing.T) {
 		}
 		return false
 	}, syncCompleteTimeout, pollInterval,
-		"torrent should be re-discovered as complete after tag removal")
+		"torrent should remain in completedOnDest after tag removal")
 
 	cancelOrchestrator()
 	<-orchestratorDone
@@ -1864,6 +1964,512 @@ func TestE2E_ExcludeSyncTagReactive(t *testing.T) {
 	env.AssertTorrentCompleteOnDestination(ctx, bigBuckBunnyHash)
 
 	t.Log("Reactive exclude-sync tag E2E test completed successfully!")
+
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
+}
+
+// TestE2E_RemovedCompletedAutoHandoff regression-tests the fix that makes
+// destination pick up seeding when the user removes a completed torrent
+// from source qB. PieceMonitor.removeAndNotify only fires for *tracked*
+// torrents, so completed (untracked) torrents removed from source bypass
+// handleTorrentRemoval entirely. Before the fix, the destination silently
+// stayed stopped; after the fix, pruneCompletedOnDest detects the
+// disappearance, calls StartTorrent with the source-removed tag, and
+// prunes the cache entry.
+func TestE2E_RemovedCompletedAutoHandoff(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+
+	t.Parallel()
+
+	env := SetupTestEnv(t)
+	ctx := context.Background()
+
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
+
+	t.Log("Downloading and syncing Big Buck Bunny end-to-end...")
+	env.DownloadTorrentOnSource(ctx, bigBuckBunnyURL, bigBuckBunnyHash, torrentDownloadTimeout)
+
+	// Disable disk-pressure cleanup so maybeMoveToDest doesn't auto-hand off
+	// the torrent before our test reaches the assertion (qB briefly reports
+	// freeGB=0 during startup which triggers default min-space=1 cleanup).
+	cfg := env.CreateSourceConfig(
+		WithSourceRemovedTag("source-removed"),
+		WithMinSpaceGB(0),
+	)
+	task, dest, err := env.CreateSourceTask(cfg)
+	require.NoError(t, err)
+	defer dest.Close()
+
+	syncCtx, cancelSync := context.WithCancel(ctx)
+	syncDone := make(chan error, 1)
+	go func() {
+		syncDone <- task.Run(syncCtx)
+	}()
+
+	require.Eventually(t, func() bool {
+		for _, hash := range task.FetchCompletedOnDestination() {
+			if hash == bigBuckBunnyHash {
+				return true
+			}
+		}
+		return false
+	}, syncCompleteTimeout, pollInterval, "torrent should be in completedOnDest cache")
+	env.AssertTorrentCompleteOnDestination(ctx, bigBuckBunnyHash)
+
+	cancelSync()
+	<-syncDone
+
+	require.Eventually(t, func() bool {
+		return env.IsTorrentStopped(ctx, env.DestinationClient(), bigBuckBunnyHash)
+	}, 15*time.Second, time.Second,
+		"baseline: dest torrent must be stopped after a fresh sync (no dual seeding)")
+
+	t.Log("Removing Big Buck Bunny from source qB (the user-visible action)...")
+	require.NoError(t, env.SourceClient().DeleteTorrentsCtx(ctx, []string{bigBuckBunnyHash}, true))
+
+	// Drive the prune cycle directly rather than waiting for the natural
+	// 50-cycle (~50s) interval. The unit-test-grade exported entrypoint
+	// matches MaybeMoveToDest's testing pattern.
+	t.Log("Triggering pruneCompletedOnDest...")
+	pruneCtx, pruneCancel := context.WithTimeout(ctx, 30*time.Second)
+	task.PruneCompletedOnDest(pruneCtx)
+	pruneCancel()
+
+	require.Eventually(t, func() bool {
+		torrents, getErr := env.DestinationClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+			Hashes: []string{bigBuckBunnyHash},
+		})
+		if getErr != nil || len(torrents) == 0 {
+			return false
+		}
+		return strings.Contains(torrents[0].Tags, "source-removed")
+	}, 30*time.Second, pollInterval,
+		"destination torrent must receive the source-removed tag — proves "+
+			"pruneCompletedOnDest invoked StartTorrent on the disappeared torrent")
+
+	require.Eventually(t, func() bool {
+		torrents, getErr := env.DestinationClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+			Hashes: []string{bigBuckBunnyHash},
+		})
+		if getErr != nil || len(torrents) == 0 {
+			return false
+		}
+		// After StartTorrent, the torrent should leave the stopped state.
+		return !env.IsTorrentStopped(ctx, env.DestinationClient(), bigBuckBunnyHash)
+	}, 15*time.Second, time.Second,
+		"destination torrent must transition out of stopped state after handoff")
+
+	// Cache entry should be pruned post-handoff.
+	for _, hash := range task.FetchCompletedOnDestination() {
+		require.NotEqual(t, bigBuckBunnyHash, hash,
+			"cache entry should be pruned after a successful handoff")
+	}
+
+	t.Log("Confirmed: removed-from-source torrent auto-hands-off to destination")
+
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
+}
+
+// TestE2E_DestinationRecoveryMidStream tests genuine mid-stream recovery.
+// The destination server is stopped while only partially synced, then restarted.
+// A new orchestrator is started and verifies the remaining pieces get streamed
+// and the torrent completes on the destination.
+//
+// Flow:
+//  1. Download Wired CD torrent on source
+//  2. Start orchestrator with WithNumSenders(1) to slow streaming
+//  3. Wait for at least 10% but less than 90% streaming progress
+//  4. Stop orchestrator + stop destination server
+//  5. Restart destination server (triggers recoverInFlightTorrents)
+//  6. Start new orchestrator (normal speed)
+//  7. Wait for sync to complete
+//  8. Assert torrent complete on destination
+func TestE2E_DestinationRecoveryMidStream(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+
+	t.Parallel()
+
+	env := SetupTestEnv(t)
+	ctx := context.Background()
+
+	env.CleanupBothSides(ctx, wiredCDHash)
+
+	// Add the torrent but do NOT wait for download completion. Start the
+	// orchestrator immediately so streaming is paced by download speed,
+	// giving us a window to catch mid-stream progress.
+	t.Log("Adding Wired CD torrent to source (not waiting for download)...")
+	err := env.AddTorrentToSource(ctx, testTorrentURL, nil)
+	require.NoError(t, err)
+
+	torrent := env.WaitForTorrent(env.SourceClient(), wiredCDHash, torrentAppearTimeout)
+	require.NotNil(t, torrent)
+
+	// Use a single sender and single gRPC connection to slow streaming.
+	cfg := env.CreateSourceConfig(WithNumSenders(1), WithGRPCConnections(1, 1))
+	task, dest, err := env.CreateSourceTask(cfg)
+	require.NoError(t, err)
+
+	orchestratorCtx, cancelOrchestrator := context.WithTimeout(ctx, orchestratorTimeout)
+
+	orchestratorDone := make(chan error, 1)
+	go func() {
+		orchestratorDone <- task.Run(orchestratorCtx)
+	}()
+
+	// Wait for streaming to make some progress (at least 1 piece streamed).
+	t.Log("Waiting for streaming to make progress...")
+	require.Eventually(t, func() bool {
+		progress, progressErr := task.Progress(ctx, wiredCDHash)
+		if progressErr != nil {
+			return false
+		}
+		t.Logf("Streaming progress: %d/%d pieces", progress.Streamed, progress.TotalPieces)
+		return progress.Streamed > 0 && progress.Streamed >= progress.TotalPieces/10
+	}, 3*time.Minute, time.Second, "streaming should start and make progress")
+
+	// Immediately stop orchestrator and destination server.
+	t.Log("Stopping orchestrator...")
+	cancelOrchestrator()
+	<-orchestratorDone
+	dest.Close()
+
+	t.Log("Stopping destination gRPC server...")
+	env.StopDestinationServer()
+	time.Sleep(2 * time.Second)
+
+	t.Log("Restarting destination gRPC server (triggers recoverInFlightTorrents)...")
+	env.StartDestinationServer()
+
+	// Wait for the source torrent download to complete before starting the
+	// new orchestrator (the first orchestrator may have stopped before download
+	// finished).
+	t.Log("Ensuring source torrent download is complete...")
+	env.WaitForTorrentComplete(env.SourceClient(), wiredCDHash, torrentDownloadTimeout)
+
+	// Start a new orchestrator at normal speed.
+	t.Log("Starting new orchestrator after destination recovery...")
+	cfg2 := env.CreateSourceConfig()
+	task2, dest2, err := env.CreateSourceTask(cfg2)
+	require.NoError(t, err)
+	defer dest2.Close()
+
+	orchestratorCtx2, cancelOrchestrator2 := context.WithTimeout(ctx, syncCompleteTimeout)
+	defer cancelOrchestrator2()
+
+	orchestratorDone2 := make(chan error, 1)
+	go func() {
+		orchestratorDone2 <- task2.Run(orchestratorCtx2)
+	}()
+
+	t.Log("Waiting for sync to complete after mid-stream recovery...")
+	env.WaitForTorrentCompleteOnDestination(ctx, wiredCDHash, syncCompleteTimeout,
+		"torrent should complete on destination after mid-stream recovery")
+
+	cancelOrchestrator2()
+	<-orchestratorDone2
+
+	env.AssertTorrentCompleteOnDestination(ctx, wiredCDHash)
+
+	t.Log("Destination recovery mid-stream test completed successfully!")
+
+	env.CleanupBothSides(ctx, wiredCDHash)
+}
+
+// TestE2E_PartialSelectionWithRestart verifies that partial file selection survives
+// a destination server restart. After syncing a torrent with deselected files, the
+// destination server is restarted and a new orchestrator connects. The test asserts
+// that the same files exist (and don't exist) as before the restart.
+//
+// Flow:
+//  1. Download Wired CD torrent on source (multi-file, 18 files)
+//  2. Deselect files 5, 6, 7 on source (priority 0)
+//  3. Start orchestrator, wait for sync to complete
+//  4. Record which files exist on destination
+//  5. Stop orchestrator, stop destination server, restart it
+//  6. Start new orchestrator
+//  7. Wait for it to see the torrent as complete
+//  8. Assert the same files exist/don't exist as before restart
+func TestE2E_PartialSelectionWithRestart(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+
+	t.Parallel()
+
+	env := SetupTestEnv(t)
+	ctx := context.Background()
+
+	env.CleanupBothSides(ctx, wiredCDHash)
+
+	// Deselected file indices (0-based).
+	deselectedIndices := map[int]bool{5: true, 6: true, 7: true}
+
+	// Step 1: Add torrent to source in stopped state so we can set priorities.
+	t.Log("Adding Wired CD torrent to source (stopped)...")
+	err := env.AddTorrentToSource(ctx, testTorrentURL, map[string]string{
+		"stopped": "true",
+	})
+	require.NoError(t, err)
+
+	torrent := env.WaitForTorrent(env.SourceClient(), wiredCDHash, torrentAppearTimeout)
+	require.NotNil(t, torrent)
+
+	// Wait for metadata to be available (files list populated).
+	var files *qbittorrent.TorrentFiles
+	require.Eventually(t, func() bool {
+		f, filesErr := env.SourceClient().GetFilesInformationCtx(ctx, wiredCDHash)
+		if filesErr != nil || f == nil || len(*f) == 0 {
+			return false
+		}
+		files = f
+		return true
+	}, 30*time.Second, time.Second, "torrent metadata should be available")
+	require.GreaterOrEqual(t, len(*files), 10, "Wired CD should have multiple files")
+
+	// Step 2: Set file priorities — deselect files 5, 6, 7 (priority 0).
+	ids := make([]string, 0, len(deselectedIndices))
+	for idx := range deselectedIndices {
+		ids = append(ids, strconv.Itoa(idx))
+	}
+	t.Logf("Deselecting files: %v", ids)
+	err = env.SourceClient().SetFilePriorityCtx(ctx, wiredCDHash, strings.Join(ids, "|"), 0)
+	require.NoError(t, err)
+
+	// Step 3: Resume torrent and wait for download to complete.
+	t.Log("Resuming torrent...")
+	err = env.SourceClient().ResumeCtx(ctx, []string{wiredCDHash})
+	require.NoError(t, err)
+
+	t.Log("Waiting for selected files to download...")
+	env.WaitForTorrentComplete(env.SourceClient(), wiredCDHash, torrentDownloadTimeout)
+
+	// Build expected file paths on the destination filesystem.
+	type fileExpectation struct {
+		name     string
+		destPath string
+		selected bool
+	}
+	expectations := make([]fileExpectation, len(*files))
+	for i, f := range *files {
+		expectations[i] = fileExpectation{
+			name:     f.Name,
+			destPath: filepath.Join(env.DestinationPath(), f.Name),
+			selected: !deselectedIndices[f.Index],
+		}
+	}
+
+	// Step 4: Start orchestrator and sync.
+	t.Log("Starting orchestrator...")
+	cfg := env.CreateSourceConfig()
+	task, dest, err := env.CreateSourceTask(cfg)
+	require.NoError(t, err)
+
+	orchestratorCtx, cancelOrchestrator := context.WithTimeout(ctx, orchestratorTimeout)
+
+	orchestratorDone := make(chan error, 1)
+	go func() {
+		orchestratorDone <- task.Run(orchestratorCtx)
+	}()
+
+	t.Log("Waiting for torrent to sync to destination...")
+	env.WaitForTorrentCompleteOnDestination(ctx, wiredCDHash, syncCompleteTimeout,
+		"torrent with partial file selection should sync to destination")
+
+	// Stop orchestrator before restart sequence.
+	cancelOrchestrator()
+	<-orchestratorDone
+	dest.Close()
+
+	// Step 5: Verify files exist/don't exist BEFORE restart.
+	t.Log("Verifying file selection on destination BEFORE restart...")
+	for _, exp := range expectations {
+		_, statErr := os.Stat(exp.destPath)
+		if exp.selected {
+			require.NoError(t, statErr,
+				"selected file should exist on destination before restart: %s", exp.name)
+		} else {
+			assert.True(t, os.IsNotExist(statErr),
+				"deselected file should NOT exist on destination before restart: %s", exp.name)
+		}
+	}
+
+	// Step 6: Stop destination server and restart it.
+	t.Log("Stopping destination gRPC server...")
+	env.StopDestinationServer()
+	time.Sleep(2 * time.Second)
+
+	t.Log("Restarting destination gRPC server...")
+	env.StartDestinationServer()
+
+	// Step 7: Start new orchestrator and wait for it to see the torrent as complete.
+	t.Log("Starting new orchestrator after destination restart...")
+	cfg2 := env.CreateSourceConfig()
+	task2, dest2, err := env.CreateSourceTask(cfg2)
+	require.NoError(t, err)
+	defer dest2.Close()
+
+	orchestratorCtx2, cancelOrchestrator2 := context.WithTimeout(ctx, syncCompleteTimeout)
+	defer cancelOrchestrator2()
+
+	orchestratorDone2 := make(chan error, 1)
+	go func() {
+		orchestratorDone2 <- task2.Run(orchestratorCtx2)
+	}()
+
+	// The torrent was already finalized, so the orchestrator should recognize it quickly.
+	t.Log("Waiting for orchestrator to confirm torrent is complete...")
+	env.WaitForTorrentCompleteOnDestination(ctx, wiredCDHash, syncCompleteTimeout,
+		"torrent should still be complete on destination after restart")
+
+	cancelOrchestrator2()
+	<-orchestratorDone2
+
+	// Step 8: Verify the same files exist/don't exist AFTER restart.
+	t.Log("Verifying file selection on destination AFTER restart...")
+	for _, exp := range expectations {
+		_, statErr := os.Stat(exp.destPath)
+		if exp.selected {
+			require.NoError(t, statErr,
+				"selected file should still exist on destination after restart: %s", exp.name)
+		} else {
+			assert.True(t, os.IsNotExist(statErr),
+				"deselected file should still NOT exist on destination after restart: %s", exp.name)
+		}
+	}
+
+	env.AssertTorrentCompleteOnDestination(ctx, wiredCDHash)
+
+	// Verify destination qBittorrent also reports deselected files correctly.
+	destFiles, err := env.DestinationClient().GetFilesInformationCtx(ctx, wiredCDHash)
+	require.NoError(t, err)
+	require.NotNil(t, destFiles)
+	for _, cf := range *destFiles {
+		if deselectedIndices[cf.Index] {
+			assert.Equal(t, 0, cf.Priority,
+				"deselected file %d should have priority 0 on destination after restart", cf.Index)
+		}
+	}
+
+	t.Log("Partial selection with restart E2E test completed successfully!")
+
+	env.CleanupBothSides(ctx, wiredCDHash)
+}
+
+// TestE2E_FinalizedTorrentSkippedOnRecovery verifies that a finalized torrent
+// (one where the .finalized marker exists) is NOT re-initialized on destination
+// recovery. After a full sync and restart, CheckTorrentStatus should return
+// COMPLETE immediately and the orchestrator should skip re-streaming.
+//
+// Flow:
+//  1. Download Big Buck Bunny torrent on source
+//  2. Start orchestrator, wait for sync to complete
+//  3. Assert torrent complete on destination
+//  4. Stop orchestrator, stop destination server, restart it
+//  5. Start new orchestrator
+//  6. Assert torrent is still complete on destination
+//  7. Assert orchestrator sees it as already synced (no re-streaming)
+func TestE2E_FinalizedTorrentSkippedOnRecovery(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+
+	t.Parallel()
+
+	env := SetupTestEnv(t)
+	ctx := context.Background()
+
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
+
+	// Step 1: Download Big Buck Bunny on source.
+	t.Log("Adding Big Buck Bunny torrent to source...")
+	env.DownloadTorrentOnSource(ctx, bigBuckBunnyURL, bigBuckBunnyHash, torrentDownloadTimeout)
+
+	// Step 2: Sync to destination.
+	cfg := env.CreateSourceConfig()
+	task, dest, err := env.CreateSourceTask(cfg)
+	require.NoError(t, err)
+
+	orchestratorCtx, cancelOrchestrator := context.WithTimeout(ctx, syncCompleteTimeout)
+
+	orchestratorDone := make(chan error, 1)
+	go func() {
+		orchestratorDone <- task.Run(orchestratorCtx)
+	}()
+
+	t.Log("Waiting for torrent to sync to destination...")
+	env.WaitForTorrentCompleteOnDestination(ctx, bigBuckBunnyHash, syncCompleteTimeout,
+		"torrent should be complete on destination")
+
+	// Wait for finalization to fully complete (synced tag on destination confirms it).
+	env.WaitForSyncedTagOnDestination(ctx, bigBuckBunnyHash, 30*time.Second,
+		"destination torrent should have 'synced' tag after finalization")
+
+	// Step 3: Stop orchestrator.
+	cancelOrchestrator()
+	<-orchestratorDone
+	dest.Close()
+
+	env.AssertTorrentCompleteOnDestination(ctx, bigBuckBunnyHash)
+	t.Log("Torrent fully synced and finalized on destination")
+
+	// Step 4: Stop destination server and restart it.
+	t.Log("Stopping destination gRPC server...")
+	env.StopDestinationServer()
+	time.Sleep(2 * time.Second)
+
+	t.Log("Restarting destination gRPC server...")
+	env.StartDestinationServer()
+
+	// Step 5: Start new orchestrator — it should see the torrent as already complete.
+	t.Log("Starting new orchestrator after destination restart...")
+	cfg2 := env.CreateSourceConfig()
+	task2, dest2, err := env.CreateSourceTask(cfg2)
+	require.NoError(t, err)
+	defer dest2.Close()
+
+	orchestratorCtx2, cancelOrchestrator2 := context.WithTimeout(ctx, syncCompleteTimeout)
+	defer cancelOrchestrator2()
+
+	orchestratorDone2 := make(chan error, 1)
+	go func() {
+		orchestratorDone2 <- task2.Run(orchestratorCtx2)
+	}()
+
+	// The orchestrator should detect the torrent as already synced via isFinalized
+	// and mark it as completed on destination. Wait for the completed cache to
+	// include the hash — this proves the orchestrator recognized it without
+	// re-streaming.
+	t.Log("Waiting for orchestrator to recognize torrent as already complete...")
+	require.Eventually(t, func() bool {
+		for _, hash := range task2.FetchCompletedOnDestination() {
+			if hash == bigBuckBunnyHash {
+				return true
+			}
+		}
+		return false
+	}, syncCompleteTimeout, pollInterval,
+		"orchestrator should recognize finalized torrent as complete without re-streaming")
+
+	// Step 6: Assert the torrent is still complete on destination.
+	env.AssertTorrentCompleteOnDestination(ctx, bigBuckBunnyHash)
+
+	// Verify synced tag is still present on destination after restart.
+	destTorrents, err := env.DestinationClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+		Hashes: []string{bigBuckBunnyHash},
+	})
+	require.NoError(t, err)
+	require.Len(t, destTorrents, 1)
+	assert.Contains(t, destTorrents[0].Tags, "synced",
+		"destination torrent should retain 'synced' tag after restart")
+
+	cancelOrchestrator2()
+	<-orchestratorDone2
+
+	t.Log("Finalized torrent skipped on recovery test completed successfully!")
 
 	env.CleanupBothSides(ctx, bigBuckBunnyHash)
 }

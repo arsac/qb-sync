@@ -85,7 +85,6 @@ func makeDrainTestQueue(t *testing.T) *BidiQueue {
 		tracker:             NewPieceMonitor(nil, nil, logger, DefaultPieceMonitorConfig()),
 		logger:              logger,
 		config:              DefaultBidiQueueConfig(),
-		pieceStreams:        make(map[string]*PooledStream),
 		pieceHashMismatches: make(map[string]int),
 	}
 }
@@ -102,21 +101,22 @@ func TestDrainInFlightPool_ProcessesAcksWithCancelledContext(t *testing.T) {
 	key := pieceKey(hash, idx)
 	pool := makeTestPoolWithInflight(t, []string{key})
 
-	// Register piece→stream mapping so processAck finds the window
+	// The ack envelope carries the source stream so processAck updates the
+	// right window without an external lookup.
 	ps := pool.streams[0]
-	q.pieceStreamsMu.Lock()
-	q.pieceStreams[key] = ps
-	q.pieceStreamsMu.Unlock()
 
 	if pool.TotalInFlight() != 1 {
 		t.Fatalf("expected 1 in-flight, got %d", pool.TotalInFlight())
 	}
 
-	// Push an ack into the pool's channel
-	pool.acks <- &pb.PieceAck{
-		TorrentHash: hash,
-		PieceIndex:  idx,
-		Success:     true,
+	// Push an ack into the pool's channel paired with the producing stream.
+	pool.acks <- AckEnvelope{
+		Ack: &pb.PieceAck{
+			TorrentHash: hash,
+			PieceIndex:  idx,
+			Success:     true,
+		},
+		Stream: ps,
 	}
 
 	// Cancel the context BEFORE calling drain — simulates shutdown
@@ -224,7 +224,6 @@ func TestSenderWorkersConcurrency(t *testing.T) {
 		tracker:             tracker,
 		logger:              logger,
 		config:              config,
-		pieceStreams:        make(map[string]*PooledStream),
 		pieceHashMismatches: make(map[string]int),
 	}
 
@@ -357,100 +356,30 @@ func TestGetAllStaleKeys_PairsKeyWithOwningStream(t *testing.T) {
 	}
 }
 
-func TestRemovePieceStreamIfMatch_DeletesOnMatch(t *testing.T) {
-	q := makeDrainTestQueue(t)
-
-	ps := &PooledStream{id: 1}
-	q.pieceStreamsMu.Lock()
-	q.pieceStreams["key1"] = ps
-	q.pieceStreamsMu.Unlock()
-
-	q.removePieceStreamIfMatch("key1", ps)
-
-	q.pieceStreamsMu.RLock()
-	_, exists := q.pieceStreams["key1"]
-	q.pieceStreamsMu.RUnlock()
-
-	if exists {
-		t.Error("expected key1 to be deleted when stream matches")
-	}
-}
-
-func TestRemovePieceStreamIfMatch_PreservesOnMismatch(t *testing.T) {
-	q := makeDrainTestQueue(t)
-
-	streamA := &PooledStream{id: 1}
-	streamB := &PooledStream{id: 2}
-
-	// Map points to streamB (simulating a retry overwrite).
-	q.pieceStreamsMu.Lock()
-	q.pieceStreams["key1"] = streamB
-	q.pieceStreamsMu.Unlock()
-
-	// Try to remove with streamA — should be a no-op.
-	q.removePieceStreamIfMatch("key1", streamA)
-
-	q.pieceStreamsMu.RLock()
-	got := q.pieceStreams["key1"]
-	q.pieceStreamsMu.RUnlock()
-
-	if got != streamB {
-		t.Errorf("expected mapping to be preserved (streamB), got %v", got)
-	}
-}
-
-func TestRemovePieceStreamIfMatch_NoopOnMissingKey(t *testing.T) {
-	q := makeDrainTestQueue(t)
-
-	// Should not panic on missing key.
-	q.removePieceStreamIfMatch("nonexistent", &PooledStream{id: 1})
-}
-
 func TestHandleStalePiecesPool_RemovesFromCorrectWindow(t *testing.T) {
-	// Reproduce the race scenario:
-	// 1. streamA has a stale key "hash:0"
-	// 2. Between GetAllStaleKeys and OnFail, pieceStreams is overwritten to streamB
-	// 3. Verify OnFail targets streamA (not streamB) and streamB mapping is preserved.
-
+	// Stale pieces are reclaimed from the window of the stream that actually
+	// owns them, sourced via pool.GetAllStaleKeys() (which iterates each
+	// stream's own inflight map). No external piece-to-stream map is involved.
 	pool, streams := makeTestPoolWithStaleKeys(t, [][]string{
 		{"hash:0"}, // streamA — will have the stale key
-		{},         // streamB — empty, will be the "retry" target
+		{},         // streamB — empty
 	})
 	defer pool.cancel()
 
 	streamA := streams[0]
-	streamB := streams[1]
-
 	q := makeDrainTestQueue(t)
-
-	// Simulate the retry overwrite: pieceStreams maps hash:0 → streamB.
-	// In the real race, this happens between GetAllStaleKeys and the loop.
-	q.pieceStreamsMu.Lock()
-	q.pieceStreams["hash:0"] = streamB
-	q.pieceStreamsMu.Unlock()
 
 	// Wait for the piece in streamA to become stale.
 	time.Sleep(60 * time.Millisecond)
 
-	// Verify the stale key is in streamA.
 	if streamA.window.InFlight() != 1 {
 		t.Fatalf("streamA should have 1 in-flight, got %d", streamA.window.InFlight())
 	}
 
 	q.handleStalePiecesPool(context.Background(), pool)
 
-	// The fix: OnFail targeted streamA (the actual owner), not streamB.
 	if streamA.window.InFlight() != 0 {
 		t.Errorf("streamA should have 0 in-flight after stale cleanup, got %d",
 			streamA.window.InFlight())
-	}
-
-	// streamB's mapping should be preserved (removePieceStreamIfMatch sees mismatch).
-	q.pieceStreamsMu.RLock()
-	got := q.pieceStreams["hash:0"]
-	q.pieceStreamsMu.RUnlock()
-
-	if got != streamB {
-		t.Errorf("streamB mapping should be preserved, got %v", got)
 	}
 }

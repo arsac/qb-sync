@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 )
 
@@ -182,14 +183,29 @@ func (c *DestinationConfig) Validate() error {
 	return nil
 }
 
+// setupCommonFlags adds flags shared between source and destination commands.
+// qbURLHelp differs between source (required, no extra context) and destination
+// (optional, used for adding verified torrents), so it is passed in.
+func setupCommonFlags(flags *pflag.FlagSet, dataHelp, qbURLHelp string) {
+	flags.String("data", "", dataHelp)
+	flags.String("qb-url", "", qbURLHelp)
+	flags.String("qb-username", "", "qBittorrent username")
+	flags.String("qb-password", "", "qBittorrent password")
+	flags.String("health-addr", defaultHealthAddr, "HTTP health endpoint address (empty to disable)")
+	flags.String("synced-tag", defaultSyncedTag, "Tag to apply to synced torrents (empty to disable)")
+	flags.Bool("dry-run", false, "Run without making changes")
+	flags.String("log-level", "info", "Log level: debug, info, warn, error")
+}
+
 // SetupSourceFlags sets up flags for the source command.
 func SetupSourceFlags(cmd *cobra.Command) {
 	flags := cmd.Flags()
 
-	flags.String("data", "", "Data directory path where torrent content is stored")
-	flags.String("qb-url", "", "qBittorrent WebUI URL")
-	flags.String("qb-username", "", "qBittorrent username")
-	flags.String("qb-password", "", "qBittorrent password")
+	setupCommonFlags(
+		flags,
+		"Data directory path where torrent content is stored",
+		"qBittorrent WebUI URL",
+	)
 	flags.String("destination-addr", "", "Destination server gRPC address (e.g., 192.168.1.100:50051)")
 	flags.Int64("min-space", defaultMinSpaceGB, "Minimum free space in GB before moving torrents")
 	flags.Int("min-seeding-time", defaultMinSeedingTimeSec, "Minimum seeding time in seconds before moving")
@@ -246,22 +262,19 @@ func SetupSourceFlags(cmd *cobra.Command) {
 		"",
 		"Tag that prevents torrents from being synced (empty to disable)",
 	)
-	flags.String("health-addr", defaultHealthAddr, "HTTP health endpoint address (empty to disable)")
-	flags.String("synced-tag", defaultSyncedTag, "Tag to apply to synced torrents (empty to disable)")
-	flags.Bool("dry-run", false, "Run without making changes")
-	flags.String("log-level", "info", "Log level: debug, info, warn, error")
 }
 
 // SetupDestinationFlags sets up flags for the destination command.
 func SetupDestinationFlags(cmd *cobra.Command) {
 	flags := cmd.Flags()
 
+	setupCommonFlags(
+		flags,
+		"Data directory path where torrent content will be written",
+		"qBittorrent WebUI URL (for adding verified torrents)",
+	)
 	flags.String("listen", defaultListenAddr, "gRPC listen address")
-	flags.String("data", "", "Data directory path where torrent content will be written")
 	flags.String("save-path", "", "Save path as destination qBittorrent sees it (defaults to --data)")
-	flags.String("qb-url", "", "qBittorrent WebUI URL (for adding verified torrents)")
-	flags.String("qb-username", "", "qBittorrent username")
-	flags.String("qb-password", "", "qBittorrent password")
 	flags.Int("poll-interval", defaultPollIntervalSec, "Poll interval in seconds for torrent verification")
 	flags.Int("poll-timeout", defaultPollTimeoutSec, "Poll timeout in seconds for torrent verification")
 	flags.Int("stream-workers", 0, "Number of concurrent piece writers (0 = auto: 8, increase for SSD/NVMe)")
@@ -270,10 +283,6 @@ func SetupDestinationFlags(cmd *cobra.Command) {
 		defaultMaxStreamBufferMB,
 		"Global memory budget in MB for buffered piece data across all streams",
 	)
-	flags.String("health-addr", defaultHealthAddr, "HTTP health endpoint address (empty to disable)")
-	flags.String("synced-tag", defaultSyncedTag, "Tag to apply to synced torrents (empty to disable)")
-	flags.Bool("dry-run", false, "Run without making changes")
-	flags.String("log-level", "info", "Log level: debug, info, warn, error")
 }
 
 // bindFlags configures viper with an env prefix and binds the given flag names.
@@ -332,6 +341,15 @@ func loadBase(v *viper.Viper) BaseConfig {
 	}
 }
 
+// applyEnvFallback overrides addr with the first set env var only if addr still
+// matches its default. This preserves "explicit flag overrides env" semantics.
+func applyEnvFallback(addr, defaultAddr string, envVars ...string) string {
+	if addr != defaultAddr {
+		return addr
+	}
+	return getEnvWithFallbacks(addr, envVars...)
+}
+
 // LoadSource loads the source server configuration from viper.
 func LoadSource(v *viper.Viper) (*SourceConfig, error) {
 	cfg := &SourceConfig{
@@ -354,15 +372,11 @@ func LoadSource(v *viper.Viper) (*SourceConfig, error) {
 		ExcludeSyncTag:     v.GetString("exclude-sync-tag"),
 	}
 
-	// Support conventional env vars as fallbacks
-	if cfg.HealthAddr == defaultHealthAddr {
-		cfg.HealthAddr = getEnvWithFallbacks(cfg.HealthAddr, "HTTP_PORT", "HEALTH_PORT")
-	}
+	cfg.HealthAddr = applyEnvFallback(cfg.HealthAddr, defaultHealthAddr, "HTTP_PORT", "HEALTH_PORT")
 
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-
 	return cfg, nil
 }
 
@@ -378,18 +392,12 @@ func LoadDestination(v *viper.Viper) (*DestinationConfig, error) {
 		MaxStreamBufferMB: v.GetInt("max-stream-buffer"),
 	}
 
-	// Support conventional env vars as fallbacks
-	if cfg.ListenAddr == defaultListenAddr {
-		cfg.ListenAddr = getEnvWithFallbacks(cfg.ListenAddr, "GRPC_PORT", "PORT")
-	}
-	if cfg.HealthAddr == defaultHealthAddr {
-		cfg.HealthAddr = getEnvWithFallbacks(cfg.HealthAddr, "HTTP_PORT", "HEALTH_PORT")
-	}
+	cfg.ListenAddr = applyEnvFallback(cfg.ListenAddr, defaultListenAddr, "GRPC_PORT", "PORT")
+	cfg.HealthAddr = applyEnvFallback(cfg.HealthAddr, defaultHealthAddr, "HTTP_PORT", "HEALTH_PORT")
 
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-
 	return cfg, nil
 }
 

@@ -6,7 +6,6 @@ import (
 
 	"github.com/bits-and-blooms/bitset"
 
-	"github.com/arsac/qb-sync/internal/utils"
 	pb "github.com/arsac/qb-sync/proto"
 )
 
@@ -33,21 +32,6 @@ func (f *serverFileInfo) openForWrite() error {
 
 	f.file = file
 	return nil
-}
-
-// verifyPieceHash checks the piece data against expected hash.
-// Returns empty string if valid, error message if invalid.
-func (m *torrentMeta) verifyPieceHash(pieceIndex int32, data []byte, reqHash string) string {
-	// Prefer pre-stored hash from InitTorrent, fall back to request hash
-	expectedHash := reqHash
-	if int(pieceIndex) < len(m.pieceHashes) && m.pieceHashes[pieceIndex] != "" {
-		expectedHash = m.pieceHashes[pieceIndex]
-	}
-
-	if err := utils.VerifyPieceHash(data, expectedHash); err != nil {
-		return err.Error()
-	}
-	return ""
 }
 
 // writeAt ensures the file is open and writes data at the given offset.

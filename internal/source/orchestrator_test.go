@@ -37,7 +37,6 @@ type mockQBClient struct {
 	deleteCalled bool
 	deleteErr    error
 	stopCalled   bool
-	stopHashes   []string
 	stopErr      error
 	stopFailHash map[string]bool
 	resumeCalled bool
@@ -111,7 +110,6 @@ func (m *mockQBClient) AddTagsCtx(_ context.Context, hashes []string, tags strin
 
 func (m *mockQBClient) StopCtx(_ context.Context, hashes []string) error {
 	m.stopCalled = true
-	m.stopHashes = hashes
 	if m.stopFailHash != nil && m.stopFailHash[hashes[0]] {
 		return errors.New("stop failed")
 	}
@@ -138,6 +136,19 @@ func (m *mockQBClient) RecheckCtx(_ context.Context, _ []string) error {
 
 func (m *mockQBClient) GetFreeSpaceOnDiskCtx(_ context.Context) (int64, error) {
 	return m.freeSpaceOnDisk, m.freeSpaceErr
+}
+
+func (m *mockQBClient) GetCategoriesCtx(context.Context) (map[string]qbittorrent.Category, error) {
+	return nil, nil
+}
+func (m *mockQBClient) CreateCategoryCtx(_ context.Context, _, _ string) error {
+	return nil
+}
+func (m *mockQBClient) SetTorrentUploadLimitCtx(_ context.Context, _ []string, _ int64) error {
+	return nil
+}
+func (m *mockQBClient) SetTorrentDownloadLimitCtx(_ context.Context, _ []string, _ int64) error {
+	return nil
 }
 
 // Tests for finalization backoff logic. These can be unit tested without mocking gRPC.
@@ -631,6 +642,125 @@ func TestHandleTorrentRemoval(t *testing.T) {
 		}
 		if dest.abortHash != "unknown_hash" {
 			t.Errorf("expected abort hash 'unknown_hash', got '%s'", dest.abortHash)
+		}
+	})
+}
+
+// TestTryFinalizeFullyStreamed pins the contract introduced in commit fa89587:
+// when streaming has finished on destination but finalization hasn't run, and
+// the torrent has just been removed from source — try to finalize so the data
+// migrates cleanly. If finalize fails (whether because source is gone or for
+// any other reason) fall through to abort, so the partial files don't orphan.
+func TestTryFinalizeFullyStreamed(t *testing.T) {
+	logger := testLogger(t)
+
+	newTask := func(t *testing.T, dest *mockDest, src *mockQBClient) *QBTask {
+		t.Helper()
+		return &QBTask{
+			cfg:       &config.SourceConfig{},
+			logger:    logger,
+			srcClient: src,
+			grpcDest:  dest,
+			source:    qbclient.NewSource(nil, ""),
+		}
+	}
+
+	t.Run("not fully streamed: returns false so caller proceeds with abort", func(t *testing.T) {
+		dest := &mockDest{
+			checkStatusResults: map[string]*streaming.InitTorrentResult{
+				"abc": {PiecesNeededCount: 5},
+			},
+		}
+		task := newTask(t, dest, &mockQBClient{})
+
+		if took := task.tryFinalizeFullyStreamed(context.Background(), "abc"); took {
+			t.Fatal("must return false when there are pieces still needed (caller should abort)")
+		}
+		if dest.finalizeCalled {
+			t.Error("FinalizeTorrent must not be called when not fully streamed")
+		}
+	})
+
+	t.Run("fully streamed and finalize succeeds: starts on destination", func(t *testing.T) {
+		dest := &mockDest{
+			checkStatusResults: map[string]*streaming.InitTorrentResult{
+				"abc": {PiecesNeededCount: 0},
+			},
+		}
+		src := &mockQBClient{
+			getTorrentsResult: []qbittorrent.Torrent{{Hash: "abc"}},
+		}
+		task := newTask(t, dest, src)
+		task.cfg.SourceRemovedTag = "source-removed"
+
+		if took := task.tryFinalizeFullyStreamed(context.Background(), "abc"); !took {
+			t.Fatal("must return true (path was taken) on successful finalize")
+		}
+		if !dest.finalizeCalled {
+			t.Error("FinalizeTorrent must be called")
+		}
+		if !dest.startCalled || dest.startTag != "source-removed" {
+			t.Error("StartTorrent must be called with the source-removed tag")
+		}
+	})
+
+	t.Run("source-gone finalize failure: falls through to abort", func(t *testing.T) {
+		dest := &mockDest{
+			checkStatusResults: map[string]*streaming.InitTorrentResult{
+				"abc": {PiecesNeededCount: 0},
+			},
+		}
+		// Empty getTorrentsResult → finalizeTorrent returns "torrent not found".
+		src := &mockQBClient{getTorrentsResult: []qbittorrent.Torrent{}}
+		task := newTask(t, dest, src)
+
+		if took := task.tryFinalizeFullyStreamed(context.Background(), "abc"); took {
+			t.Fatal("must return false on finalize failure so caller falls through to abort " +
+				"and cleans up the .partial files")
+		}
+		if dest.startCalled {
+			t.Error("StartTorrent must NOT be called when finalize fails")
+		}
+	})
+
+	t.Run("transient finalize failure: also falls through to abort", func(t *testing.T) {
+		// Source torrent IS present, but the destination's FinalizeTorrent
+		// returns a transient error (e.g., destination briefly unreachable
+		// after a restart). The pre-fa89587 behavior was to leave .partial
+		// files for the orphan cleaner; the post-fix behavior is to abort
+		// immediately. The data isn't recoverable as-is (no source qB →
+		// nothing will retry the finalize), so cleanup-now is correct.
+		dest := &mockDest{
+			checkStatusResults: map[string]*streaming.InitTorrentResult{
+				"abc": {PiecesNeededCount: 0},
+			},
+			finalizeErr: errors.New("destination briefly unreachable"),
+		}
+		src := &mockQBClient{
+			getTorrentsResult: []qbittorrent.Torrent{{Hash: "abc"}},
+		}
+		task := newTask(t, dest, src)
+
+		if took := task.tryFinalizeFullyStreamed(context.Background(), "abc"); took {
+			t.Fatal("transient finalize failure must also fall through to abort — " +
+				"leaving for the orphan cleaner gave no recovery path and just delayed cleanup")
+		}
+		if !dest.finalizeCalled {
+			t.Error("FinalizeTorrent must have been attempted")
+		}
+		if dest.startCalled {
+			t.Error("StartTorrent must NOT be called when finalize fails")
+		}
+	})
+
+	t.Run("CheckTorrentStatus error: returns false so caller proceeds with abort", func(t *testing.T) {
+		dest := &mockDest{
+			checkStatusErr: errors.New("destination unreachable"),
+		}
+		task := newTask(t, dest, &mockQBClient{})
+
+		if took := task.tryFinalizeFullyStreamed(context.Background(), "abc"); took {
+			t.Fatal("status-check failure must return false (caller proceeds with abort)")
 		}
 	})
 }
@@ -1490,6 +1620,99 @@ func TestQueryDestStatus(t *testing.T) {
 
 		if !task.completed.IsComplete("abc123") {
 			t.Error("COMPLETE torrent should be cached")
+		}
+	})
+}
+
+func TestPruneCompletedOnDest(t *testing.T) {
+	logger := testLogger(t)
+
+	newTask := func(t *testing.T, dest *mockDest, srcTorrents []qbittorrent.Torrent, dryRun bool) (*QBTask, *CompletionCache) {
+		t.Helper()
+		mockClient := &mockQBClient{getTorrentsResult: srcTorrents}
+		completed := NewCompletionCache("", logger)
+		return &QBTask{
+			cfg: &config.SourceConfig{
+				BaseConfig:       config.BaseConfig{DryRun: dryRun},
+				SourceRemovedTag: "source-removed",
+			},
+			logger:    logger,
+			srcClient: mockClient,
+			grpcDest:  dest,
+			completed: completed,
+		}, completed
+	}
+
+	t.Run("hands off and prunes when source torrent is gone", func(t *testing.T) {
+		dest := &mockDest{}
+		task, completed := newTask(t, dest, []qbittorrent.Torrent{
+			{Hash: "still-present"},
+		}, false)
+		completed.Mark("still-present")
+		completed.Mark("removed-from-source")
+
+		task.pruneCompletedOnDest(context.Background())
+
+		if !dest.startCalled {
+			t.Fatal("StartTorrent should be called for the removed-from-source torrent")
+		}
+		if dest.startHash != "removed-from-source" {
+			t.Errorf("StartTorrent hash = %q, want %q", dest.startHash, "removed-from-source")
+		}
+		if dest.startTag != "source-removed" {
+			t.Errorf("StartTorrent tag = %q, want %q", dest.startTag, "source-removed")
+		}
+		if completed.IsComplete("removed-from-source") {
+			t.Error("removed-from-source should be pruned from cache after handoff")
+		}
+		if !completed.IsComplete("still-present") {
+			t.Error("still-present should remain in cache")
+		}
+	})
+
+	t.Run("retains cache entry when handoff fails", func(t *testing.T) {
+		dest := &mockDest{startErr: errors.New("destination unreachable")}
+		task, completed := newTask(t, dest, nil, false)
+		completed.Mark("removed-from-source")
+
+		task.pruneCompletedOnDest(context.Background())
+
+		if !completed.IsComplete("removed-from-source") {
+			t.Error("cache entry must be retained on handoff failure so the next cycle retries")
+		}
+	})
+
+	t.Run("dry-run skips StartTorrent but still prunes", func(t *testing.T) {
+		dest := &mockDest{}
+		task, completed := newTask(t, dest, nil, true)
+		completed.Mark("removed-from-source")
+
+		task.pruneCompletedOnDest(context.Background())
+
+		if dest.startCalled {
+			t.Error("StartTorrent must not be called in dry-run")
+		}
+		if completed.IsComplete("removed-from-source") {
+			t.Error("dry-run should still prune the cache")
+		}
+	})
+
+	t.Run("no-op when all completed entries are still in source", func(t *testing.T) {
+		dest := &mockDest{}
+		task, completed := newTask(t, dest, []qbittorrent.Torrent{
+			{Hash: "abc"},
+			{Hash: "def"},
+		}, false)
+		completed.Mark("abc")
+		completed.Mark("def")
+
+		task.pruneCompletedOnDest(context.Background())
+
+		if dest.startCalled {
+			t.Error("StartTorrent must not fire when no entries are stale")
+		}
+		if !completed.IsComplete("abc") || !completed.IsComplete("def") {
+			t.Error("non-stale entries must be retained")
 		}
 	})
 }
@@ -2935,7 +3158,7 @@ func TestExcludeSyncTagReactive(t *testing.T) {
 		}
 	})
 
-	t.Run("forgets completed torrent when tag is added", func(t *testing.T) {
+	t.Run("preserves completed cache entry when tag is added", func(t *testing.T) {
 		mockSource := &mockPieceSource{numPieces: numPieces}
 		tracker := streaming.NewPieceMonitor(nil, mockSource, logger, streaming.DefaultPieceMonitorConfig())
 
@@ -2977,12 +3200,20 @@ func TestExcludeSyncTagReactive(t *testing.T) {
 
 		task.checkExcludedTorrents(context.Background())
 
-		if task.completed.IsComplete("completed-hash") {
-			t.Error("completed-hash should have been removed from completedOnDest")
+		// The completion-cache entry MUST be preserved so a subsequent source-side
+		// removal takes the safe StartTorrent path in handleTorrentRemoval rather
+		// than the AbortTorrent path (which would delete destination data of a
+		// torrent that is already finalized).
+		if !task.completed.IsComplete("completed-hash") {
+			t.Error("completed-hash should remain in completedOnDest as the source of truth for safe handoff")
 		}
 
 		if dest.abortCalled {
 			t.Error("AbortTorrent should NOT be called for completed torrents")
+		}
+
+		if !dest.clearInitCalled {
+			t.Error("ClearInitResult should have been called to release streaming-side caches")
 		}
 	})
 

@@ -31,8 +31,8 @@ func TestTryHardlinkFromRegistered_SizeMismatchEvicts(t *testing.T) {
 	}
 
 	relSource, _ := filepath.Rel(tmpDir, sourceFile)
-	inode := Inode(9999)
-	s.inodes.Register(inode, relSource)
+	inode := FileID{Ino: 9999}
+	s.store.Inodes().Register(inode, relSource)
 
 	targetPath := filepath.Join(tmpDir, "target", "new.mkv")
 	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
@@ -49,12 +49,12 @@ func TestTryHardlinkFromRegistered_SizeMismatchEvicts(t *testing.T) {
 		_ = os.WriteFile(srcFile2, make([]byte, 200), 0o644)
 
 		relSrc2, _ := filepath.Rel(tmpDir2, srcFile2)
-		s2.inodes.Register(Inode(1234), relSrc2)
+		s2.store.Inodes().Register(FileID{Ino: 1234}, relSrc2)
 
 		tgt2 := filepath.Join(tmpDir2, "tgt", "file.bin")
 		_ = os.MkdirAll(filepath.Dir(tgt2), 0o755)
 
-		outcome, ok := s2.tryHardlinkFromRegistered(ctx, "h1", "file.bin", tgt2, Inode(1234), 200)
+		outcome, ok := s2.tryHardlinkFromRegistered(ctx, "h1", "file.bin", tgt2, FileID{Ino: 1234}, 200)
 		if !ok {
 			t.Fatal("expected ok=true for matching size")
 		}
@@ -75,20 +75,20 @@ func TestTryHardlinkFromRegistered_SizeMismatchEvicts(t *testing.T) {
 		}
 
 		// Inode should be evicted from registry.
-		if _, found := s.inodes.GetRegistered(inode); found {
+		if _, found := s.store.Inodes().GetRegistered(inode); found {
 			t.Fatal("stale inode should have been evicted")
 		}
 	})
 
 	t.Run("missing source file evicts and returns not-found", func(t *testing.T) {
-		missingInode := Inode(8888)
-		s.inodes.Register(missingInode, "nonexistent/file.mkv")
+		missingInode := FileID{Ino: 8888}
+		s.store.Inodes().Register(missingInode, "nonexistent/file.mkv")
 
 		outcome, ok := s.tryHardlinkFromRegistered(ctx, "hash2", "f.mkv", targetPath, missingInode, 100)
 		if ok {
 			t.Fatalf("expected ok=false for missing source, got outcome=%+v", outcome)
 		}
-		if _, found := s.inodes.GetRegistered(missingInode); found {
+		if _, found := s.store.Inodes().GetRegistered(missingInode); found {
 			t.Fatal("stale inode should have been evicted")
 		}
 	})
@@ -99,20 +99,75 @@ func TestInodeRegistry_Evict(t *testing.T) {
 	logger := testLogger(t)
 	r := NewInodeRegistry(t.TempDir(), logger)
 
-	r.Register(Inode(1), "path/a")
-	r.Register(Inode(2), "path/b")
+	r.Register(FileID{Ino: 1}, "path/a")
+	r.Register(FileID{Ino: 2}, "path/b")
 
-	r.Evict(Inode(1))
+	r.Evict(FileID{Ino: 1})
 
-	if _, found := r.GetRegistered(Inode(1)); found {
+	if _, found := r.GetRegistered(FileID{Ino: 1}); found {
 		t.Fatal("inode 1 should be evicted")
 	}
-	if _, found := r.GetRegistered(Inode(2)); !found {
+	if _, found := r.GetRegistered(FileID{Ino: 2}); !found {
 		t.Fatal("inode 2 should still exist")
 	}
 	if r.Len() != 1 {
 		t.Fatalf("expected 1 registered inode, got %d", r.Len())
 	}
+}
+
+// TestSameFilesystem documents the hardlink-safety guard. If sameFilesystem
+// returns false at the wrong time we either miss valid hardlink optimizations
+// or attempt cross-device [os.Link] calls that fail with EXDEV.
+func TestSameFilesystem(t *testing.T) {
+	t.Parallel()
+
+	t.Run("two paths on the same temp fs return true", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		a := filepath.Join(dir, "a.bin")
+		b := filepath.Join(dir, "b.bin")
+		if err := os.WriteFile(a, []byte("a"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(b, []byte("b"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if !sameFilesystem(a, b) {
+			t.Error("two files in the same TempDir must report same filesystem")
+		}
+	})
+
+	t.Run("one missing path returns false (fail-safe)", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		a := filepath.Join(dir, "exists.bin")
+		if err := os.WriteFile(a, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		missing := filepath.Join(dir, "does-not-exist.bin")
+		if sameFilesystem(a, missing) {
+			t.Error("missing path must yield false so the caller falls back to streaming, not os.Link")
+		}
+	})
+
+	t.Run("both missing paths return false", func(t *testing.T) {
+		t.Parallel()
+		if sameFilesystem("/nope/a", "/nope/b") {
+			t.Error("two missing paths must yield false")
+		}
+	})
+
+	t.Run("self-comparison returns true", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		a := filepath.Join(dir, "a.bin")
+		if err := os.WriteFile(a, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if !sameFilesystem(a, a) {
+			t.Error("a path compared to itself must report same filesystem")
+		}
+	})
 }
 
 // ---------- Bug B: RegisterInProgress return value ----------
@@ -122,7 +177,7 @@ func TestResolveHardlink_RaceReturnsPending(t *testing.T) {
 	s, tmpDir := newTestDestServer(t)
 	ctx := context.Background()
 
-	inode := Inode(5555)
+	inode := FileID{Ino: 5555}
 	targetA := filepath.Join(tmpDir, "torrentA", "file.mkv")
 	targetB := filepath.Join(tmpDir, "torrentB", "file.mkv")
 	_ = os.MkdirAll(filepath.Dir(targetA), 0o755)
@@ -149,7 +204,7 @@ func TestRegisterInodeInProgress_ReturnsFalseOnRace(t *testing.T) {
 	s, tmpDir := newTestDestServer(t)
 	ctx := context.Background()
 
-	inode := Inode(7777)
+	inode := FileID{Ino: 7777}
 	target := filepath.Join(tmpDir, "t", "f.mkv")
 
 	first := s.registerInodeInProgress(ctx, "h1", "f.mkv", target, inode)
@@ -174,8 +229,8 @@ func TestRecoverVerificationFailure_ClearsInProgressPieces(t *testing.T) {
 	s, tmpDir := newTestDestServer(t)
 	ctx := context.Background()
 
-	inode := Inode(3333)
-	s.inodes.RegisterInProgress(inode, "hashX", "sub/file.mkv")
+	inode := FileID{Ino: 3333}
+	s.store.Inodes().RegisterInProgress(inode, "hashX", "sub/file.mkv")
 
 	filePath := filepath.Join(tmpDir, "sub", "file.mkv")
 	_ = os.MkdirAll(filepath.Dir(filePath), 0o755)
@@ -192,8 +247,8 @@ func TestRecoverVerificationFailure_ClearsInProgressPieces(t *testing.T) {
 					size:     200,
 					selected: true,
 					hardlink: hardlinkInfo{
-						sourceInode: inode,
-						state:       hlStateInProgress,
+						sourceFileID: inode,
+						state:        hlStateInProgress,
 					},
 					firstPiece:  0,
 					lastPiece:   1,
@@ -223,7 +278,7 @@ func TestAbortInProgress_ClosesDoneCh(t *testing.T) {
 	r := NewInodeRegistry(t.TempDir(), logger)
 	ctx := context.Background()
 
-	inode := Inode(4444)
+	inode := FileID{Ino: 4444}
 	r.RegisterInProgress(inode, "torrentA", "sub/file.mkv")
 
 	// Get the doneCh before abort.
@@ -348,8 +403,8 @@ func TestRecoverAffectedFile_BreaksHardlink(t *testing.T) {
 		size:     200,
 		selected: true,
 		hardlink: hardlinkInfo{
-			state:       hlStateComplete,
-			sourceInode: 12345,
+			state:        hlStateComplete,
+			sourceFileID: FileID{Ino: 12345},
 		},
 		firstPiece:    0,
 		lastPiece:     1,
@@ -478,7 +533,7 @@ func TestResolveHardlink_ConcurrentRace(t *testing.T) {
 	s, tmpDir := newTestDestServer(t)
 	ctx := context.Background()
 
-	inode := Inode(6666)
+	inode := FileID{Ino: 6666}
 	const numGoroutines = 10
 
 	var wg sync.WaitGroup
@@ -526,17 +581,17 @@ func TestInitNewTorrent_PathCollisionDetected(t *testing.T) {
 
 	// Register a path as owned by torrent A.
 	targetPath := filepath.Join(tmpDir, "movies", "film.mkv")
-	s.mu.Lock()
-	s.filePaths[targetPath] = "hashA"
-	s.mu.Unlock()
+	s.store.mu.Lock()
+	s.store.filePaths[targetPath] = "hashA"
+	s.store.mu.Unlock()
 
 	files := []*serverFileInfo{
 		{path: targetPath + partialSuffix, size: 100, selected: true},
 	}
 
-	s.mu.Lock()
-	collisionErr := s.checkPathCollisions("hashB", files)
-	s.mu.Unlock()
+	s.store.mu.Lock()
+	collisionErr := checkPathCollisions(s.store.filePaths, "hashB", files)
+	s.store.mu.Unlock()
 
 	if collisionErr == nil {
 		t.Fatal("expected collision error for path owned by another torrent")
@@ -551,18 +606,18 @@ func TestInitNewTorrent_SameTorrentNoCollision(t *testing.T) {
 	s, tmpDir := newTestDestServer(t)
 
 	targetPath := filepath.Join(tmpDir, "movies", "film.mkv")
-	s.mu.Lock()
-	s.filePaths[targetPath] = "hashA"
-	s.mu.Unlock()
+	s.store.mu.Lock()
+	s.store.filePaths[targetPath] = "hashA"
+	s.store.mu.Unlock()
 
 	files := []*serverFileInfo{
 		{path: targetPath + partialSuffix, size: 100, selected: true},
 	}
 
 	// Same hash re-initializing should not collide with itself.
-	s.mu.Lock()
-	collisionErr := s.checkPathCollisions("hashA", files)
-	s.mu.Unlock()
+	s.store.mu.Lock()
+	collisionErr := checkPathCollisions(s.store.filePaths, "hashA", files)
+	s.store.mu.Unlock()
 
 	if collisionErr != nil {
 		t.Fatalf("same torrent should not collide with itself: %v", collisionErr)
@@ -576,36 +631,36 @@ func TestFilePathRegistration_Lifecycle(t *testing.T) {
 	files := []*serverFileInfo{
 		{path: filepath.Join(tmpDir, "a.mkv") + partialSuffix, size: 100, selected: true},
 		{path: filepath.Join(tmpDir, "b.mkv"), size: 200, selected: true},
-		{path: filepath.Join(tmpDir, "c.mkv"), size: 300, selected: false}, // unselected — not tracked
+		{path: filepath.Join(tmpDir, "c.mkv"), size: 300, selected: false}, // unselected -- not tracked
 	}
 
-	s.mu.Lock()
-	s.registerFilePaths("hash1", files)
-	s.mu.Unlock()
+	s.store.mu.Lock()
+	registerFilePaths(s.store.filePaths, "hash1", files)
+	s.store.mu.Unlock()
 
 	// Selected files should be registered.
-	s.mu.RLock()
-	if s.filePaths[filepath.Join(tmpDir, "a.mkv")] != "hash1" {
+	s.store.mu.RLock()
+	if s.store.filePaths[filepath.Join(tmpDir, "a.mkv")] != "hash1" {
 		t.Fatal("a.mkv should be registered")
 	}
-	if s.filePaths[filepath.Join(tmpDir, "b.mkv")] != "hash1" {
+	if s.store.filePaths[filepath.Join(tmpDir, "b.mkv")] != "hash1" {
 		t.Fatal("b.mkv should be registered")
 	}
-	if _, exists := s.filePaths[filepath.Join(tmpDir, "c.mkv")]; exists {
+	if _, exists := s.store.filePaths[filepath.Join(tmpDir, "c.mkv")]; exists {
 		t.Fatal("unselected c.mkv should not be registered")
 	}
-	s.mu.RUnlock()
+	s.store.mu.RUnlock()
 
 	// Unregister and verify cleanup.
-	s.mu.Lock()
-	s.unregisterFilePaths("hash1", files)
-	s.mu.Unlock()
+	s.store.mu.Lock()
+	unregisterFilePaths(s.store.filePaths, "hash1", files)
+	s.store.mu.Unlock()
 
-	s.mu.RLock()
-	if len(s.filePaths) != 0 {
-		t.Fatalf("expected empty filePaths after unregister, got %d", len(s.filePaths))
+	s.store.mu.RLock()
+	if len(s.store.filePaths) != 0 {
+		t.Fatalf("expected empty filePaths after unregister, got %d", len(s.store.filePaths))
 	}
-	s.mu.RUnlock()
+	s.store.mu.RUnlock()
 }
 
 // ---------- Bug 4: writeAt holds RLock during write ----------
@@ -720,9 +775,9 @@ func TestFinalizeTorrent_RelocatesWhenSubPathBecomesEmpty(t *testing.T) {
 		written:     bitset.New(1).Set(0),
 		saveSubPath: "movies",
 	}
-	s.mu.Lock()
-	s.torrents[hash] = state
-	s.mu.Unlock()
+	s.store.mu.Lock()
+	s.store.entries[hash] = state
+	s.store.mu.Unlock()
 
 	// Relocate from "movies" to "" (root) with explicit flag.
 	relocErr := s.relocateForSubPathChange(ctx, hash, state, "")

@@ -161,20 +161,3 @@ func (c *CompletionCache) Save() {
 		c.logger.Warn("failed to write completed cache", "error", writeErr)
 	}
 }
-
-// Prune removes entries from the cache that are not present in sourceHashes.
-// Returns the number of entries pruned.
-func (c *CompletionCache) Prune(sourceHashes map[string]struct{}) int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	var pruned int
-	for hash := range c.completed {
-		if _, exists := sourceHashes[hash]; !exists {
-			delete(c.completed, hash)
-			pruned++
-		}
-	}
-	metrics.CompletedOnDestCacheSize.Set(float64(len(c.completed)))
-	return pruned
-}

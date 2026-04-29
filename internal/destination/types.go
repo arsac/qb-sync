@@ -3,14 +3,24 @@ package destination
 import (
 	"os"
 	"sync"
+	"sync/atomic"
 
 	"github.com/bits-and-blooms/bitset"
 
 	pb "github.com/arsac/qb-sync/proto"
 )
 
-// Inode represents a filesystem inode number.
-type Inode uint64
+// FileID uniquely identifies a file across filesystems using the (device, inode) pair.
+// Comparable — usable as a map key without allocation.
+type FileID struct {
+	Dev uint64
+	Ino uint64
+}
+
+// IsZero returns true if the FileID is uninitialized.
+func (f FileID) IsZero() bool {
+	return f.Dev == 0 && f.Ino == 0
+}
 
 // hardlinkState represents the state of hardlink resolution for a file.
 // States are ordered by typical progression: None -> InProgress/Pending -> Complete.
@@ -49,7 +59,7 @@ func (i *inProgressInode) close() {
 // Immutable per-file (set during init, never modified):
 //
 //	offset, size, selected, firstPiece, lastPiece, piecesTotal,
-//	hardlink.sourceInode, hardlink.sourcePath, hardlink.doneCh
+//	hardlink.sourceFileID, hardlink.sourcePath, hardlink.doneCh
 //
 // Mutable per-file (require state.mu):
 //
@@ -124,17 +134,17 @@ type serverTorrentState struct {
 	torrentMeta // Immutable metadata (safe to read without mu)
 
 	// Immutable after init (set once during initNewTorrent):
-	info      *pb.InitTorrentRequest // Original init request
-	statePath string                 // Path to written pieces state file
+	statePath string // Path to written pieces state file
 
 	// Mutable state (require state.mu):
-	torrentPath      string         // Path to stored .torrent file; may be set late during resumeTorrent
+	torrentFile      []byte         // Raw bencode bytes for qBittorrent API; cached in memory
 	saveSubPath      string         // Relative sub-path prefix; may change if category relocates at finalize
 	written          *bitset.BitSet // Bitmap of written pieces (use Count()/Len() instead of separate counter)
+	verified         *bitset.BitSet // Bitmap of pieces already hash-verified post-disk-flush; pieces with this bit set may be skipped during verifyFinalizedPieces
 	dirty            bool           // Whether state needs to be flushed
 	piecesSinceFlush int            // Pieces written since last flush (for count-based trigger)
 	flushGen         uint64         // Monotonic counter incremented on every successful state flush
-	initializing     bool           // True while disk I/O is in progress during InitTorrent
+	initializing     atomic.Bool    // True while disk I/O is in progress; set once before publication, never written again.
 	mu               sync.Mutex
 
 	// Finalization lifecycle (state machine: inactive -> active -> result stored).
@@ -191,14 +201,14 @@ type finalizeResult struct {
 // hardlinkInfo tracks the hardlink resolution state for a single file.
 // State machine: None -> InProgress (first writer) or Pending (wait for another) -> Complete.
 //
-// sourceInode, sourcePath, and doneCh are immutable after init.
+// sourceFileID, sourcePath, and doneCh are immutable after init.
 // state is mutable and requires the parent serverTorrentState.mu.
 // Use applyOutcome() during init and markComplete() during finalization.
 type hardlinkInfo struct {
-	state       hardlinkState // Current state in the hardlink state machine
-	sourceInode Inode         // Source inode for registration (immutable after init)
-	sourcePath  string        // Relative path to hardlink from (immutable after init)
-	doneCh      chan struct{} // Wait on this before hardlinking (immutable after init)
+	state        hardlinkState // Current state in the hardlink state machine
+	sourceFileID FileID        // Source file ID for registration (immutable after init)
+	sourcePath   string        // Relative path to hardlink from (immutable after init)
+	doneCh       chan struct{} // Wait on this before hardlinking (immutable after init)
 }
 
 // applyOutcome sets the hardlink state from an init-time resolution outcome.
@@ -223,7 +233,7 @@ func (h *hardlinkInfo) markComplete() {
 // Immutable fields (set during init, safe to read without state.mu):
 //
 //	offset, size, selected, firstPiece, lastPiece, piecesTotal,
-//	hardlink.sourceInode, hardlink.sourcePath, hardlink.doneCh
+//	hardlink.sourceFileID, hardlink.sourcePath, hardlink.doneCh
 //
 // Mutable fields (require state.mu):
 //
@@ -274,7 +284,7 @@ func (f *serverFileInfo) recalcPiecesWritten(written *bitset.BitSet) {
 }
 
 // torrentRef is a reference to a torrent state for safe iteration.
-// Used when collecting torrents under s.mu to process under individual state.mu.
+// Used when collecting torrents under store.mu to process under individual state.mu.
 type torrentRef struct {
 	hash  string
 	state *serverTorrentState
