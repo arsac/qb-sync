@@ -30,6 +30,10 @@ type mockQBClient struct {
 	deleteHashes      []string
 	deleteDeleteFiles bool
 	deleteErr         error
+
+	stopCalled bool
+	stopHashes []string
+	stopErr    error
 }
 
 func (m *mockQBClient) LoginCtx(context.Context) error { return m.loginErr }
@@ -88,7 +92,11 @@ func (m *mockQBClient) DeleteTorrentsCtx(_ context.Context, hashes []string, del
 	m.torrents = filtered
 	return nil
 }
-func (m *mockQBClient) StopCtx(context.Context, []string) error { return nil }
+func (m *mockQBClient) StopCtx(_ context.Context, hashes []string) error {
+	m.stopCalled = true
+	m.stopHashes = hashes
+	return m.stopErr
+}
 func (m *mockQBClient) AddTorrentFromMemoryCtx(context.Context, []byte, map[string]string) error {
 	return nil
 }
@@ -255,6 +263,94 @@ func TestStartTorrent(t *testing.T) {
 		}
 		if mock.addTagsArgs.tags != "" {
 			t.Fatal("AddTagsCtx should not be called when resume fails")
+		}
+	})
+}
+
+// TestAddAndVerifyTorrent_StopsFoundReadyTorrent regression-tests the autobrr
+// Tier-1 fix: when addAndVerifyTorrent finds the torrent already in qB at 100%
+// in a ready state (the path hit during recovery from a destination crash mid-
+// finalization), it must stop the torrent before returning. Without this, the
+// post-restart finalization completes with the torrent already running on
+// destination qB while source still believes itself canonical seeder — a
+// dual-seeding window against the tracker.
+func TestAddAndVerifyTorrent_StopsFoundReadyTorrent(t *testing.T) {
+	t.Parallel()
+
+	t.Run("stops torrent when found in stoppedUp at 100%", func(t *testing.T) {
+		t.Parallel()
+		mock := &mockQBClient{
+			torrents: []qbittorrent.Torrent{{
+				Hash:     "abc123",
+				State:    qbittorrent.TorrentStateStoppedUp,
+				Progress: 1.0,
+			}},
+		}
+		s := newTestServerWithQB(t, mock)
+
+		state := &serverTorrentState{}
+		_, err := s.addAndVerifyTorrent(context.Background(), "abc123", state,
+			&pb.FinalizeTorrentRequest{TorrentHash: "abc123"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if !mock.stopCalled {
+			t.Fatal("StopCtx must be called even when torrent is found in a ready state — " +
+				"otherwise dual-seeding against source after dest crash recovery")
+		}
+		if len(mock.stopHashes) != 1 || mock.stopHashes[0] != "abc123" {
+			t.Errorf("StopCtx hashes = %v, want [abc123]", mock.stopHashes)
+		}
+	})
+
+	t.Run("stops torrent when found in stalledUp at 100%", func(t *testing.T) {
+		t.Parallel()
+		mock := &mockQBClient{
+			torrents: []qbittorrent.Torrent{{
+				Hash:     "abc123",
+				State:    qbittorrent.TorrentStateStalledUp,
+				Progress: 1.0,
+			}},
+		}
+		s := newTestServerWithQB(t, mock)
+
+		state := &serverTorrentState{}
+		_, err := s.addAndVerifyTorrent(context.Background(), "abc123", state,
+			&pb.FinalizeTorrentRequest{TorrentHash: "abc123"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if !mock.stopCalled {
+			t.Fatal("StopCtx must be called for an actively-uploading found torrent")
+		}
+	})
+
+	t.Run("propagates stop failure as a warn, returns success", func(t *testing.T) {
+		t.Parallel()
+		mock := &mockQBClient{
+			torrents: []qbittorrent.Torrent{{
+				Hash:     "abc123",
+				State:    qbittorrent.TorrentStateStoppedUp,
+				Progress: 1.0,
+			}},
+			stopErr: errors.New("transient qB error"),
+		}
+		s := newTestServerWithQB(t, mock)
+
+		state := &serverTorrentState{}
+		finalState, err := s.addAndVerifyTorrent(context.Background(), "abc123", state,
+			&pb.FinalizeTorrentRequest{TorrentHash: "abc123"})
+
+		if err != nil {
+			t.Fatalf("stop failure must not propagate as error (best-effort): %v", err)
+		}
+		if finalState != qbittorrent.TorrentStateStoppedUp {
+			t.Errorf("finalState = %v, want stoppedUp", finalState)
+		}
+		if !mock.stopCalled {
+			t.Fatal("StopCtx must be attempted even though it returned an error")
 		}
 	})
 }
