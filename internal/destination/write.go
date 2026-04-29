@@ -85,10 +85,11 @@ func (s *Server) writePiece(ctx context.Context, req *pb.WritePieceRequest) writ
 	// changing the hash. writePieceData skips deselected files, so only
 	// the selected file data is actually written.
 	writeStart := time.Now()
-	if state.classifyPiece(int(pieceIndex)) == pieceFullySelected {
-		if hashErr := state.verifyPieceHash(pieceIndex, data); hashErr != "" {
+	if state.classifyPiece(int(pieceIndex)) == pieceFullySelected &&
+		int(pieceIndex) < len(state.pieceHashes) && state.pieceHashes[pieceIndex] != "" {
+		if hashErr := utils.VerifyPieceHash(data, state.pieceHashes[pieceIndex]); hashErr != nil {
 			metrics.PieceWriteDuration.Observe(time.Since(writeStart).Seconds())
-			return writePieceError(hashErr, pb.PieceErrorCode_PIECE_ERROR_HASH_MISMATCH)
+			return writePieceError(hashErr.Error(), pb.PieceErrorCode_PIECE_ERROR_HASH_MISMATCH)
 		}
 	}
 
@@ -155,7 +156,14 @@ func (s *Server) verifyFilePieces(
 	if fh == nil {
 		f, openErr := os.Open(fi.path)
 		if openErr != nil {
-			return allInteriorPieces(state, fi)
+			// Can't read anything — treat every interior piece as failed so
+			// the caller re-streams them. Boundary pieces are deferred to
+			// verifyFinalizedPieces regardless.
+			var failed []int
+			forEachInteriorPiece(state, fi, func(p int) {
+				failed = append(failed, p)
+			})
+			return failed
 		}
 		defer f.Close()
 		fh = f
@@ -191,16 +199,6 @@ func (s *Server) verifyFilePieces(
 		}
 	}
 
-	return failed
-}
-
-// allInteriorPieces returns the indices of every interior (non-boundary) piece
-// in fi. Used as the failure set when the verify pass can't open the file at all.
-func allInteriorPieces(state *serverTorrentState, fi *serverFileInfo) []int {
-	var failed []int
-	forEachInteriorPiece(state, fi, func(p int) {
-		failed = append(failed, p)
-	})
 	return failed
 }
 

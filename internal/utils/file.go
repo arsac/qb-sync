@@ -122,7 +122,18 @@ func GetFileID(path string) (uint64, uint64, error) {
 // fsync ensures data is durable before the rename publishes the new content; this is the
 // safe choice for source-of-truth files (.meta, .finalized markers, completion cache).
 func AtomicWriteFile(path string, data []byte, perm os.FileMode) error {
-	return atomicWriteFile(path, data, perm, true)
+	return writeTempThenRename(path, data, func(tmp *os.File) error {
+		if syncErr := tmp.Sync(); syncErr != nil {
+			return fmt.Errorf("syncing temp file: %w", syncErr)
+		}
+		if closeErr := tmp.Close(); closeErr != nil {
+			return fmt.Errorf("closing temp file: %w", closeErr)
+		}
+		if chmodErr := os.Chmod(tmp.Name(), perm); chmodErr != nil {
+			return fmt.Errorf("setting permissions: %w", chmodErr)
+		}
+		return nil
+	})
 }
 
 // AtomicWriteFileNoSync writes data atomically without fsync or chmod. Use for
@@ -130,10 +141,19 @@ func AtomicWriteFile(path string, data []byte, perm os.FileMode) error {
 // crash time is acceptable because recovery code re-derives the missing data.
 // Saves ~2 NFS round-trips per call (the fsync commit and the setattr).
 func AtomicWriteFileNoSync(path string, data []byte) error {
-	return atomicWriteFile(path, data, 0, false)
+	return writeTempThenRename(path, data, func(tmp *os.File) error {
+		if closeErr := tmp.Close(); closeErr != nil {
+			return fmt.Errorf("closing temp file: %w", closeErr)
+		}
+		return nil
+	})
 }
 
-func atomicWriteFile(path string, data []byte, perm os.FileMode, sync bool) error {
+// writeTempThenRename creates a temp file in path's directory, writes data,
+// runs finalize (which must close the file and may sync/chmod), then renames
+// over path. On any failure before the rename, the temp file is closed and
+// removed. finalize takes ownership of closing tmp.
+func writeTempThenRename(path string, data []byte, finalize func(tmp *os.File) error) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".tmp-*")
 	if err != nil {
@@ -152,18 +172,8 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode, sync bool) erro
 	if _, writeErr := tmp.Write(data); writeErr != nil {
 		return fmt.Errorf("writing temp file: %w", writeErr)
 	}
-	if sync {
-		if syncErr := tmp.Sync(); syncErr != nil {
-			return fmt.Errorf("syncing temp file: %w", syncErr)
-		}
-	}
-	if closeErr := tmp.Close(); closeErr != nil {
-		return fmt.Errorf("closing temp file: %w", closeErr)
-	}
-	if sync {
-		if chmodErr := os.Chmod(tmpPath, perm); chmodErr != nil {
-			return fmt.Errorf("setting permissions: %w", chmodErr)
-		}
+	if finalizeErr := finalize(tmp); finalizeErr != nil {
+		return finalizeErr
 	}
 	if renameErr := os.Rename(tmpPath, path); renameErr != nil {
 		return fmt.Errorf("renaming temp file: %w", renameErr)
