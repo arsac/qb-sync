@@ -259,6 +259,16 @@ func withDestRPCTimeout(parent context.Context) (context.Context, context.Cancel
 	return context.WithTimeout(parent, destRPCTimeout)
 }
 
+// PruneCompletedOnDest is the exported version of pruneCompletedOnDest for testing.
+func (t *QBTask) PruneCompletedOnDest(ctx context.Context) {
+	t.pruneCompletedOnDest(ctx)
+}
+
+// RecheckFileSelections is the exported version of recheckFileSelections for testing.
+func (t *QBTask) RecheckFileSelections(ctx context.Context) {
+	t.recheckFileSelections(ctx)
+}
+
 // pruneCompletedOnDest hands off completed torrents whose source-side copy has
 // been removed (so the destination picks up seeding with the source-removed
 // tag) and removes their entries from the completed cache.

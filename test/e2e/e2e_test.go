@@ -1968,6 +1968,110 @@ func TestE2E_ExcludeSyncTagReactive(t *testing.T) {
 	env.CleanupBothSides(ctx, bigBuckBunnyHash)
 }
 
+// TestE2E_RemovedCompletedAutoHandoff regression-tests the fix that makes
+// destination pick up seeding when the user removes a completed torrent
+// from source qB. PieceMonitor.removeAndNotify only fires for *tracked*
+// torrents, so completed (untracked) torrents removed from source bypass
+// handleTorrentRemoval entirely. Before the fix, the destination silently
+// stayed stopped; after the fix, pruneCompletedOnDest detects the
+// disappearance, calls StartTorrent with the source-removed tag, and
+// prunes the cache entry.
+func TestE2E_RemovedCompletedAutoHandoff(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+
+	t.Parallel()
+
+	env := SetupTestEnv(t)
+	ctx := context.Background()
+
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
+
+	t.Log("Downloading and syncing Big Buck Bunny end-to-end...")
+	env.DownloadTorrentOnSource(ctx, bigBuckBunnyURL, bigBuckBunnyHash, torrentDownloadTimeout)
+
+	// Disable disk-pressure cleanup so maybeMoveToDest doesn't auto-hand off
+	// the torrent before our test reaches the assertion (qB briefly reports
+	// freeGB=0 during startup which triggers default min-space=1 cleanup).
+	cfg := env.CreateSourceConfig(
+		WithSourceRemovedTag("source-removed"),
+		WithMinSpaceGB(0),
+	)
+	task, dest, err := env.CreateSourceTask(cfg)
+	require.NoError(t, err)
+	defer dest.Close()
+
+	syncCtx, cancelSync := context.WithCancel(ctx)
+	syncDone := make(chan error, 1)
+	go func() {
+		syncDone <- task.Run(syncCtx)
+	}()
+
+	require.Eventually(t, func() bool {
+		for _, hash := range task.FetchCompletedOnDestination() {
+			if hash == bigBuckBunnyHash {
+				return true
+			}
+		}
+		return false
+	}, syncCompleteTimeout, pollInterval, "torrent should be in completedOnDest cache")
+	env.AssertTorrentCompleteOnDestination(ctx, bigBuckBunnyHash)
+
+	cancelSync()
+	<-syncDone
+
+	require.Eventually(t, func() bool {
+		return env.IsTorrentStopped(ctx, env.DestinationClient(), bigBuckBunnyHash)
+	}, 15*time.Second, time.Second,
+		"baseline: dest torrent must be stopped after a fresh sync (no dual seeding)")
+
+	t.Log("Removing Big Buck Bunny from source qB (the user-visible action)...")
+	require.NoError(t, env.SourceClient().DeleteTorrentsCtx(ctx, []string{bigBuckBunnyHash}, true))
+
+	// Drive the prune cycle directly rather than waiting for the natural
+	// 50-cycle (~50s) interval. The unit-test-grade exported entrypoint
+	// matches MaybeMoveToDest's testing pattern.
+	t.Log("Triggering pruneCompletedOnDest...")
+	pruneCtx, pruneCancel := context.WithTimeout(ctx, 30*time.Second)
+	task.PruneCompletedOnDest(pruneCtx)
+	pruneCancel()
+
+	require.Eventually(t, func() bool {
+		torrents, getErr := env.DestinationClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+			Hashes: []string{bigBuckBunnyHash},
+		})
+		if getErr != nil || len(torrents) == 0 {
+			return false
+		}
+		return strings.Contains(torrents[0].Tags, "source-removed")
+	}, 30*time.Second, pollInterval,
+		"destination torrent must receive the source-removed tag — proves "+
+			"pruneCompletedOnDest invoked StartTorrent on the disappeared torrent")
+
+	require.Eventually(t, func() bool {
+		torrents, getErr := env.DestinationClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+			Hashes: []string{bigBuckBunnyHash},
+		})
+		if getErr != nil || len(torrents) == 0 {
+			return false
+		}
+		// After StartTorrent, the torrent should leave the stopped state.
+		return !env.IsTorrentStopped(ctx, env.DestinationClient(), bigBuckBunnyHash)
+	}, 15*time.Second, time.Second,
+		"destination torrent must transition out of stopped state after handoff")
+
+	// Cache entry should be pruned post-handoff.
+	for _, hash := range task.FetchCompletedOnDestination() {
+		require.NotEqual(t, bigBuckBunnyHash, hash,
+			"cache entry should be pruned after a successful handoff")
+	}
+
+	t.Log("Confirmed: removed-from-source torrent auto-hands-off to destination")
+
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
+}
+
 // TestE2E_DestinationRecoveryMidStream tests genuine mid-stream recovery.
 // The destination server is stopped while only partially synced, then restarted.
 // A new orchestrator is started and verifies the remaining pieces get streamed

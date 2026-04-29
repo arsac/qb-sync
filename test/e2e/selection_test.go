@@ -184,3 +184,97 @@ func TestE2E_PartialFileSelection(t *testing.T) {
 
 	env.CleanupBothSides(ctx, wiredCDHash)
 }
+
+// TestE2E_FileSelectionChangeTriggersResync verifies that recheckFileSelections
+// detects a post-sync change in source-side file priorities, evicts caches,
+// and re-runs InitTorrent with resync=true so the destination picks up the
+// newly-selected pieces. This path was previously uncovered by e2e tests
+// despite being a core "user changed their mind about which files they want"
+// flow.
+func TestE2E_FileSelectionChangeTriggersResync(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+
+	t.Parallel()
+
+	env := SetupTestEnv(t)
+	ctx := context.Background()
+
+	env.CleanupBothSides(ctx, wiredCDHash)
+
+	t.Log("Adding Wired CD torrent to source...")
+	env.DownloadTorrentOnSource(ctx, testTorrentURL, wiredCDHash, torrentDownloadTimeout)
+
+	// Disable disk-pressure cleanup so maybeMoveToDest doesn't auto-hand off
+	// before the resync.
+	cfg := env.CreateSourceConfig(WithMinSpaceGB(0))
+	task, dest, err := env.CreateSourceTask(cfg)
+	require.NoError(t, err)
+	defer dest.Close()
+
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- task.Run(runCtx)
+	}()
+
+	t.Log("Waiting for first sync to complete (all files selected)...")
+	require.Eventually(t, func() bool {
+		for _, hash := range task.FetchCompletedOnDestination() {
+			if hash == wiredCDHash {
+				return true
+			}
+		}
+		return false
+	}, syncCompleteTimeout, pollInterval, "torrent should be in completedOnDest cache")
+	env.AssertTorrentCompleteOnDestination(ctx, wiredCDHash)
+
+	// Capture original priorities so the post-resync diff is meaningful.
+	preFiles, err := env.DestinationClient().GetFilesInformationCtx(ctx, wiredCDHash)
+	require.NoError(t, err)
+	require.NotNil(t, preFiles)
+	for _, cf := range *preFiles {
+		require.NotEqual(t, 0, cf.Priority,
+			"baseline: all files should be selected (priority>0) before resync, file %d has priority %d",
+			cf.Index, cf.Priority)
+	}
+
+	t.Log("Deselecting files 5, 6, 7 on source...")
+	deselectedIndices := []string{"5", "6", "7"}
+	require.NoError(t, env.SourceClient().SetFilePriorityCtx(
+		ctx, wiredCDHash, strings.Join(deselectedIndices, "|"), 0))
+
+	t.Log("Triggering RecheckFileSelections — the running orchestrator handles streaming...")
+	recheckCtx, recheckCancel := context.WithTimeout(ctx, 90*time.Second)
+	task.RecheckFileSelections(recheckCtx)
+	recheckCancel()
+
+	deselectedSet := map[int]bool{5: true, 6: true, 7: true}
+
+	t.Log("Waiting for destination file priorities to reflect the new selection...")
+	require.Eventually(t, func() bool {
+		destFiles, getErr := env.DestinationClient().GetFilesInformationCtx(ctx, wiredCDHash)
+		if getErr != nil || destFiles == nil {
+			return false
+		}
+		for _, cf := range *destFiles {
+			if deselectedSet[cf.Index] && cf.Priority != 0 {
+				return false
+			}
+			if !deselectedSet[cf.Index] && cf.Priority == 0 {
+				return false
+			}
+		}
+		return true
+	}, syncCompleteTimeout, pollInterval,
+		"destination should reflect new selection: deselected files priority=0, selected files priority>0")
+
+	t.Log("Confirmed: file-selection change triggered resync and destination reflects the new selection")
+
+	cancelRun()
+	<-runDone
+
+	env.CleanupBothSides(ctx, wiredCDHash)
+}
