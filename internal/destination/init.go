@@ -715,7 +715,8 @@ func (s *Server) tryHardlinkFromInProgress(
 // sameFilesystem reports whether two paths reside on the same filesystem
 // by comparing the device IDs of their stat results. Returns false on any
 // stat error or if device IDs cannot be obtained — callers treat that as
-// "not safe to hardlink".
+// "not safe to hardlink". The actual Dev comparison is platform-specific
+// (sameDev): Linux Stat_t.Dev is uint64, Darwin's int32.
 func sameFilesystem(pathA, pathB string) bool {
 	infoA, errA := os.Stat(pathA)
 	if errA != nil {
@@ -730,7 +731,7 @@ func sameFilesystem(pathA, pathB string) bool {
 	if !okA || !okB {
 		return false
 	}
-	return uint64(statA.Dev) == uint64(statB.Dev)
+	return sameDev(statA, statB)
 }
 
 // registerInodeInProgress registers this torrent as the first writer for an inode.
