@@ -313,6 +313,218 @@ func TestDetectRootFolder(t *testing.T) {
 	}
 }
 
+func TestCanonicalSubPath(t *testing.T) {
+	rootedFiles := qbittorrent.TorrentFiles{
+		{Name: "MyMovie/video.mkv"},
+		{Name: "MyMovie/subs.srt"},
+	}
+	singleFile := qbittorrent.TorrentFiles{
+		{Name: "movie.mkv"},
+	}
+	rootlessFiles := qbittorrent.TorrentFiles{
+		{Name: "file1.mkv"},
+		{Name: "file2.mkv"},
+	}
+
+	tests := []struct {
+		name              string
+		qbDefaultSavePath string
+		torrent           qbittorrent.Torrent
+		files             qbittorrent.TorrentFiles
+		want              string
+	}{
+		{
+			name:              "normal multi-file: SavePath equals parent of root",
+			qbDefaultSavePath: "/downloads",
+			torrent: qbittorrent.Torrent{
+				SavePath:    "/downloads/movies",
+				ContentPath: "/downloads/movies/MyMovie",
+			},
+			files: rootedFiles,
+			want:  "movies",
+		},
+		{
+			// Bug repro: AutoTMM/Set-Location made qB report SavePath as the
+			// content directory itself, but the on-disk layout never doubled.
+			// ContentPath still reflects reality, so derive from there.
+			name:              "drift: SavePath includes root, disk does not",
+			qbDefaultSavePath: "/downloads",
+			torrent: qbittorrent.Torrent{
+				SavePath:    "/downloads/movies/MyMovie",
+				ContentPath: "/downloads/movies/MyMovie",
+			},
+			files: rootedFiles,
+			want:  "movies",
+		},
+		{
+			// Legitimate "Set Location into the root-folder name" case: qB
+			// physically moved files, so ContentPath is genuinely doubled.
+			// Mirror that doubling on destination.
+			name:              "Set Location with truly doubled disk layout",
+			qbDefaultSavePath: "/downloads",
+			torrent: qbittorrent.Torrent{
+				SavePath:    "/downloads/movies/MyMovie",
+				ContentPath: "/downloads/movies/MyMovie/MyMovie",
+			},
+			files: rootedFiles,
+			want:  "movies/MyMovie",
+		},
+		{
+			name:              "rootless multi-file: ContentPath is the directory",
+			qbDefaultSavePath: "/downloads",
+			torrent: qbittorrent.Torrent{
+				SavePath:    "/downloads/movies",
+				ContentPath: "/downloads/movies",
+			},
+			files: rootlessFiles,
+			want:  "movies",
+		},
+		{
+			name:              "single-file: parent of file path",
+			qbDefaultSavePath: "/downloads",
+			torrent: qbittorrent.Torrent{
+				SavePath:    "/downloads/movies",
+				ContentPath: "/downloads/movies/movie.mkv",
+			},
+			files: singleFile,
+			want:  "movies",
+		},
+		{
+			name:              "default save path (no category)",
+			qbDefaultSavePath: "/downloads",
+			torrent: qbittorrent.Torrent{
+				SavePath:    "/downloads",
+				ContentPath: "/downloads/MyMovie",
+			},
+			files: rootedFiles,
+			want:  "",
+		},
+		{
+			name:              "empty ContentPath falls back to SavePath",
+			qbDefaultSavePath: "/downloads",
+			torrent: qbittorrent.Torrent{
+				SavePath: "/downloads/movies",
+			},
+			files: rootedFiles,
+			want:  "movies",
+		},
+		{
+			name:              "trailing slash on ContentPath is normalized",
+			qbDefaultSavePath: "/downloads",
+			torrent: qbittorrent.Torrent{
+				SavePath:    "/downloads/movies",
+				ContentPath: "/downloads/movies/MyMovie/",
+			},
+			files: rootedFiles,
+			want:  "movies",
+		},
+		{
+			name:              "nested category subdirectory",
+			qbDefaultSavePath: "/downloads",
+			torrent: qbittorrent.Torrent{
+				SavePath:    "/downloads/media/movies",
+				ContentPath: "/downloads/media/movies/MyMovie",
+			},
+			files: rootedFiles,
+			want:  "media/movies",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Source{qbDefaultSavePath: tt.qbDefaultSavePath}
+			got := s.CanonicalSubPath(tt.torrent, tt.files)
+			if got != tt.want {
+				t.Errorf("CanonicalSubPath() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestActualQBSavePath(t *testing.T) {
+	rootedFiles := qbittorrent.TorrentFiles{
+		{Name: "Show/S01E01.mkv"},
+		{Name: "Show/S01E02.mkv"},
+	}
+
+	tests := []struct {
+		name    string
+		torrent qbittorrent.Torrent
+		files   qbittorrent.TorrentFiles
+		want    string
+	}{
+		{
+			name:    "empty ContentPath returns empty",
+			torrent: qbittorrent.Torrent{SavePath: "/downloads/movies"},
+			files:   rootedFiles,
+			want:    "",
+		},
+		{
+			name:    "relative ContentPath returns empty",
+			torrent: qbittorrent.Torrent{ContentPath: "relative/path"},
+			files:   rootedFiles,
+			want:    "",
+		},
+		{
+			name:    "empty file list returns empty",
+			torrent: qbittorrent.Torrent{ContentPath: "/downloads/movies/Show"},
+			files:   qbittorrent.TorrentFiles{},
+			want:    "",
+		},
+		{
+			name:    "rooted multi-file strips root",
+			torrent: qbittorrent.Torrent{ContentPath: "/downloads/movies/Show"},
+			files:   rootedFiles,
+			want:    "/downloads/movies",
+		},
+		{
+			// Pathological: ContentPath ends in the first file's full path
+			// (root + file) instead of just the root folder. qui's fallback
+			// strips the first-file name suffix, recovering the parent dir.
+			name:    "rooted multi-file: ContentPath includes first file path",
+			torrent: qbittorrent.Torrent{ContentPath: "/downloads/movies/Show/S01E01.mkv"},
+			files:   rootedFiles,
+			want:    "/downloads/movies",
+		},
+		{
+			name: "rootless multi-file: ContentPath is the directory",
+			torrent: qbittorrent.Torrent{
+				ContentPath: "/downloads/loose",
+			},
+			files: qbittorrent.TorrentFiles{
+				{Name: "a.bin"},
+				{Name: "b.bin"},
+			},
+			want: "/downloads/loose",
+		},
+		{
+			name: "single-file strips file name",
+			torrent: qbittorrent.Torrent{
+				ContentPath: "/downloads/movies/movie.mkv",
+			},
+			files: qbittorrent.TorrentFiles{{Name: "movie.mkv"}},
+			want:  "/downloads/movies",
+		},
+		{
+			name: "single-file with nested name strips full relative path",
+			torrent: qbittorrent.Torrent{
+				ContentPath: "/downloads/movies/Sub/movie.mkv",
+			},
+			files: qbittorrent.TorrentFiles{{Name: "Sub/movie.mkv"}},
+			want:  "/downloads/movies",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := actualQBSavePath(tt.torrent, tt.files)
+			if got != tt.want {
+				t.Errorf("actualQBSavePath() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestResolveSubPath_TrailingSlash(t *testing.T) {
 	s := &Source{
 		dataPath:          "/data",
