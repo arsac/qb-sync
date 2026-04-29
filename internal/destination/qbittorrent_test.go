@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/autobrr/go-qbittorrent"
 
@@ -34,6 +35,23 @@ type mockQBClient struct {
 	stopCalled bool
 	stopHashes []string
 	stopErr    error
+
+	categories           map[string]qbittorrent.Category
+	getCategoriesErr     error
+	createCategoryCalled bool
+	createCategoryName   string
+	createCategoryPath   string
+	createCategoryErr    error
+
+	upLimitCalled bool
+	upLimitHashes []string
+	upLimit       int64
+	upLimitErr    error
+
+	dlLimitCalled bool
+	dlLimitHashes []string
+	dlLimit       int64
+	dlLimitErr    error
 }
 
 func (m *mockQBClient) LoginCtx(context.Context) error { return m.loginErr }
@@ -96,6 +114,32 @@ func (m *mockQBClient) StopCtx(_ context.Context, hashes []string) error {
 	m.stopCalled = true
 	m.stopHashes = hashes
 	return m.stopErr
+}
+
+func (m *mockQBClient) GetCategoriesCtx(context.Context) (map[string]qbittorrent.Category, error) {
+	return m.categories, m.getCategoriesErr
+}
+func (m *mockQBClient) SetTorrentUploadLimitCtx(_ context.Context, hashes []string, limit int64) error {
+	m.upLimitCalled = true
+	m.upLimitHashes = hashes
+	m.upLimit = limit
+	return m.upLimitErr
+}
+func (m *mockQBClient) SetTorrentDownloadLimitCtx(_ context.Context, hashes []string, limit int64) error {
+	m.dlLimitCalled = true
+	m.dlLimitHashes = hashes
+	m.dlLimit = limit
+	return m.dlLimitErr
+}
+func (m *mockQBClient) CreateCategoryCtx(_ context.Context, category, path string) error {
+	m.createCategoryCalled = true
+	m.createCategoryName = category
+	m.createCategoryPath = path
+	if m.categories == nil {
+		m.categories = map[string]qbittorrent.Category{}
+	}
+	m.categories[category] = qbittorrent.Category{Name: category, SavePath: path}
+	return m.createCategoryErr
 }
 func (m *mockQBClient) AddTorrentFromMemoryCtx(context.Context, []byte, map[string]string) error {
 	return nil
@@ -265,6 +309,173 @@ func TestStartTorrent(t *testing.T) {
 			t.Fatal("AddTagsCtx should not be called when resume fails")
 		}
 	})
+}
+
+// TestStartTorrent_ClearsRateLimits pins the autobrr-pattern fix that closes
+// the brief announce-before-stop window during AddTorrent. Pre-fix, qB v5
+// could occasionally announce on the brief gap between AddTorrent (with
+// stopped=true) and our explicit StopCtx. Post-fix, AddTorrent sets
+// upLimit/dlLimit to 0; StartTorrent clears the limits (-1) so transfer
+// resumes at full speed.
+func TestStartTorrent_ClearsRateLimits(t *testing.T) {
+	t.Parallel()
+	mock := &mockQBClient{
+		torrents: []qbittorrent.Torrent{{Hash: "abc"}},
+	}
+	s := newTestServerWithQB(t, mock)
+
+	resp, err := s.StartTorrent(context.Background(), &pb.StartTorrentRequest{
+		TorrentHash: "abc",
+	})
+	if err != nil || !resp.GetSuccess() {
+		t.Fatalf("StartTorrent failed: err=%v resp=%v", err, resp)
+	}
+
+	if !mock.upLimitCalled || mock.upLimit != -1 {
+		t.Errorf("upload limit must be cleared (-1), got called=%v limit=%d",
+			mock.upLimitCalled, mock.upLimit)
+	}
+	if !mock.dlLimitCalled || mock.dlLimit != -1 {
+		t.Errorf("download limit must be cleared (-1), got called=%v limit=%d",
+			mock.dlLimitCalled, mock.dlLimit)
+	}
+}
+
+// TestEnsureCategoryExists pins the autobrr-known fix for qBittorrent silently
+// dropping the category field of AddTorrent when the category doesn't already
+// exist on the destination instance. Without ensureCategoryExists the user's
+// "movies" category on source would silently never apply on destination,
+// breaking the directory-layout invariant.
+func TestEnsureCategoryExists(t *testing.T) {
+	t.Parallel()
+
+	t.Run("creates category when missing", func(t *testing.T) {
+		t.Parallel()
+		mock := &mockQBClient{
+			categories: map[string]qbittorrent.Category{}, // empty
+		}
+		s := newTestServerWithQB(t, mock)
+		s.ensureCategoryExists(context.Background(), "movies")
+
+		if !mock.createCategoryCalled {
+			t.Fatal("CreateCategoryCtx must be called when the category doesn't exist")
+		}
+		if mock.createCategoryName != "movies" {
+			t.Errorf("created name = %q, want %q", mock.createCategoryName, "movies")
+		}
+	})
+
+	t.Run("skips creation when category already exists", func(t *testing.T) {
+		t.Parallel()
+		mock := &mockQBClient{
+			categories: map[string]qbittorrent.Category{
+				"movies": {Name: "movies"},
+			},
+		}
+		s := newTestServerWithQB(t, mock)
+		s.ensureCategoryExists(context.Background(), "movies")
+
+		if mock.createCategoryCalled {
+			t.Fatal("CreateCategoryCtx must NOT be called when the category already exists")
+		}
+	})
+
+	t.Run("GetCategories error is best-effort: logs but doesn't fail", func(t *testing.T) {
+		t.Parallel()
+		mock := &mockQBClient{
+			getCategoriesErr: errors.New("transient API error"),
+		}
+		s := newTestServerWithQB(t, mock)
+		// Should not panic or return.
+		s.ensureCategoryExists(context.Background(), "movies")
+
+		if mock.createCategoryCalled {
+			t.Error("CreateCategoryCtx must not be called when GetCategories fails")
+		}
+	})
+
+	t.Run("CreateCategory error is best-effort: logs but doesn't fail", func(t *testing.T) {
+		t.Parallel()
+		mock := &mockQBClient{
+			categories:        map[string]qbittorrent.Category{},
+			createCategoryErr: errors.New("category creation forbidden"),
+		}
+		s := newTestServerWithQB(t, mock)
+		s.ensureCategoryExists(context.Background(), "movies")
+
+		if !mock.createCategoryCalled {
+			t.Fatal("CreateCategoryCtx should still be attempted")
+		}
+	})
+}
+
+// TestComputePollTimeout pins the size-scaling contract for the qB readiness
+// poll timeout. The historical 5-minute fixed budget failed on multi-TB
+// torrents (qB recheck on spinning rust takes hours); the scaled timeout is
+// (base + per-GB * size_in_GB), capped to a hard maximum.
+func TestComputePollTimeout(t *testing.T) {
+	t.Parallel()
+
+	const oneGB = int64(1024 * 1024 * 1024)
+
+	cases := []struct {
+		name    string
+		bytes   int64
+		minWant time.Duration
+		maxWant time.Duration
+		comment string
+	}{
+		{
+			name:    "tiny torrent",
+			bytes:   100 * 1024 * 1024, // 100 MB
+			minWant: defaultQBPollTimeoutBase,
+			maxWant: defaultQBPollTimeoutBase,
+			comment: "below 1GB the floor governs",
+		},
+		{
+			name:    "100GB torrent",
+			bytes:   100 * oneGB,
+			minWant: defaultQBPollTimeoutBase + 100*defaultQBPollTimeoutPerGB,
+			maxWant: defaultQBPollTimeoutBase + 100*defaultQBPollTimeoutPerGB,
+			comment: "scaling kicks in linearly",
+		},
+		{
+			name:    "1TB torrent",
+			bytes:   1024 * oneGB,
+			minWant: defaultQBPollTimeoutBase + 1024*defaultQBPollTimeoutPerGB,
+			maxWant: defaultQBPollTimeoutMax,
+			comment: "still below cap (depends on constants)",
+		},
+		{
+			name:    "10TB torrent",
+			bytes:   10 * 1024 * oneGB,
+			minWant: defaultQBPollTimeoutMax,
+			maxWant: defaultQBPollTimeoutMax,
+			comment: "must hit the hard cap, not grow unboundedly",
+		},
+		{
+			name:    "negative size (defensive)",
+			bytes:   -1,
+			minWant: 0,
+			maxWant: defaultQBPollTimeoutBase,
+			comment: "shouldn't panic; should produce a reasonable value",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := computePollTimeout(tc.bytes)
+			// Allow either >= minWant (when calculated value is at or above floor)
+			// or == maxWant when the cap fires.
+			capped := got > defaultQBPollTimeoutMax
+			belowFloor := got < defaultQBPollTimeoutBase && tc.bytes >= 0
+			if capped || belowFloor {
+				t.Errorf("%s: got %v, expected within [%v, %v] (%s)",
+					tc.name, got, defaultQBPollTimeoutBase, defaultQBPollTimeoutMax, tc.comment)
+			}
+		})
+	}
 }
 
 // TestCheckTorrentInQB_OnlyAcceptsReadyStateAt100 pins the contract introduced

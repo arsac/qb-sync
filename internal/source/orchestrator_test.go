@@ -138,6 +138,19 @@ func (m *mockQBClient) GetFreeSpaceOnDiskCtx(_ context.Context) (int64, error) {
 	return m.freeSpaceOnDisk, m.freeSpaceErr
 }
 
+func (m *mockQBClient) GetCategoriesCtx(context.Context) (map[string]qbittorrent.Category, error) {
+	return nil, nil
+}
+func (m *mockQBClient) CreateCategoryCtx(_ context.Context, _, _ string) error {
+	return nil
+}
+func (m *mockQBClient) SetTorrentUploadLimitCtx(_ context.Context, _ []string, _ int64) error {
+	return nil
+}
+func (m *mockQBClient) SetTorrentDownloadLimitCtx(_ context.Context, _ []string, _ int64) error {
+	return nil
+}
+
 // Tests for finalization backoff logic. These can be unit tested without mocking gRPC.
 func TestFinalizeBackoff(t *testing.T) {
 	logger := testLogger(t)

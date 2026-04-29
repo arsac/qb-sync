@@ -23,9 +23,14 @@ const (
 	workChBufferMultiple = 2   // Work channel is N*workers; memory bounded by memBudget semaphore
 	ackQueueSize         = 100 // Buffer size for outbound acks (small messages, larger buffer is fine)
 
-	// Default polling settings for waitForTorrentReady.
-	defaultQBPollInterval = 2 * time.Second
-	defaultQBPollTimeout  = 5 * time.Minute
+	// Default polling settings for waitForTorrentReady. The timeout is sized
+	// from the torrent's totalSize since qBittorrent's recheck of large
+	// torrents can take well over the historical 5-minute fixed budget on
+	// spinning rust or NFS — see computePollTimeout.
+	defaultQBPollInterval     = 2 * time.Second
+	defaultQBPollTimeoutBase  = 10 * time.Minute // floor for any torrent, regardless of size
+	defaultQBPollTimeoutPerGB = 1 * time.Minute  // added per GB of torrent data
+	defaultQBPollTimeoutMax   = 6 * time.Hour    // hard cap to prevent unbounded waits
 
 	// stopTorrentTimeout is how long to wait when stopping a torrent after adding to qBittorrent.
 	// Uses a detached context because the gRPC caller may cancel before the stop completes.
