@@ -572,6 +572,43 @@ func TestCheckTorrentInQB_VerifyingDuringChecking(t *testing.T) {
 	}
 }
 
+// TestWaitForTorrentReady_MissingFilesIsTerminal regression-tests the
+// finalize-hang fix: when qB parks the torrent in missingFiles (priority-0
+// update lost a race, files genuinely absent, etc.) the poll loop must fail
+// fast instead of treating it as transient and waiting out the multi-hour
+// budget. The source converts the resulting error into FINALIZE_ERROR_INCOMPLETE
+// and re-syncs.
+func TestWaitForTorrentReady_MissingFilesIsTerminal(t *testing.T) {
+	t.Parallel()
+
+	mock := &mockQBClient{
+		torrents: []qbittorrent.Torrent{{
+			Hash:  "abc123",
+			State: qbittorrent.TorrentStateMissingFiles,
+		}},
+	}
+	s := newTestServerWithQB(t, mock)
+	s.config.QB = &QBConfig{
+		PollInterval: 10 * time.Millisecond,
+		PollTimeout:  5 * time.Second,
+	}
+
+	start := time.Now()
+	state, err := s.waitForTorrentReady(context.Background(), "abc123", 0)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("waitForTorrentReady must return an error for missingFiles, not poll until timeout")
+	}
+	if state != qbittorrent.TorrentStateMissingFiles {
+		t.Errorf("returned state = %v, want missingFiles", state)
+	}
+	// Must fail well before the 5s budget; the first poll should catch it.
+	if elapsed > 1*time.Second {
+		t.Errorf("waitForTorrentReady took %v — should fail-fast on missingFiles, not wait out the budget", elapsed)
+	}
+}
+
 // TestAddAndVerifyTorrent_StopsFoundReadyTorrent regression-tests the autobrr
 // Tier-1 fix: when addAndVerifyTorrent finds the torrent already in qB at 100%
 // in a ready state (the path hit during recovery from a destination crash mid-

@@ -186,56 +186,78 @@ func (s *Source) ResolveContentDir(torrentSavePath string) string {
 	return s.resolveQBDir(filepath.Clean(torrentSavePath))
 }
 
-// resolveContentBase determines the directory to use for reading piece data.
-// Uses ContentPath (actual disk location) when available, falling back to SavePath.
-//
-// Rather than blindly calling [filepath.Dir] on ContentPath — which fails when
-// the trailing component isn't what we expect — this strips the known root folder
-// detected from the file list, following the pattern used by autobrr/qui's
-// actualSavePathFromContentPath.
-//
-// [strings.CutSuffix] strips the last occurrence of the root folder, recovering
-// save_path. This is correct even when save_path itself includes the root folder
-// name (e.g. after "Set Location"): qBittorrent physically places files at
-// save_path/f.Name, so the doubled structure on disk is intentional and must be
-// preserved in the read path.
-//
-// Cases handled:
-//   - Rooted multi-file: strip root folder from ContentPath (e.g. /dl/Name → /dl)
-//   - Rootless multi-file: ContentPath IS the base directory
-//   - Single-file: [filepath.Dir] extracts the parent directory
+// resolveContentBase returns the local directory to read piece data from.
+// Maps the qB-namespaced parent-of-content directory (from actualQBSavePath)
+// onto dataPath/tempDataPath, falling back to torrent.SavePath when
+// ContentPath is unusable.
 func (s *Source) resolveContentBase(
 	torrent qbittorrent.Torrent,
 	files qbittorrent.TorrentFiles,
 ) string {
-	if torrent.ContentPath == "" {
-		return s.resolveQBDir(filepath.Clean(torrent.SavePath))
+	if actual := actualQBSavePath(torrent, files); actual != "" {
+		return s.resolveQBDir(actual)
+	}
+	return s.resolveQBDir(filepath.Clean(torrent.SavePath))
+}
+
+// CanonicalSubPath returns the save sub-path that, joined with f.Name on the
+// destination, mirrors source's on-disk layout. Derived from ContentPath
+// rather than torrent.SavePath so it stays correct when qB's SavePath drifts
+// from disk reality (Auto-TMM, "Set Location" with category churn).
+func (s *Source) CanonicalSubPath(
+	torrent qbittorrent.Torrent,
+	files qbittorrent.TorrentFiles,
+) string {
+	if actual := actualQBSavePath(torrent, files); actual != "" {
+		return s.ResolveSubPath(actual)
+	}
+	return s.ResolveSubPath(filepath.Clean(torrent.SavePath))
+}
+
+// actualQBSavePath returns the qB-namespaced parent directory of the torrent's
+// content, derived from torrent.ContentPath. Returns "" when ContentPath is
+// missing or unusable (callers fall back to torrent.SavePath).
+//
+// Modeled on autobrr/qui's actualSavePathFromContentPath: ContentPath is the
+// authoritative on-disk location reported by qB, so stripping the trailing
+// layout component (root folder for rooted multi-file, file name for
+// single-file) yields the directory that joins with f.Name to give the real
+// file path. Survives qB drift between SavePath and ContentPath after
+// Auto-TMM moves or Set Location, and matches torrent.SavePath for
+// well-behaved torrents.
+func actualQBSavePath(torrent qbittorrent.Torrent, files qbittorrent.TorrentFiles) string {
+	contentPath := filepath.Clean(torrent.ContentPath)
+	if contentPath == "" || !filepath.IsAbs(contentPath) || len(files) == 0 {
+		return ""
 	}
 
-	clean := filepath.Clean(torrent.ContentPath)
-	root := detectRootFolder(files)
+	stripSuffix := func(name string) (string, bool) {
+		clean := filepath.Clean(filepath.FromSlash(name))
+		base, ok := strings.CutSuffix(contentPath, string(filepath.Separator)+clean)
+		return base, ok && base != ""
+	}
 
-	switch {
-	case root != "":
-		// Rooted multi-file: strip the known root folder from ContentPath.
-		// The result is save_path (or its temp-path equivalent), which is
-		// the correct base for filepath.Join(base, f.Name).
-		suffix := string(filepath.Separator) + root
-		base, found := strings.CutSuffix(clean, suffix)
-		if !found {
-			// Root folder not at end of ContentPath — fall back to Dir.
-			return s.resolveQBDir(filepath.Dir(clean))
+	if len(files) == 1 {
+		if base, ok := stripSuffix(files[0].Name); ok {
+			return base
 		}
-		return s.resolveQBDir(base)
-
-	case len(files) > 1:
-		// Rootless multi-file: ContentPath IS the content directory.
-		return s.resolveQBDir(clean)
-
-	default:
-		// Single-file: ContentPath is the file path; Dir gives the parent.
-		return s.resolveQBDir(filepath.Dir(clean))
+		return filepath.Dir(contentPath)
 	}
+
+	if root := detectRootFolder(files); root != "" {
+		if base, ok := stripSuffix(root); ok {
+			return base
+		}
+		// Root not at suffix — qui falls back to stripping the first file's
+		// full path (handles ContentPath that points at a specific file).
+		if base, ok := stripSuffix(files[0].Name); ok {
+			return base
+		}
+		return filepath.Dir(contentPath)
+	}
+
+	// Rootless multi-file: ContentPath IS the directory containing the files.
+	return contentPath
 }
 
 // detectRootFolder returns the common root directory shared by all files in a
@@ -329,8 +351,7 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 		return sortedQBFiles[i].Index < sortedQBFiles[j].Index
 	})
 
-	// Resolve content directory using the file list to detect root folder
-	// structure. Must happen after sorting so detectRootFolder sees all files.
+	// Must happen after sorting so detectRootFolder sees files in stable order.
 	contentDir := s.resolveContentBase(torrent, sortedQBFiles)
 
 	files := make([]*pb.FileInfo, len(sortedQBFiles))
@@ -383,7 +404,7 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 			Files:       files,
 			TorrentFile: torrentFile,
 			PieceHashes: pieceHashes,
-			SaveSubPath: s.ResolveSubPath(torrent.SavePath),
+			SaveSubPath: s.CanonicalSubPath(torrent, sortedQBFiles),
 		},
 		ContentDir: contentDir,
 	}, nil
