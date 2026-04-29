@@ -1851,17 +1851,18 @@ func TestE2E_ExcludeSyncTag(t *testing.T) {
 //
 // Note: the in-progress abort path (abortExcludedTracked) is covered by unit tests.
 // Big Buck Bunny syncs too fast (~15s) to reliably catch mid-sync in E2E, so this
-// test exercises the completed-torrent path (forgetExcludedCompleted).
+// test exercises the completed-torrent path (quiesceExcludedCompleted).
 //
 // Strategy:
 //  1. Download Big Buck Bunny on source (no tag)
 //  2. Start the orchestrator — torrent syncs to destination
 //  3. Wait for torrent to be in the source's completedOnDest cache
 //  4. Apply exclude-sync tag
-//  5. Assert: torrent is forgotten from completedOnDest cache
+//  5. Assert: completion-cache entry remains (preserved as authoritative
+//     record for safe-handoff in handleTorrentRemoval)
 //  6. Assert: torrent still exists on destination (files preserved for completed torrents)
 //  7. Remove the tag
-//  8. Assert: orchestrator re-discovers torrent as complete on destination
+//  8. Assert: orchestrator continues to recognize the torrent as complete
 func TestE2E_ExcludeSyncTagReactive(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")
@@ -1911,18 +1912,24 @@ func TestE2E_ExcludeSyncTagReactive(t *testing.T) {
 	err = env.SourceClient().AddTagsCtx(ctx, []string{bigBuckBunnyHash}, "no-sync")
 	require.NoError(t, err)
 
-	// Step 5: Wait for the torrent to be forgotten from completedOnDest cache.
-	t.Log("Waiting for torrent to be forgotten from completedOnDest cache...")
-	require.Eventually(t, func() bool {
-		for _, hash := range task.FetchCompletedOnDestination() {
-			if hash == bigBuckBunnyHash {
-				return false
-			}
+	// Step 5: Confirm the completion-cache entry is preserved. We must keep
+	// the entry so a subsequent source-side removal takes the safe handoff
+	// path instead of deleting destination data of a finalized torrent.
+	// Sleep through a full check-excluded cycle (~10s) and verify the entry
+	// survives.
+	t.Log("Verifying completion-cache entry survives a check-excluded cycle...")
+	time.Sleep(15 * time.Second)
+	stillCached := false
+	for _, hash := range task.FetchCompletedOnDestination() {
+		if hash == bigBuckBunnyHash {
+			stillCached = true
+			break
 		}
-		return true
-	}, 30*time.Second, pollInterval,
-		"torrent should be forgotten from completedOnDest after exclude tag is applied")
-	t.Log("Confirmed: torrent was forgotten from completedOnDest cache")
+	}
+	require.True(t, stillCached,
+		"torrent should remain in completedOnDest after exclude tag is applied "+
+			"(preserved as authoritative record for safe-handoff)")
+	t.Log("Confirmed: completion-cache entry preserved")
 
 	// Step 6: Verify the torrent still exists on destination (files preserved for completed torrents).
 	destTorrents, err := env.DestinationClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
@@ -1933,13 +1940,14 @@ func TestE2E_ExcludeSyncTagReactive(t *testing.T) {
 		"torrent should still exist on destination (completed torrents are preserved)")
 	t.Log("Confirmed: torrent files preserved on destination")
 
-	// Step 7: Remove the tag — orchestrator should re-discover it as complete.
+	// Step 7: Remove the tag — orchestrator continues to recognize the
+	// torrent as complete (entry was never evicted).
 	t.Log("Removing 'no-sync' tag...")
 	err = env.SourceClient().RemoveTagsCtx(ctx, []string{bigBuckBunnyHash}, "no-sync")
 	require.NoError(t, err)
 
-	// Step 8: Wait for the torrent to re-appear in completedOnDest cache.
-	t.Log("Waiting for orchestrator to re-discover torrent as complete...")
+	// Step 8: Confirm the torrent is still in the cache after tag removal.
+	t.Log("Confirming torrent remains complete on destination after tag removal...")
 	require.Eventually(t, func() bool {
 		for _, hash := range task.FetchCompletedOnDestination() {
 			if hash == bigBuckBunnyHash {
@@ -1948,7 +1956,7 @@ func TestE2E_ExcludeSyncTagReactive(t *testing.T) {
 		}
 		return false
 	}, syncCompleteTimeout, pollInterval,
-		"torrent should be re-discovered as complete after tag removal")
+		"torrent should remain in completedOnDest after tag removal")
 
 	cancelOrchestrator()
 	<-orchestratorDone

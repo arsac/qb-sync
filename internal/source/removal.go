@@ -105,13 +105,15 @@ func (t *QBTask) handleTorrentRemoval(ctx context.Context, hash string) {
 
 // tryFinalizeFullyStreamed handles the race where streaming finished on
 // destination but finalization hasn't run yet, when the torrent has just been
-// removed from source. Returns true if the path was taken (caller should not
-// fall through to abort), false if the torrent isn't fully streamed and
-// abort should proceed.
-//
-// Without this path, the subsequent abort would delete fully-streamed data;
-// if we instead finalize and then start, the destination retains the torrent
-// tagged as source-removed.
+// removed from source. Returns true if the torrent was finalized + started
+// (caller must NOT fall through to abort, which would delete the data).
+// Returns false if either:
+//   - the torrent isn't fully streamed (caller proceeds with normal abort), or
+//   - finalize failed (typically because the source torrent is already gone,
+//     so source-side metadata is unreachable). Without source metadata the
+//     data can't be added to destination qB and won't be useful as-is, so
+//     fall through to abort to clean up the .partial files immediately
+//     rather than leaving them for the orphan cleaner.
 func (t *QBTask) tryFinalizeFullyStreamed(ctx context.Context, hash string) bool {
 	checkCtx, checkCancel := withDestRPCTimeout(ctx)
 	result, checkErr := t.grpcDest.CheckTorrentStatus(checkCtx, hash)
@@ -125,18 +127,14 @@ func (t *QBTask) tryFinalizeFullyStreamed(ctx context.Context, hash string) bool
 		"hash", hash,
 	)
 
-	// finalizeTorrent fetches source metadata via GetTorrentsCtx; if the
-	// torrent is already gone from source (the common case once the user
-	// has deleted it), the call fails and the .partial files remain on
-	// destination for the orphan cleaner to handle.
 	finalizeCtx, finalizeCancel := withDestRPCTimeout(ctx)
 	finalizeErr := t.finalizeTorrent(finalizeCtx, hash)
 	finalizeCancel()
 	if finalizeErr != nil {
-		t.logger.WarnContext(ctx, "failed to finalize fully-streamed torrent on removal",
+		t.logger.WarnContext(ctx, "failed to finalize fully-streamed torrent on removal, falling through to abort",
 			"hash", hash, "error", finalizeErr,
 		)
-		return true
+		return false
 	}
 
 	startCtx, startCancel := withDestRPCTimeout(ctx)
