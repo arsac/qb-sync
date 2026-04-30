@@ -3,6 +3,7 @@ package destination
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -52,6 +53,18 @@ type mockQBClient struct {
 	dlLimitHashes []string
 	dlLimit       int64
 	dlLimitErr    error
+
+	setFilePriorityCalls int
+	setFilePriorityIDs   string
+	setFilePriority      int
+	setFilePriorityErr   error
+
+	// filesByCall lets tests script qB's view evolving over successive
+	// GetFilesInformationCtx calls — needed to simulate the silent-drop-then-
+	// persist sequence the verify-and-retry loop is built to handle. Calls past
+	// the last entry reuse it so tests only specify what changes.
+	filesByCall  []qbittorrent.TorrentFiles
+	getFilesCall int
 }
 
 func (m *mockQBClient) LoginCtx(context.Context) error { return m.loginErr }
@@ -86,7 +99,13 @@ func (m *mockQBClient) GetTorrentPropertiesCtx(context.Context, string) (qbittor
 	return qbittorrent.TorrentProperties{}, nil
 }
 func (m *mockQBClient) GetFilesInformationCtx(context.Context, string) (*qbittorrent.TorrentFiles, error) {
-	return nil, nil
+	if len(m.filesByCall) == 0 {
+		return &qbittorrent.TorrentFiles{}, nil
+	}
+	idx := min(m.getFilesCall, len(m.filesByCall)-1)
+	m.getFilesCall++
+	files := m.filesByCall[idx]
+	return &files, nil
 }
 func (m *mockQBClient) ExportTorrentCtx(context.Context, string) ([]byte, error) { return nil, nil }
 func (m *mockQBClient) DeleteTorrentsCtx(_ context.Context, hashes []string, deleteFiles bool) error {
@@ -144,9 +163,14 @@ func (m *mockQBClient) CreateCategoryCtx(_ context.Context, category, path strin
 func (m *mockQBClient) AddTorrentFromMemoryCtx(context.Context, []byte, map[string]string) error {
 	return nil
 }
-func (m *mockQBClient) SetFilePriorityCtx(context.Context, string, string, int) error { return nil }
-func (m *mockQBClient) RecheckCtx(context.Context, []string) error                    { return nil }
-func (m *mockQBClient) GetFreeSpaceOnDiskCtx(context.Context) (int64, error)          { return 0, nil }
+func (m *mockQBClient) SetFilePriorityCtx(_ context.Context, _, ids string, priority int) error {
+	m.setFilePriorityCalls++
+	m.setFilePriorityIDs = ids
+	m.setFilePriority = priority
+	return m.setFilePriorityErr
+}
+func (m *mockQBClient) RecheckCtx(context.Context, []string) error           { return nil }
+func (m *mockQBClient) GetFreeSpaceOnDiskCtx(context.Context) (int64, error) { return 0, nil }
 
 func newTestServerWithQB(t *testing.T, mock *mockQBClient) *Server {
 	t.Helper()
@@ -693,6 +717,109 @@ func TestAddAndVerifyTorrent_StopsFoundReadyTorrent(t *testing.T) {
 		}
 		if !mock.stopCalled {
 			t.Fatal("StopCtx must be attempted even though it returned an error")
+		}
+	})
+}
+
+// TestApplyAndVerifyDeselectedPriorities regression-tests the verify-and-retry
+// flow that catches qB's silent-drop quirk on freshly-added stopped torrents.
+// SetFilePriorityCtx returns 200 OK whether qB persists the change or not, so
+// without verification a partial-selection torrent stays in stoppedDl with
+// default priorities and the downstream wait times out.
+func TestApplyAndVerifyDeselectedPriorities(t *testing.T) {
+	t.Parallel()
+
+	// files: [selected, deselected, selected, deselected]
+	state := &serverTorrentState{
+		torrentMeta: torrentMeta{files: []*serverFileInfo{
+			{selected: true},
+			{selected: false},
+			{selected: true},
+			{selected: false},
+		}},
+	}
+
+	allDeselectedAtZero := qbittorrent.TorrentFiles{
+		{Index: 0, Priority: 1},
+		{Index: 1, Priority: 0},
+		{Index: 2, Priority: 1},
+		{Index: 3, Priority: 0},
+	}
+	allDeselectedAtDefault := qbittorrent.TorrentFiles{
+		{Index: 0, Priority: 1},
+		{Index: 1, Priority: 1},
+		{Index: 2, Priority: 1},
+		{Index: 3, Priority: 1},
+	}
+
+	t.Run("priorities apply on first try, resume called once", func(t *testing.T) {
+		t.Parallel()
+		mock := &mockQBClient{
+			filesByCall: []qbittorrent.TorrentFiles{allDeselectedAtZero},
+		}
+		s := newTestServerWithQB(t, mock)
+
+		err := s.applyAndVerifyDeselectedPriorities(context.Background(), "abc123", state.files)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if mock.setFilePriorityCalls != 1 {
+			t.Errorf("SetFilePriority calls = %d, want 1", mock.setFilePriorityCalls)
+		}
+		if mock.setFilePriorityIDs != "1|3" {
+			t.Errorf("setFilePriorityIDs = %q, want %q", mock.setFilePriorityIDs, "1|3")
+		}
+		if len(mock.resumeHash) != 1 || mock.resumeHash[0] != "abc123" {
+			t.Errorf("Resume must be called once with the torrent hash; got %v", mock.resumeHash)
+		}
+	})
+
+	t.Run("priorities silently dropped on first try, applied on second", func(t *testing.T) {
+		t.Parallel()
+		mock := &mockQBClient{
+			filesByCall: []qbittorrent.TorrentFiles{
+				allDeselectedAtDefault, // first call: qB silently dropped
+				allDeselectedAtZero,    // second call: persisted
+			},
+		}
+		s := newTestServerWithQB(t, mock)
+		s.config.QB = &QBConfig{
+			PriorityVerifyInterval: 5 * time.Millisecond,
+			PriorityVerifyTimeout:  500 * time.Millisecond,
+		}
+
+		err := s.applyAndVerifyDeselectedPriorities(context.Background(), "abc123", state.files)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if mock.setFilePriorityCalls < 2 {
+			t.Errorf("expected at least 2 SetFilePriority calls (retry); got %d", mock.setFilePriorityCalls)
+		}
+		if len(mock.resumeHash) != 1 {
+			t.Errorf("Resume must be called exactly once after verification succeeds; got %v", mock.resumeHash)
+		}
+	})
+
+	t.Run("priorities never persist, returns error and no resume", func(t *testing.T) {
+		t.Parallel()
+		mock := &mockQBClient{
+			filesByCall: []qbittorrent.TorrentFiles{allDeselectedAtDefault},
+		}
+		s := newTestServerWithQB(t, mock)
+		s.config.QB = &QBConfig{
+			PriorityVerifyInterval: 5 * time.Millisecond,
+			PriorityVerifyTimeout:  50 * time.Millisecond,
+		}
+
+		err := s.applyAndVerifyDeselectedPriorities(context.Background(), "abc123", state.files)
+		if err == nil {
+			t.Fatal("expected error when priorities never persist; got nil")
+		}
+		if !strings.Contains(err.Error(), "never persisted") {
+			t.Errorf("error should mention persistence failure; got %q", err.Error())
+		}
+		if len(mock.resumeHash) != 0 {
+			t.Error("Resume must NOT be called when verification never succeeds")
 		}
 	})
 }
