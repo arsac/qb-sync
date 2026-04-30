@@ -54,8 +54,9 @@ const (
 
 // Error wraps an HTTP/transport error with a Kind classification for metrics.
 type Error struct {
-	Kind  Kind
-	Cause error
+	Kind       Kind
+	Cause      error
+	RetryAfter time.Duration // populated for KindRateLimited when Retry-After header is set
 }
 
 func (e *Error) Error() string {

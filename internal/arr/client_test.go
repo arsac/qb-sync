@@ -110,3 +110,21 @@ func TestGetHistoryByDownloadIDClassifies5xx(t *testing.T) {
 		t.Fatalf("expected Error.Kind=KindHTTP5xx, got %v", err)
 	}
 }
+
+func TestClassifyStatusErrorReadsRetryAfter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "7")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := NewClient(srv.URL, "k", time.Second)
+	_, err := c.GetHistoryByDownloadID(context.Background(), "h")
+	var arrErr *Error
+	if !errors.As(err, &arrErr) || arrErr.Kind != KindRateLimited {
+		t.Fatalf("expected Kind=KindRateLimited, got %v", err)
+	}
+	if arrErr.RetryAfter != 7*time.Second {
+		t.Fatalf("expected RetryAfter=7s, got %v", arrErr.RetryAfter)
+	}
+}

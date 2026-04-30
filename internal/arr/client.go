@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -104,12 +105,30 @@ func classifyStatusError(resp *http.Response) error {
 	case resp.StatusCode == http.StatusUnauthorized:
 		return &Error{Kind: KindUnauthorized, Cause: errors.New(resp.Status)}
 	case resp.StatusCode == http.StatusTooManyRequests:
-		return &Error{Kind: KindRateLimited, Cause: errors.New(resp.Status)}
+		return &Error{
+			Kind:       KindRateLimited,
+			Cause:      errors.New(resp.Status),
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+		}
 	case resp.StatusCode >= http.StatusInternalServerError:
 		return &Error{Kind: KindHTTP5xx, Cause: errors.New(resp.Status)}
 	default:
 		return &Error{Kind: KindNetwork, Cause: errors.New(resp.Status)}
 	}
+}
+
+// parseRetryAfter accepts the integer-seconds form of Retry-After. The HTTP
+// date form is rare in *arr responses; return 0 (caller will use a default backoff).
+func parseRetryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	secs, err := strconv.Atoi(v)
+	if err != nil || secs < 0 {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
 }
 
 // GetHistoryByDownloadID calls GET /api/v3/history?downloadId={hash}.
