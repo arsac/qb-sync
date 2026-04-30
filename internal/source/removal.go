@@ -2,8 +2,6 @@ package source
 
 import (
 	"context"
-
-	"github.com/arsac/qb-sync/internal/metrics"
 )
 
 // listenForRemovals watches for torrents removed from source qBittorrent
@@ -30,7 +28,7 @@ func (t *QBTask) handleTorrentRemoval(ctx context.Context, hash string) {
 		"hash", hash,
 	)
 
-	tt, wasTracked := t.tracked.DeleteAndGet(hash)
+	_, wasTracked := t.tracked.DeleteAndGet(hash)
 
 	// Read completedOnDest but don't delete yet -- only remove after
 	// StartTorrent succeeds so pruneCompletedOnDest can retry on failure.
@@ -38,9 +36,7 @@ func (t *QBTask) handleTorrentRemoval(ctx context.Context, hash string) {
 
 	t.backoffs.Clear(hash)
 
-	if wasTracked {
-		metrics.OldestPendingSyncSeconds.DeleteLabelValues(hash, tt.Name)
-	} else {
+	if !wasTracked {
 		t.logger.DebugContext(ctx, "removed torrent was not in tracked list",
 			"hash", hash,
 		)

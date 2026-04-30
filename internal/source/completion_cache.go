@@ -9,7 +9,6 @@ import (
 	"slices"
 	"sync"
 
-	"github.com/arsac/qb-sync/internal/metrics"
 	"github.com/arsac/qb-sync/internal/utils"
 )
 
@@ -43,7 +42,6 @@ func (c *CompletionCache) Keys() []string {
 func (c *CompletionCache) Mark(hash string) {
 	c.mu.Lock()
 	c.completed[hash] = ""
-	metrics.CompletedOnDestCacheSize.Set(float64(len(c.completed)))
 	c.mu.Unlock()
 }
 
@@ -60,7 +58,6 @@ func (c *CompletionCache) IsComplete(hash string) bool {
 func (c *CompletionCache) MarkWithFingerprint(hash, fingerprint string) {
 	c.mu.Lock()
 	c.completed[hash] = fingerprint
-	metrics.CompletedOnDestCacheSize.Set(float64(len(c.completed)))
 	c.mu.Unlock()
 }
 
@@ -68,7 +65,6 @@ func (c *CompletionCache) MarkWithFingerprint(hash, fingerprint string) {
 func (c *CompletionCache) Remove(hash string) {
 	c.mu.Lock()
 	delete(c.completed, hash)
-	metrics.CompletedOnDestCacheSize.Set(float64(len(c.completed)))
 	c.mu.Unlock()
 }
 
@@ -78,7 +74,6 @@ func (c *CompletionCache) RemoveAll(hashes []string) {
 	for _, hash := range hashes {
 		delete(c.completed, hash)
 	}
-	metrics.CompletedOnDestCacheSize.Set(float64(len(c.completed)))
 	c.mu.Unlock()
 }
 
@@ -128,7 +123,6 @@ func (c *CompletionCache) Load() {
 
 	c.mu.Lock()
 	maps.Copy(c.completed, fingerprints)
-	metrics.CompletedOnDestCacheSize.Set(float64(len(c.completed)))
 	c.mu.Unlock()
 
 	c.logger.Info("loaded completed-on-destination cache",

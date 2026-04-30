@@ -19,6 +19,7 @@ const (
 	LabelName       = "name"       // torrent name
 	LabelConnection = "connection" // gRPC connection index
 	LabelDirection  = "direction"  // scaling direction (up, down)
+	LabelSelection  = "selection"  // partial, full
 )
 
 // Label value constants for consistent usage across the codebase.
@@ -31,6 +32,11 @@ const (
 	ResultSkippedSeeding = "skipped_seeding"
 	ResultHit            = "hit"
 	ResultMiss           = "miss"
+	ResultSynced         = "synced" // sync_outcomes_total
+	ResultFailed         = "failed" // sync_outcomes_total
+
+	SelectionPartial = "partial"
+	SelectionFull    = "full"
 
 	ComponentStreamQueue = "stream_queue"
 
@@ -45,14 +51,18 @@ const (
 
 // Counters track cumulative values that only increase.
 var (
-	// TorrentsSyncedTotal counts torrents successfully synced.
-	TorrentsSyncedTotal = promauto.NewCounterVec(
+	// SyncOutcomesTotal counts torrents reaching a terminal sync outcome
+	// (synced or sync-failed). Replaces the prior split torrents_synced_total
+	// + sync_failed_total. Selection label distinguishes partial vs full
+	// torrents so operators can see whether partial-selection finalization
+	// succeeds at the same rate as full.
+	SyncOutcomesTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: namespace,
-			Name:      "torrents_synced_total",
-			Help:      "Total torrents successfully synced",
+			Name:      "sync_outcomes_total",
+			Help:      "Torrent sync outcomes: result=synced (succeeded) or result=failed (sync-failed tagged)",
 		},
-		[]string{LabelMode, LabelHash, LabelName},
+		[]string{LabelMode, LabelResult, LabelSelection},
 	)
 
 	// FinalizationErrorsTotal counts finalization failures.
@@ -341,14 +351,17 @@ var (
 		},
 	)
 
-	// TorrentBytesSyncedTotal counts bytes synced per torrent for Grafana completed-transfers table.
-	TorrentBytesSyncedTotal = promauto.NewCounterVec(
+	// BytesSyncedTotal counts bytes synced from source to destination, broken
+	// down by mode and selection. Per-torrent breakdown previously available
+	// via {hash, name} labels was dropped: hash+name is unbounded over time
+	// and operators reading per-torrent totals belong in logs, not Prometheus.
+	BytesSyncedTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: namespace,
-			Name:      "torrent_bytes_synced_total",
-			Help:      "Total bytes synced per torrent from source to destination",
+			Name:      "bytes_synced_total",
+			Help:      "Total bytes synced from source to destination",
 		},
-		[]string{LabelHash, LabelName},
+		[]string{LabelMode, LabelSelection},
 	)
 
 	// HealthCheckCacheTotal counts health check cache hits and misses.
@@ -468,16 +481,6 @@ var (
 		},
 	)
 
-	// SyncFailedTotal counts torrents that exhausted verification retries
-	// and were tagged as sync-failed on source.
-	SyncFailedTotal = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Namespace: namespace,
-			Name:      "sync_failed_total",
-			Help:      "Torrents that failed verification repeatedly and were tagged as sync-failed",
-		},
-	)
-
 	// ExcludeSyncAbortTotal counts torrents aborted due to exclude-sync tag applied mid-sync.
 	ExcludeSyncAbortTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
@@ -523,18 +526,86 @@ var (
 	)
 )
 
-// Gauges track values that can go up or down.
+// Descriptors for state-derived gauges emitted via per-binary Collectors at
+// scrape time. Reading state directly on Collect eliminates drift between
+// state mutation and metric value, and removes the orchestrator-cycle lag
+// operators previously saw on dashboards.
 var (
-	// ActiveTorrents tracks torrents currently being synced.
-	ActiveTorrents = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "active_torrents",
-			Help:      "Torrents currently being tracked/synced",
-		},
-		[]string{LabelMode},
+	ActiveTorrentsDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "", "active_torrents"),
+		"Torrents currently being tracked/synced",
+		[]string{LabelMode}, nil,
 	)
 
+	OldestPendingSyncSecondsDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "", "oldest_pending_sync_seconds"),
+		"Age in seconds of the oldest torrent waiting to sync from source to destination",
+		[]string{LabelHash, LabelName}, nil,
+	)
+
+	TorrentPiecesDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "", "torrent_pieces"),
+		"Total number of pieces per tracked torrent",
+		[]string{LabelHash, LabelName}, nil,
+	)
+
+	TorrentPiecesStreamedDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "", "torrent_pieces_streamed"),
+		"Number of pieces synced to destination per tracked torrent",
+		[]string{LabelHash, LabelName}, nil,
+	)
+
+	TorrentSizeBytesDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "", "torrent_size_bytes"),
+		"Total size in bytes per tracked torrent",
+		[]string{LabelHash, LabelName}, nil,
+	)
+
+	// TorrentProgressRatioDesc and TorrentBytesStreamedDesc are derived from the
+	// same scrape-time snapshot as the raw piece counters, so they can't drift
+	// against TorrentPiecesStreamedDesc / TorrentPiecesDesc. They also save
+	// dashboards from a divide-by-zero-guarded join across multiple metrics.
+	TorrentProgressRatioDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "", "torrent_progress_ratio"),
+		"Streaming progress per tracked torrent as a ratio in [0,1]",
+		[]string{LabelHash, LabelName}, nil,
+	)
+
+	TorrentBytesStreamedDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "", "torrent_bytes_streamed"),
+		"Approximate bytes streamed to destination per tracked torrent",
+		[]string{LabelHash, LabelName}, nil,
+	)
+
+	CompletedOnDestCacheSizeDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "", "completed_on_dest_cache_size"),
+		"Number of torrents cached as complete on destination",
+		nil, nil,
+	)
+
+	ActiveFinalizationBackoffsDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "", "active_finalization_backoffs"),
+		"Torrents currently in finalization backoff on source server",
+		nil, nil,
+	)
+
+	InodeRegistrySizeDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "", "inode_registry_size"),
+		"Number of registered inodes for hardlink deduplication",
+		nil, nil,
+	)
+
+	TorrentsWithDirtyStateDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "", "torrents_with_dirty_state"),
+		"Torrents with state not yet flushed to disk on destination server",
+		nil, nil,
+	)
+)
+
+// Gauges track values that can go up or down. Event-driven gauges live here
+// (set inline at the state-change site); state-derived gauges live above as
+// prometheus.Desc + Collector emission.
+var (
 	// InflightPieces tracks pieces currently in-flight (sent but not acked).
 	InflightPieces = promauto.NewGauge(
 		prometheus.GaugeOpts{
@@ -596,82 +667,6 @@ var (
 			Namespace: namespace,
 			Name:      "transfer_throughput_bytes_per_second",
 			Help:      "Current transfer throughput in bytes per second",
-		},
-	)
-
-	// TorrentsWithDirtyState tracks torrents with unflushed state on destination.
-	TorrentsWithDirtyState = promauto.NewGauge(
-		prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "torrents_with_dirty_state",
-			Help:      "Torrents with state not yet flushed to disk on destination server",
-		},
-	)
-
-	// ActiveFinalizationBackoffs tracks torrents in finalization backoff on source.
-	ActiveFinalizationBackoffs = promauto.NewGauge(
-		prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "active_finalization_backoffs",
-			Help:      "Torrents currently in finalization backoff on source server",
-		},
-	)
-
-	// OldestPendingSyncSeconds tracks the age of the longest-waiting torrent sync.
-	OldestPendingSyncSeconds = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "oldest_pending_sync_seconds",
-			Help:      "Age in seconds of the oldest torrent waiting to sync from source to destination",
-		},
-		[]string{LabelHash, LabelName},
-	)
-
-	// TorrentPieces tracks the total number of pieces per tracked torrent.
-	TorrentPieces = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "torrent_pieces",
-			Help:      "Total number of pieces per tracked torrent",
-		},
-		[]string{LabelHash, LabelName},
-	)
-
-	// TorrentPiecesStreamed tracks the number of pieces synced to destination per tracked torrent.
-	TorrentPiecesStreamed = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "torrent_pieces_streamed",
-			Help:      "Number of pieces synced to destination per tracked torrent",
-		},
-		[]string{LabelHash, LabelName},
-	)
-
-	// TorrentSizeBytes tracks the total size in bytes per tracked torrent.
-	TorrentSizeBytes = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "torrent_size_bytes",
-			Help:      "Total size in bytes per tracked torrent",
-		},
-		[]string{LabelHash, LabelName},
-	)
-
-	// CompletedOnDestCacheSize tracks the size of the completed-on-destination cache on source.
-	CompletedOnDestCacheSize = promauto.NewGauge(
-		prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "completed_on_dest_cache_size",
-			Help:      "Number of torrents cached as complete on destination",
-		},
-	)
-
-	// InodeRegistrySize tracks the number of registered inodes on destination.
-	InodeRegistrySize = promauto.NewGauge(
-		prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "inode_registry_size",
-			Help:      "Number of registered inodes for hardlink deduplication",
 		},
 	)
 

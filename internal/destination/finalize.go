@@ -257,7 +257,11 @@ func (s *Server) storeSuccessResult(
 	state.finalization.storeResult(&finalizeResult{success: true, state: stateStr})
 	state.mu.Unlock()
 
-	metrics.TorrentsSyncedTotal.WithLabelValues(metrics.ModeDestination, hash, hash).Inc()
+	selection := metrics.SelectionFull
+	if deselectedFileIDs(state.files) != "" {
+		selection = metrics.SelectionPartial
+	}
+	metrics.SyncOutcomesTotal.WithLabelValues(metrics.ModeDestination, metrics.ResultSynced, selection).Inc()
 	s.logger.InfoContext(ctx, "torrent finalized (background)", "hash", hash, "state", stateStr)
 }
 

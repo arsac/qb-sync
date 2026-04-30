@@ -50,7 +50,7 @@ const (
 type TrackedTorrent struct {
 	CompletionTime time.Time // when the torrent finished downloading on source (from qbittorrent CompletionOn)
 	Name           string    // torrent name for metric labels
-	Size           int64     // torrent size in bytes for TorrentBytesSyncedTotal metric
+	Size           int64     // torrent size in bytes for BytesSyncedTotal metric
 }
 
 // QBTask orchestrates torrent streaming from source to destination.
@@ -227,9 +227,6 @@ func (t *QBTask) runOnce(ctx context.Context) {
 			t.logger.ErrorContext(ctx, "failed to move torrents", "error", err)
 		}
 	}
-	metrics.ActiveTorrents.WithLabelValues(metrics.ModeSource).Set(float64(t.tracked.Count()))
-	t.updateSyncAgeGauge()
-	t.updateTorrentProgressGauges()
 
 	t.pruneCycleCount++
 	if t.pruneCycleCount >= pruneCycleInterval {
@@ -238,6 +235,12 @@ func (t *QBTask) runOnce(ctx context.Context) {
 		t.recheckFileSelections(ctx)
 		t.pruneStaleMonitorEntries(ctx)
 	}
+}
+
+// Progress returns the streaming progress for a torrent.
+// Exported for testing (used by E2E tests).
+func (t *QBTask) Progress(_ context.Context, hash string) (streaming.StreamProgress, error) {
+	return t.tracker.GetProgress(hash)
 }
 
 // FetchCompletedOnDestination returns torrents known to be complete on destination.

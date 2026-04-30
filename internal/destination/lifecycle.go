@@ -58,19 +58,12 @@ func (s *Server) runStateFlusher(ctx context.Context) {
 // flushDirtyStates saves state for all torrents marked as dirty.
 // Uses consistent lock ordering: collect references via store.ForEach, then acquire state.mu individually.
 func (s *Server) flushDirtyStates(ctx context.Context) {
-	metrics.ActiveTorrents.WithLabelValues(metrics.ModeDestination).Set(float64(s.store.Len()))
-
 	// Process each torrent: snapshot state under lock, then do I/O outside it.
 	// This prevents a slow/hung filesystem from holding state.mu and blocking
 	// WritePiece or FinalizeTorrent for the same torrent.
-	var dirtyAfterFlush int
-
 	s.store.ForEach(func(hash string, state *serverTorrentState) bool {
 		state.mu.Lock()
 		if !state.dirty || state.statePath == "" {
-			if state.dirty {
-				dirtyAfterFlush++
-			}
 			state.mu.Unlock()
 			return true
 		}
@@ -87,7 +80,6 @@ func (s *Server) flushDirtyStates(ctx context.Context) {
 				"hash", hash,
 				"error", saveErr,
 			)
-			dirtyAfterFlush++
 			return true
 		}
 
@@ -98,8 +90,6 @@ func (s *Server) flushDirtyStates(ctx context.Context) {
 		// The inline flush already wrote a newer state to disk -- skip bookkeeping
 		// to avoid clearing dirty/piecesSinceFlush for pieces not in our snapshot.
 		if state.flushGen != snapshotGen {
-			// Still dirty from the inline flush's perspective; recount next cycle.
-			dirtyAfterFlush++
 			state.mu.Unlock()
 			return true
 		}
@@ -108,8 +98,6 @@ func (s *Server) flushDirtyStates(ctx context.Context) {
 		if state.piecesSinceFlush <= 0 {
 			state.dirty = false
 			state.piecesSinceFlush = 0
-		} else {
-			dirtyAfterFlush++
 		}
 		state.mu.Unlock()
 
@@ -119,7 +107,6 @@ func (s *Server) flushDirtyStates(ctx context.Context) {
 		)
 		return true
 	})
-	metrics.TorrentsWithDirtyState.Set(float64(dirtyAfterFlush))
 }
 
 // runOrphanCleaner periodically scans for and cleans up orphaned torrents.

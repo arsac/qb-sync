@@ -112,9 +112,9 @@ func (t *QBTask) markTorrentSynced(ctx context.Context, hash string, tt TrackedT
 	t.source.EvictCache(hash)
 	t.tracked.Delete(hash)
 
-	metrics.TorrentsSyncedTotal.WithLabelValues(metrics.ModeSource, hash, tt.Name).Inc()
-	metrics.TorrentBytesSyncedTotal.WithLabelValues(hash, tt.Name).Add(float64(tt.Size))
-	metrics.OldestPendingSyncSeconds.DeleteLabelValues(hash, tt.Name)
+	selection := t.computeSelectionLabel(ctx, hash)
+	metrics.SyncOutcomesTotal.WithLabelValues(metrics.ModeSource, metrics.ResultSynced, selection).Inc()
+	metrics.BytesSyncedTotal.WithLabelValues(metrics.ModeSource, selection).Add(float64(tt.Size))
 
 	t.logger.InfoContext(ctx, "torrent synced successfully", "hash", hash)
 
@@ -224,11 +224,16 @@ func (t *QBTask) markSyncFailed(ctx context.Context, hash string) {
 		}
 	}
 
+	// Capture selection before untracking, so the outcome metric carries the
+	// label. Defaults to "full" on API error — preserves the historical
+	// behavior where sync_failed_total had no label distinction.
+	selection := t.computeSelectionLabel(ctx, hash)
+
 	// Stop tracking so the torrent is not re-streamed.
 	// It will be picked up again if the user removes the tag.
 	t.stopTracking(hash)
 
-	metrics.SyncFailedTotal.Inc()
+	metrics.SyncOutcomesTotal.WithLabelValues(metrics.ModeSource, metrics.ResultFailed, selection).Inc()
 }
 
 // stopTracking tears down all tracking state for a torrent: unregisters from the

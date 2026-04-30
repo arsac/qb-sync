@@ -263,6 +263,30 @@ func (t *QBTask) computeSelectionFingerprint(ctx context.Context, hash string) s
 	return selectedFingerprint(*qbFiles)
 }
 
+// selectionLabel returns the metrics.SelectionPartial / SelectionFull value
+// for the given file list. Used to label sync outcome metrics so operators
+// can see whether partial-selection torrents are succeeding at the same rate
+// as full-selection ones.
+func selectionLabel(files qbittorrent.TorrentFiles) string {
+	for _, f := range files {
+		if f.Priority == 0 {
+			return metrics.SelectionPartial
+		}
+	}
+	return metrics.SelectionFull
+}
+
+// computeSelectionLabel fetches file info and returns the selection label.
+// Defaults to SelectionFull on error (safe assumption; selection-conditional
+// code paths only fire when the explicit partial signal exists elsewhere).
+func (t *QBTask) computeSelectionLabel(ctx context.Context, hash string) string {
+	qbFiles, err := t.srcClient.GetFilesInformationCtx(ctx, hash)
+	if err != nil {
+		return metrics.SelectionFull
+	}
+	return selectionLabel(*qbFiles)
+}
+
 // findTorrentByHash looks up a torrent from the per-cycle cache.
 func (t *QBTask) findTorrentByHash(hash string) *qbittorrent.Torrent {
 	for i := range t.cycleTorrents {
@@ -328,7 +352,6 @@ func (t *QBTask) abortExcludedTracked(ctx context.Context, excludedHashes map[st
 
 		t.stopTracking(hash)
 
-		metrics.OldestPendingSyncSeconds.DeleteLabelValues(hash, tt.Name)
 		metrics.ExcludeSyncAbortTotal.Inc()
 	}
 }

@@ -7,8 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-
-	"github.com/arsac/qb-sync/internal/metrics"
 )
 
 // InodeRegistry manages inode-to-path mappings for hardlink deduplication.
@@ -51,7 +49,6 @@ func (r *InodeRegistry) GetRegistered(fileID FileID) (string, bool) {
 func (r *InodeRegistry) Register(fileID FileID, relPath string) {
 	r.registeredMu.Lock()
 	r.registered[fileID] = relPath
-	metrics.InodeRegistrySize.Set(float64(len(r.registered)))
 	r.registeredMu.Unlock()
 }
 
@@ -61,7 +58,6 @@ func (r *InodeRegistry) Register(fileID FileID, relPath string) {
 func (r *InodeRegistry) Evict(fileID FileID) {
 	r.registeredMu.Lock()
 	delete(r.registered, fileID)
-	metrics.InodeRegistrySize.Set(float64(len(r.registered)))
 	r.registeredMu.Unlock()
 }
 
@@ -172,7 +168,6 @@ func (r *InodeRegistry) CleanupStale(ctx context.Context) {
 		}
 	}
 	remaining := len(r.registered)
-	metrics.InodeRegistrySize.Set(float64(remaining))
 	r.registeredMu.Unlock()
 
 	r.logger.InfoContext(ctx, "cleaned up stale inode entries",

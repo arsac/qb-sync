@@ -3,8 +3,6 @@ package source
 import (
 	"sync"
 	"time"
-
-	"github.com/arsac/qb-sync/internal/metrics"
 )
 
 // Finalization retry settings - exponential backoff.
@@ -66,7 +64,6 @@ func (b *BackoffTracker) RecordFailure(hash string) int {
 
 	backoff.failures++
 	backoff.lastAttempt = time.Now()
-	metrics.ActiveFinalizationBackoffs.Set(float64(len(b.backoffs)))
 	return backoff.failures
 }
 
@@ -75,5 +72,12 @@ func (b *BackoffTracker) Clear(hash string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	delete(b.backoffs, hash)
-	metrics.ActiveFinalizationBackoffs.Set(float64(len(b.backoffs)))
+}
+
+// Count returns the number of hashes currently in backoff state.
+// Used by metrics collectors to emit active_finalization_backoffs at scrape time.
+func (b *BackoffTracker) Count() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.backoffs)
 }

@@ -20,8 +20,8 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 
 | Metric | Labels | Description |
 |--------|--------|-------------|
-| `qbsync_torrents_synced_total` | `mode`, `hash`, `name` | Torrents successfully synced |
-| `qbsync_torrent_bytes_synced_total` | `hash`, `name` | Bytes synced per torrent (source only, for completed-transfers table) |
+| `qbsync_sync_outcomes_total` | `mode`, `result`, `selection` | Torrent sync outcomes (`result=synced` or `result=failed`, `selection=partial` or `full`). Replaces the prior `torrents_synced_total` + `sync_failed_total`. |
+| `qbsync_bytes_synced_total` | `mode`, `selection` | Bytes synced from source to destination. Per-torrent breakdown was dropped — `hash`/`name` labels are unbounded over time and per-torrent audit belongs in logs. |
 | `qbsync_finalization_errors_total` | `mode` | Finalization failures |
 | `qbsync_torrent_stop_errors_total` | `mode` | Failures stopping torrents before handoff |
 | `qbsync_torrent_resume_errors_total` | `mode` | Failures resuming torrents after handoff rollback |
@@ -64,7 +64,6 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_file_selection_resyncs_total` | | Re-syncs triggered by file selection changes (source) |
 | `qbsync_early_finalize_verify_failures_total` | | Files that failed read-back verification during early finalization (destination) |
 | `qbsync_verification_recoveries_total` | | Torrents recovered from verification failure by marking pieces for re-streaming (destination) |
-| `qbsync_sync_failed_total` | | Torrents that failed verification repeatedly and were tagged as sync-failed (source) |
 | `qbsync_exclude_sync_abort_total` | | Torrents aborted due to exclude-sync tag applied mid-sync (source) |
 | `qbsync_finalize_not_found_total` | | Torrents untracked because destination had no state — will re-initialize (source) |
 | `qbsync_stale_bitmap_pieces_cleared_total` | | Piece bits cleared from written bitmap because backing data file was missing (destination) |
@@ -88,6 +87,8 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_torrent_pieces` | `hash`, `name` | Total pieces per tracked torrent |
 | `qbsync_torrent_pieces_streamed` | `hash`, `name` | Pieces synced to destination per tracked torrent |
 | `qbsync_torrent_size_bytes` | `hash`, `name` | Total size in bytes per tracked torrent |
+| `qbsync_torrent_progress_ratio` | `hash`, `name` | Streaming progress as a ratio in `[0,1]` — derived from `pieces_streamed / pieces`, exposed directly to avoid divide-by-zero in dashboard PromQL |
+| `qbsync_torrent_bytes_streamed` | `hash`, `name` | Approximate bytes streamed to destination per tracked torrent — derived from `progress_ratio * size_bytes` |
 | `qbsync_completed_on_dest_cache_size` | | Torrents cached as complete on destination (source) |
 | `qbsync_inode_registry_size` | | Registered inodes for hardlink deduplication (destination) |
 | `qbsync_write_worker_queue_depth` | | Pieces queued waiting for a destination write worker |
@@ -116,20 +117,20 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 
 | Column | PromQL |
 |--------|--------|
-| Name | `qbsync_torrent_bytes_synced_total` label `name` |
-| Bytes | `qbsync_torrent_bytes_synced_total` |
-| Synced at | `timestamp(qbsync_torrents_synced_total{mode="source"})` |
+| Bytes synced (system) | `rate(qbsync_bytes_synced_total{mode="source"}[5m])` |
+| Sync rate | `rate(qbsync_sync_outcomes_total{mode="source",result="synced"}[5m])` |
+| Per-torrent audit | use the source-side log lines (`"torrent synced successfully"` carries `hash`); Prometheus retains only aggregate counts |
 
 **Live per-torrent progress** (download list view):
 
 | Panel | PromQL |
 |-------|--------|
-| Progress bar per torrent | `qbsync_torrent_pieces_streamed / qbsync_torrent_pieces` |
+| Progress bar per torrent | `qbsync_torrent_progress_ratio` |
 | Pieces remaining | `qbsync_torrent_pieces - qbsync_torrent_pieces_streamed` |
 | Torrent size | `qbsync_torrent_size_bytes` |
-| Bytes synced (estimated) | `qbsync_torrent_pieces_streamed / qbsync_torrent_pieces * qbsync_torrent_size_bytes` |
-| Sync rate | `rate(qbsync_torrent_pieces_streamed[5m])` per torrent |
-| Active torrent list | Table panel filtering on `qbsync_torrent_pieces > 0` |
+| Bytes streamed (per torrent) | `qbsync_torrent_bytes_streamed` |
+| Sync rate (per torrent) | `rate(qbsync_torrent_pieces_streamed[5m])` |
+| Active torrent list | Table panel on `qbsync_torrent_progress_ratio` (presence implies tracked) |
 
 **Sync latency distribution** (aggregated across all torrents):
 
