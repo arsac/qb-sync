@@ -12,6 +12,8 @@ import (
 
 	"github.com/failsafe-go/failsafe-go"
 	"github.com/failsafe-go/failsafe-go/circuitbreaker"
+
+	"github.com/arsac/qb-sync/internal/metrics"
 )
 
 // instanceState holds per-instance config and runtime state.
@@ -40,6 +42,13 @@ var _ Filter = (*Service)(nil)
 // ShouldSync is the entry point for the source package. It is total: errors,
 // breaker-open, and budget exhaustion all map to a Decision (fail-open).
 func (s *Service) ShouldSync(ctx context.Context, hash, category string) Decision {
+	d := s.decide(ctx, hash, category)
+	s.recordDecision(ctx, hash, category, d)
+	return d
+}
+
+// decide is the pure decision logic without metric side-effects.
+func (s *Service) decide(ctx context.Context, hash, category string) Decision {
 	instanceName, ok := s.routes[category]
 	if !ok {
 		return Decision{Sync: true, Reason: ReasonNoCategory}
@@ -55,9 +64,29 @@ func (s *Service) ShouldSync(ctx context.Context, hash, category string) Decisio
 		return d
 	}
 
+	start := timeNow()
 	d := s.lookup(ctx, inst, hash)
+	metrics.ArrLookupSeconds.WithLabelValues(instanceName).Observe(timeNow().Sub(start).Seconds())
 	s.cache.Set(key, d)
 	return d
+}
+
+// recordDecision emits decision-level metrics for the verdict.
+func (s *Service) recordDecision(_ context.Context, _ string, category string, d Decision) {
+	if d.Reason == ReasonNoCategory {
+		return // not a real decision; never count routing-skips
+	}
+	instanceName := s.routes[category] // safe: ReasonNoCategory was filtered
+
+	switch {
+	case !d.Sync:
+		metrics.ArrDecisionsTotal.WithLabelValues(instanceName, "skipped").Inc()
+		metrics.ArrSkipTotal.WithLabelValues(instanceName, string(d.Reason)).Inc()
+	case d.Reason == ReasonLookupFailed || d.Reason == ReasonCircuitOpen || d.Reason == ReasonBudgetExceeded:
+		metrics.ArrDecisionsTotal.WithLabelValues(instanceName, "failed_open").Inc()
+	default:
+		metrics.ArrDecisionsTotal.WithLabelValues(instanceName, "synced").Inc()
+	}
 }
 
 // breakerConfig configures a per-instance circuit breaker.
@@ -125,6 +154,7 @@ func (s *Service) logArrError(ctx context.Context, inst *instanceState, hash str
 			"kind", arrErr.Kind,
 			"error", arrErr.Cause,
 		)
+		metrics.ArrLookupErrorsTotal.WithLabelValues(inst.name, string(arrErr.Kind)).Inc()
 	}
 }
 
@@ -165,5 +195,5 @@ func matchesHash(a, b string) bool {
 
 // timeNow is a small indirection for tests; defaults to [time.Now].
 //
-//nolint:unused,gochecknoglobals // test-injectable time; used in Tasks 10-12
+//nolint:gochecknoglobals // test-injectable time; used in Tasks 10-12
 var timeNow = time.Now

@@ -8,6 +8,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/arsac/qb-sync/internal/metrics"
 )
 
 // historyHandler returns a handler that responds with the given records list as JSON.
@@ -135,5 +139,24 @@ func TestServiceCircuitBreakerOpensAfterFailures(t *testing.T) {
 	d := svc.ShouldSync(context.Background(), "d", "radarr")
 	if !d.Sync || d.Reason != ReasonCircuitOpen {
 		t.Fatalf("expected SYNC/CircuitOpen, got %+v", d)
+	}
+}
+
+func TestServiceEmitsDecisionMetric(t *testing.T) {
+	srv := httptest.NewServer(historyHandler(t,
+		`[{"eventType":"downloadIgnored","downloadId":"abc"}]`))
+	t.Cleanup(srv.Close)
+
+	svc := newTestService(t, &instanceState{
+		name:       "radarr",
+		client:     NewClient(srv.URL, "k", time.Second),
+		categories: []string{"radarr"},
+	})
+
+	before := testutil.ToFloat64(metrics.ArrDecisionsTotal.WithLabelValues("radarr", "skipped"))
+	_ = svc.ShouldSync(context.Background(), "abc", "radarr")
+	after := testutil.ToFloat64(metrics.ArrDecisionsTotal.WithLabelValues("radarr", "skipped"))
+	if after-before != 1 {
+		t.Fatalf("expected counter to increment by 1, got delta=%v", after-before)
 	}
 }
