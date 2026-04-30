@@ -41,6 +41,12 @@ type historyResponse struct {
 	Records []HistoryRecord `json:"records"`
 }
 
+// *arr event type values returned in HistoryRecord.EventType.
+const (
+	eventTypeIgnored = "downloadIgnored"
+	eventTypeFailed  = "downloadFailed"
+)
+
 // Kind classifies a lookup error for metric labels.
 type Kind string
 

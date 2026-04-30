@@ -1,10 +1,11 @@
 package arr
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"log/slog"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -66,7 +67,7 @@ func (s *Service) lookup(ctx context.Context, inst *instanceState, hash string) 
 			s.logger.WarnContext(ctx, "arr lookup error",
 				"instance", inst.name,
 				"hash", hash,
-				"kind", string(arrErr.Kind),
+				"kind", arrErr.Kind,
 				"error", arrErr.Cause,
 			)
 		}
@@ -81,19 +82,17 @@ func (s *Service) lookup(ctx context.Context, inst *instanceState, hash string) 
 
 // interpretHistory finds the most recent terminal event and maps it to a Decision.
 // Falls through to ReasonNotRejected if no terminal event is present.
+// records is mutated (sorted in-place); callers pass a freshly allocated slice.
 func interpretHistory(records []HistoryRecord) Decision {
-	// Sort by Date desc so the first matching terminal event wins.
-	sorted := make([]HistoryRecord, len(records))
-	copy(sorted, records)
-	sort.SliceStable(sorted, func(i, j int) bool {
-		return sorted[i].Date.After(sorted[j].Date)
+	slices.SortStableFunc(records, func(a, b HistoryRecord) int {
+		return cmp.Compare(b.Date.UnixNano(), a.Date.UnixNano()) // desc
 	})
 
-	for _, r := range sorted {
+	for _, r := range records {
 		switch r.EventType {
-		case "downloadIgnored":
+		case eventTypeIgnored:
 			return Decision{Sync: false, Reason: ReasonIgnored}
-		case "downloadFailed":
+		case eventTypeFailed:
 			return Decision{Sync: false, Reason: ReasonFailed}
 		}
 	}
