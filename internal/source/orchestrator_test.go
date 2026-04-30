@@ -1860,6 +1860,11 @@ func TestIsSyncableState(t *testing.T) {
 		qbittorrent.TorrentStateStalledUp,
 		qbittorrent.TorrentStateQueuedUp,
 		qbittorrent.TorrentStateForcedUp,
+		// Seeding-side stopped/paused states: torrent is complete and resting
+		// (qB auto-pause from share-ratio/seeding-time limits, or user
+		// pause-on-finish). The source is the natural handoff trigger.
+		qbittorrent.TorrentStatePausedUp,
+		qbittorrent.TorrentStateStoppedUp,
 	}
 	for _, state := range syncable {
 		if !isSyncableState(state) {
@@ -1868,10 +1873,9 @@ func TestIsSyncableState(t *testing.T) {
 	}
 
 	notSyncable := []qbittorrent.TorrentState{
+		// Download-side stopped/paused: user-explicit "leave alone, I'm not done."
 		qbittorrent.TorrentStatePausedDl,
-		qbittorrent.TorrentStatePausedUp,
 		qbittorrent.TorrentStateStoppedDl,
-		qbittorrent.TorrentStateStoppedUp,
 		qbittorrent.TorrentStateError,
 		qbittorrent.TorrentStateMissingFiles,
 		qbittorrent.TorrentStateMoving,

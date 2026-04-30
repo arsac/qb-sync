@@ -43,6 +43,10 @@ type candidateTorrent struct {
 }
 
 // isSyncableState returns true for torrent states where pieces can be read and synced.
+// Seeding-side stopped/paused states are accepted: they signal completion + auto-stop
+// (share-ratio limit, seeding-time limit, user pause-on-finish), and the source is
+// the canonical use case for handing off to destination. Download-side stopped/paused
+// is excluded — that's user-explicit "leave this alone, I'm not done with it".
 func isSyncableState(state qbittorrent.TorrentState) bool {
 	switch state { //nolint:exhaustive // Only positive matches matter; all other states are non-syncable.
 	case qbittorrent.TorrentStateDownloading,
@@ -52,7 +56,9 @@ func isSyncableState(state qbittorrent.TorrentState) bool {
 		qbittorrent.TorrentStateUploading,
 		qbittorrent.TorrentStateStalledUp,
 		qbittorrent.TorrentStateQueuedUp,
-		qbittorrent.TorrentStateForcedUp:
+		qbittorrent.TorrentStateForcedUp,
+		qbittorrent.TorrentStatePausedUp,
+		qbittorrent.TorrentStateStoppedUp:
 		return true
 	default:
 		return false
