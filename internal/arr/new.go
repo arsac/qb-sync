@@ -35,7 +35,6 @@ type InstanceConfig struct {
 	Categories []string
 }
 
-// Default configuration values used when the caller provides zero values.
 const (
 	defaultCacheTTL            = 15 * time.Second
 	defaultBreakerResetTimeout = 60 * time.Second
@@ -53,7 +52,7 @@ func New(cfg Config, logger *slog.Logger) (Filter, error) {
 		logger = slog.Default()
 	}
 	if cfg.PerCallTimeout <= 0 {
-		cfg.PerCallTimeout = defaultPerCallTimeout // defined in client.go
+		cfg.PerCallTimeout = defaultPerCallTimeout
 	}
 	if cfg.CacheTTL <= 0 {
 		cfg.CacheTTL = defaultCacheTTL
@@ -101,7 +100,6 @@ func New(cfg Config, logger *slog.Logger) (Filter, error) {
 }
 
 // addInstance validates and inserts an instance into the maps.
-// No-op if the InstanceConfig is zero.
 func addInstance(
 	instances map[string]*instanceState,
 	routes map[string]string,
