@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/arsac/qb-sync/internal/config"
 	"github.com/arsac/qb-sync/internal/health"
 	"github.com/arsac/qb-sync/internal/metrics"
@@ -72,6 +74,8 @@ func (r *Runner) Run(ctx context.Context) error {
 	if taskErr != nil {
 		return fmt.Errorf("creating qb task: %w", taskErr)
 	}
+
+	prometheus.MustRegister(NewMetricsCollector(qbTask))
 
 	// Register health checks if health server is configured
 	if r.healthServer != nil {

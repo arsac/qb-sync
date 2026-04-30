@@ -13,6 +13,7 @@ import (
 
 	"github.com/autobrr/go-qbittorrent"
 	"github.com/bits-and-blooms/bitset"
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/semaphore"
 
 	"github.com/arsac/qb-sync/internal/grpcutil"
@@ -136,6 +137,10 @@ func (s *Server) SetHealthServer(hs *health.Server) {
 
 // Run starts the gRPC server and blocks until context is cancelled.
 func (s *Server) Run(ctx context.Context) error {
+	// Register in Run, not NewServer, so tests can construct Servers without
+	// mutating the global Prometheus registry.
+	prometheus.MustRegister(NewMetricsCollector(s))
+
 	lc := net.ListenConfig{}
 	listener, err := lc.Listen(ctx, "tcp", s.config.ListenAddr)
 	if err != nil {
