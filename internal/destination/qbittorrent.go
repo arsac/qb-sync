@@ -70,87 +70,31 @@ func (s *Server) addAndVerifyTorrent(
 		return "", fmt.Errorf("checking existing: %w", getErr)
 	}
 
-	if found {
-		if isErrorState(existingTorrent.State) {
-			return existingTorrent.State, fmt.Errorf("torrent in error state: %s", existingTorrent.State)
-		}
-		finalState := existingTorrent.State
-		var waitErr error
-		// If already at 100% and seeding-side, accept the current state; otherwise
-		// (checking, incomplete, moving, etc.) poll until ready.
-		if existingTorrent.Progress < 1.0 || !isReadyState(existingTorrent.State) {
-			finalState, waitErr = s.waitForTorrentReady(ctx, hash, state.totalSize)
-		}
+	if found && isErrorState(existingTorrent.State) {
+		return existingTorrent.State, fmt.Errorf("torrent in error state: %s", existingTorrent.State)
+	}
+
+	// Fast path: torrent is already verified and seeding-ready. Just stop
+	// (source remains canonical seeder until handoff) and return.
+	if found && existingTorrent.Progress >= 1.0 && isReadyState(existingTorrent.State) {
 		s.stopTorrentBestEffort(ctx, hash)
-		return finalState, waitErr
+		return existingTorrent.State, nil
 	}
 
-	// Torrent doesn't exist - add it.
-	state.mu.Lock()
-	torrentData := state.torrentFile
-	state.mu.Unlock()
-	if len(torrentData) == 0 {
-		return "", errors.New("torrent file bytes not cached on state")
+	if !found {
+		if addErr := s.addTorrentToQB(ctx, hash, state, req); addErr != nil {
+			return "", addErr
+		}
 	}
 
-	// Use the destination-side save path (container mount point, e.g., "/downloads"),
-	// joined with the sub-path from init (e.g., "movies" from category).
-	savePath := filepath.Join(s.config.GetSavePath(), state.saveSubPath)
-
-	deselectedIDs := deselectedFileIDs(state.files)
-
-	opts := map[string]string{
-		"savepath":           savePath,
-		"stopped":            "true", // Add stopped so source controls when destination starts seeding (qB v5+)
-		"paused":             "true", // Compat alias for qB v4.x
-		"autoTMM":            "false",
-		"sequentialDownload": "false",
-		// Defense in depth against the brief window between AddTorrent and the
-		// post-add Stop. With stopped=true, qB shouldn't announce or upload —
-		// but autobrr observed qB v5 occasionally announcing during this
-		// window. Pinning bandwidth to 0 prevents any traffic while the
-		// torrent is technically "added" but our explicit StopCtx hasn't
-		// landed yet. StartTorrent re-enables transfer by removing the limits.
-		"upLimit": "0",
-		"dlLimit": "0",
-	}
-
-	// skip_checking is safe only when all files are present on disk. With
-	// partial file selection, deselected files are absent, and qBittorrent
-	// reports missingFiles even with skip_checking=true. In that case, we
-	// set priorities first and let qBittorrent check only selected files.
-	if deselectedIDs == "" {
-		opts["skip_checking"] = "true"
-	}
-
-	if req.GetCategory() != "" {
-		// qBittorrent silently drops the category field on AddTorrent if the
-		// category doesn't already exist on the destination instance — autobrr
-		// learned this the hard way. Ensure the category exists first so the
-		// user's directory-layout assumption (savePath joined with sub-path
-		// from category folders) doesn't silently diverge from qB's view.
-		s.ensureCategoryExists(ctx, req.GetCategory())
-		opts["category"] = req.GetCategory()
-	}
-	if req.GetTags() != "" {
-		opts["tags"] = req.GetTags()
-	}
-
-	if addErr := s.qbClient.AddTorrentFromMemoryCtx(ctx, torrentData, opts); addErr != nil {
-		return "", fmt.Errorf("adding torrent: %w", addErr)
-	}
-
-	s.logger.InfoContext(ctx, "added torrent to qBittorrent",
-		"hash", hash,
-		"savePath", savePath,
-		"skipChecking", deselectedIDs == "",
-	)
-
-	// For partial file selection: set deselected file priorities to 0 and
-	// resume so qBittorrent checks only selected files. Verification + retry
-	// catches qB's silent-drop quirk on freshly-added stopped torrents — fail
-	// the finalize attempt rather than wait on a torrent that won't progress.
-	if deselectedIDs != "" {
+	if needsPartialSelectionRecovery(found, existingTorrent, state.files) {
+		if found {
+			s.logger.InfoContext(ctx, "existing torrent stuck stopped near zero progress, re-applying priorities",
+				"hash", hash,
+				"state", existingTorrent.State,
+				"progress", existingTorrent.Progress,
+			)
+		}
 		if priErr := s.applyAndVerifyDeselectedPriorities(ctx, hash, state.files); priErr != nil {
 			s.stopTorrentBestEffort(ctx, hash)
 			return "", fmt.Errorf("applying deselected priorities: %w", priErr)
@@ -160,6 +104,87 @@ func (s *Server) addAndVerifyTorrent(
 	finalState, waitErr := s.waitForTorrentReady(ctx, hash, state.totalSize)
 	s.stopTorrentBestEffort(ctx, hash)
 	return finalState, waitErr
+}
+
+// addTorrentToQB issues the actual AddTorrent against destination qB with the
+// options block. Stopped + bandwidth=0 + autoTMM=false is the safe-add posture
+// (no announce, no upload, qB doesn't move files); skip_checking=true is only
+// safe when all files exist on disk, so it's gated on full selection.
+func (s *Server) addTorrentToQB(
+	ctx context.Context,
+	hash string,
+	state *serverTorrentState,
+	req *pb.FinalizeTorrentRequest,
+) error {
+	state.mu.Lock()
+	torrentData := state.torrentFile
+	state.mu.Unlock()
+	if len(torrentData) == 0 {
+		return errors.New("torrent file bytes not cached on state")
+	}
+
+	savePath := filepath.Join(s.config.GetSavePath(), state.saveSubPath)
+	deselectedIDs := deselectedFileIDs(state.files)
+
+	opts := map[string]string{
+		"savepath":           savePath,
+		"stopped":            "true", // Source controls when destination starts seeding (qB v5+)
+		"paused":             "true", // Compat alias for qB v4.x
+		"autoTMM":            "false",
+		"sequentialDownload": "false",
+		// autobrr observed qB v5 occasionally announcing during the brief
+		// window between AddTorrent and the explicit Stop. Pinning bandwidth
+		// to 0 prevents traffic. StartTorrent re-enables on handoff.
+		"upLimit": "0",
+		"dlLimit": "0",
+	}
+
+	// Partial selection: deselected files are absent, so qB reports missingFiles
+	// even with skip_checking=true. Caller applies priorities + resumes after add.
+	if deselectedIDs == "" {
+		opts["skip_checking"] = "true"
+	}
+
+	if req.GetCategory() != "" {
+		// qBittorrent silently drops the category field on AddTorrent if the
+		// category doesn't already exist on the destination instance.
+		s.ensureCategoryExists(ctx, req.GetCategory())
+		opts["category"] = req.GetCategory()
+	}
+	if req.GetTags() != "" {
+		opts["tags"] = req.GetTags()
+	}
+
+	if addErr := s.qbClient.AddTorrentFromMemoryCtx(ctx, torrentData, opts); addErr != nil {
+		return fmt.Errorf("adding torrent: %w", addErr)
+	}
+
+	s.logger.InfoContext(ctx, "added torrent to qBittorrent",
+		"hash", hash,
+		"savePath", savePath,
+		"skipChecking", deselectedIDs == "",
+	)
+	return nil
+}
+
+// needsPartialSelectionRecovery decides when to (re-)apply deselected file
+// priorities. Two cases:
+//
+//   - Fresh add: always apply, since priorities aren't set yet.
+//   - Existing torrent stuck at near-zero progress in a download-side stopped
+//     state: this is the production-observed signature of qB silently dropping
+//     the priority change on a prior attempt's add. Progress > 0 means qB is
+//     actively making progress (mid-recheck, partial download) — don't disrupt
+//     by re-issuing SetFilePriority, and don't override an operator who paused
+//     a torrent mid-progress for investigation.
+func needsPartialSelectionRecovery(found bool, t *qbittorrent.Torrent, files []*serverFileInfo) bool {
+	if deselectedFileIDs(files) == "" {
+		return false
+	}
+	if !found {
+		return true
+	}
+	return t.Progress < 0.001 && isDownloadStoppedState(t.State)
 }
 
 // ensureCategoryExists creates the category on destination qB if it doesn't
@@ -440,6 +465,7 @@ func (s *Server) applyAndVerifyDeselectedPriorities(
 			if resumeErr := s.qbClient.ResumeCtx(ctx, []string{hash}); resumeErr != nil {
 				return fmt.Errorf("resume after priorities verified: %w", resumeErr)
 			}
+			metrics.PartialSelectionRecoveryTotal.WithLabelValues(metrics.ResultSuccess).Inc()
 			return nil
 		}
 		if attemptErr != nil {
@@ -454,6 +480,7 @@ func (s *Server) applyAndVerifyDeselectedPriorities(
 		interval = min(interval*priorityVerifyBackoffMultiplier, priorityVerifyMaxInterval)
 	}
 
+	metrics.PartialSelectionRecoveryTotal.WithLabelValues(metrics.ResultFailure).Inc()
 	if lastErr != nil {
 		return fmt.Errorf("deselected priorities never persisted after %d attempts: %w", attempts, lastErr)
 	}
@@ -525,6 +552,14 @@ func isCheckingState(state qbittorrent.TorrentState) bool {
 	return state == qbittorrent.TorrentStateCheckingUp ||
 		state == qbittorrent.TorrentStateCheckingDl ||
 		state == qbittorrent.TorrentStateCheckingResumeData
+}
+
+// isDownloadStoppedState returns true for download-side stopped states.
+// Distinct from pausedUp/stoppedUp (seeding-ready, see isReadyState): those
+// are terminal-good, these mean "qB never finished verifying".
+func isDownloadStoppedState(state qbittorrent.TorrentState) bool {
+	return state == qbittorrent.TorrentStateStoppedDl ||
+		state == qbittorrent.TorrentStatePausedDl
 }
 
 // isReadyState returns true if the torrent is in a seeding/upload state.

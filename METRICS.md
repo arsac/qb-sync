@@ -68,6 +68,7 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_exclude_sync_abort_total` | | Torrents aborted due to exclude-sync tag applied mid-sync (source) |
 | `qbsync_finalize_not_found_total` | | Torrents untracked because destination had no state — will re-initialize (source) |
 | `qbsync_stale_bitmap_pieces_cleared_total` | | Piece bits cleared from written bitmap because backing data file was missing (destination) |
+| `qbsync_partial_selection_recovery_total` | `result` | Recovery attempts for stuck partial-selection torrents — `success` if priorities persisted on retry, `failure` if budget exhausted (destination) |
 
 ## Gauges
 
