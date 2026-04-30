@@ -1860,6 +1860,11 @@ func TestIsSyncableState(t *testing.T) {
 		qbittorrent.TorrentStateStalledUp,
 		qbittorrent.TorrentStateQueuedUp,
 		qbittorrent.TorrentStateForcedUp,
+		// Seeding-side stopped/paused states: torrent is complete and resting
+		// (qB auto-pause from share-ratio/seeding-time limits, or user
+		// pause-on-finish). The source is the natural handoff trigger.
+		qbittorrent.TorrentStatePausedUp,
+		qbittorrent.TorrentStateStoppedUp,
 	}
 	for _, state := range syncable {
 		if !isSyncableState(state) {
@@ -1868,10 +1873,9 @@ func TestIsSyncableState(t *testing.T) {
 	}
 
 	notSyncable := []qbittorrent.TorrentState{
+		// Download-side stopped/paused: user-explicit "leave alone, I'm not done."
 		qbittorrent.TorrentStatePausedDl,
-		qbittorrent.TorrentStatePausedUp,
 		qbittorrent.TorrentStateStoppedDl,
-		qbittorrent.TorrentStateStoppedUp,
 		qbittorrent.TorrentStateError,
 		qbittorrent.TorrentStateMissingFiles,
 		qbittorrent.TorrentStateMoving,
@@ -2893,6 +2897,100 @@ func TestSyncFailedTag(t *testing.T) {
 			if count != i {
 				t.Errorf("attempt %d: expected count %d, got %d", i, i, count)
 			}
+		}
+	})
+}
+
+// TestHandleFinalizeError_DefaultBranchCapsAtMaxRetries regression-tests the
+// "stuck at 100% never finalize" symptom: persistent qBittorrent-integration
+// errors (FINALIZE_ERROR_NONE wrapped from runBackgroundFinalization, e.g.
+// "qBittorrent: torrent in error state: missingFiles") came back to the source
+// in handleFinalizeError's default branch, which retried forever without ever
+// calling markSyncFailed. The torrent stayed in tracked indefinitely, keeping
+// the qbsync_active_torrents Prometheus gauge elevated and producing the
+// Grafana symptom: rows where TorrentPiecesStreamed == TorrentPieces, never
+// dropping. This mirrors the existing maxVerificationRetries cap that
+// handleIncompleteFinalization already applies for INCOMPLETE failures.
+func TestHandleFinalizeError_DefaultBranchCapsAtMaxRetries(t *testing.T) {
+	logger := testLogger(t)
+
+	newCapTask := func(hash, name string) (*QBTask, *mockQBClient) {
+		mockClient := &mockQBClient{}
+		task := &QBTask{
+			cfg:       &config.SourceConfig{SyncFailedTag: "sync-failed"},
+			logger:    logger,
+			srcClient: mockClient,
+			grpcDest:  &mockDest{},
+			source:    qbclient.NewSource(nil, ""),
+			tracker: streaming.NewPieceMonitor(
+				nil, &mockPieceSource{numPieces: 1}, logger, streaming.DefaultPieceMonitorConfig(),
+			),
+			tracked:  NewTrackedSet(),
+			backoffs: NewBackoffTracker(),
+		}
+		task.tracked.Add(hash, TrackedTorrent{Name: name})
+		return task, mockClient
+	}
+
+	t.Run("persistent qB-integration error marks sync-failed at the cap", func(t *testing.T) {
+		hash := "stuck-hash"
+		task, mockClient := newCapTask(hash, "stuck-torrent")
+
+		// Mirror the exact wrapped error runBackgroundFinalization stores when
+		// addAndVerifyTorrent fails (e.g. existing torrent in missingFiles).
+		qbErr := errors.New("qBittorrent: torrent in error state: missingFiles")
+
+		for range maxVerificationRetries {
+			task.handleFinalizeError(context.Background(), hash, qbErr)
+		}
+
+		if task.tracked.Has(hash) {
+			t.Errorf("torrent must be untracked after %d generic-error retries — "+
+				"otherwise ActiveTorrents stays elevated forever", maxVerificationRetries)
+		}
+		if mockClient.addTagsTag != "sync-failed" {
+			t.Errorf("expected sync-failed tag to be applied at cap; got %q", mockClient.addTagsTag)
+		}
+	})
+
+	t.Run("transient errors do not accumulate toward the cap", func(t *testing.T) {
+		// Transient gRPC errors signal destination-wide outages; counting them
+		// toward the per-torrent cap would mark every in-flight torrent as
+		// sync-failed during a brief dest outage.
+		hash := "flapping-hash"
+		task, mockClient := newCapTask(hash, "flapping-torrent")
+
+		transientErr := status.Error(codes.Unavailable, "destination unreachable")
+
+		for range maxVerificationRetries * 5 {
+			task.handleFinalizeError(context.Background(), hash, transientErr)
+		}
+
+		if !task.tracked.Has(hash) {
+			t.Error("transient errors must not untrack the torrent")
+		}
+		if mockClient.addTagsCalled {
+			t.Error("transient errors must not trigger sync-failed tagging")
+		}
+	})
+
+	t.Run("INCOMPLETE failures still cap via handleIncompleteFinalization", func(t *testing.T) {
+		// The new default-branch cap shares its backoff counter with the existing
+		// INCOMPLETE path; this guards against regressing that path.
+		hash := "incomplete-hash"
+		task, mockClient := newCapTask(hash, "incomplete-torrent")
+
+		incompleteErr := fmt.Errorf("%w: incomplete: 50/100 pieces", streaming.ErrFinalizeIncomplete)
+
+		for range maxVerificationRetries {
+			task.handleFinalizeError(context.Background(), hash, incompleteErr)
+		}
+
+		if task.tracked.Has(hash) {
+			t.Errorf("torrent must be untracked after %d INCOMPLETE retries", maxVerificationRetries)
+		}
+		if mockClient.addTagsTag != "sync-failed" {
+			t.Errorf("expected sync-failed tag at INCOMPLETE cap; got %q", mockClient.addTagsTag)
 		}
 	})
 }

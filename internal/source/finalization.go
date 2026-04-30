@@ -68,13 +68,30 @@ func (t *QBTask) handleFinalizeError(ctx context.Context, hash string, finalizeE
 
 	metrics.FinalizationErrorsTotal.WithLabelValues(metrics.ModeSource).Inc()
 	t.logger.ErrorContext(ctx, "finalize failed", "hash", hash, "error", finalizeErr)
-	t.backoffs.RecordFailure(hash)
 
+	// Transient gRPC errors are destination-wide outages, not per-torrent
+	// failures. Don't record a failure (cycle interval is the backoff) and
+	// don't count toward the per-torrent retry cap — otherwise a brief dest
+	// outage would mark every in-flight torrent as sync-failed.
 	if streaming.IsTransientError(finalizeErr) {
 		t.logger.WarnContext(ctx, "destination server unreachable, skipping remaining finalizations",
 			"error", finalizeErr,
 		)
 		return true
+	}
+
+	// Persistent per-torrent failure (e.g. destination qB stuck in missingFiles).
+	// Share the maxVerificationRetries budget with handleIncompleteFinalization so
+	// the torrent surfaces as sync-failed instead of looping in tracked forever.
+	failures := t.backoffs.RecordFailure(hash)
+	if failures >= maxVerificationRetries {
+		t.logger.ErrorContext(ctx, "finalize failed repeatedly, marking torrent as sync-failed",
+			"hash", hash,
+			"failures", failures,
+			"maxRetries", maxVerificationRetries,
+			"error", finalizeErr,
+		)
+		t.markSyncFailed(ctx, hash)
 	}
 	return false
 }
