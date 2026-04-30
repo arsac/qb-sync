@@ -147,9 +147,14 @@ func (s *Server) addAndVerifyTorrent(
 	)
 
 	// For partial file selection: set deselected file priorities to 0 and
-	// resume so qBittorrent checks only selected files (which exist on disk).
+	// resume so qBittorrent checks only selected files. Verification + retry
+	// catches qB's silent-drop quirk on freshly-added stopped torrents — fail
+	// the finalize attempt rather than wait on a torrent that won't progress.
 	if deselectedIDs != "" {
-		s.applyDeselectedPriorities(ctx, hash, deselectedIDs)
+		if priErr := s.applyAndVerifyDeselectedPriorities(ctx, hash, state.files); priErr != nil {
+			s.stopTorrentBestEffort(ctx, hash)
+			return "", fmt.Errorf("applying deselected priorities: %w", priErr)
+		}
 	}
 
 	finalState, waitErr := s.waitForTorrentReady(ctx, hash, state.totalSize)
@@ -390,19 +395,111 @@ func (s *Server) deleteTorrentFromQB(ctx context.Context, hash string) error {
 	return nil
 }
 
-// applyDeselectedPriorities sets file priorities to 0 for deselected files
-// and resumes the torrent so qBittorrent checks only selected files.
-func (s *Server) applyDeselectedPriorities(ctx context.Context, hash, ids string) {
-	if priorityErr := s.qbClient.SetFilePriorityCtx(ctx, hash, ids, 0); priorityErr != nil {
-		s.logger.WarnContext(ctx, "failed to set deselected file priorities",
-			"hash", hash, "error", priorityErr)
+// applyAndVerifyDeselectedPriorities exists because qB returns 200 OK to
+// filePrio on freshly-added stopped torrents whether it persists the change or
+// not. Skipping the read-back verify lets a silently-dropped priority update
+// strand the torrent in stoppedDl with default priorities until the downstream
+// poll budget expires. The retry loop keeps trying until qB has settled enough
+// for the change to stick; a budget-exhaustion error fails the finalize
+// attempt so the source-side cap takes over instead of blocking on a doomed
+// torrent.
+func (s *Server) applyAndVerifyDeselectedPriorities(
+	ctx context.Context,
+	hash string,
+	files []*serverFileInfo,
+) error {
+	deselectedIDs := deselectedFileIDs(files)
+	expected := make(map[int]bool, len(files))
+	for i, f := range files {
+		if !f.selected {
+			expected[i] = true
+		}
 	}
-	if resumeErr := s.qbClient.ResumeCtx(ctx, []string{hash}); resumeErr != nil {
-		s.logger.WarnContext(ctx, "failed to resume for file checking",
-			"hash", hash, "error", resumeErr)
+
+	interval := priorityVerifyInterval
+	timeout := priorityVerifyTimeout
+	if s.config.QB != nil {
+		if s.config.QB.PriorityVerifyInterval > 0 {
+			interval = s.config.QB.PriorityVerifyInterval
+		}
+		if s.config.QB.PriorityVerifyTimeout > 0 {
+			timeout = s.config.QB.PriorityVerifyTimeout
+		}
 	}
-	s.logger.InfoContext(ctx, "set deselected file priorities and started checking",
-		"hash", hash, "deselected", ids)
+
+	deadline := time.Now().Add(timeout)
+	var attempts int
+	var lastErr error
+
+	for time.Now().Before(deadline) {
+		attempts++
+		applied, attemptErr := s.attemptDeselectedPrioritiesOnce(ctx, hash, deselectedIDs, expected, attempts)
+		if applied {
+			s.logger.InfoContext(ctx, "deselected priorities applied and verified",
+				"hash", hash, "attempts", attempts, "deselected", deselectedIDs)
+			if resumeErr := s.qbClient.ResumeCtx(ctx, []string{hash}); resumeErr != nil {
+				return fmt.Errorf("resume after priorities verified: %w", resumeErr)
+			}
+			return nil
+		}
+		if attemptErr != nil {
+			lastErr = attemptErr
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(interval):
+		}
+		interval = min(interval*priorityVerifyBackoffMultiplier, priorityVerifyMaxInterval)
+	}
+
+	if lastErr != nil {
+		return fmt.Errorf("deselected priorities never persisted after %d attempts: %w", attempts, lastErr)
+	}
+	return fmt.Errorf("deselected priorities never persisted after %d attempts", attempts)
+}
+
+// attemptDeselectedPrioritiesOnce is split out from the retry loop to keep the
+// caller under gocognit/nestif limits. The returned err is the latest transient
+// API failure so the outer budget-exhaustion error can wrap it.
+func (s *Server) attemptDeselectedPrioritiesOnce(
+	ctx context.Context,
+	hash, deselectedIDs string,
+	expected map[int]bool,
+	attempt int,
+) (bool, error) {
+	if priErr := s.qbClient.SetFilePriorityCtx(ctx, hash, deselectedIDs, 0); priErr != nil {
+		s.logger.DebugContext(ctx, "set file priority failed, will retry",
+			"hash", hash, "attempt", attempt, "error", priErr)
+		return false, priErr
+	}
+	applied, verifyErr := s.deselectedPrioritiesApplied(ctx, hash, expected)
+	if verifyErr != nil {
+		s.logger.DebugContext(ctx, "verify priorities failed, will retry",
+			"hash", hash, "attempt", attempt, "error", verifyErr)
+		return false, verifyErr
+	}
+	return applied, nil
+}
+
+// deselectedPrioritiesApplied reads back qB's reported file priorities and
+// returns true when every expected-deselected file is at priority 0.
+func (s *Server) deselectedPrioritiesApplied(
+	ctx context.Context,
+	hash string,
+	expectedDeselected map[int]bool,
+) (bool, error) {
+	qbFiles, err := s.qbClient.GetFilesInformationCtx(ctx, hash)
+	if err != nil {
+		return false, err
+	}
+	for _, f := range *qbFiles {
+		if expectedDeselected[f.Index] && f.Priority != 0 {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // deselectedFileIDs returns a pipe-separated string of 0-based file indices
