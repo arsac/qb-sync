@@ -31,7 +31,7 @@ type Service struct {
 	routes    map[string]string // category -> instance name
 	cache     *verdictCache
 	logger    *slog.Logger
-	mu        sync.Mutex //nolint:unused // reserved for circuit-breaker state added in Task 10
+	mu        sync.Mutex //nolint:unused // reserved for future concurrent state management
 }
 
 // Compile-time interface assertion.
@@ -99,38 +99,37 @@ func (s *Service) lookup(ctx context.Context, inst *instanceState, hash string) 
 		if errors.Is(err, circuitbreaker.ErrOpen) {
 			return Decision{Sync: true, Reason: ReasonCircuitOpen}
 		}
-		var arrErr *Error
-		if errors.As(err, &arrErr) {
-			s.logger.WarnContext(ctx, "arr lookup error",
-				"instance", inst.name,
-				"hash", hash,
-				"kind", arrErr.Kind,
-				"error", arrErr.Cause,
-			)
-		}
+		s.logArrError(ctx, inst, hash, err)
 		return Decision{Sync: true, Reason: ReasonLookupFailed}
 	}
-	if len(records) == 0 {
-		return Decision{Sync: true, Reason: ReasonEmptyHistory}
-	}
-	return interpretHistory(records)
+	return decideFromRecords(records)
 }
 
-// lookupDirect is the no-breaker variant used by tests that don't attach one.
+// lookupDirect is the no-breaker path, used when no executor is attached.
 func (s *Service) lookupDirect(ctx context.Context, inst *instanceState, hash string) Decision {
 	records, err := inst.client.GetHistoryByDownloadID(ctx, hash)
 	if err != nil {
-		var arrErr *Error
-		if errors.As(err, &arrErr) {
-			s.logger.WarnContext(ctx, "arr lookup error",
-				"instance", inst.name,
-				"hash", hash,
-				"kind", arrErr.Kind,
-				"error", arrErr.Cause,
-			)
-		}
+		s.logArrError(ctx, inst, hash, err)
 		return Decision{Sync: true, Reason: ReasonLookupFailed}
 	}
+	return decideFromRecords(records)
+}
+
+// logArrError logs typed *Error details; silently ignores non-*Error values.
+func (s *Service) logArrError(ctx context.Context, inst *instanceState, hash string, err error) {
+	var arrErr *Error
+	if errors.As(err, &arrErr) {
+		s.logger.WarnContext(ctx, "arr lookup error",
+			"instance", inst.name,
+			"hash", hash,
+			"kind", arrErr.Kind,
+			"error", arrErr.Cause,
+		)
+	}
+}
+
+// decideFromRecords maps a (possibly empty) history slice to a Decision.
+func decideFromRecords(records []HistoryRecord) Decision {
 	if len(records) == 0 {
 		return Decision{Sync: true, Reason: ReasonEmptyHistory}
 	}
