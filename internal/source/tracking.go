@@ -536,8 +536,9 @@ func (t *QBTask) recheckArrRejectedTorrents(ctx context.Context) {
 	g.SetLimit(arrRecheckConcurrency)
 
 	type flipped struct {
-		hash   string
-		reason arr.Reason
+		hash     string
+		category string
+		reason   arr.Reason
 	}
 	var (
 		mu      sync.Mutex
@@ -554,7 +555,7 @@ func (t *QBTask) recheckArrRejectedTorrents(ctx context.Context) {
 			d := t.arrFilter.ShouldSync(gCtx, hash, category)
 			if !d.Sync {
 				mu.Lock()
-				toAbort = append(toAbort, flipped{hash: hash, reason: d.Reason})
+				toAbort = append(toAbort, flipped{hash: hash, category: category, reason: d.Reason})
 				mu.Unlock()
 			}
 			return nil
@@ -565,12 +566,13 @@ func (t *QBTask) recheckArrRejectedTorrents(ctx context.Context) {
 	}
 
 	for _, f := range toAbort {
-		t.abortArrFlipped(ctx, f.hash, f.reason)
+		t.abortArrFlipped(ctx, f.hash, f.category, f.reason)
 	}
 }
 
 // abortArrFlipped handles a single torrent whose verdict flipped to SKIP.
-func (t *QBTask) abortArrFlipped(ctx context.Context, hash string, reason arr.Reason) {
+// category is the qBittorrent category used to derive the metric instance label.
+func (t *QBTask) abortArrFlipped(ctx context.Context, hash, category string, reason arr.Reason) {
 	tt, ok := t.tracked.Get(hash)
 	if !ok {
 		return
@@ -590,12 +592,9 @@ func (t *QBTask) abortArrFlipped(ctx context.Context, hash string, reason arr.Re
 	}
 	t.stopTracking(hash)
 
-	// Determine instance from category for metric label.
-	instance := "unknown"
-	if torrent := t.findTorrentByHash(hash); torrent != nil {
-		if i := instanceForCategory(t.cfg, torrent.Category); i != "" {
-			instance = i
-		}
+	instance := instanceForCategory(t.cfg, category)
+	if instance == "" {
+		instance = "unknown"
 	}
 	metrics.ArrAbortedTotal.WithLabelValues(instance, string(reason)).Inc()
 }
