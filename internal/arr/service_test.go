@@ -111,3 +111,29 @@ func TestServiceShouldSyncCacheHit(t *testing.T) {
 		t.Fatalf("expected 1 HTTP call (rest cached), got %d", calls)
 	}
 }
+
+func TestServiceCircuitBreakerOpensAfterFailures(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	inst := &instanceState{
+		name:       "radarr",
+		client:     NewClient(srv.URL, "k", 100*time.Millisecond),
+		categories: []string{"radarr"},
+	}
+	attachBreaker(inst, breakerConfig{MaxFailures: 3, ResetTimeout: time.Hour})
+
+	svc := newTestService(t, inst)
+	// Drive 3 distinct hashes through the failing endpoint to trip the breaker.
+	for i := range 3 {
+		hash := []string{"a", "b", "c"}[i]
+		_ = svc.ShouldSync(context.Background(), hash, "radarr")
+	}
+	// Next call should short-circuit with ReasonCircuitOpen.
+	d := svc.ShouldSync(context.Background(), "d", "radarr")
+	if !d.Sync || d.Reason != ReasonCircuitOpen {
+		t.Fatalf("expected SYNC/CircuitOpen, got %+v", d)
+	}
+}
