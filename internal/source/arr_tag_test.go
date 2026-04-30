@@ -2,11 +2,19 @@ package source
 
 import (
 	"context"
+	"log/slog"
 	"testing"
+
+	"github.com/autobrr/go-qbittorrent"
 
 	"github.com/arsac/qb-sync/internal/arr"
 	"github.com/arsac/qb-sync/internal/config"
 )
+
+// stubFilter returns a fixed Decision regardless of input.
+type stubFilter struct{ d arr.Decision }
+
+func (s stubFilter) ShouldSync(_ context.Context, _, _ string) arr.Decision { return s.d }
 
 func TestApplyArrSkippedTagSkipsWhenDisabled(t *testing.T) {
 	mock := &mockQBClient{}
@@ -61,5 +69,35 @@ func TestRemoveArrSkippedTagIfPresent(t *testing.T) {
 	task.removeArrSkippedTagIfPresent(context.Background(), "abc", "arr-skipped,synced")
 	if mock.removeTagCalls != 1 {
 		t.Fatalf("expected 1 remove call when tag present, got %d", mock.removeTagCalls)
+	}
+}
+
+func TestIsExcludedFromTrackingSkipsOnArrFilter(t *testing.T) {
+	mock := &mockQBClient{}
+	cfg := &config.SourceConfig{}
+	cfg.ArrSkippedTag = "arr-skipped"
+	logger := slog.Default()
+
+	task := &QBTask{
+		cfg:       cfg,
+		srcClient: mock,
+		arrFilter: stubFilter{d: arr.Decision{Sync: false, Reason: arr.ReasonIgnored}},
+		tracked:   NewTrackedSet(),
+		completed: NewCompletionCache("", logger),
+		logger:    logger,
+	}
+	tor := qbittorrent.Torrent{
+		Hash:     "abc",
+		Category: "radarr",
+		State:    qbittorrent.TorrentStateDownloading,
+		Progress: 0.5,
+	}
+
+	excluded := task.isExcludedFromTracking(context.Background(), tor)
+	if !excluded {
+		t.Fatalf("expected exclusion when arr filter says SKIP")
+	}
+	if mock.addTagCalls != 1 {
+		t.Fatalf("expected arr-skipped tag to be applied, got %d calls", mock.addTagCalls)
 	}
 }

@@ -79,7 +79,7 @@ func (t *QBTask) trackNewTorrents(ctx context.Context) error {
 
 	var candidates []candidateTorrent
 	for _, torrent := range torrents {
-		if t.isExcludedFromTracking(torrent) {
+		if t.isExcludedFromTracking(ctx, torrent) {
 			continue
 		}
 
@@ -114,8 +114,9 @@ func (t *QBTask) trackNewTorrents(ctx context.Context) error {
 }
 
 // isExcludedFromTracking returns true if the torrent should be skipped during tracking:
-// non-syncable state, zero progress, excluded/sync-failed tag, already complete, or already tracked.
-func (t *QBTask) isExcludedFromTracking(torrent qbittorrent.Torrent) bool {
+// non-syncable state, zero progress, excluded/sync-failed tag, already complete, already tracked,
+// or rejected by the arr filter.
+func (t *QBTask) isExcludedFromTracking(ctx context.Context, torrent qbittorrent.Torrent) bool {
 	if !isSyncableState(torrent.State) || torrent.Progress <= 0 {
 		return true
 	}
@@ -132,7 +133,25 @@ func (t *QBTask) isExcludedFromTracking(torrent qbittorrent.Torrent) bool {
 		return true
 	}
 
-	return t.tracked.Has(torrent.Hash)
+	if t.tracked.Has(torrent.Hash) {
+		return true
+	}
+
+	// Arr filter: skip if *arr explicitly rejected this hash.
+	if t.arrFilter == nil {
+		return false
+	}
+	decision := t.arrFilter.ShouldSync(ctx, torrent.Hash, torrent.Category)
+	if !decision.Sync {
+		t.applyArrSkippedTag(ctx, torrent.Hash, decision.Reason)
+		t.logger.InfoContext(ctx, "arr filter: skipping torrent",
+			"hash", torrent.Hash,
+			"category", torrent.Category,
+			"reason", decision.Reason)
+		return true
+	}
+	t.removeArrSkippedTagIfPresent(ctx, torrent.Hash, torrent.Tags)
+	return false
 }
 
 // queryDestStatus checks a torrent's status on destination without starting tracking.
