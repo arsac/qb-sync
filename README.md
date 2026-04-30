@@ -206,6 +206,39 @@ services:
       - /path/to/destination/downloads:/downloads
 ```
 
+## Sonarr/Radarr filter (optional)
+
+qb-sync can consult Sonarr and Radarr to skip torrents they've explicitly rejected (e.g. `downloadIgnored` because not an upgrade, `downloadFailed` because the grab broke). Torrents the *arr stack hasn't rejected — and torrents in non-*arr categories — are synced normally.
+
+### Configure
+
+```
+QBSYNC_SOURCE_RADARR_URL=http://radarr:7878
+QBSYNC_SOURCE_RADARR_API_KEY=<api-key>
+QBSYNC_SOURCE_RADARR_CATEGORIES=radarr,radarr-1080p
+
+QBSYNC_SOURCE_SONARR_URL=http://sonarr:8989
+QBSYNC_SOURCE_SONARR_API_KEY=<api-key>
+QBSYNC_SOURCE_SONARR_CATEGORIES=tv-sonarr,sonarr-anime
+
+QBSYNC_SOURCE_ARR_SKIPPED_TAG=arr-skipped   # default; "" disables tag
+```
+
+Both Radarr and Sonarr are optional. Leaving an instance unconfigured disables filtering for that type — torrents in those categories sync as before.
+
+### Behavior
+
+- **Pre-sync:** before a new torrent enters the tracked set, qb-sync checks its category. If routed to a configured *arr instance, qb-sync queries `/api/v3/history?downloadId={hash}`. A `downloadIgnored` or `downloadFailed` terminal event causes a SKIP; anything else (including `grabbed`, `downloadFolderImported`, no record) results in SYNC.
+- **In-progress re-check:** every few cycles, qb-sync re-checks tracked torrents. If a verdict flips to SKIP, the in-flight sync is aborted (partial files removed on destination) and the source torrent gets the `arr-skipped` tag.
+- **Tag:** SKIP'd torrents are tagged `arr-skipped` (configurable) for visibility in qBittorrent's UI. The tag is removed automatically if the verdict flips back to SYNC.
+- **Fail-open:** errors, circuit-breaker-open, and per-cycle budget exhaustion all default to SYNC. Watch `qbsync_arr_circuit_breaker_state` and `qbsync_arr_lookup_errors_total` for visibility.
+
+### Limitations
+
+- Catches *arr-rejected hashes only. Torrents *arr never grabbed (cross-seed, manual adds) typically have empty history → SYNC.
+- BitTorrent v2 infohashes are not matched (v1 only, case-insensitive).
+- Single instance per type. Separate 1080p/4K *arr stacks are deferred to v2.
+
 ## License
 
 MIT
