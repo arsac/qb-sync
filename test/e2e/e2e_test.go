@@ -2473,3 +2473,93 @@ func TestE2E_FinalizedTorrentSkippedOnRecovery(t *testing.T) {
 
 	env.CleanupBothSides(ctx, bigBuckBunnyHash)
 }
+
+// TestE2E_StuckAtFullStreamedQBIntegrationFailureCapsAtMaxRetries regression-tests
+// the "stuck at 100% never finalize" symptom: when destination qBittorrent has
+// the torrent in a non-recoverable state (here: missingFiles), addAndVerifyTorrent
+// returns an error wrapped as FINALIZE_ERROR_NONE. Source's handleFinalizeError
+// default branch must cap retries at maxVerificationRetries and apply the
+// sync-failed tag, otherwise the torrent loops forever in tracked and the
+// qbsync_active_torrents gauge stays elevated.
+//
+// Reproduction: pre-stage destination qB with the torrent at a non-existent
+// savepath so qB parks it in missingFiles. Streaming still succeeds (the piece
+// store is independent of dest qB), but addAndVerifyTorrent fails on the
+// pre-existing torrent. With the cap, sync-failed lands within a few backoff
+// cycles; without it, the test times out.
+func TestE2E_StuckAtFullStreamedQBIntegrationFailureCapsAtMaxRetries(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+
+	t.Parallel()
+
+	env := SetupTestEnv(t)
+	ctx := context.Background()
+
+	env.CleanupBothSides(ctx, bigBuckBunnyHash)
+	defer env.CleanupBothSides(ctx, bigBuckBunnyHash)
+
+	// 1. Pre-stage destination qB: add the torrent at a non-existent savepath
+	//    so qB enters missingFiles state.
+	t.Log("Pre-staging destination qB with torrent at non-existent savepath...")
+	require.NoError(t, env.AddTorrentToDestination(ctx, bigBuckBunnyURL, map[string]string{
+		"savepath":      "/no-such-dir-on-dest",
+		"skip_checking": "false",
+	}))
+	require.Eventually(t, func() bool {
+		torrents, err := env.DestinationClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+			Hashes: []string{bigBuckBunnyHash},
+		})
+		if err != nil || len(torrents) == 0 {
+			return false
+		}
+		return torrents[0].State == qbittorrent.TorrentStateMissingFiles
+	}, 30*time.Second, shortPollInterval, "destination qB must enter missingFiles before sync starts")
+
+	// 2. Add torrent to source and run orchestrator.
+	t.Log("Adding torrent to source and running orchestrator...")
+	env.DownloadTorrentOnSource(ctx, bigBuckBunnyURL, bigBuckBunnyHash, torrentDownloadTimeout)
+
+	cfg := env.CreateSourceConfig()
+	cfg.SyncFailedTag = "sync-failed"
+	task, dest, err := env.CreateSourceTask(cfg)
+	require.NoError(t, err)
+	defer dest.Close()
+
+	orchestratorCtx, cancelOrchestrator := context.WithTimeout(ctx, syncCompleteTimeout)
+	defer cancelOrchestrator()
+
+	orchestratorDone := make(chan error, 1)
+	go func() {
+		orchestratorDone <- task.Run(orchestratorCtx)
+	}()
+
+	// 3. Without the cap, the Eventually times out instead of seeing sync-failed.
+	t.Log("Waiting for source torrent to be marked sync-failed...")
+	require.Eventually(t, func() bool {
+		torrents, getErr := env.SourceClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+			Hashes: []string{bigBuckBunnyHash},
+		})
+		if getErr != nil || len(torrents) == 0 {
+			return false
+		}
+		return strings.Contains(torrents[0].Tags, "sync-failed")
+	}, 2*time.Minute, pollInterval,
+		"source torrent must reach sync-failed within retry cap; without the cap fix "+
+			"this loops forever and is the chart's stuck-at-100% symptom")
+
+	// Sanity check: torrent must NOT have the synced tag (since finalize failed).
+	sourceTorrents, err := env.SourceClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+		Hashes: []string{bigBuckBunnyHash},
+	})
+	require.NoError(t, err)
+	require.Len(t, sourceTorrents, 1)
+	assert.NotContains(t, sourceTorrents[0].Tags, "synced",
+		"source torrent must not have 'synced' tag after a failed sync")
+
+	cancelOrchestrator()
+	<-orchestratorDone
+
+	t.Log("Stuck-at-100% retry cap test completed successfully!")
+}
