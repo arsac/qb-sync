@@ -140,6 +140,12 @@ func TestServiceCircuitBreakerOpensAfterFailures(t *testing.T) {
 	if !d.Sync || d.Reason != ReasonCircuitOpen {
 		t.Fatalf("expected SYNC/CircuitOpen, got %+v", d)
 	}
+
+	// Gauge must report 1 (open) after the breaker trips.
+	val := testutil.ToFloat64(metrics.ArrCircuitBreakerState.WithLabelValues("radarr"))
+	if val != 1 {
+		t.Fatalf("expected ArrCircuitBreakerState=1 (open), got %v", val)
+	}
 }
 
 func TestServiceEmitsDecisionMetric(t *testing.T) {

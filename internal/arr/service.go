@@ -103,9 +103,20 @@ func attachBreaker(inst *instanceState, cfg breakerConfig) {
 		WithSuccessThreshold(1).
 		WithDelay(cfg.ResetTimeout).
 		HandleIf(func(_ any, err error) bool { return err != nil }).
+		OnOpen(func(_ circuitbreaker.StateChangedEvent) {
+			metrics.ArrCircuitBreakerState.WithLabelValues(inst.name).Set(metrics.CircuitStateOpen)
+		}).
+		OnHalfOpen(func(_ circuitbreaker.StateChangedEvent) {
+			metrics.ArrCircuitBreakerState.WithLabelValues(inst.name).Set(metrics.CircuitStateHalfOpen)
+		}).
+		OnClose(func(_ circuitbreaker.StateChangedEvent) {
+			metrics.ArrCircuitBreakerState.WithLabelValues(inst.name).Set(metrics.CircuitStateClosed)
+		}).
 		Build()
 	inst.breaker = cb
 	inst.executor = failsafe.With[any](cb)
+	// Initialize gauge so the label appears in /metrics output from the start.
+	metrics.ArrCircuitBreakerState.WithLabelValues(inst.name).Set(metrics.CircuitStateClosed)
 }
 
 // lookup performs the network call and interprets the response.
