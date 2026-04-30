@@ -37,8 +37,6 @@ type HistoryRecord struct {
 }
 
 // historyResponse is the paginated wrapper *arr returns from /api/v3/history.
-//
-//nolint:unused // used by Client in task 4
 type historyResponse struct {
 	Records []HistoryRecord `json:"records"`
 }
