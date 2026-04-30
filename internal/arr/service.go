@@ -6,8 +6,6 @@ import (
 	"errors"
 	"log/slog"
 	"slices"
-	"strings"
-	"sync"
 	"time"
 
 	"github.com/failsafe-go/failsafe-go"
@@ -33,7 +31,6 @@ type Service struct {
 	routes    map[string]string // category -> instance name
 	cache     *verdictCache
 	logger    *slog.Logger
-	mu        sync.Mutex //nolint:unused // reserved for future concurrent state management
 }
 
 // Compile-time interface assertion.
@@ -185,15 +182,7 @@ func interpretHistory(records []HistoryRecord) Decision {
 	return Decision{Sync: true, Reason: ReasonNotRejected}
 }
 
-// matchesHash reports whether two infohashes refer to the same torrent.
-// *arr stores uppercase, qB stores lowercase; we compare case-insensitively.
-//
-//nolint:unused // required by Tasks 10-12 for case-insensitive hash comparison
-func matchesHash(a, b string) bool {
-	return strings.EqualFold(a, b)
-}
-
 // timeNow is a small indirection for tests; defaults to [time.Now].
 //
-//nolint:gochecknoglobals // test-injectable time; used in Tasks 10-12
+//nolint:gochecknoglobals // test-injectable clock for unit tests
 var timeNow = time.Now
