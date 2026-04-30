@@ -229,9 +229,14 @@ func (s *Server) waitForTorrentReady(
 		}
 	}
 
-	var finalState qbittorrent.TorrentState
+	var (
+		finalState    qbittorrent.TorrentState
+		finalProgress float64
+		pollCount     int
+	)
 
 	waitErr := utils.Until(ctx, func(pollCtx context.Context) (bool, error) {
+		pollCount++
 		torrents, getErr := s.qbClient.GetTorrentsCtx(pollCtx, qbittorrent.TorrentFilterOptions{
 			Hashes: []string{hash},
 		})
@@ -244,6 +249,7 @@ func (s *Server) waitForTorrentReady(
 
 		torrent := torrents[0]
 		finalState = torrent.State
+		finalProgress = torrent.Progress
 
 		// Terminal qB-reported failures. missingFiles persists once qB lands in
 		// it (priority-0 update lost a race, files truly absent, etc.) — polling
@@ -285,6 +291,20 @@ func (s *Server) waitForTorrentReady(
 		)
 		return true, nil
 	}, interval, timeout)
+
+	// Capture the qB state at the moment of timeout so operators can tell which
+	// sub-cause fired (stoppedDL+<100% from a failed Resume, persistent
+	// pausedUP that never reaches a ready state, torrent disappeared from qB
+	// entirely, etc.) without re-running with debug logging.
+	if errors.Is(waitErr, utils.ErrTimeout) {
+		s.logger.WarnContext(ctx, "waitForTorrentReady timed out",
+			"hash", hash,
+			"lastState", finalState,
+			"lastProgress", finalProgress,
+			"polls", pollCount,
+			"budget", timeout,
+		)
+	}
 
 	return finalState, waitErr
 }
