@@ -46,12 +46,12 @@ const (
 
 // TestEnv holds the complete test environment for source/destination e2e tests.
 type TestEnv struct {
-	compose          compose.ComposeStack
-	sourceURL        string
-	destinationURL   string
-	sourcePath       string
-	destinationPath  string
-	sourceClient     *qbittorrent.Client
+	compose           compose.ComposeStack
+	sourceURL         string
+	destinationURL    string
+	sourcePath        string
+	destinationPath   string
+	sourceClient      *qbittorrent.Client
 	destinationClient *qbittorrent.Client
 	destinationServer *destination.Server
 	grpcAddr          string
@@ -680,20 +680,86 @@ func WithExcludeSyncTag(tag string) SourceConfigOption {
 	}
 }
 
+// WithRadarrConfig sets the Radarr instance configuration on the source config.
+// The arr filter will be built from these fields when CreateSourceTask is called.
+func WithRadarrConfig(url, apiKey string, categories []string) SourceConfigOption {
+	return func(cfg *config.SourceConfig) {
+		cfg.Radarr = config.ArrInstanceConfig{
+			URL:        url,
+			APIKey:     apiKey,
+			Categories: categories,
+		}
+	}
+}
+
+// WithArrSkippedTag sets the tag applied to source torrents skipped by the arr filter.
+func WithArrSkippedTag(tag string) SourceConfigOption {
+	return func(cfg *config.SourceConfig) {
+		cfg.ArrSkippedTag = tag
+	}
+}
+
 // CreateSourceTask creates a QBTask for testing.
+// If the config has Radarr or Sonarr fields set, the arr filter is built from those;
+// otherwise a no-op filter is used so existing tests are unaffected.
 func (env *TestEnv) CreateSourceTask(cfg *config.SourceConfig) (*source.QBTask, *streaming.GRPCDestination, error) {
 	dest, err := env.CreateGRPCDestination()
 	if err != nil {
 		return nil, nil, fmt.Errorf("creating gRPC destination: %w", err)
 	}
 
-	task, err := source.NewQBTask(cfg, dest, arr.NoopFilter(), env.logger)
+	arrFilter, arrErr := arr.New(arr.Config{
+		Radarr: arr.InstanceConfig{
+			URL:        cfg.Radarr.URL,
+			APIKey:     cfg.Radarr.APIKey,
+			Categories: cfg.Radarr.Categories,
+		},
+		Sonarr: arr.InstanceConfig{
+			URL:        cfg.Sonarr.URL,
+			APIKey:     cfg.Sonarr.APIKey,
+			Categories: cfg.Sonarr.Categories,
+		},
+	}, env.logger)
+	if arrErr != nil {
+		if closeErr := dest.Close(); closeErr != nil {
+			env.t.Logf("closing gRPC destination after arr filter build failure: %v", closeErr)
+		}
+		return nil, nil, fmt.Errorf("building arr filter: %w", arrErr)
+	}
+
+	task, err := source.NewQBTask(cfg, dest, arrFilter, env.logger)
 	if err != nil {
-		dest.Close()
+		if closeErr := dest.Close(); closeErr != nil {
+			env.t.Logf("closing gRPC destination after task creation failure: %v", closeErr)
+		}
 		return nil, nil, fmt.Errorf("creating source task: %w", err)
 	}
 
 	return task, dest, nil
+}
+
+// WaitForSourceTag polls until the source torrent with the given hash has the specified
+// tag applied, failing if the deadline is exceeded.
+func (env *TestEnv) WaitForSourceTag(ctx context.Context, hash, tag string, timeout time.Duration, msg string) {
+	env.t.Helper()
+	require.Eventually(env.t, func() bool {
+		torrents, err := env.sourceClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+			Hashes: []string{hash},
+		})
+		if err != nil || len(torrents) == 0 {
+			return false
+		}
+		return strings.Contains(torrents[0].Tags, tag)
+	}, timeout, time.Second, msg)
+}
+
+// DestinationHasTorrent returns true if the destination qBittorrent has a torrent
+// with the given hash.
+func (env *TestEnv) DestinationHasTorrent(ctx context.Context, hash string) bool {
+	torrents, err := env.destinationClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+		Hashes: []string{hash},
+	})
+	return err == nil && len(torrents) > 0
 }
 
 // StopDestinationServer stops the destination gRPC server.
