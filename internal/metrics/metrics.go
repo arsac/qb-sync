@@ -20,6 +20,9 @@ const (
 	LabelConnection = "connection" // gRPC connection index
 	LabelDirection  = "direction"  // scaling direction (up, down)
 	LabelSelection  = "selection"  // partial, full
+	LabelInstance   = "instance"   // arr instance name (radarr, sonarr)
+	LabelKind       = "kind"       // arr lookup error kind
+	LabelOutcome    = "outcome"    // arr decision outcome (synced, skipped, failed_open)
 )
 
 // Label value constants for consistent usage across the codebase.
