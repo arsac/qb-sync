@@ -24,23 +24,24 @@ const (
 // Client is a thin HTTP client for Sonarr/Radarr. It is unaware of which app
 // it is talking to — both expose the same v3 endpoints we use.
 type Client struct {
-	baseURL string
-	apiKey  string
-	httpc   *http.Client
+	baseURL        string
+	apiKey         string
+	httpc          *http.Client
+	perCallTimeout time.Duration
 }
 
 // NewClient constructs a Client. perCallTimeout bounds each HTTP round-trip
-// via the per-call context derived inside each method.
+// via [context.WithTimeout] derived inside each method. The transport timeout
+// is set to perCallTimeout*transportTimeoutMult as a safety net only.
 func NewClient(baseURL, apiKey string, perCallTimeout time.Duration) *Client {
 	if perCallTimeout <= 0 {
 		perCallTimeout = defaultPerCallTimeout
 	}
 	return &Client{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		apiKey:  apiKey,
+		baseURL:        strings.TrimRight(baseURL, "/"),
+		apiKey:         apiKey,
+		perCallTimeout: perCallTimeout,
 		httpc: &http.Client{
-			// Per-call timeout is enforced via context.WithTimeout on each call.
-			// Set a generous transport-level default as a safety net.
 			Timeout: perCallTimeout * transportTimeoutMult,
 		},
 	}
@@ -48,6 +49,9 @@ func NewClient(baseURL, apiKey string, perCallTimeout time.Duration) *Client {
 
 // Ping calls GET /api/v3/system/status. Returns nil on 200, *Error otherwise.
 func (c *Client) Ping(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, c.perCallTimeout)
+	defer cancel()
+
 	req, err := c.newRequest(ctx, http.MethodGet, apiV3Prefix+"/system/status", nil)
 	if err != nil {
 		return err
@@ -136,6 +140,9 @@ func parseRetryAfter(v string) time.Duration {
 // may have uppercase DownloadID values; callers should compare case-insensitively.
 // Returns nil records on 200 with empty body or empty list. Returns *Error on failure.
 func (c *Client) GetHistoryByDownloadID(ctx context.Context, hash string) ([]HistoryRecord, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.perCallTimeout)
+	defer cancel()
+
 	q := url.Values{}
 	q.Set("downloadId", strings.ToLower(hash))
 

@@ -128,3 +128,18 @@ func TestClassifyStatusErrorReadsRetryAfter(t *testing.T) {
 		t.Fatalf("expected RetryAfter=7s, got %v", arrErr.RetryAfter)
 	}
 }
+
+func TestPerCallTimeoutFiresKindTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := NewClient(srv.URL, "k", 50*time.Millisecond)
+	err := c.Ping(context.Background())
+	var arrErr *Error
+	if !errors.As(err, &arrErr) || arrErr.Kind != KindTimeout {
+		t.Fatalf("expected KindTimeout, got %v", err)
+	}
+}
