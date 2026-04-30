@@ -15,3 +15,6 @@ type noopFilter struct{}
 func (noopFilter) ShouldSync(_ context.Context, _, _ string) Decision {
 	return Decision{Sync: true, Reason: ReasonNoCategory}
 }
+
+// NoopFilter returns a no-op Filter that always returns SYNC. Exported for test wiring.
+func NoopFilter() Filter { return noopFilter{} }

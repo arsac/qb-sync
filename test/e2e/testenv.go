@@ -19,6 +19,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/modules/compose"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	"github.com/arsac/qb-sync/internal/arr"
 	"github.com/arsac/qb-sync/internal/config"
 	"github.com/arsac/qb-sync/internal/destination"
 	"github.com/arsac/qb-sync/internal/source"
@@ -686,7 +687,7 @@ func (env *TestEnv) CreateSourceTask(cfg *config.SourceConfig) (*source.QBTask, 
 		return nil, nil, fmt.Errorf("creating gRPC destination: %w", err)
 	}
 
-	task, err := source.NewQBTask(cfg, dest, env.logger)
+	task, err := source.NewQBTask(cfg, dest, arr.NoopFilter(), env.logger)
 	if err != nil {
 		dest.Close()
 		return nil, nil, fmt.Errorf("creating source task: %w", err)

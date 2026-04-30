@@ -12,10 +12,22 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/arsac/qb-sync/internal/arr"
 	"github.com/arsac/qb-sync/internal/config"
 	"github.com/arsac/qb-sync/internal/health"
 	"github.com/arsac/qb-sync/internal/metrics"
 	"github.com/arsac/qb-sync/internal/streaming"
+)
+
+const (
+	// arrPerCallTimeout is the per-HTTP-call timeout for arr API requests.
+	arrPerCallTimeout = 3 * time.Second
+	// arrCacheDivisor halves the sleep interval to derive the arr verdict cache TTL.
+	arrCacheDivisor = 2
+	// arrBreakerMaxFailures is the consecutive-failure threshold before the circuit opens.
+	arrBreakerMaxFailures = 5
+	// arrBreakerResetTimeout is the cool-down period before the circuit moves to half-open.
+	arrBreakerResetTimeout = 60 * time.Second
 )
 
 // Runner orchestrates the source server tasks.
@@ -69,8 +81,39 @@ func (r *Runner) Run(ctx context.Context) error {
 		"maxConnections", maxConns,
 	)
 
+	arrCfg := arr.Config{
+		Radarr: arr.InstanceConfig{
+			URL:        r.cfg.Radarr.URL,
+			APIKey:     r.cfg.Radarr.APIKey,
+			Categories: r.cfg.Radarr.Categories,
+		},
+		Sonarr: arr.InstanceConfig{
+			URL:        r.cfg.Sonarr.URL,
+			APIKey:     r.cfg.Sonarr.APIKey,
+			Categories: r.cfg.Sonarr.Categories,
+		},
+		PerCallTimeout:      arrPerCallTimeout,
+		CacheTTL:            r.cfg.SleepInterval / arrCacheDivisor,
+		BreakerMaxFailures:  arrBreakerMaxFailures,
+		BreakerResetTimeout: arrBreakerResetTimeout,
+	}
+	arrFilter, arrErr := arr.New(arrCfg, r.logger.With("component", "arr"))
+	if arrErr != nil {
+		return fmt.Errorf("constructing arr filter: %w", arrErr)
+	}
+
+	// Ping results are logged for operator visibility; failures do not gate startup.
+	for name, pingErr := range arr.PingAll(ctx, arrFilter) {
+		if pingErr != nil {
+			r.logger.WarnContext(ctx, "arr instance ping failed at startup",
+				"instance", name, "error", pingErr)
+		} else {
+			r.logger.InfoContext(ctx, "arr instance reachable at startup", "instance", name)
+		}
+	}
+
 	// Create QBTask with streaming destination
-	qbTask, taskErr := NewQBTask(r.cfg, dest, r.logger.With("task", "qb"))
+	qbTask, taskErr := NewQBTask(r.cfg, dest, arrFilter, r.logger.With("task", "qb"))
 	if taskErr != nil {
 		return fmt.Errorf("creating qb task: %w", taskErr)
 	}

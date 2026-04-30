@@ -12,6 +12,7 @@ import (
 	"github.com/autobrr/go-qbittorrent"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/arsac/qb-sync/internal/arr"
 	"github.com/arsac/qb-sync/internal/config"
 	"github.com/arsac/qb-sync/internal/congestion"
 	"github.com/arsac/qb-sync/internal/metrics"
@@ -59,6 +60,7 @@ type QBTask struct {
 	logger    *slog.Logger
 	srcClient qbclient.Client
 	grpcDest  Destination
+	arrFilter arr.Filter
 
 	// Streaming components
 	source  *qbclient.Source
@@ -89,6 +91,7 @@ type QBTask struct {
 func NewQBTask(
 	cfg *config.SourceConfig,
 	dest *streaming.GRPCDestination,
+	arrFilter arr.Filter,
 	logger *slog.Logger,
 ) (*QBTask, error) {
 	rawClient := qbittorrent.NewClient(qbittorrent.Config{
@@ -133,6 +136,7 @@ func NewQBTask(
 		logger:    logger,
 		srcClient: srcClient,
 		grpcDest:  dest,
+		arrFilter: arrFilter,
 		source:    source,
 		tracker:   tracker,
 		queue:     queue,
