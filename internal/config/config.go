@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -53,6 +54,48 @@ type BaseConfig struct {
 	LogLevel string // Log level: debug, info, warn, error (default: info)
 
 	DryRun bool
+}
+
+// ArrInstanceConfig holds the connection and routing for a single Sonarr or Radarr instance.
+// The API key is masked in String() and MarshalJSON output to prevent accidental leakage.
+type ArrInstanceConfig struct {
+	URL        string
+	APIKey     string
+	Categories []string
+}
+
+// String returns a redacted representation suitable for logging.
+func (c ArrInstanceConfig) String() string {
+	return fmt.Sprintf("ArrInstanceConfig{URL:%q, APIKey:%s, Categories:%v}",
+		c.URL, redactAPIKey(c.APIKey), c.Categories)
+}
+
+// MarshalJSON masks the API key in JSON output.
+func (c ArrInstanceConfig) MarshalJSON() ([]byte, error) {
+	type alias struct {
+		URL        string   `json:"url"`
+		APIKey     string   `json:"api_key"`
+		Categories []string `json:"categories"`
+	}
+	//nolint:gosec // intentionally redacted via redactAPIKey()
+	return json.Marshal(alias{
+		URL:        c.URL,
+		APIKey:     redactAPIKey(c.APIKey),
+		Categories: c.Categories,
+	})
+}
+
+// IsZero reports whether the instance is unconfigured.
+func (c ArrInstanceConfig) IsZero() bool {
+	return c.URL == "" && c.APIKey == "" && len(c.Categories) == 0
+}
+
+// redactAPIKey returns a fixed mask for non-empty keys, or "<unset>" for empty ones.
+func redactAPIKey(key string) string {
+	if key == "" {
+		return "<unset>"
+	}
+	return "***"
 }
 
 // SourceConfig contains configuration for the source server.
