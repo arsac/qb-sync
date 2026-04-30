@@ -511,11 +511,16 @@ func (t *QBTask) resyncFileSelection(ctx context.Context, hash, fingerprint stri
 
 // arrRecheckConcurrency is the maximum number of concurrent arr API calls
 // during recheckArrRejectedTorrents.
-const arrRecheckConcurrency = 4
+const (
+	arrRecheckConcurrency  = 4
+	arrRecheckBudgetMax    = 15 * time.Second
+	arrRecheckBudgetDivsor = 2 // budget = SleepInterval / arrRecheckBudgetDivsor
+)
 
 // recheckArrRejectedTorrents scans tracked torrents and aborts any whose arr
 // verdict has flipped to SKIP since tracking started. Bounded concurrency via
-// errgroup; the caller's ctx bounds total time.
+// errgroup; a per-cycle budget of min(SleepInterval/2, 15s) caps total time.
+// Torrents that cannot run within the budget are skipped (fail-open).
 func (t *QBTask) recheckArrRejectedTorrents(ctx context.Context) {
 	if t.arrFilter == nil {
 		return
@@ -532,7 +537,15 @@ func (t *QBTask) recheckArrRejectedTorrents(ctx context.Context) {
 		categoryFor[tr.Hash] = tr.Category
 	}
 
-	g, gCtx := errgroup.WithContext(ctx)
+	// Derive a per-cycle budget: min(SleepInterval/2, 15s).
+	budget := min(t.cfg.SleepInterval/arrRecheckBudgetDivsor, arrRecheckBudgetMax)
+	if budget <= 0 {
+		budget = arrRecheckBudgetMax // safety: zero/negative SleepInterval
+	}
+	batchCtx, batchCancel := context.WithTimeout(ctx, budget)
+	defer batchCancel()
+
+	g, gCtx := errgroup.WithContext(batchCtx)
 	g.SetLimit(arrRecheckConcurrency)
 
 	type flipped struct {
@@ -552,6 +565,13 @@ func (t *QBTask) recheckArrRejectedTorrents(ctx context.Context) {
 			continue
 		}
 		g.Go(func() error {
+			if gCtx.Err() != nil {
+				// Budget exhausted before this torrent ran. Fail-open: don't decide.
+				// Intentionally return nil — we never propagate budget cancellation
+				// as a goroutine error; the deadline is handled at the batchCtx level.
+				metrics.ArrLookupSkippedBudgetTotal.Inc()
+				return nil //nolint:nilerr // deliberate fail-open: budget exhaustion is not a goroutine error
+			}
 			d := t.arrFilter.ShouldSync(gCtx, hash, category)
 			if !d.Sync {
 				mu.Lock()
@@ -561,8 +581,13 @@ func (t *QBTask) recheckArrRejectedTorrents(ctx context.Context) {
 			return nil
 		})
 	}
-	if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) {
+	if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		t.logger.WarnContext(ctx, "arr re-check group error", "error", err)
+	}
+
+	if errors.Is(batchCtx.Err(), context.DeadlineExceeded) {
+		t.logger.WarnContext(ctx, "arr re-check budget exhausted",
+			"budget", budget, "tracked", len(tracked))
 	}
 
 	for _, f := range toAbort {
