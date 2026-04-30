@@ -2,6 +2,7 @@ package arr
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -109,4 +110,33 @@ func classifyStatusError(resp *http.Response) error {
 	default:
 		return &Error{Kind: KindNetwork, Cause: errors.New(resp.Status)}
 	}
+}
+
+// GetHistoryByDownloadID calls GET /api/v3/history?downloadId={hash}.
+// hash is normalized to lowercase before sending. Records returned by *arr
+// may have uppercase DownloadID values; callers should compare case-insensitively.
+// Returns nil records on 200 with empty body or empty list. Returns *Error on failure.
+func (c *Client) GetHistoryByDownloadID(ctx context.Context, hash string) ([]HistoryRecord, error) {
+	q := url.Values{}
+	q.Set("downloadId", strings.ToLower(hash))
+
+	req, err := c.newRequest(ctx, http.MethodGet, apiV3Prefix+"/history", q)
+	if err != nil {
+		return nil, err
+	}
+	resp, doErr := c.httpc.Do(req)
+	if doErr != nil {
+		return nil, classifyDoError(doErr)
+	}
+	defer func() { drainAndClose(resp.Body) }()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, classifyStatusError(resp)
+	}
+
+	var hr historyResponse
+	if decodeErr := json.NewDecoder(resp.Body).Decode(&hr); decodeErr != nil {
+		return nil, &Error{Kind: KindNetwork, Cause: decodeErr}
+	}
+	return hr.Records, nil
 }

@@ -36,6 +36,11 @@ type HistoryRecord struct {
 	Date       time.Time `json:"date"`
 }
 
+// historyResponse is the paginated wrapper *arr returns from /api/v3/history.
+type historyResponse struct {
+	Records []HistoryRecord `json:"records"`
+}
+
 // Kind classifies a lookup error for metric labels.
 type Kind string
 
