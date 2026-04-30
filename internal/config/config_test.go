@@ -483,3 +483,39 @@ func TestLoadSource_EnvFallbacks(t *testing.T) {
 		assert.Equal(t, ":9090", cfg.HealthAddr)
 	})
 }
+
+func TestSourceConfigValidatesArrInstance(t *testing.T) {
+	// URL set without API key should fail.
+	cfg := &SourceConfig{
+		BaseConfig:      BaseConfig{DataPath: "/tmp", QBURL: "http://qb"},
+		DestinationAddr: "host:1",
+		Radarr:          ArrInstanceConfig{URL: "http://radarr"},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatalf("expected validation to fail when URL is set without API key")
+	}
+
+	// URL+API key without categories should fail.
+	cfg.Radarr = ArrInstanceConfig{URL: "http://radarr", APIKey: "k"}
+	if err := cfg.Validate(); err == nil {
+		t.Fatalf("expected validation to fail without categories")
+	}
+
+	// Full config should pass.
+	cfg.Radarr = ArrInstanceConfig{URL: "http://radarr", APIKey: "k", Categories: []string{"radarr"}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected validation to pass, got %v", err)
+	}
+}
+
+func TestSourceConfigRejectsCategoryAcrossArrInstances(t *testing.T) {
+	cfg := &SourceConfig{
+		BaseConfig:      BaseConfig{DataPath: "/tmp", QBURL: "http://qb"},
+		DestinationAddr: "host:1",
+		Radarr:          ArrInstanceConfig{URL: "http://r", APIKey: "k", Categories: []string{"shared"}},
+		Sonarr:          ArrInstanceConfig{URL: "http://s", APIKey: "k", Categories: []string{"shared"}},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatalf("expected validation to reject overlapping categories")
+	}
+}

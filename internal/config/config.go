@@ -32,6 +32,7 @@ const (
 	defaultMaxGRPCConnections   = 8
 	DefaultDrainTimeoutSec      = 300 // 5 minutes
 	defaultMaxStreamBufferMB    = 512
+	defaultArrSkippedTag        = "arr-skipped"
 )
 
 // BaseConfig contains configuration shared between source and destination servers.
@@ -127,6 +128,13 @@ type SourceConfig struct {
 	ExcludeCleanupTag  string        // Tag that prevents torrents from being cleaned up from source (empty to disable)
 	SyncFailedTag      string        // Tag applied on source when verification fails repeatedly (empty to disable; remove tag to retry)
 	ExcludeSyncTag     string        // Tag that prevents torrents from being synced (empty to disable)
+
+	// Sonarr/Radarr integration. Empty (zero) values disable the filter for that type.
+	Radarr ArrInstanceConfig
+	Sonarr ArrInstanceConfig
+
+	// ArrSkippedTag is applied to source torrents skipped by the arr filter (empty disables).
+	ArrSkippedTag string
 }
 
 // Validate validates the base configuration shared by source and destination.
@@ -179,6 +187,15 @@ func (c *SourceConfig) Validate() error {
 	}
 	if c.DrainTimeout < 0 {
 		return errors.New("drain timeout cannot be negative")
+	}
+	if err := validateArrInstance("radarr", c.Radarr); err != nil {
+		return err
+	}
+	if err := validateArrInstance("sonarr", c.Sonarr); err != nil {
+		return err
+	}
+	if conflict := overlappingCategory(c.Radarr.Categories, c.Sonarr.Categories); conflict != "" {
+		return fmt.Errorf("category %q is configured for both radarr and sonarr", conflict)
 	}
 	return nil
 }
@@ -305,6 +322,23 @@ func SetupSourceFlags(cmd *cobra.Command) {
 		"",
 		"Tag that prevents torrents from being synced (empty to disable)",
 	)
+
+	flags.String("radarr-url", "", "Radarr URL (e.g. http://radarr:7878). Empty disables Radarr filter.")
+	flags.String("radarr-api-key", "", "Radarr API key (sent via X-Api-Key header)")
+	flags.StringSlice("radarr-categories", nil,
+		"qBittorrent categories routed to Radarr. "+
+			"Filtering only applies to torrents Radarr grabbed itself; "+
+			"cross-seed and manually-added torrents typically have empty history and will be synced. "+
+			"v1 supports one Radarr; multi-instance support is tracked for v2.")
+
+	flags.String("sonarr-url", "", "Sonarr URL (e.g. http://sonarr:8989). Empty disables Sonarr filter.")
+	flags.String("sonarr-api-key", "", "Sonarr API key (sent via X-Api-Key header)")
+	flags.StringSlice("sonarr-categories", nil,
+		"qBittorrent categories routed to Sonarr. "+
+			"Same scope and limitations as --radarr-categories.")
+
+	flags.String("arr-skipped-tag", defaultArrSkippedTag,
+		"Tag applied to source torrents skipped by the arr filter (empty to disable)")
 }
 
 // SetupDestinationFlags sets up flags for the destination command.
@@ -353,6 +387,9 @@ func BindSourceFlags(cmd *cobra.Command, v *viper.Viper) error {
 		"source-removed-tag", "exclude-cleanup-tag", "sync-failed-tag", "exclude-sync-tag",
 		"health-addr", "synced-tag",
 		"dry-run", "log-level", "drain-annotation", "drain-timeout",
+		"radarr-url", "radarr-api-key", "radarr-categories",
+		"sonarr-url", "sonarr-api-key", "sonarr-categories",
+		"arr-skipped-tag",
 	})
 }
 
@@ -417,6 +454,18 @@ func LoadSource(v *viper.Viper) (*SourceConfig, error) {
 
 	cfg.HealthAddr = applyEnvFallback(cfg.HealthAddr, defaultHealthAddr, "HTTP_PORT", "HEALTH_PORT")
 
+	cfg.Radarr = ArrInstanceConfig{
+		URL:        v.GetString("radarr-url"),
+		APIKey:     v.GetString("radarr-api-key"),
+		Categories: v.GetStringSlice("radarr-categories"),
+	}
+	cfg.Sonarr = ArrInstanceConfig{
+		URL:        v.GetString("sonarr-url"),
+		APIKey:     v.GetString("sonarr-api-key"),
+		Categories: v.GetStringSlice("sonarr-categories"),
+	}
+	cfg.ArrSkippedTag = v.GetString("arr-skipped-tag")
+
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -457,4 +506,33 @@ func getEnvWithFallbacks(defaultVal string, envVars ...string) string {
 		}
 	}
 	return defaultVal
+}
+
+func validateArrInstance(name string, cfg ArrInstanceConfig) error {
+	if cfg.IsZero() {
+		return nil
+	}
+	if cfg.URL == "" {
+		return fmt.Errorf("%s URL is required when instance is configured", name)
+	}
+	if cfg.APIKey == "" {
+		return fmt.Errorf("%s API key is required when URL is set", name)
+	}
+	if len(cfg.Categories) == 0 {
+		return fmt.Errorf("%s requires at least one category", name)
+	}
+	return nil
+}
+
+func overlappingCategory(a, b []string) string {
+	set := make(map[string]struct{}, len(a))
+	for _, x := range a {
+		set[x] = struct{}{}
+	}
+	for _, y := range b {
+		if _, ok := set[y]; ok {
+			return y
+		}
+	}
+	return ""
 }
