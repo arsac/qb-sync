@@ -169,8 +169,9 @@ func (m *mockQBClient) SetFilePriorityCtx(_ context.Context, _, ids string, prio
 	m.setFilePriority = priority
 	return m.setFilePriorityErr
 }
-func (m *mockQBClient) RecheckCtx(context.Context, []string) error           { return nil }
-func (m *mockQBClient) GetFreeSpaceOnDiskCtx(context.Context) (int64, error) { return 0, nil }
+func (m *mockQBClient) RecheckCtx(context.Context, []string) error            { return nil }
+func (m *mockQBClient) GetFreeSpaceOnDiskCtx(context.Context) (int64, error)  { return 0, nil }
+func (m *mockQBClient) RemoveTagsCtx(context.Context, []string, string) error { return nil }
 
 func newTestServerWithQB(t *testing.T, mock *mockQBClient) *Server {
 	t.Helper()

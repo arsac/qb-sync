@@ -29,10 +29,12 @@ func testLogger(t *testing.T) *slog.Logger {
 
 // mockQBClient implements qbclient.Client for testing.
 type mockQBClient struct {
-	addTagsCalled bool
-	addTagsHashes []string
-	addTagsTag    string
-	addTagsErr    error
+	addTagsCalled  bool
+	addTagsHashes  []string
+	addTagsTag     string
+	addTagsErr     error
+	addTagCalls    int
+	removeTagCalls int
 
 	deleteCalled bool
 	deleteErr    error
@@ -105,7 +107,13 @@ func (m *mockQBClient) AddTagsCtx(_ context.Context, hashes []string, tags strin
 	m.addTagsCalled = true
 	m.addTagsHashes = hashes
 	m.addTagsTag = tags
+	m.addTagCalls++
 	return m.addTagsErr
+}
+
+func (m *mockQBClient) RemoveTagsCtx(_ context.Context, _ []string, _ string) error {
+	m.removeTagCalls++
+	return nil
 }
 
 func (m *mockQBClient) StopCtx(_ context.Context, hashes []string) error {
