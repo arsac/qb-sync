@@ -823,3 +823,157 @@ func TestApplyAndVerifyDeselectedPriorities(t *testing.T) {
 		}
 	})
 }
+
+// TestNeedsPartialSelectionRecovery covers the predicate that gates
+// re-application of priorities on existing-but-stuck torrents. The threshold
+// (Progress < 0.001 in stoppedDl/pausedDl) is what protects mid-recheck and
+// operator-paused torrents from being disrupted — Skeptic findings #1, #2, #5.
+func TestNeedsPartialSelectionRecovery(t *testing.T) {
+	t.Parallel()
+
+	withDeselected := []*serverFileInfo{
+		{selected: true},
+		{selected: false},
+	}
+	allSelected := []*serverFileInfo{
+		{selected: true},
+		{selected: true},
+	}
+
+	tests := []struct {
+		name  string
+		found bool
+		t     *qbittorrent.Torrent
+		files []*serverFileInfo
+		want  bool
+	}{
+		{
+			name:  "fresh add with deselected files: apply",
+			found: false,
+			t:     nil,
+			files: withDeselected,
+			want:  true,
+		},
+		{
+			name:  "fresh add with no deselected files: skip",
+			found: false,
+			t:     nil,
+			files: allSelected,
+			want:  false,
+		},
+		{
+			name:  "existing stoppedDl at 0% with deselected files: recover",
+			found: true,
+			t:     &qbittorrent.Torrent{State: qbittorrent.TorrentStateStoppedDl, Progress: 0},
+			files: withDeselected,
+			want:  true,
+		},
+		{
+			name:  "existing pausedDl at 0% with deselected files: recover",
+			found: true,
+			t:     &qbittorrent.Torrent{State: qbittorrent.TorrentStatePausedDl, Progress: 0},
+			files: withDeselected,
+			want:  true,
+		},
+		{
+			// Skeptic #1 regression: don't disrupt mid-recheck torrents.
+			name:  "existing stoppedDl at 50%: skip (mid-recheck)",
+			found: true,
+			t:     &qbittorrent.Torrent{State: qbittorrent.TorrentStateStoppedDl, Progress: 0.5},
+			files: withDeselected,
+			want:  false,
+		},
+		{
+			// Skeptic #2 regression: don't disrupt actively checking torrents.
+			name:  "existing checking at 0%: skip",
+			found: true,
+			t:     &qbittorrent.Torrent{State: qbittorrent.TorrentStateCheckingDl, Progress: 0},
+			files: withDeselected,
+			want:  false,
+		},
+		{
+			// Guardian #6 add: full-selection stuck torrents shouldn't trigger recovery.
+			name:  "existing stoppedDl at 0% with all files selected: skip",
+			found: true,
+			t:     &qbittorrent.Torrent{State: qbittorrent.TorrentStateStoppedDl, Progress: 0},
+			files: allSelected,
+			want:  false,
+		},
+		{
+			name:  "existing seeding at 100%: skip (already done)",
+			found: true,
+			t:     &qbittorrent.Torrent{State: qbittorrent.TorrentStateUploading, Progress: 1.0},
+			files: withDeselected,
+			want:  false,
+		},
+		{
+			// Boundary: exactly at the 0.001 threshold is excluded (qB has begun progressing).
+			name:  "existing stoppedDl at 0.001%: skip (FP threshold boundary)",
+			found: true,
+			t:     &qbittorrent.Torrent{State: qbittorrent.TorrentStateStoppedDl, Progress: 0.001},
+			files: withDeselected,
+			want:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := needsPartialSelectionRecovery(tt.found, tt.t, tt.files)
+			if got != tt.want {
+				t.Errorf("needsPartialSelectionRecovery() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestAddAndVerifyTorrent_RecoveryErrorPathStopsAndWraps regression-tests the
+// Arbiter precondition: when applyAndVerifyDeselectedPriorities returns an
+// error from the recovery branch, addAndVerifyTorrent must call
+// stopTorrentBestEffort and return the wrapped error so the source-side cap
+// can mark the torrent sync-failed.
+func TestAddAndVerifyTorrent_RecoveryErrorPathStopsAndWraps(t *testing.T) {
+	t.Parallel()
+
+	// Existing torrent stuck at 0% in stoppedDl with deselected files —
+	// triggers recovery. GetFilesInformation returns wrong priorities forever,
+	// so applyAndVerifyDeselectedPriorities fails after the budget.
+	mock := &mockQBClient{
+		torrents: []qbittorrent.Torrent{{
+			Hash:     "abc123",
+			State:    qbittorrent.TorrentStateStoppedDl,
+			Progress: 0,
+		}},
+		filesByCall: []qbittorrent.TorrentFiles{
+			{
+				{Index: 0, Priority: 1},
+				{Index: 1, Priority: 1}, // deselected file stuck at default
+			},
+		},
+	}
+	s := newTestServerWithQB(t, mock)
+	s.config.QB = &QBConfig{
+		PriorityVerifyInterval: 5 * time.Millisecond,
+		PriorityVerifyTimeout:  50 * time.Millisecond,
+	}
+
+	state := &serverTorrentState{
+		torrentMeta: torrentMeta{files: []*serverFileInfo{
+			{selected: true},
+			{selected: false},
+		}},
+	}
+
+	_, err := s.addAndVerifyTorrent(context.Background(), "abc123", state,
+		&pb.FinalizeTorrentRequest{TorrentHash: "abc123"})
+
+	if err == nil {
+		t.Fatal("expected error from recovery failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "applying deselected priorities") {
+		t.Errorf("error must wrap with 'applying deselected priorities' so source can correlate; got %q", err.Error())
+	}
+	if !mock.stopCalled {
+		t.Error("stopTorrentBestEffort must run on recovery failure to keep the dest qB torrent quiescent")
+	}
+}

@@ -506,6 +506,21 @@ var (
 			Help:      "Piece bits cleared from written bitmap because backing data file was missing",
 		},
 	)
+
+	// PartialSelectionRecoveryTotal counts attempts to recover stuck
+	// partial-selection torrents on destination — qB silently dropped the
+	// initial filePrio change, leaving the torrent in stoppedDl with default
+	// priorities. Result label distinguishes successful recovery (qB persisted
+	// priorities on the second attempt) from budget-exhausted failure (the
+	// source-side cap then surfaces it as sync-failed).
+	PartialSelectionRecoveryTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "partial_selection_recovery_total",
+			Help:      "Recovery attempts for stuck partial-selection torrents on destination",
+		},
+		[]string{LabelResult},
+	)
 )
 
 // Gauges track values that can go up or down.
