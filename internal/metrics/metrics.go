@@ -732,7 +732,6 @@ var (
 		[]string{LabelInstance},
 	)
 
-
 	// DestWorkerQueueDepth tracks pieces waiting for a worker on destination.
 	DestWorkerQueueDepth = promauto.NewGauge(
 		prometheus.GaugeOpts{
