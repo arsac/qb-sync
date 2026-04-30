@@ -8,10 +8,14 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/autobrr/go-qbittorrent"
+	"golang.org/x/sync/errgroup"
 
+	"github.com/arsac/qb-sync/internal/arr"
+	"github.com/arsac/qb-sync/internal/config"
 	"github.com/arsac/qb-sync/internal/metrics"
 	"github.com/arsac/qb-sync/internal/streaming"
 	pb "github.com/arsac/qb-sync/proto"
@@ -503,4 +507,106 @@ func (t *QBTask) resyncFileSelection(ctx context.Context, hash, fingerprint stri
 		tt = trackedTorrentFromQB(*torrent)
 	}
 	t.tracked.Add(hash, tt)
+}
+
+// arrRecheckConcurrency is the maximum number of concurrent arr API calls
+// during recheckArrRejectedTorrents.
+const arrRecheckConcurrency = 4
+
+// recheckArrRejectedTorrents scans tracked torrents and aborts any whose arr
+// verdict has flipped to SKIP since tracking started. Bounded concurrency via
+// errgroup; the caller's ctx bounds total time.
+func (t *QBTask) recheckArrRejectedTorrents(ctx context.Context) {
+	if t.arrFilter == nil {
+		return
+	}
+	tracked := t.tracked.Snapshot()
+	if len(tracked) == 0 {
+		return
+	}
+
+	// Build a hash->category lookup from cycleTorrents (already fetched this cycle).
+	categoryFor := make(map[string]string, len(t.cycleTorrents))
+	for i := range t.cycleTorrents {
+		tr := &t.cycleTorrents[i]
+		categoryFor[tr.Hash] = tr.Category
+	}
+
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(arrRecheckConcurrency)
+
+	type flipped struct {
+		hash   string
+		reason arr.Reason
+	}
+	var (
+		mu      sync.Mutex
+		toAbort []flipped
+	)
+
+	for hash := range tracked {
+		category, ok := categoryFor[hash]
+		if !ok {
+			// Torrent dropped from qB this cycle; let normal removal handle it.
+			continue
+		}
+		g.Go(func() error {
+			d := t.arrFilter.ShouldSync(gCtx, hash, category)
+			if !d.Sync {
+				mu.Lock()
+				toAbort = append(toAbort, flipped{hash: hash, reason: d.Reason})
+				mu.Unlock()
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) {
+		t.logger.WarnContext(ctx, "arr re-check group error", "error", err)
+	}
+
+	for _, f := range toAbort {
+		t.abortArrFlipped(ctx, f.hash, f.reason)
+	}
+}
+
+// abortArrFlipped handles a single torrent whose verdict flipped to SKIP.
+func (t *QBTask) abortArrFlipped(ctx context.Context, hash string, reason arr.Reason) {
+	tt, ok := t.tracked.Get(hash)
+	if !ok {
+		return
+	}
+	t.applyArrSkippedTag(ctx, hash, reason)
+	t.logger.InfoContext(ctx, "arr re-check: aborting in-progress sync",
+		"hash", hash, "name", tt.Name, "reason", reason)
+
+	if !t.cfg.DryRun {
+		abortCtx, cancel := withDestRPCTimeout(ctx)
+		_, abortErr := t.grpcDest.AbortTorrent(abortCtx, hash, true)
+		cancel()
+		if abortErr != nil {
+			t.logger.WarnContext(ctx, "arr re-check: AbortTorrent failed",
+				"hash", hash, "error", abortErr)
+		}
+	}
+	t.stopTracking(hash)
+
+	// Determine instance from category for metric label.
+	instance := "unknown"
+	if torrent := t.findTorrentByHash(hash); torrent != nil {
+		if i := instanceForCategory(t.cfg, torrent.Category); i != "" {
+			instance = i
+		}
+	}
+	metrics.ArrAbortedTotal.WithLabelValues(instance, string(reason)).Inc()
+}
+
+// instanceForCategory maps a qB category to an arr instance name using SourceConfig routing.
+func instanceForCategory(cfg *config.SourceConfig, category string) string {
+	if slices.Contains(cfg.Radarr.Categories, category) {
+		return "radarr"
+	}
+	if slices.Contains(cfg.Sonarr.Categories, category) {
+		return "sonarr"
+	}
+	return ""
 }

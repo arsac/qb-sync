@@ -237,6 +237,7 @@ func (t *QBTask) runOnce(ctx context.Context) {
 		t.pruneCycleCount = 0
 		t.pruneCompletedOnDest(ctx)
 		t.recheckFileSelections(ctx)
+		t.recheckArrRejectedTorrents(ctx)
 		t.pruneStaleMonitorEntries(ctx)
 	}
 }

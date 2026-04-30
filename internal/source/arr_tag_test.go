@@ -9,6 +9,8 @@ import (
 
 	"github.com/arsac/qb-sync/internal/arr"
 	"github.com/arsac/qb-sync/internal/config"
+	"github.com/arsac/qb-sync/internal/qbclient"
+	"github.com/arsac/qb-sync/internal/streaming"
 )
 
 // stubFilter returns a fixed Decision regardless of input.
@@ -99,5 +101,43 @@ func TestIsExcludedFromTrackingSkipsOnArrFilter(t *testing.T) {
 	}
 	if mock.addTagCalls != 1 {
 		t.Fatalf("expected arr-skipped tag to be applied, got %d calls", mock.addTagCalls)
+	}
+}
+
+func TestRecheckArrRejectedTorrentsAbortsFlippedVerdict(t *testing.T) {
+	logger := slog.Default()
+	mockSrc := &mockQBClient{}
+	mockDestination := &mockDest{}
+	cfg := &config.SourceConfig{}
+	cfg.ArrSkippedTag = "arr-skipped"
+
+	tracker := streaming.NewPieceMonitor(nil, nil, logger, streaming.DefaultPieceMonitorConfig())
+
+	task := &QBTask{
+		cfg:       cfg,
+		srcClient: mockSrc,
+		grpcDest:  mockDestination,
+		arrFilter: stubFilter{d: arr.Decision{Sync: false, Reason: arr.ReasonIgnored}},
+		tracked:   NewTrackedSet(),
+		tracker:   tracker,
+		source:    qbclient.NewSource(nil, ""),
+		backoffs:  NewBackoffTracker(),
+		logger:    logger,
+	}
+	task.tracked.Add("abc", TrackedTorrent{Name: "Movie.2026"})
+	task.cycleTorrents = []qbittorrent.Torrent{
+		{Hash: "abc", Category: "radarr"},
+	}
+
+	task.recheckArrRejectedTorrents(context.Background())
+
+	if mockDestination.abortCalls != 1 {
+		t.Fatalf("expected 1 AbortTorrent call, got %d", mockDestination.abortCalls)
+	}
+	if !mockDestination.lastAbortDeleteFiles {
+		t.Fatalf("expected AbortTorrent to be called with deleteFiles=true")
+	}
+	if mockSrc.addTagCalls != 1 {
+		t.Fatalf("expected arr-skipped tag to be applied, got %d calls", mockSrc.addTagCalls)
 	}
 }

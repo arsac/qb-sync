@@ -373,11 +373,13 @@ type mockDest struct {
 	finalizeSaveSubPath string
 	finalizeErr         error
 
-	abortCalled      bool
-	abortHash        string
-	abortDeleteFiles bool
-	abortResult      int32
-	abortErr         error
+	abortCalled          bool
+	abortCalls           int
+	abortHash            string
+	abortDeleteFiles     bool
+	lastAbortDeleteFiles bool
+	abortResult          int32
+	abortErr             error
 
 	startCalled bool
 	startHash   string
@@ -414,8 +416,10 @@ func (m *mockDest) FinalizeTorrent(_ context.Context, hash, savePath, category, 
 
 func (m *mockDest) AbortTorrent(_ context.Context, hash string, deleteFiles bool) (int32, error) {
 	m.abortCalled = true
+	m.abortCalls++
 	m.abortHash = hash
 	m.abortDeleteFiles = deleteFiles
+	m.lastAbortDeleteFiles = deleteFiles
 	return m.abortResult, m.abortErr
 }
 
