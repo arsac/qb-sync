@@ -36,6 +36,16 @@ const (
 	// Uses a detached context because the gRPC caller may cancel before the stop completes.
 	stopTorrentTimeout = 10 * time.Second
 
+	// Settings for verifying deselected file priorities actually persisted on
+	// destination qB after AddTorrent. qB silently drops priority changes on
+	// freshly-added stopped torrents occasionally — verification + retry catches
+	// that and keeps trying until the torrent has settled enough for the change
+	// to stick.
+	priorityVerifyInterval          = 500 * time.Millisecond
+	priorityVerifyMaxInterval       = 5 * time.Second
+	priorityVerifyTimeout           = 30 * time.Second
+	priorityVerifyBackoffMultiplier = 2 // exponential backoff base
+
 	// Default orphan cleanup settings.
 	defaultOrphanCleanupInterval = 1 * time.Hour  // How often to scan for orphans
 	defaultOrphanTimeout         = 24 * time.Hour // Consider torrent orphaned after this inactive period
@@ -80,11 +90,13 @@ const (
 
 // QBConfig holds qBittorrent configuration for the destination server.
 type QBConfig struct {
-	URL          string        // qBittorrent WebUI URL
-	Username     string        // qBittorrent username
-	Password     string        // qBittorrent password
-	PollInterval time.Duration // Poll interval for torrent verification (default: 2s)
-	PollTimeout  time.Duration // Poll timeout for torrent verification (default: 5m)
+	URL                    string        // qBittorrent WebUI URL
+	Username               string        // qBittorrent username
+	Password               string        // qBittorrent password
+	PollInterval           time.Duration // Poll interval for torrent verification (default: 2s)
+	PollTimeout            time.Duration // Poll timeout for torrent verification (default: 5m)
+	PriorityVerifyInterval time.Duration // Initial backoff between filePrio retries on partial-selection adds (default: 500ms)
+	PriorityVerifyTimeout  time.Duration // Total budget for filePrio verify-and-retry (default: 30s)
 }
 
 // ServerConfig configures the gRPC piece receiver server.
