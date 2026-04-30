@@ -69,6 +69,18 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_stale_bitmap_pieces_cleared_total` | | Piece bits cleared from written bitmap because backing data file was missing (destination) |
 | `qbsync_partial_selection_recovery_total` | `result` | Recovery attempts for stuck partial-selection torrents — `success` if priorities persisted on retry, `failure` if budget exhausted (destination) |
 
+## Arr filter
+
+| Metric | Labels | Description |
+|--------|--------|-------------|
+| `qbsync_arr_decisions_total` | `instance`, `outcome` | Total arr filter decisions. `outcome`: `synced`, `skipped`, `failed_open`. |
+| `qbsync_arr_skip_total` | `instance`, `reason` | Pre-sync skips driven by arr verdict. `reason`: `download_ignored`, `download_failed`. |
+| `qbsync_arr_aborted_total` | `instance`, `reason` | In-progress syncs aborted because arr's verdict flipped to skip. Same reason values. |
+| `qbsync_arr_lookup_errors_total` | `instance`, `kind` | Arr lookup errors. `kind`: `timeout`, `http_5xx`, `unauthorized`, `network`, `rate_limited`. |
+| `qbsync_arr_lookup_seconds` | `instance` | Per-call latency of arr history lookups (histogram). |
+| `qbsync_arr_circuit_breaker_state` | `instance` | Arr circuit breaker state: 0=closed, 1=open, 2=half-open. |
+| `qbsync_arr_lookup_skipped_budget_total` | | Torrents that bypassed arr lookup due to per-cycle budget exhaustion. |
+
 ## Gauges
 
 | Metric | Labels | Description |
