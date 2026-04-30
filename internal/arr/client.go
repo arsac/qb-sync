@@ -17,7 +17,6 @@ const (
 	defaultPerCallTimeout = 3 * time.Second
 	transportTimeoutMult  = 2
 	maxResponseBodySize   = 1 << 20
-	httpServerErrorCode   = 500
 )
 
 // Client is a thin HTTP client for Sonarr/Radarr. It is unaware of which app
@@ -105,7 +104,7 @@ func classifyStatusError(resp *http.Response) error {
 		return &Error{Kind: KindUnauthorized, Cause: errors.New(resp.Status)}
 	case resp.StatusCode == http.StatusTooManyRequests:
 		return &Error{Kind: KindRateLimited, Cause: errors.New(resp.Status)}
-	case resp.StatusCode >= httpServerErrorCode:
+	case resp.StatusCode >= http.StatusInternalServerError:
 		return &Error{Kind: KindHTTP5xx, Cause: errors.New(resp.Status)}
 	default:
 		return &Error{Kind: KindNetwork, Cause: errors.New(resp.Status)}
