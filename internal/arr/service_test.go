@@ -160,3 +160,32 @@ func TestServiceEmitsDecisionMetric(t *testing.T) {
 		t.Fatalf("expected counter to increment by 1, got delta=%v", after-before)
 	}
 }
+
+func TestNewWithEmptyConfigReturnsNoop(t *testing.T) {
+	f, err := New(Config{}, slog.Default())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := f.(noopFilter); !ok {
+		t.Fatalf("expected noopFilter, got %T", f)
+	}
+}
+
+func TestNewRejectsURLWithoutAPIKey(t *testing.T) {
+	_, err := New(Config{
+		Radarr: InstanceConfig{URL: "http://radarr:7878"},
+	}, slog.Default())
+	if err == nil {
+		t.Fatalf("expected error when URL is set but APIKey is empty")
+	}
+}
+
+func TestNewRejectsCategoryConflict(t *testing.T) {
+	_, err := New(Config{
+		Radarr: InstanceConfig{URL: "http://r", APIKey: "k", Categories: []string{"shared"}},
+		Sonarr: InstanceConfig{URL: "http://s", APIKey: "k", Categories: []string{"shared"}},
+	}, slog.Default())
+	if err == nil {
+		t.Fatalf("expected error for category appearing in both instances")
+	}
+}
