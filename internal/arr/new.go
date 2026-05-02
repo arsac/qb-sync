@@ -94,7 +94,8 @@ func New(cfg Config, logger *slog.Logger) (Filter, error) {
 	return &Service{
 		instances: instances,
 		routes:    routes,
-		cache:     newVerdictCache(cfg.CacheTTL),
+		cache:     newVerdictCache(),
+		cacheTTL:  cfg.CacheTTL,
 		logger:    logger,
 	}, nil
 }

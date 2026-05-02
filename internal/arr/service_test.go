@@ -39,7 +39,8 @@ func newTestService(t *testing.T, instances ...*instanceState) *Service {
 	return &Service{
 		instances: im,
 		routes:    rt,
-		cache:     newVerdictCache(50 * time.Millisecond),
+		cache:     newVerdictCache(),
+		cacheTTL:  50 * time.Millisecond,
 		logger:    slog.New(slog.NewTextHandler(testWriter{t: t}, nil)),
 	}
 }
@@ -193,5 +194,63 @@ func TestNewRejectsCategoryConflict(t *testing.T) {
 	}, slog.Default())
 	if err == nil {
 		t.Fatalf("expected error for category appearing in both instances")
+	}
+}
+
+func TestServiceCachesIgnoredVerdictForLongTTL(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"records":[{"eventType":"downloadIgnored","downloadId":"abc"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	svc := newTestService(t, &instanceState{
+		name:       "radarr",
+		client:     NewClient(srv.URL, "k", time.Second),
+		categories: []string{"radarr"},
+	})
+
+	d := svc.ShouldSync(context.Background(), "abc", "radarr")
+	if d.Sync || d.Reason != ReasonIgnored {
+		t.Fatalf("expected SKIP/Ignored, got %+v", d)
+	}
+
+	// Sleep past the short sync TTL (50ms) but well inside the terminal TTL (1h).
+	time.Sleep(100 * time.Millisecond)
+
+	d2 := svc.ShouldSync(context.Background(), "abc", "radarr")
+	if d2.Sync || d2.Reason != ReasonIgnored {
+		t.Fatalf("expected cached SKIP/Ignored, got %+v", d2)
+	}
+	if calls != 1 {
+		t.Fatalf("expected 1 HTTP call (terminal verdict cached), got %d", calls)
+	}
+}
+
+func TestServiceDoesNotCacheLookupFailures(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	svc := newTestService(t, &instanceState{
+		name:       "radarr",
+		client:     NewClient(srv.URL, "k", time.Second),
+		categories: []string{"radarr"},
+	})
+
+	for range 3 {
+		d := svc.ShouldSync(context.Background(), "abc", "radarr")
+		if !d.Sync || d.Reason != ReasonLookupFailed {
+			t.Fatalf("expected SYNC/LookupFailed, got %+v", d)
+		}
+	}
+	// Each call should hit the server (not cached).
+	if calls != 3 {
+		t.Fatalf("expected 3 HTTP calls (errors not cached), got %d", calls)
 	}
 }

@@ -23,6 +23,11 @@ type instanceState struct {
 	executor   failsafe.Executor[any]             // nil if disabled
 }
 
+// verdictTerminalTTL is the cache lifetime for terminal SKIP decisions
+// (ReasonIgnored, ReasonFailed). These states are effectively permanent in
+// *arr and won't reverse without manual user intervention.
+const verdictTerminalTTL = time.Hour
+
 // Service routes torrents to the right *arr instance, queries history,
 // and produces a Decision. Always returned via the Filter interface so
 // callers don't depend on concrete type.
@@ -30,6 +35,7 @@ type Service struct {
 	instances map[string]*instanceState
 	routes    map[string]string // category -> instance name
 	cache     *verdictCache
+	cacheTTL  time.Duration // "sync" TTL for non-terminal decisions
 	logger    *slog.Logger
 }
 
@@ -64,7 +70,9 @@ func (s *Service) decide(ctx context.Context, hash, category string) Decision {
 	start := timeNow()
 	d := s.lookup(ctx, inst, hash)
 	metrics.ArrLookupSeconds.WithLabelValues(instanceName).Observe(timeNow().Sub(start).Seconds())
-	s.cache.Set(key, d)
+	if ttl := ttlFor(d.Reason, s.cacheTTL); ttl > 0 {
+		s.cache.Set(key, d, ttl)
+	}
 	return d
 }
 
@@ -191,6 +199,25 @@ func interpretHistory(records []HistoryRecord) Decision {
 		}
 	}
 	return Decision{Sync: true, Reason: ReasonNotRejected}
+}
+
+// ttlFor returns the cache TTL for a given Reason.
+// Terminal SKIP reasons get a long TTL since *arr won't reverse them without
+// user intervention. SYNC reasons get the configured short TTL since *arr may
+// fire a terminal event after the initial grab. Fail-open reasons return 0 so
+// they are NOT cached — every cycle should retry.
+func ttlFor(r Reason, syncTTL time.Duration) time.Duration {
+	switch r {
+	case ReasonIgnored, ReasonFailed:
+		return verdictTerminalTTL
+	case ReasonNotRejected, ReasonEmptyHistory:
+		return syncTTL
+	case ReasonLookupFailed, ReasonCircuitOpen, ReasonBudgetExceeded:
+		return 0 // retry next cycle
+	case ReasonNoCategory:
+		return 0 // short-circuited before the cache is ever consulted
+	}
+	return 0
 }
 
 // timeNow is a small indirection for tests; defaults to [time.Now].

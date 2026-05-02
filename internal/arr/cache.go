@@ -30,14 +30,12 @@ type verdictEntry struct {
 type verdictCache struct {
 	mu      sync.Mutex
 	entries map[verdictKey]verdictEntry
-	ttl     time.Duration
 	now     func() time.Time // overridable for tests
 }
 
-func newVerdictCache(ttl time.Duration) *verdictCache {
+func newVerdictCache() *verdictCache {
 	return &verdictCache{
 		entries: make(map[verdictKey]verdictEntry),
-		ttl:     ttl,
 		now:     time.Now,
 	}
 }
@@ -58,10 +56,10 @@ func (c *verdictCache) Get(k verdictKey) (Decision, bool) {
 	return e.decision, true
 }
 
-// Set stores a decision with TTL = c.ttl from now.
-func (c *verdictCache) Set(k verdictKey, d Decision) {
+// Set stores a decision with the given TTL from now.
+func (c *verdictCache) Set(k verdictKey, d Decision, ttl time.Duration) {
 	k = k.normalize()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.entries[k] = verdictEntry{decision: d, expiry: c.now().Add(c.ttl)}
+	c.entries[k] = verdictEntry{decision: d, expiry: c.now().Add(ttl)}
 }
