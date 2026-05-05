@@ -19,6 +19,9 @@ import (
 	pb "github.com/arsac/qb-sync/proto"
 )
 
+// stateVerifying is the in-progress state returned while background verification runs.
+const stateVerifying = "verifying"
+
 // FinalizeTorrent completes the torrent transfer by renaming partial files,
 // verifying piece integrity, adding to qBittorrent, and confirming.
 //
@@ -112,7 +115,7 @@ func (s *Server) FinalizeTorrent(
 	// FinalizeTorrent calls until it gets the final result.
 	return &pb.FinalizeTorrentResponse{
 		Success: true,
-		State:   "verifying",
+		State:   stateVerifying,
 	}, nil
 }
 
@@ -877,7 +880,7 @@ func (s *Server) handleExistingFinalization(
 	if result == nil {
 		return &pb.FinalizeTorrentResponse{
 			Success: true,
-			State:   "verifying",
+			State:   stateVerifying,
 		}, nil
 	}
 

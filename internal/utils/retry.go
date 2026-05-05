@@ -20,6 +20,12 @@ const (
 	retryJitterFactor   = 0.1 // 10% randomization on retry delays
 )
 
+// Network error substrings matched by isRetriableNetworkError.
+const (
+	errPatternConnectionRefused = "connection refused"
+	errPatternIOTimeout         = "i/o timeout"
+)
+
 // RetryConfig configures retry behavior with exponential backoff.
 type RetryConfig struct {
 	MaxAttempts      int           // Maximum number of attempts (including first try)
@@ -127,12 +133,12 @@ func classifyError(err error) errorClass {
 // isRetriableNetworkError checks if the error string indicates a network issue worth retrying.
 func isRetriableNetworkError(errStr string) bool {
 	networkPatterns := []string{
-		"connection refused",
+		errPatternConnectionRefused,
 		"connection reset",
 		"connection timed out",
 		"no such host",
 		"network is unreachable",
-		"i/o timeout",
+		errPatternIOTimeout,
 		"eof",
 		"broken pipe",
 		"temporary failure",

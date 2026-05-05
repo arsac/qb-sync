@@ -314,7 +314,7 @@ func TestFinalizeTorrent_PollReturnsVerifying(t *testing.T) {
 	if !resp.GetSuccess() {
 		t.Fatalf("expected success=true for verifying response, got error: %s", resp.GetError())
 	}
-	if resp.GetState() != "verifying" {
+	if resp.GetState() != stateVerifying {
 		t.Errorf("expected state 'verifying', got %q", resp.GetState())
 	}
 }
@@ -530,7 +530,7 @@ func TestFinalizeTorrent_ConcurrentPollDuringSetup(t *testing.T) {
 	if !resp.GetSuccess() {
 		t.Fatalf("expected success=true for verifying response, got error: %s", resp.GetError())
 	}
-	if resp.GetState() != "verifying" {
+	if resp.GetState() != stateVerifying {
 		t.Errorf("expected state 'verifying', got %q", resp.GetState())
 	}
 }

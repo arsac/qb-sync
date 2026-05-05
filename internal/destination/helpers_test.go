@@ -2,7 +2,6 @@ package destination
 
 import (
 	"context"
-	"io"
 	"log/slog"
 	"os"
 	"testing"
@@ -16,7 +15,7 @@ func testLogger(t *testing.T) *slog.Logger {
 }
 
 func slogDiscard() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+	return slog.New(slog.DiscardHandler)
 }
 
 // newTestDestServer creates a minimal Server for destination-path unit tests
