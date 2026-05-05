@@ -512,9 +512,9 @@ func (t *QBTask) resyncFileSelection(ctx context.Context, hash, fingerprint stri
 // arrRecheckConcurrency is the maximum number of concurrent arr API calls
 // during recheckArrRejectedTorrents.
 const (
-	arrRecheckConcurrency  = 4
-	arrRecheckBudgetMax    = 15 * time.Second
-	arrRecheckBudgetDivsor = 2 // budget = SleepInterval / arrRecheckBudgetDivsor
+	arrRecheckConcurrency   = 4
+	arrRecheckBudgetMax     = 15 * time.Second
+	arrRecheckBudgetDivisor = 2 // budget = SleepInterval / arrRecheckBudgetDivisor
 )
 
 // recheckArrRejectedTorrents scans tracked torrents and aborts any whose arr
@@ -522,9 +522,6 @@ const (
 // errgroup; a per-cycle budget of min(SleepInterval/2, 15s) caps total time.
 // Torrents that cannot run within the budget are skipped (fail-open).
 func (t *QBTask) recheckArrRejectedTorrents(ctx context.Context) {
-	if t.arrFilter == nil {
-		return
-	}
 	tracked := t.tracked.Snapshot()
 	if len(tracked) == 0 {
 		return
@@ -538,7 +535,7 @@ func (t *QBTask) recheckArrRejectedTorrents(ctx context.Context) {
 	}
 
 	// Derive a per-cycle budget: min(SleepInterval/2, 15s).
-	budget := min(t.cfg.SleepInterval/arrRecheckBudgetDivsor, arrRecheckBudgetMax)
+	budget := min(t.cfg.SleepInterval/arrRecheckBudgetDivisor, arrRecheckBudgetMax)
 	if budget <= 0 {
 		budget = arrRecheckBudgetMax // safety: zero/negative SleepInterval
 	}
@@ -581,9 +578,7 @@ func (t *QBTask) recheckArrRejectedTorrents(ctx context.Context) {
 			return nil
 		})
 	}
-	if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-		t.logger.WarnContext(ctx, "arr re-check group error", "error", err)
-	}
+	_ = g.Wait() // goroutines always return nil; Wait is called only for its barrier semantics
 
 	if errors.Is(batchCtx.Err(), context.DeadlineExceeded) {
 		t.logger.WarnContext(ctx, "arr re-check budget exhausted",
@@ -624,13 +619,19 @@ func (t *QBTask) abortArrFlipped(ctx context.Context, hash, category string, rea
 	metrics.ArrAbortedTotal.WithLabelValues(instance, string(reason)).Inc()
 }
 
+// arr instance name constants — used as metric labels and for routing.
+const (
+	arrInstanceRadarr = "radarr"
+	arrInstanceSonarr = "sonarr"
+)
+
 // instanceForCategory maps a qB category to an arr instance name using SourceConfig routing.
 func instanceForCategory(cfg *config.SourceConfig, category string) string {
 	if slices.Contains(cfg.Radarr.Categories, category) {
-		return "radarr"
+		return arrInstanceRadarr
 	}
 	if slices.Contains(cfg.Sonarr.Categories, category) {
-		return "sonarr"
+		return arrInstanceSonarr
 	}
 	return ""
 }

@@ -17,8 +17,9 @@ type Config struct {
 	// PerCallTimeout bounds each HTTP round-trip. Default: 3s.
 	PerCallTimeout time.Duration
 
-	// CacheTTL is the per-verdict TTL. Default: 15s — caller passes a value
-	// derived from SleepInterval/2.
+	// CacheTTL is the TTL for non-terminal SYNC decisions (e.g. empty history, not rejected).
+	// Terminal SKIP decisions (ignored, failed) use a fixed long TTL regardless of this value.
+	// Default: 15s. Callers typically pass SleepInterval/2.
 	CacheTTL time.Duration
 
 	// BreakerMaxFailures triggers the breaker after N consecutive failures. <=0 disables.
