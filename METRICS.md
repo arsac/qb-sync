@@ -68,6 +68,7 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_finalize_not_found_total` | | Torrents untracked because destination had no state — will re-initialize (source) |
 | `qbsync_stale_bitmap_pieces_cleared_total` | | Piece bits cleared from written bitmap because backing data file was missing (destination) |
 | `qbsync_partial_selection_recovery_total` | `result` | Recovery attempts for stuck partial-selection torrents — `success` if priorities persisted on retry, `failure` if budget exhausted (destination) |
+| `qbsync_post_add_rechecks_total` | | Auto-triggered qB rechecks for torrents that landed in an error state right after AddTorrent — typically NFS attribute-cache staleness on destination qB's mount (destination) |
 
 ## Gauges
 

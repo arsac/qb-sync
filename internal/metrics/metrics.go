@@ -481,6 +481,19 @@ var (
 		},
 	)
 
+	// PostAddRechecksTotal counts auto-triggered qB rechecks fired when a
+	// freshly-added torrent landed in an error state. Typical cause: the
+	// destination qB's mount (commonly NFS) has a stale attribute cache and
+	// hasn't yet seen the renames we just performed; a recheck forces qB to
+	// re-walk the savepath and pick up the correct file sizes.
+	PostAddRechecksTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "post_add_rechecks_total",
+			Help:      "Auto-triggered qB rechecks for torrents that landed in an error state right after AddTorrent",
+		},
+	)
+
 	// ExcludeSyncAbortTotal counts torrents aborted due to exclude-sync tag applied mid-sync.
 	ExcludeSyncAbortTotal = promauto.NewCounter(
 		prometheus.CounterOpts{

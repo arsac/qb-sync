@@ -383,6 +383,22 @@ func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTo
 			return fmt.Errorf("pending hardlink %s -> %s spans filesystems (source removed or remounted?)",
 				sourcePath, fi.path)
 		}
+		// Validate the source's final size matches what THIS torrent's metadata
+		// expects before linking. tryHardlinkFromRegistered does the same check
+		// against its on-disk view; the in-progress path has historically relied
+		// on the assumption that two torrents sharing a (Dev, Ino) share the
+		// same file size. That assumption breaks under inode recycling or stale
+		// in-progress entries from a crashed prior run, and a wrong-sized link
+		// makes destination qB reject the torrent at AddTorrent with
+		// "mismatching file size", with no way to recover short of manual
+		// cleanup. Fail finalize so the source re-streams instead.
+		if sourceInfo, statErr := os.Stat(sourcePath); statErr != nil {
+			return fmt.Errorf("stat'ing pending hardlink source %s: %w", sourcePath, statErr)
+		} else if sourceInfo.Size() != fi.size {
+			return fmt.Errorf("pending hardlink source %s has size %d, expected %d "+
+				"(stale FileID or source-torrent metadata divergence)",
+				sourcePath, sourceInfo.Size(), fi.size)
+		}
 		if linkErr := os.Link(sourcePath, fi.path); linkErr != nil {
 			if os.IsExist(linkErr) {
 				s.logger.DebugContext(ctx, "pending hardlink target already exists",
