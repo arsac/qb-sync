@@ -204,14 +204,34 @@ func (s *Source) resolveContentBase(
 // destination, mirrors source's on-disk layout. Derived from ContentPath
 // rather than torrent.SavePath so it stays correct when qB's SavePath drifts
 // from disk reality (Auto-TMM, "Set Location" with category churn).
+//
+// Skips ContentPath when it sits outside the default save root — qB reports
+// ContentPath under the temp directory while a torrent is still downloading,
+// which would yield a different sub-path before vs. after completion and
+// trigger a destination-side relocation that leaves an empty <TorrentName>/
+// shell behind. torrent.SavePath reflects qB's currently configured save
+// location, which is stable across the temp→final transition (it is the
+// destination of that transition) so it is the correct fallback here.
 func (s *Source) CanonicalSubPath(
 	torrent qbittorrent.Torrent,
 	files qbittorrent.TorrentFiles,
 ) string {
-	if actual := actualQBSavePath(torrent, files); actual != "" {
+	if actual := actualQBSavePath(torrent, files); actual != "" && s.isUnderDefaultSave(actual) {
 		return s.ResolveSubPath(actual)
 	}
 	return s.ResolveSubPath(filepath.Clean(torrent.SavePath))
+}
+
+// isUnderDefaultSave reports whether p lives under qbDefaultSavePath. Used to
+// distinguish "legitimately at the save root" (subpath "") from "not under
+// the save root at all" (e.g., qB's incomplete-files temp directory), which
+// ResolveSubPath collapses into the same empty-string return value.
+func (s *Source) isUnderDefaultSave(p string) bool {
+	if s.qbDefaultSavePath == "" {
+		return false
+	}
+	rel, err := filepath.Rel(s.qbDefaultSavePath, p)
+	return err == nil && !strings.HasPrefix(rel, "..")
 }
 
 // actualQBSavePath returns the qB-namespaced parent directory of the torrent's
