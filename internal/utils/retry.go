@@ -124,15 +124,23 @@ func classifyError(err error) errorClass {
 	return errorPermanent
 }
 
+// Stable Go runtime error-message fragments that mark a network issue worth
+// retrying. Exposed as named constants so tests can reuse the exact strings
+// without duplicating the literal.
+const (
+	netErrConnRefused = "connection refused"
+	netErrIOTimeout   = "i/o timeout"
+)
+
 // isRetriableNetworkError checks if the error string indicates a network issue worth retrying.
 func isRetriableNetworkError(errStr string) bool {
 	networkPatterns := []string{
-		"connection refused",
+		netErrConnRefused,
 		"connection reset",
 		"connection timed out",
 		"no such host",
 		"network is unreachable",
-		"i/o timeout",
+		netErrIOTimeout,
 		"eof",
 		"broken pipe",
 		"temporary failure",

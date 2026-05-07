@@ -14,12 +14,12 @@ func TestIsRetriableError_NetworkErrors(t *testing.T) {
 		name string
 		err  error
 	}{
-		{"connection refused", errors.New("dial tcp 127.0.0.1:8080: connection refused")},
+		{netErrConnRefused, errors.New("dial tcp 127.0.0.1:8080: " + netErrConnRefused)},
 		{"connection reset", errors.New("read: connection reset by peer")},
 		{"connection timed out", errors.New("dial tcp: connection timed out")},
 		{"no such host", errors.New("dial tcp: lookup qbit.local: no such host")},
 		{"network unreachable", errors.New("dial tcp: network is unreachable")},
-		{"i/o timeout", errors.New("read tcp 127.0.0.1:8080: i/o timeout")},
+		{netErrIOTimeout, errors.New("read tcp 127.0.0.1:8080: " + netErrIOTimeout)},
 		{"eof", errors.New("unexpected EOF")},
 		{"broken pipe", errors.New("write: broken pipe")},
 		{"temporary failure", errors.New("lookup qbit: temporary failure in name resolution")},
@@ -106,11 +106,11 @@ func TestIsCircuitBreakerFailure_Included(t *testing.T) {
 		name string
 		err  error
 	}{
-		{"connection refused", errors.New("dial tcp: connection refused")},
+		{netErrConnRefused, errors.New("dial tcp: " + netErrConnRefused)},
 		{"500 internal server error", errors.New("status: 500")},
 		{"502 bad gateway", errors.New("status: 502")},
 		{"generic error", errors.New("something went wrong")},
-		{"i/o timeout", errors.New("i/o timeout")},
+		{netErrIOTimeout, errors.New(netErrIOTimeout)},
 	}
 
 	for _, tt := range tests {

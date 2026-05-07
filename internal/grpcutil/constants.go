@@ -29,4 +29,9 @@ const (
 	// matches typical piece sizes and reduces syscall and TCP send-coalescing
 	// overhead for bulk streaming.
 	TransportBufferSize = 1 * 1024 * 1024 // 1 MiB
+
+	// FinalizeStateVerifying is the wire-protocol value the destination returns
+	// in FinalizeTorrentResponse.State while background verification is still
+	// running. The source polls until it sees a different value.
+	FinalizeStateVerifying = "verifying"
 )

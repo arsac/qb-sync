@@ -12,6 +12,20 @@ import (
 	"github.com/spf13/viper"
 )
 
+// Flag names used in both registration (flags.String/Bool) and viper lookups
+// (v.GetString/GetBool). Defined as constants so a typo at one site cannot
+// silently fail to bind without surfacing as a compile error.
+const (
+	flagData       = "data"
+	flagSyncedTag  = "synced-tag"
+	flagDryRun     = "dry-run"
+	flagQBURL      = "qb-url"
+	flagQBUsername = "qb-username"
+	flagQBPassword = "qb-password"
+	flagHealthAddr = "health-addr"
+	flagLogLevel   = "log-level"
+)
+
 // Default configuration values.
 const (
 	defaultMinSpaceGB           = 50
@@ -187,14 +201,14 @@ func (c *DestinationConfig) Validate() error {
 // qbURLHelp differs between source (required, no extra context) and destination
 // (optional, used for adding verified torrents), so it is passed in.
 func setupCommonFlags(flags *pflag.FlagSet, dataHelp, qbURLHelp string) {
-	flags.String("data", "", dataHelp)
-	flags.String("qb-url", "", qbURLHelp)
-	flags.String("qb-username", "", "qBittorrent username")
-	flags.String("qb-password", "", "qBittorrent password")
-	flags.String("health-addr", defaultHealthAddr, "HTTP health endpoint address (empty to disable)")
-	flags.String("synced-tag", defaultSyncedTag, "Tag to apply to synced torrents (empty to disable)")
-	flags.Bool("dry-run", false, "Run without making changes")
-	flags.String("log-level", "info", "Log level: debug, info, warn, error")
+	flags.String(flagData, "", dataHelp)
+	flags.String(flagQBURL, "", qbURLHelp)
+	flags.String(flagQBUsername, "", "qBittorrent username")
+	flags.String(flagQBPassword, "", "qBittorrent password")
+	flags.String(flagHealthAddr, defaultHealthAddr, "HTTP health endpoint address (empty to disable)")
+	flags.String(flagSyncedTag, defaultSyncedTag, "Tag to apply to synced torrents (empty to disable)")
+	flags.Bool(flagDryRun, false, "Run without making changes")
+	flags.String(flagLogLevel, "info", "Log level: debug, info, warn, error")
 }
 
 // SetupSourceFlags sets up flags for the source command.
@@ -303,22 +317,22 @@ func bindFlags(cmd *cobra.Command, v *viper.Viper, envPrefix string, flags []str
 // BindSourceFlags binds source command flags to viper.
 func BindSourceFlags(cmd *cobra.Command, v *viper.Viper) error {
 	return bindFlags(cmd, v, "QBSYNC_SOURCE", []string{
-		"data", "qb-url", "qb-username", "qb-password",
+		flagData, flagQBURL, flagQBUsername, flagQBPassword,
 		"destination-addr", "min-space", "min-seeding-time", "sleep",
 		"rate-limit", "piece-timeout", "reconnect-max-delay",
 		"num-senders", "min-connections", "max-connections",
 		"source-removed-tag", "exclude-cleanup-tag", "sync-failed-tag", "exclude-sync-tag",
-		"health-addr", "synced-tag",
-		"dry-run", "log-level", "drain-annotation", "drain-timeout",
+		flagHealthAddr, flagSyncedTag,
+		flagDryRun, flagLogLevel, "drain-annotation", "drain-timeout",
 	})
 }
 
 // BindDestinationFlags binds destination command flags to viper.
 func BindDestinationFlags(cmd *cobra.Command, v *viper.Viper) error {
 	return bindFlags(cmd, v, "QBSYNC_DESTINATION", []string{
-		"listen", "data", "save-path", "qb-url", "qb-username", "qb-password",
+		"listen", flagData, "save-path", flagQBURL, flagQBUsername, flagQBPassword,
 		"poll-interval", "poll-timeout", "stream-workers", "max-stream-buffer",
-		"health-addr", "synced-tag", "dry-run", "log-level",
+		flagHealthAddr, flagSyncedTag, flagDryRun, flagLogLevel,
 	})
 }
 
@@ -330,14 +344,14 @@ func seconds(v *viper.Viper, key string) time.Duration {
 // loadBase loads the base configuration shared by source and destination.
 func loadBase(v *viper.Viper) BaseConfig {
 	return BaseConfig{
-		QBURL:      v.GetString("qb-url"),
-		QBUsername: v.GetString("qb-username"),
-		QBPassword: v.GetString("qb-password"),
-		DataPath:   v.GetString("data"),
-		HealthAddr: v.GetString("health-addr"),
-		SyncedTag:  v.GetString("synced-tag"),
-		LogLevel:   v.GetString("log-level"),
-		DryRun:     v.GetBool("dry-run"),
+		QBURL:      v.GetString(flagQBURL),
+		QBUsername: v.GetString(flagQBUsername),
+		QBPassword: v.GetString(flagQBPassword),
+		DataPath:   v.GetString(flagData),
+		HealthAddr: v.GetString(flagHealthAddr),
+		SyncedTag:  v.GetString(flagSyncedTag),
+		LogLevel:   v.GetString(flagLogLevel),
+		DryRun:     v.GetBool(flagDryRun),
 	}
 }
 
