@@ -14,6 +14,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/arsac/qb-sync/internal/grpcutil"
 	"github.com/arsac/qb-sync/internal/metrics"
 	"github.com/arsac/qb-sync/internal/utils"
 	pb "github.com/arsac/qb-sync/proto"
@@ -112,7 +113,7 @@ func (s *Server) FinalizeTorrent(
 	// FinalizeTorrent calls until it gets the final result.
 	return &pb.FinalizeTorrentResponse{
 		Success: true,
-		State:   "verifying",
+		State:   grpcutil.FinalizeStateVerifying,
 	}, nil
 }
 
@@ -877,7 +878,7 @@ func (s *Server) handleExistingFinalization(
 	if result == nil {
 		return &pb.FinalizeTorrentResponse{
 			Success: true,
-			State:   "verifying",
+			State:   grpcutil.FinalizeStateVerifying,
 		}, nil
 	}
 

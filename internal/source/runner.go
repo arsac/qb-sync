@@ -6,6 +6,7 @@ package source
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -75,7 +76,14 @@ func (r *Runner) Run(ctx context.Context) error {
 		return fmt.Errorf("creating qb task: %w", taskErr)
 	}
 
-	prometheus.MustRegister(NewMetricsCollector(qbTask))
+	// See destination.Server.Run for the registration rationale: production has
+	// one Runner per process so AlreadyRegisteredError never fires; e2e tests
+	// run multiple Runners in one process and the first registration wins.
+	if regErr := prometheus.Register(NewMetricsCollector(qbTask)); regErr != nil {
+		if !errors.As(regErr, new(prometheus.AlreadyRegisteredError)) {
+			return fmt.Errorf("registering metrics collector: %w", regErr)
+		}
+	}
 
 	// Register health checks if health server is configured
 	if r.healthServer != nil {

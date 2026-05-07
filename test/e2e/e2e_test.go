@@ -1682,7 +1682,7 @@ func TestE2E_CategoryWithATM(t *testing.T) {
 
 	// Step 2: Add torrent with category "music" and ATM enabled.
 	t.Log("Adding Wired CD torrent with category 'music' and ATM...")
-	err = env.SourceClient().AddTorrentFromUrlCtx(ctx, testTorrentURL, map[string]string{
+	err = env.AddTorrentToSource(ctx, testTorrentURL, map[string]string{
 		"category": "music",
 		"autoTMM":  "true",
 	})
@@ -2514,8 +2514,13 @@ func TestE2E_StuckAtFullStreamedQBIntegrationFailureCapsAtMaxRetries(t *testing.
 		if err != nil || len(torrents) == 0 {
 			return false
 		}
-		return torrents[0].State == qbittorrent.TorrentStateMissingFiles
-	}, 30*time.Second, shortPollInterval, "destination qB must enter missingFiles before sync starts")
+		// qB parks the torrent as either MissingFiles or Error when the savepath
+		// doesn't exist; both signal "addAndVerifyTorrent will fail on this
+		// pre-existing torrent", which is what this test needs to set up. The
+		// destination's own isErrorState predicate already treats both as fatal.
+		state := torrents[0].State
+		return state == qbittorrent.TorrentStateMissingFiles || state == qbittorrent.TorrentStateError
+	}, 30*time.Second, shortPollInterval, "destination qB must reach missingFiles or error before sync starts")
 
 	// 2. Add torrent to source and run orchestrator.
 	t.Log("Adding torrent to source and running orchestrator...")

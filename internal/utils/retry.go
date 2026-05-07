@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/autobrr/go-qbittorrent"
 	"github.com/failsafe-go/failsafe-go"
 	"github.com/failsafe-go/failsafe-go/retrypolicy"
 )
@@ -98,9 +99,19 @@ func classifyError(err error) errorClass {
 		return errorBenign
 	}
 
+	// Library propagates ErrTorrentNotFound from GetFilesInformationCtx,
+	// GetTorrentPropertiesCtx, ExportTorrentCtx, etc. Prefer the typed sentinel
+	// over string matching so retry classification stays correct if the
+	// library's error wording changes.
+	if errors.Is(err, qbittorrent.ErrTorrentNotFound) {
+		return errorBenign
+	}
+
 	errStr := strings.ToLower(err.Error())
 
-	// 404/not-found: resource doesn't exist, not a service issue.
+	// 404/not-found fallback: catches methods like GetTorrentPieceStatesCtx
+	// that return a coarser sentinel (ErrCannotGetTorrentPieceStates) wrapping
+	// the HTTP status in the message rather than ErrTorrentNotFound.
 	if strings.Contains(errStr, "404") || strings.Contains(errStr, "not found") {
 		return errorBenign
 	}
@@ -124,15 +135,23 @@ func classifyError(err error) errorClass {
 	return errorPermanent
 }
 
+// Stable Go runtime error-message fragments that mark a network issue worth
+// retrying. Exposed as named constants so tests can reuse the exact strings
+// without duplicating the literal.
+const (
+	netErrConnRefused = "connection refused"
+	netErrIOTimeout   = "i/o timeout"
+)
+
 // isRetriableNetworkError checks if the error string indicates a network issue worth retrying.
 func isRetriableNetworkError(errStr string) bool {
 	networkPatterns := []string{
-		"connection refused",
+		netErrConnRefused,
 		"connection reset",
 		"connection timed out",
 		"no such host",
 		"network is unreachable",
-		"i/o timeout",
+		netErrIOTimeout,
 		"eof",
 		"broken pipe",
 		"temporary failure",

@@ -16,6 +16,11 @@ import (
 	pb "github.com/arsac/qb-sync/proto"
 )
 
+// qbAPITrue is the literal "true" string qBittorrent's HTTP API expects in
+// boolean form fields. Defined as a constant to keep call sites consistent
+// (qB rejects non-canonical spellings like "True" or "1").
+const qbAPITrue = "true"
+
 // getQBTorrent logs in to qBittorrent and fetches a torrent by hash.
 // Returns (torrent, found, error). If the torrent does not exist, found is false with nil error.
 func (s *Server) getQBTorrent(ctx context.Context, hash string) (*qbittorrent.Torrent, bool, error) {
@@ -128,8 +133,8 @@ func (s *Server) addTorrentToQB(
 
 	opts := map[string]string{
 		"savepath":           savePath,
-		"stopped":            "true", // Source controls when destination starts seeding (qB v5+)
-		"paused":             "true", // Compat alias for qB v4.x
+		"stopped":            qbAPITrue, // Source controls when destination starts seeding (qB v5+)
+		"paused":             qbAPITrue, // Compat alias for qB v4.x
 		"autoTMM":            "false",
 		"sequentialDownload": "false",
 		// autobrr observed qB v5 occasionally announcing during the brief
@@ -142,7 +147,7 @@ func (s *Server) addTorrentToQB(
 	// Partial selection: deselected files are absent, so qB reports missingFiles
 	// even with skip_checking=true. Caller applies priorities + resumes after add.
 	if deselectedIDs == "" {
-		opts["skip_checking"] = "true"
+		opts["skip_checking"] = qbAPITrue
 	}
 
 	if req.GetCategory() != "" {

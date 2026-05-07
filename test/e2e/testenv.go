@@ -5,11 +5,14 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -125,7 +128,7 @@ func SetupTestEnv(t *testing.T, opts ...SetupOption) *TestEnv {
 	composeContent := fmt.Sprintf(`
 services:
   qb-source:
-    image: ghcr.io/home-operations/qbittorrent:5.1.4
+    image: ghcr.io/home-operations/qbittorrent:5.2.0@sha256:08eb7ed4c7fe70425064d58154c35fccc89fafffd64ce9d1affed399e173ff20
     volumes:
       - %s:/downloads
       - %s:/config%s
@@ -139,7 +142,7 @@ services:
       start_period: 10s
 
   qb-destination:
-    image: ghcr.io/home-operations/qbittorrent:5.1.4
+    image: ghcr.io/home-operations/qbittorrent:5.2.0@sha256:08eb7ed4c7fe70425064d58154c35fccc89fafffd64ce9d1affed399e173ff20
     volumes:
       - %s:/destination-data
       - %s:/config
@@ -376,12 +379,12 @@ func (env *TestEnv) CreateTestFile(relativePath string, size int) string {
 	return fullPath
 }
 
-// AddTorrentToSource adds a test torrent to source qBittorrent from URL.
+// AddTorrentToSource adds a test torrent to source qBittorrent.
 func (env *TestEnv) AddTorrentToSource(ctx context.Context, url string, opts map[string]string) error {
 	return env.addTorrent(ctx, env.sourceClient, url, opts)
 }
 
-// AddTorrentToDestination adds a test torrent to destination qBittorrent from URL.
+// AddTorrentToDestination adds a test torrent to destination qBittorrent.
 func (env *TestEnv) AddTorrentToDestination(ctx context.Context, url string, opts map[string]string) error {
 	if opts == nil {
 		opts = make(map[string]string)
@@ -389,9 +392,19 @@ func (env *TestEnv) AddTorrentToDestination(ctx context.Context, url string, opt
 	if _, ok := opts["savepath"]; !ok {
 		opts["savepath"] = "/destination-data"
 	}
-	return env.destinationClient.AddTorrentFromUrlCtx(ctx, url, opts)
+	body, err := fetchTorrentBytes(url)
+	if err != nil {
+		return err
+	}
+	return env.destinationClient.AddTorrentFromMemoryCtx(ctx, body, opts)
 }
 
+// addTorrent fetches the .torrent body once and adds it via the memory API.
+//
+// We deliberately do not use AddTorrentFromUrlCtx: qB v5.2.0+ returns HTTP 202
+// for URL-based adds (qB fetches the URL asynchronously) which go-qbittorrent
+// v1.15.0 treats as an error. Memory adds remain synchronous (HTTP 200) and
+// also remove the test's runtime dependency on the upstream URL host.
 func (env *TestEnv) addTorrent(
 	ctx context.Context,
 	client *qbittorrent.Client,
@@ -404,7 +417,43 @@ func (env *TestEnv) addTorrent(
 	if _, ok := opts["savepath"]; !ok {
 		opts["savepath"] = "/downloads"
 	}
-	return client.AddTorrentFromUrlCtx(ctx, url, opts)
+	body, err := fetchTorrentBytes(url)
+	if err != nil {
+		return err
+	}
+	return client.AddTorrentFromMemoryCtx(ctx, body, opts)
+}
+
+// torrentBytesByURL caches downloaded .torrent bodies for the lifetime of the
+// test binary so parallel tests share a single fetch per URL.
+var torrentBytesByURL sync.Map // url -> *torrentBytesEntry
+
+type torrentBytesEntry struct {
+	once sync.Once
+	body []byte
+	err  error
+}
+
+// fetchTorrentBytes downloads the .torrent at url and caches it. Concurrent
+// calls for the same URL block on the first download and share its result.
+func fetchTorrentBytes(url string) ([]byte, error) {
+	v, _ := torrentBytesByURL.LoadOrStore(url, &torrentBytesEntry{})
+	entry := v.(*torrentBytesEntry)
+	entry.once.Do(func() {
+		client := &http.Client{Timeout: 30 * time.Second}
+		resp, getErr := client.Get(url)
+		if getErr != nil {
+			entry.err = fmt.Errorf("fetching %s: %w", url, getErr)
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			entry.err = fmt.Errorf("fetching %s: status %d", url, resp.StatusCode)
+			return
+		}
+		entry.body, entry.err = io.ReadAll(resp.Body)
+	})
+	return entry.body, entry.err
 }
 
 // WaitForTorrent waits for a torrent to appear in qBittorrent.

@@ -402,7 +402,7 @@ func (d *GRPCDestination) FinalizeTorrent(
 
 	// Destination returns state="verifying" when background verification is still running.
 	// Return a sentinel error so the orchestrator can retry without penalty.
-	if resp.GetState() == "verifying" {
+	if resp.GetState() == grpcutil.FinalizeStateVerifying {
 		return ErrFinalizeVerifying
 	}
 

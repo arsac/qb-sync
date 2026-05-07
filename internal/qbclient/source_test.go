@@ -329,6 +329,7 @@ func TestCanonicalSubPath(t *testing.T) {
 	tests := []struct {
 		name              string
 		qbDefaultSavePath string
+		qbTempPath        string
 		torrent           qbittorrent.Torrent
 		files             qbittorrent.TorrentFiles
 		want              string
@@ -428,11 +429,41 @@ func TestCanonicalSubPath(t *testing.T) {
 			files: rootedFiles,
 			want:  "media/movies",
 		},
+		{
+			// Race repro: while a torrent is downloading, qB reports ContentPath
+			// in the temp directory. actualQBSavePath would strip the root and
+			// return the temp parent, which is *not* the final layout. Trusting
+			// it would produce saveSubPath="" during download and "movies" after
+			// completion — and the destination would relocate files between two
+			// locations, leaving an empty <TorrentName>/ shell at the BasePath
+			// root. Falling back to torrent.SavePath (always the final location)
+			// keeps the subpath stable across the temp→final transition.
+			name:              "incomplete download with temp path: ignores temp ContentPath",
+			qbDefaultSavePath: "/downloads",
+			qbTempPath:        "/temp",
+			torrent: qbittorrent.Torrent{
+				SavePath:    "/downloads/movies",
+				ContentPath: "/temp/MyMovie",
+			},
+			files: rootedFiles,
+			want:  "movies",
+		},
+		{
+			name:              "incomplete single-file download with temp path",
+			qbDefaultSavePath: "/downloads",
+			qbTempPath:        "/temp",
+			torrent: qbittorrent.Torrent{
+				SavePath:    "/downloads/movies",
+				ContentPath: "/temp/movie.mkv",
+			},
+			files: singleFile,
+			want:  "movies",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s := &Source{qbDefaultSavePath: tt.qbDefaultSavePath}
+			s := &Source{qbDefaultSavePath: tt.qbDefaultSavePath, qbTempPath: tt.qbTempPath}
 			got := s.CanonicalSubPath(tt.torrent, tt.files)
 			if got != tt.want {
 				t.Errorf("CanonicalSubPath() = %q, want %q", got, tt.want)
