@@ -6,6 +6,8 @@ package destination
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"sync"
@@ -138,8 +140,16 @@ func (s *Server) SetHealthServer(hs *health.Server) {
 // Run starts the gRPC server and blocks until context is cancelled.
 func (s *Server) Run(ctx context.Context) error {
 	// Register in Run, not NewServer, so tests can construct Servers without
-	// mutating the global Prometheus registry.
-	prometheus.MustRegister(NewMetricsCollector(s))
+	// mutating the global Prometheus registry. Production runs one Server per
+	// process so AlreadyRegisteredError never fires; e2e tests run multiple
+	// Servers concurrently — the first wins and subsequent ones share the
+	// global default registry without panicking. /metrics is not asserted on
+	// in tests, so first-Server-wins is acceptable test behavior.
+	if regErr := prometheus.Register(NewMetricsCollector(s)); regErr != nil {
+		if !errors.As(regErr, new(prometheus.AlreadyRegisteredError)) {
+			return fmt.Errorf("registering metrics collector: %w", regErr)
+		}
+	}
 
 	lc := net.ListenConfig{}
 	listener, err := lc.Listen(ctx, "tcp", s.config.ListenAddr)
