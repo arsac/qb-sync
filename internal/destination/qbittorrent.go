@@ -107,6 +107,28 @@ func (s *Server) addAndVerifyTorrent(
 	}
 
 	finalState, waitErr := s.waitForTorrentReady(ctx, hash, state.totalSize)
+
+	// Auto-recovery for the NFS-attribute-cache failure mode: when destination
+	// qB lives behind an NFS mount (or any mount with a stat cache), it can
+	// scan the savepath at AddTorrent time before our just-completed renames
+	// are visible, land in an error state, and stay there. The user-side
+	// workaround is to click "Force recheck" — qB then re-walks the directory,
+	// the renames are visible, and the torrent completes. Automate that here.
+	// Bounded to a single retry: if recheck doesn't clear the error, it isn't
+	// a cache-staleness problem and we surface the failure normally.
+	if waitErr != nil && isErrorState(finalState) {
+		s.logger.WarnContext(ctx, "torrent landed in error state after add, triggering recheck",
+			"hash", hash,
+			"state", finalState,
+		)
+		metrics.PostAddRechecksTotal.Inc()
+		if recheckErr := s.qbClient.RecheckCtx(ctx, []string{hash}); recheckErr != nil {
+			s.stopTorrentBestEffort(ctx, hash)
+			return finalState, fmt.Errorf("triggering recheck after error state %s: %w", finalState, recheckErr)
+		}
+		finalState, waitErr = s.waitForTorrentReady(ctx, hash, state.totalSize)
+	}
+
 	s.stopTorrentBestEffort(ctx, hash)
 	return finalState, waitErr
 }
