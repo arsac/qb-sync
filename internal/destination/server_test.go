@@ -725,6 +725,148 @@ func TestAbortTorrent_PreservesFiles(t *testing.T) {
 	}
 }
 
+func TestAbortTorrent_SkipsDeletionWhenInQB(t *testing.T) {
+	s := newAbortTestServer(t)
+	hash := "abc123"
+	partialFile := filepath.Join(s.config.BasePath, "data", "test.partial")
+	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
+
+	if err := os.MkdirAll(filepath.Dir(partialFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(metaDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(partialFile, []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s.store.entries[hash] = &serverTorrentState{
+		torrentMeta: torrentMeta{files: []*serverFileInfo{{path: partialFile, size: 4, selected: true}}},
+	}
+
+	// Simulate the finalize-completion race: destination qB already has this
+	// torrent, so AbortTorrent must not delete its data.
+	s.qbClient = &mockQBClient{
+		torrents: []qbittorrent.Torrent{{Hash: hash}},
+	}
+
+	resp, err := s.AbortTorrent(context.Background(), &pb.AbortTorrentRequest{
+		TorrentHash: hash,
+		DeleteFiles: true,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !resp.GetSuccess() {
+		t.Errorf("expected success, got error: %s", resp.GetError())
+	}
+	if resp.GetFilesDeleted() != 0 {
+		t.Errorf("expected 0 files deleted, got %d", resp.GetFilesDeleted())
+	}
+
+	if _, statErr := os.Stat(partialFile); os.IsNotExist(statErr) {
+		t.Error("partial file should be preserved when torrent is in destination qB")
+	}
+	if _, statErr := os.Stat(metaDir); os.IsNotExist(statErr) {
+		t.Error("meta dir should be preserved when torrent is in destination qB")
+	}
+}
+
+func TestAbortTorrent_PreservesPreExistingFiles(t *testing.T) {
+	s := newAbortTestServer(t)
+	hash := "abc123"
+	preExistingFile := filepath.Join(s.config.BasePath, "data", "preexisting.mkv")
+	streamedPartial := filepath.Join(s.config.BasePath, "data", "streamed.partial")
+
+	if err := os.MkdirAll(filepath.Dir(preExistingFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(preExistingFile, []byte("operator-owned"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(streamedPartial, []byte("our data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s.store.entries[hash] = &serverTorrentState{
+		torrentMeta: torrentMeta{files: []*serverFileInfo{
+			{path: preExistingFile, size: 14, selected: true},
+			{path: streamedPartial, size: 8, selected: true},
+		}},
+		hardlinkResults: []*pb.HardlinkResult{
+			{FileIndex: 0, PreExisting: true},
+			{FileIndex: 1},
+		},
+	}
+
+	resp, err := s.AbortTorrent(context.Background(), &pb.AbortTorrentRequest{
+		TorrentHash: hash,
+		DeleteFiles: true,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !resp.GetSuccess() {
+		t.Errorf("expected success, got error: %s", resp.GetError())
+	}
+	if resp.GetFilesDeleted() != 1 {
+		t.Errorf("expected 1 file deleted (only the streamed partial), got %d", resp.GetFilesDeleted())
+	}
+
+	if _, statErr := os.Stat(preExistingFile); os.IsNotExist(statErr) {
+		t.Error("pre-existing operator file should be preserved on abort")
+	}
+	if _, statErr := os.Stat(streamedPartial); !os.IsNotExist(statErr) {
+		t.Error("streamed partial file should be deleted")
+	}
+}
+
+func TestAbortTorrent_PreservesUnselectedFiles(t *testing.T) {
+	s := newAbortTestServer(t)
+	hash := "abc123"
+	unrelatedAtUnselectedPath := filepath.Join(s.config.BasePath, "data", "unselected-but-on-disk.mkv")
+	streamedPartial := filepath.Join(s.config.BasePath, "data", "streamed.partial")
+
+	if err := os.MkdirAll(filepath.Dir(unrelatedAtUnselectedPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unrelatedAtUnselectedPath, []byte("operator-owned"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(streamedPartial, []byte("our data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s.store.entries[hash] = &serverTorrentState{
+		torrentMeta: torrentMeta{files: []*serverFileInfo{
+			{path: unrelatedAtUnselectedPath, size: 14, selected: false},
+			{path: streamedPartial, size: 8, selected: true},
+		}},
+	}
+
+	resp, err := s.AbortTorrent(context.Background(), &pb.AbortTorrentRequest{
+		TorrentHash: hash,
+		DeleteFiles: true,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !resp.GetSuccess() {
+		t.Errorf("expected success, got error: %s", resp.GetError())
+	}
+	if resp.GetFilesDeleted() != 1 {
+		t.Errorf("expected 1 file deleted (only the selected streamed partial), got %d", resp.GetFilesDeleted())
+	}
+
+	if _, statErr := os.Stat(unrelatedAtUnselectedPath); os.IsNotExist(statErr) {
+		t.Error("file at deselected path should be preserved on abort")
+	}
+	if _, statErr := os.Stat(streamedPartial); !os.IsNotExist(statErr) {
+		t.Error("streamed partial file should be deleted")
+	}
+}
+
 func TestAbortTorrent_ClosesFileHandles(t *testing.T) {
 	s := newAbortTestServer(t)
 	hash := "abc123"

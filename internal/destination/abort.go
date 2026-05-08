@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/arsac/qb-sync/internal/metrics"
 	pb "github.com/arsac/qb-sync/proto"
 )
 
@@ -39,6 +40,30 @@ func tryRemoveWithLog(
 	return false
 }
 
+// shouldDeleteAbortedFile reports whether AbortTorrent should remove the given
+// file. Returns false (with metric incremented) for files qb-sync didn't put on
+// disk: deselected files (never written) and PreExisting files (operator data
+// that setupFile reused at the right size).
+func (s *Server) shouldDeleteAbortedFile(
+	ctx context.Context,
+	hash string,
+	fi *serverFileInfo,
+	result *pb.HardlinkResult,
+) bool {
+	if !fi.selected {
+		metrics.AbortFileDeletionsSkippedTotal.WithLabelValues(metrics.ReasonAbortUnselected).Inc()
+		return false
+	}
+	if result.GetPreExisting() {
+		s.logger.InfoContext(ctx, "preserving pre-existing file on abort",
+			"hash", hash, "path", fi.path,
+		)
+		metrics.AbortFileDeletionsSkippedTotal.WithLabelValues(metrics.ReasonAbortPreExisting).Inc()
+		return false
+	}
+	return true
+}
+
 // AbortTorrent aborts an in-progress torrent transfer and optionally cleans up partial files.
 // This is called when a torrent is removed from source before streaming completes.
 func (s *Server) AbortTorrent(
@@ -52,6 +77,22 @@ func (s *Server) AbortTorrent(
 		"hash", hash,
 		"deleteFiles", deleteFiles,
 	)
+
+	// Safety guard: if destination qB already has the torrent, deleting its
+	// files would leave qB seeing missing files. This catches the narrow
+	// finalization-completion race (source's removal detection fires after
+	// destination's FinalizeTorrent succeeded but before source's completion
+	// cache reflects it) and any other path where source's view drifts from
+	// destination's qB state. Disable file deletion; the destination becomes
+	// the canonical seeder. In-memory state is still dropped via BeginAbort
+	// below so this doesn't accumulate.
+	if deleteFiles && s.qbClient != nil && s.isTorrentInQB(ctx, hash) {
+		s.logger.WarnContext(ctx, "torrent exists in destination qBittorrent, preserving files on abort",
+			"hash", hash,
+		)
+		metrics.AbortFileDeletionsSkippedTotal.WithLabelValues(metrics.ReasonAbortInQB).Inc()
+		deleteFiles = false
+	}
 
 	// Register this abort to prevent concurrent InitTorrent from racing with cleanup.
 	// Create a channel that InitTorrent can wait on.
@@ -87,14 +128,22 @@ func (s *Server) AbortTorrent(
 	state.mu.Lock()
 	defer state.mu.Unlock()
 
-	for _, fi := range state.files {
+	for i, fi := range state.files {
 		// closeFileHandle is idempotent (no-op if fi.file is nil).
 		_ = s.closeFileHandle(ctx, hash, fi)
 
-		if deleteFiles {
-			if tryRemoveWithLog(ctx, s.logger, fi.path, "partial file", hash, &deleteErrors) {
-				filesDeleted++
-			}
+		if !deleteFiles {
+			continue
+		}
+		var hardlinkResult *pb.HardlinkResult
+		if i < len(state.hardlinkResults) {
+			hardlinkResult = state.hardlinkResults[i]
+		}
+		if !s.shouldDeleteAbortedFile(ctx, hash, fi, hardlinkResult) {
+			continue
+		}
+		if tryRemoveWithLog(ctx, s.logger, fi.path, "partial file", hash, &deleteErrors) {
+			filesDeleted++
 		}
 	}
 

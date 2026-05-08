@@ -921,3 +921,73 @@ func TestFinalizeTorrent_NotFound_ReturnsErrorCode(t *testing.T) {
 		t.Errorf("expected FINALIZE_ERROR_NOT_FOUND, got %v", resp.GetErrorCode())
 	}
 }
+
+// TestFinalizeFiles_PendingHardlinkRejectsWrongSizedSource regression-tests the
+// guard added to mirror tryHardlinkFromRegistered: when a pending-hardlink
+// source has finished writing but ends up at a size that doesn't match this
+// torrent's expected size (stale FileID, source-torrent metadata divergence,
+// crash-restart with stale in-progress state), finalizeFiles must NOT create
+// the link. A wrong-sized link makes destination qB reject the torrent at
+// AddTorrent with "mismatching file size".
+func TestFinalizeFiles_PendingHardlinkRejectsWrongSizedSource(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+	ctx := context.Background()
+
+	// Source file the pending hardlink would link to. Written at 50 bytes.
+	sourceRel := filepath.Join("other-torrent", "shared.mkv")
+	sourceAbs := filepath.Join(tmpDir, sourceRel)
+	if err := os.MkdirAll(filepath.Dir(sourceAbs), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sourceAbs, make([]byte, 50), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Source has finished writing → its doneCh is closed before finalizeFiles runs.
+	doneCh := make(chan struct{})
+	close(doneCh)
+
+	// THIS torrent's metadata claims the file should be 100 bytes. The 50-byte
+	// source thus must NOT be linked.
+	targetDir := filepath.Join(tmpDir, "this-torrent")
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	state := &serverTorrentState{
+		torrentMeta: torrentMeta{
+			pieceLength: 100,
+			totalSize:   100,
+			files: []*serverFileInfo{
+				{
+					path:     filepath.Join(targetDir, "shared.mkv"),
+					offset:   0,
+					size:     100,
+					selected: true,
+					hardlink: hardlinkInfo{
+						state:      hlStatePending,
+						sourcePath: sourceRel,
+						doneCh:     doneCh,
+					},
+				},
+			},
+		},
+		written:   bitset.New(1).Set(0),
+		statePath: filepath.Join(tmpDir, ".state"),
+	}
+
+	err := s.finalizeFiles(ctx, "testHash", state)
+	if err == nil {
+		t.Fatal("expected finalizeFiles to fail when pending-hardlink source size mismatches expected size")
+	}
+	if !strings.Contains(err.Error(), "expected 100") || !strings.Contains(err.Error(), "size 50") {
+		t.Errorf("error should name observed and expected sizes, got: %v", err)
+	}
+
+	// Crucially, NO link must have been created — qb-sync would otherwise have
+	// produced the wrong-sized destination file that triggers qB's rejection.
+	targetPath := filepath.Join(targetDir, "shared.mkv")
+	if _, statErr := os.Stat(targetPath); statErr == nil {
+		t.Errorf("hardlink should NOT have been created at %s", targetPath)
+	}
+}

@@ -47,6 +47,10 @@ const (
 	ReasonEOF               = "eof"
 	ReasonStreamError       = "error"
 	ReasonAckChannelBlocked = "ack_channel_blocked"
+
+	ReasonAbortInQB        = "in_qb"        // AbortFileDeletionsSkippedTotal: torrent already in destination qB
+	ReasonAbortPreExisting = "pre_existing" // AbortFileDeletionsSkippedTotal: setupFile reused operator data
+	ReasonAbortUnselected  = "unselected"   // AbortFileDeletionsSkippedTotal: deselected file we never wrote
 )
 
 // Counters track cumulative values that only increase.
@@ -501,6 +505,24 @@ var (
 			Name:      "exclude_sync_abort_total",
 			Help:      "Total torrents aborted due to exclude-sync tag applied mid-sync",
 		},
+	)
+
+	// AbortFileDeletionsSkippedTotal counts deletions suppressed by AbortTorrent's
+	// safety guards. Reasons:
+	//   - in_qb: destination qB already has the torrent (typically the
+	//     finalization-completion race); incremented once per AbortTorrent call
+	//     where the guard fires, suppressing the entire deletion path.
+	//   - pre_existing: a file the operator had on disk before sync started and
+	//     that setupFile reused without writing; incremented per skipped file.
+	//   - unselected: a deselected file that qb-sync never wrote; incremented
+	//     per skipped file.
+	AbortFileDeletionsSkippedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "abort_file_deletions_skipped_total",
+			Help:      "AbortTorrent file deletions suppressed by safety guards (reason: in_qb / pre_existing / unselected)",
+		},
+		[]string{LabelReason},
 	)
 
 	// FinalizeNotFoundTotal counts torrents where the destination had no state
