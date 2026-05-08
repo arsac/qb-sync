@@ -65,6 +65,18 @@ type mockQBClient struct {
 	// the last entry reuse it so tests only specify what changes.
 	filesByCall  []qbittorrent.TorrentFiles
 	getFilesCall int
+
+	// recheckCalled records that RecheckCtx fired and (when set) swaps the
+	// torrent list to torrentsAfterRecheck so subsequent GetTorrentsCtx polls
+	// see the post-recheck state. Used by post-add error-state recovery tests.
+	recheckCalled        bool
+	recheckHashes        []string
+	torrentsAfterRecheck []qbittorrent.Torrent
+
+	// torrentsAfterAdd, when non-nil, swaps the torrent list on the next
+	// AddTorrentFromMemoryCtx call. Lets tests model "torrent not present →
+	// add → torrent now in some state" without manual mid-test mutation.
+	torrentsAfterAdd []qbittorrent.Torrent
 }
 
 func (m *mockQBClient) LoginCtx(context.Context) error { return m.loginErr }
@@ -161,6 +173,9 @@ func (m *mockQBClient) CreateCategoryCtx(_ context.Context, category, path strin
 	return m.createCategoryErr
 }
 func (m *mockQBClient) AddTorrentFromMemoryCtx(context.Context, []byte, map[string]string) error {
+	if m.torrentsAfterAdd != nil {
+		m.torrents = m.torrentsAfterAdd
+	}
 	return nil
 }
 func (m *mockQBClient) SetFilePriorityCtx(_ context.Context, _, ids string, priority int) error {
@@ -169,7 +184,14 @@ func (m *mockQBClient) SetFilePriorityCtx(_ context.Context, _, ids string, prio
 	m.setFilePriority = priority
 	return m.setFilePriorityErr
 }
-func (m *mockQBClient) RecheckCtx(context.Context, []string) error           { return nil }
+func (m *mockQBClient) RecheckCtx(_ context.Context, hashes []string) error {
+	m.recheckCalled = true
+	m.recheckHashes = hashes
+	if m.torrentsAfterRecheck != nil {
+		m.torrents = m.torrentsAfterRecheck
+	}
+	return nil
+}
 func (m *mockQBClient) GetFreeSpaceOnDiskCtx(context.Context) (int64, error) { return 0, nil }
 
 func newTestServerWithQB(t *testing.T, mock *mockQBClient) *Server {
@@ -976,4 +998,90 @@ func TestAddAndVerifyTorrent_RecoveryErrorPathStopsAndWraps(t *testing.T) {
 	if !mock.stopCalled {
 		t.Error("stopTorrentBestEffort must run on recovery failure to keep the dest qB torrent quiescent")
 	}
+}
+
+// TestAddAndVerifyTorrent_AutoRechecksOnErrorState regression-tests the NFS
+// attribute-cache recovery path: when destination qB's mount serves a stale
+// directory listing at AddTorrent time and the torrent lands in an error
+// state, addAndVerifyTorrent must call RecheckCtx and re-poll once before
+// surfacing the failure. The user-visible workaround is "click Force recheck";
+// without this automation, every NFS-cache hiccup needs manual intervention.
+func TestAddAndVerifyTorrent_AutoRechecksOnErrorState(t *testing.T) {
+	t.Parallel()
+
+	t.Run("recheck recovers torrent into ready state", func(t *testing.T) {
+		t.Parallel()
+		// Pre-add: torrent not in qB. Add: lands in error state (the NFS-cache
+		// symptom we automate around). Recheck: forces qB to re-walk savepath,
+		// finds correct files, transitions to uploading.
+		mock := &mockQBClient{
+			torrentsAfterAdd: []qbittorrent.Torrent{{
+				Hash:  "abc123",
+				State: qbittorrent.TorrentStateError,
+			}},
+			torrentsAfterRecheck: []qbittorrent.Torrent{{
+				Hash:     "abc123",
+				State:    qbittorrent.TorrentStateUploading,
+				Progress: 1.0,
+			}},
+		}
+		s := newTestServerWithQB(t, mock)
+		s.config.QB = &QBConfig{
+			PollInterval: 5 * time.Millisecond,
+			PollTimeout:  2 * time.Second,
+		}
+
+		state := &serverTorrentState{torrentMeta: torrentMeta{
+			files: []*serverFileInfo{{selected: true}},
+		}, torrentFile: []byte("fake")}
+		finalState, err := s.addAndVerifyTorrent(context.Background(), "abc123", state,
+			&pb.FinalizeTorrentRequest{TorrentHash: "abc123"})
+		if err != nil {
+			t.Fatalf("expected recheck to recover, got error: %v", err)
+		}
+		if !mock.recheckCalled {
+			t.Fatal("RecheckCtx must be called when initial wait lands in error state")
+		}
+		if len(mock.recheckHashes) != 1 || mock.recheckHashes[0] != "abc123" {
+			t.Errorf("RecheckCtx hashes = %v, want [abc123]", mock.recheckHashes)
+		}
+		if finalState != qbittorrent.TorrentStateUploading {
+			t.Errorf("final state = %v, want uploading after recheck", finalState)
+		}
+	})
+
+	t.Run("retry is bounded — second error state surfaces failure", func(t *testing.T) {
+		t.Parallel()
+		// Recheck doesn't clear the error: real failure, must not loop forever.
+		mock := &mockQBClient{
+			torrentsAfterAdd: []qbittorrent.Torrent{{
+				Hash:  "abc123",
+				State: qbittorrent.TorrentStateError,
+			}},
+			torrentsAfterRecheck: []qbittorrent.Torrent{{
+				Hash:  "abc123",
+				State: qbittorrent.TorrentStateError,
+			}},
+		}
+		s := newTestServerWithQB(t, mock)
+		s.config.QB = &QBConfig{
+			PollInterval: 5 * time.Millisecond,
+			PollTimeout:  2 * time.Second,
+		}
+
+		state := &serverTorrentState{torrentMeta: torrentMeta{
+			files: []*serverFileInfo{{selected: true}},
+		}, torrentFile: []byte("fake")}
+		_, err := s.addAndVerifyTorrent(context.Background(), "abc123", state,
+			&pb.FinalizeTorrentRequest{TorrentHash: "abc123"})
+		if err == nil {
+			t.Fatal("expected error when recheck doesn't clear error state — must not loop forever")
+		}
+		if !mock.recheckCalled {
+			t.Error("RecheckCtx should still have been attempted once")
+		}
+		if !mock.stopCalled {
+			t.Error("stopTorrentBestEffort must run before returning to keep the torrent quiescent")
+		}
+	})
 }
