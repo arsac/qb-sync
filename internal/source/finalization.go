@@ -64,6 +64,15 @@ func (t *QBTask) handleFinalizeError(ctx context.Context, hash string, finalizeE
 	case errors.Is(finalizeErr, streaming.ErrFinalizeNotFound):
 		t.handleNotFoundFinalization(ctx, hash)
 		return false
+	case errors.Is(finalizeErr, streaming.ErrFinalizeTransient):
+		// Destination qB is transiently unhealthy (briefly unreachable,
+		// recheck pending, in-error-state-but-recoverable). Don't count
+		// against the per-torrent retry budget — a brief qB hiccup
+		// shouldn't quarantine valid data.
+		t.logger.WarnContext(ctx, "destination qB transient, will retry without counting against budget",
+			"hash", hash, "error", finalizeErr,
+		)
+		return false
 	}
 
 	metrics.FinalizationErrorsTotal.WithLabelValues(metrics.ModeSource).Inc()
@@ -155,11 +164,11 @@ func (t *QBTask) finalizeTorrent(ctx context.Context, hash string) error {
 
 	// Derive saveSubPath from ContentPath + file root rather than torrent.SavePath:
 	// SavePath drifts from disk reality after Auto-TMM moves or Set Location.
-	qbFiles, filesErr := t.srcClient.GetFilesInformationCtx(ctx, hash)
+	qbFiles, filesErr := t.cycleFilesFor(ctx, hash)
 	if filesErr != nil {
 		return fmt.Errorf("getting torrent files: %w", filesErr)
 	}
-	saveSubPath := t.source.CanonicalSubPath(torrent, *qbFiles)
+	saveSubPath := t.source.CanonicalSubPath(torrent, qbFiles)
 
 	t.logger.InfoContext(ctx, "finalizing torrent on destination",
 		"name", torrent.Name,

@@ -51,6 +51,9 @@ const (
 	ReasonAbortInQB        = "in_qb"        // AbortFileDeletionsSkippedTotal: torrent already in destination qB
 	ReasonAbortPreExisting = "pre_existing" // AbortFileDeletionsSkippedTotal: setupFile reused operator data
 	ReasonAbortUnselected  = "unselected"   // AbortFileDeletionsSkippedTotal: deselected file we never wrote
+
+	ReasonOrphanInQB          = "in_qb"          // OrphanCleanupSkippedTotal: torrent currently registered in destination qB
+	ReasonOrphanQBUnreachable = "qb_unreachable" // OrphanCleanupSkippedTotal: destination qB unreachable during safety check
 )
 
 // Counters track cumulative values that only increase.
@@ -106,6 +109,23 @@ var (
 			Name:      "orphan_cleanups_total",
 			Help:      "Total orphan torrents cleaned up on destination server",
 		},
+	)
+
+	// OrphanCleanupSkippedTotal counts orphan-cleanup attempts that were
+	// suppressed by safety checks. Reasons:
+	//   - in_qb: torrent is currently registered in destination qBittorrent
+	//     (do not delete data qB still owns).
+	//   - qb_unreachable: destination qB returned an error during the safety
+	//     check; cleanup is skipped fail-closed. Sustained increments here
+	//     indicate destination qB is offline / misconfigured and orphans are
+	//     accumulating on disk.
+	OrphanCleanupSkippedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "orphan_cleanup_skipped_total",
+			Help:      "Orphan-cleanup attempts suppressed by safety checks (reason: in_qb / qb_unreachable)",
+		},
+		[]string{LabelReason},
 	)
 
 	// PiecesSentTotal counts pieces sent from source server, per gRPC connection.

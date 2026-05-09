@@ -68,6 +68,13 @@ var (
 	// state for the torrent (metadata missing or data files deleted). The caller should
 	// untrack the torrent so it gets re-discovered and re-initialized from scratch.
 	ErrFinalizeNotFound = errors.New("finalization failed: torrent not found on destination")
+
+	// ErrFinalizeTransient is returned by FinalizeTorrent when the destination
+	// reports a transient qB problem (qB unreachable, briefly in error state,
+	// recheck didn't converge). The caller should retry on the next cycle
+	// WITHOUT counting against the per-torrent retry budget — otherwise a
+	// brief qB hiccup quarantines valid data as sync-failed.
+	ErrFinalizeTransient = errors.New("finalization deferred: destination qB transient")
 )
 
 // successResponse is implemented by gRPC response types that have Success/Error fields.
@@ -395,6 +402,11 @@ func (d *GRPCDestination) FinalizeTorrent(
 			// Destination has no state for this torrent (metadata missing or data
 			// files externally deleted). Caller should untrack and re-initialize.
 			return fmt.Errorf("%w: %s", ErrFinalizeNotFound, resp.GetError())
+		case pb.FinalizeErrorCode_FINALIZE_ERROR_TRANSIENT:
+			// Destination qB is transiently unhealthy (unreachable, briefly in
+			// error state, recheck pending). Caller should retry on the next
+			// cycle WITHOUT counting against the per-torrent retry budget.
+			return fmt.Errorf("%w: %s", ErrFinalizeTransient, resp.GetError())
 		default:
 			return respErr
 		}

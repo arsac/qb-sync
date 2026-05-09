@@ -237,11 +237,24 @@ func (s *Server) cleanupOrphan(ctx context.Context, hash string) {
 	// This covers the narrow crash window between addAndVerifyTorrent and
 	// markFinalized where the .finalized marker was not written.
 	// Fail-closed: if QB is unreachable, skip cleanup to avoid data loss.
-	if s.isTorrentInQB(ctx, hash) {
-		s.logger.InfoContext(ctx, "skipping orphan cleanup, torrent exists in destination qBittorrent",
-			"hash", hash,
-		)
-		return
+	// Metric is labeled by reason so operators can distinguish "qB owns it"
+	// (healthy skip) from "qB unreachable, orphans accumulating" (broken).
+	if s.qbClient != nil {
+		_, found, qbErr := s.getQBTorrent(ctx, hash)
+		switch {
+		case qbErr != nil:
+			metrics.OrphanCleanupSkippedTotal.WithLabelValues(metrics.ReasonOrphanQBUnreachable).Inc()
+			s.logger.WarnContext(ctx, "skipping orphan cleanup, destination qBittorrent unreachable",
+				"hash", hash, "error", qbErr,
+			)
+			return
+		case found:
+			metrics.OrphanCleanupSkippedTotal.WithLabelValues(metrics.ReasonOrphanInQB).Inc()
+			s.logger.InfoContext(ctx, "skipping orphan cleanup, torrent exists in destination qBittorrent",
+				"hash", hash,
+			)
+			return
+		}
 	}
 
 	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)

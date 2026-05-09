@@ -81,9 +81,10 @@ func (PieceErrorCode) EnumDescriptor() ([]byte, []int) {
 type FinalizeErrorCode int32
 
 const (
-	FinalizeErrorCode_FINALIZE_ERROR_NONE       FinalizeErrorCode = 0 // Default / unknown
-	FinalizeErrorCode_FINALIZE_ERROR_INCOMPLETE FinalizeErrorCode = 1 // Not all pieces written
-	FinalizeErrorCode_FINALIZE_ERROR_NOT_FOUND  FinalizeErrorCode = 2 // Torrent state not found or stale (data files missing)
+	FinalizeErrorCode_FINALIZE_ERROR_NONE       FinalizeErrorCode = 0 // Default / unknown — counts against retry budget
+	FinalizeErrorCode_FINALIZE_ERROR_INCOMPLETE FinalizeErrorCode = 1 // Not all pieces written; source re-streams (no retry budget)
+	FinalizeErrorCode_FINALIZE_ERROR_NOT_FOUND  FinalizeErrorCode = 2 // Torrent state not found or stale (data files missing); source re-inits
+	FinalizeErrorCode_FINALIZE_ERROR_TRANSIENT  FinalizeErrorCode = 3 // Destination qB transient (unreachable, recheck pending, briefly in error state). Source retries without counting against the per-torrent failure budget so a brief qB hiccup doesn't quarantine valid data.
 )
 
 // Enum value maps for FinalizeErrorCode.
@@ -92,11 +93,13 @@ var (
 		0: "FINALIZE_ERROR_NONE",
 		1: "FINALIZE_ERROR_INCOMPLETE",
 		2: "FINALIZE_ERROR_NOT_FOUND",
+		3: "FINALIZE_ERROR_TRANSIENT",
 	}
 	FinalizeErrorCode_value = map[string]int32{
 		"FINALIZE_ERROR_NONE":       0,
 		"FINALIZE_ERROR_INCOMPLETE": 1,
 		"FINALIZE_ERROR_NOT_FOUND":  2,
+		"FINALIZE_ERROR_TRANSIENT":  3,
 	}
 )
 
@@ -1268,11 +1271,12 @@ const file_qbsync_proto_rawDesc = "" +
 	"\x0ePIECE_ERROR_IO\x10\x01\x12\x1d\n" +
 	"\x19PIECE_ERROR_HASH_MISMATCH\x10\x02\x12\x1f\n" +
 	"\x1bPIECE_ERROR_NOT_INITIALIZED\x10\x03\x12\x1a\n" +
-	"\x16PIECE_ERROR_FINALIZING\x10\x04*i\n" +
+	"\x16PIECE_ERROR_FINALIZING\x10\x04*\x87\x01\n" +
 	"\x11FinalizeErrorCode\x12\x17\n" +
 	"\x13FINALIZE_ERROR_NONE\x10\x00\x12\x1d\n" +
 	"\x19FINALIZE_ERROR_INCOMPLETE\x10\x01\x12\x1c\n" +
-	"\x18FINALIZE_ERROR_NOT_FOUND\x10\x02*_\n" +
+	"\x18FINALIZE_ERROR_NOT_FOUND\x10\x02\x12\x1c\n" +
+	"\x18FINALIZE_ERROR_TRANSIENT\x10\x03*_\n" +
 	"\x11TorrentSyncStatus\x12\x15\n" +
 	"\x11SYNC_STATUS_READY\x10\x00\x12\x18\n" +
 	"\x14SYNC_STATUS_COMPLETE\x10\x01\x12\x19\n" +

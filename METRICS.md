@@ -70,6 +70,7 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_partial_selection_recovery_total` | `result` | Recovery attempts for stuck partial-selection torrents — `success` if priorities persisted on retry, `failure` if budget exhausted (destination) |
 | `qbsync_post_add_rechecks_total` | | Auto-triggered qB rechecks for torrents that landed in an error state right after AddTorrent — typically NFS attribute-cache staleness on destination qB's mount (destination) |
 | `qbsync_abort_file_deletions_skipped_total` | `reason` | AbortTorrent file deletions suppressed by safety guards — `in_qb` (per call: torrent already in destination qB), `pre_existing` (per file: setupFile reused operator data), `unselected` (per file: deselected file we never wrote) (destination) |
+| `qbsync_orphan_cleanup_skipped_total` | `reason` | Orphan-cleanup attempts suppressed by safety checks — `in_qb` (torrent currently registered in destination qB), `qb_unreachable` (destination qB returned an error during the safety check; sustained increments mean orphans accumulating because qB is offline / misconfigured) (destination) |
 
 ## Gauges
 

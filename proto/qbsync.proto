@@ -47,9 +47,10 @@ enum PieceErrorCode {
 
 // FinalizeErrorCode categorizes finalization failures for retry decisions.
 enum FinalizeErrorCode {
-  FINALIZE_ERROR_NONE = 0;       // Default / unknown
-  FINALIZE_ERROR_INCOMPLETE = 1; // Not all pieces written
-  FINALIZE_ERROR_NOT_FOUND = 2;  // Torrent state not found or stale (data files missing)
+  FINALIZE_ERROR_NONE = 0;       // Default / unknown — counts against retry budget
+  FINALIZE_ERROR_INCOMPLETE = 1; // Not all pieces written; source re-streams (no retry budget)
+  FINALIZE_ERROR_NOT_FOUND = 2;  // Torrent state not found or stale (data files missing); source re-inits
+  FINALIZE_ERROR_TRANSIENT = 3;  // Destination qB transient (unreachable, recheck pending, briefly in error state). Source retries without counting against the per-torrent failure budget so a brief qB hiccup doesn't quarantine valid data.
 }
 
 message WritePieceRequest {
