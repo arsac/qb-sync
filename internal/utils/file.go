@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -74,7 +75,13 @@ func readChunkInto(path string, offset int64, buf []byte) error {
 		return err
 	}
 	defer file.Close()
+	return readAtFull(file, buf, offset, path)
+}
 
+// readAtFull issues a single ReadAt and treats short reads as errors. EOF is
+// only acceptable if the read completed; otherwise it's a short-read error.
+// Path is included in error messages purely for diagnostics.
+func readAtFull(file *os.File, buf []byte, offset int64, path string) error {
 	n, err := file.ReadAt(buf, offset)
 	if err != nil && !errors.Is(err, io.EOF) {
 		return err
@@ -83,6 +90,97 @@ func readChunkInto(path string, offset int64, buf []byte) error {
 		return fmt.Errorf("short read from %s at offset %d: got %d bytes, want %d", path, offset, n, len(buf))
 	}
 	return nil
+}
+
+// FdCache is a per-goroutine fd cache for repeated piece reads against a
+// fixed set of files. Verify reads back N pieces per file; opening the file
+// once per worker instead of once per piece saves N-1 open+close round-trips
+// (significant on NFS where each open is a LOOKUP+OPEN RTT).
+//
+// NOT SAFE for concurrent use across goroutines. Each verify worker must own
+// its own FdCache and Close() it before exit. Sharing a single FdCache across
+// goroutines would (a) serialize reads on the same fd via NFS server-side
+// per-fh state, and (b) cause one slow read to block siblings.
+//
+// Open() is lazy. Close() closes all cached fds and zeros the map; safe to
+// call multiple times.
+type FdCache struct {
+	fds map[string]*os.File
+}
+
+// NewFdCache creates an empty cache.
+func NewFdCache() *FdCache {
+	return &FdCache{fds: make(map[string]*os.File)}
+}
+
+// Open returns a cached file handle, opening the file on first access. The
+// returned [os.File] belongs to the cache; do not Close() it directly.
+func (c *FdCache) Open(path string) (*os.File, error) {
+	if f, ok := c.fds[path]; ok {
+		return f, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	c.fds[path] = f
+	return f, nil
+}
+
+// Close closes every cached fd and clears the cache. Errors are ignored —
+// these are read-only fds, close failures don't affect data correctness.
+func (c *FdCache) Close() {
+	for _, f := range c.fds {
+		_ = f.Close()
+	}
+	c.fds = nil
+}
+
+// ReadPieceFromFilesCached is the cached variant of ReadPieceFromFiles. The
+// caller-supplied FdCache must be used by exactly one goroutine. Honors ctx
+// cancellation between file regions (regular-file ReadAt on Unix can't be
+// interrupted mid-syscall, but the regular cancellation check prevents
+// queueing further work after the verify-idle watchdog fires).
+func ReadPieceFromFilesCached(
+	ctx context.Context, cache *FdCache, files []FileRegion, pieceOffset, pieceSize int64,
+) ([]byte, error) {
+	buf := make([]byte, pieceSize)
+	written := int64(0)
+	currentOffset := pieceOffset
+
+	for _, f := range files {
+		if written >= pieceSize {
+			break
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		fileEnd := f.Offset + f.Size
+		if fileEnd <= currentOffset {
+			continue
+		}
+
+		fileReadOffset := max(currentOffset-f.Offset, 0)
+		availableInFile := f.Size - fileReadOffset
+		toRead := min(pieceSize-written, availableInFile)
+
+		fd, openErr := cache.Open(f.Path)
+		if openErr != nil {
+			return nil, fmt.Errorf("opening %s: %w", f.Path, openErr)
+		}
+		if err := readAtFull(fd, buf[written:written+toRead], fileReadOffset, f.Path); err != nil {
+			return nil, fmt.Errorf("reading from %s at offset %d: %w", f.Path, fileReadOffset, err)
+		}
+
+		written += toRead
+		currentOffset += toRead
+	}
+
+	if written < pieceSize {
+		return nil, fmt.Errorf("short read: got %d bytes, want %d", written, pieceSize)
+	}
+	return buf, nil
 }
 
 // AreHardlinked reports whether two paths refer to the same underlying file (i.e., share an inode).
