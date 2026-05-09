@@ -134,13 +134,8 @@ func (t *QBTask) tryFinalizeFullyStreamed(ctx context.Context, hash string) bool
 	}
 
 	// Mark completed BEFORE StartTorrent so pruneCompletedOnDest can retry
-	// if StartTorrent fails. Source torrent is already gone, so we can't
-	// compute a real selection fingerprint — that's only used by
-	// recheckFileSelections, which won't fire for an orphaned-completed
-	// entry. Without this, a transient StartTorrent failure here would
-	// leave the torrent finalized on disk but never seeding in destination
-	// qB, with no retry path (the existing prune cycle only iterates
-	// hashes already in the completion cache).
+	// if StartTorrent fails. Empty fingerprint is fine — source torrent is
+	// already gone, recheckFileSelections won't fire for an orphan entry.
 	t.completed.MarkWithFingerprint(hash, "")
 	t.completed.Save()
 
@@ -150,9 +145,6 @@ func (t *QBTask) tryFinalizeFullyStreamed(ctx context.Context, hash string) bool
 		t.logger.WarnContext(ctx, "failed to start fully-streamed torrent on destination (will retry via prune)",
 			"hash", hash, "error", startErr,
 		)
-		return true // completion-cache entry above ensures pruneCompletedOnDest retries
 	}
-	// StartTorrent succeeded — pruneCompletedOnDest will see the source
-	// torrent is gone and prune the cache entry on the next cycle.
 	return true
 }

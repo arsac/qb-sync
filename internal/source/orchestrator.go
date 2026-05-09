@@ -78,11 +78,8 @@ type QBTask struct {
 	// nil means not yet fetched this cycle; non-nil (even empty) means cached.
 	cycleTorrents []qbittorrent.Torrent
 
-	// Per-cycle cache of file-information results to avoid redundant
-	// GetFilesInformationCtx calls. A finalize cycle previously issued 3-4
-	// round-trips per torrent (finalize, fingerprint, label, cleanup); on a
-	// 50-torrent burst that's 200 sequential WebUI calls against
-	// single-threaded qBittorrent. Reset each cycle alongside cycleTorrents.
+	// Per-cycle file-information cache; populated lazily via cycleFilesFor,
+	// reset in runOnce alongside cycleTorrents.
 	cycleFiles map[string]qbittorrent.TorrentFiles
 
 	// trackingOrderHook is called with each hash when tracking starts. Test-only.
