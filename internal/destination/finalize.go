@@ -215,15 +215,17 @@ func (s *Server) runBackgroundFinalization(
 				"hash", hash,
 				"error", qbErr,
 			)
-			// Pieces are written and verified on disk — the failure is in the
-			// hand-off to destination qB (qB unreachable, recheck didn't
-			// converge after auto-retry, addTorrent network error). These are
-			// recoverable by another attempt once qB is healthy. Emit
-			// TRANSIENT so source retries without quarantining the torrent
-			// as sync-failed for a brief qB hiccup.
+			// Use FINALIZE_ERROR_NONE so the source-side cap fires for
+			// genuinely-stuck torrents (savepath misconfigured, qB rejecting
+			// the add, etc.). The auto-recheck on AddTorrent error state
+			// already covers the dominant transient case (NFS attribute
+			// staleness). FINALIZE_ERROR_TRANSIENT is reserved for a future
+			// classifier that can distinguish network errors from
+			// application-level rejections; emitting it broadly here lets
+			// permanently-broken torrents loop forever without quarantining.
 			storeFailure(
 				fmt.Sprintf("qBittorrent: %v", qbErr),
-				pb.FinalizeErrorCode_FINALIZE_ERROR_TRANSIENT,
+				pb.FinalizeErrorCode_FINALIZE_ERROR_NONE,
 			)
 			return
 		}
