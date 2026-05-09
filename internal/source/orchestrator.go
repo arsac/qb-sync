@@ -78,6 +78,13 @@ type QBTask struct {
 	// nil means not yet fetched this cycle; non-nil (even empty) means cached.
 	cycleTorrents []qbittorrent.Torrent
 
+	// Per-cycle cache of file-information results to avoid redundant
+	// GetFilesInformationCtx calls. A finalize cycle previously issued 3-4
+	// round-trips per torrent (finalize, fingerprint, label, cleanup); on a
+	// 50-torrent burst that's 200 sequential WebUI calls against
+	// single-threaded qBittorrent. Reset each cycle alongside cycleTorrents.
+	cycleFiles map[string]qbittorrent.TorrentFiles
+
 	// trackingOrderHook is called with each hash when tracking starts. Test-only.
 	trackingOrderHook func(hash string)
 
@@ -214,6 +221,7 @@ func (t *QBTask) Run(ctx context.Context) error {
 
 func (t *QBTask) runOnce(ctx context.Context) {
 	t.cycleTorrents = nil
+	t.cycleFiles = nil
 
 	if err := t.trackNewTorrents(ctx); err != nil {
 		t.logger.ErrorContext(ctx, "failed to track torrents", "error", err)
