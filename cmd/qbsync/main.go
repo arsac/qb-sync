@@ -143,6 +143,7 @@ func runDestination(cmd *cobra.Command, _ []string) error {
 		"healthAddr", cfg.HealthAddr,
 		"streamWorkers", cfg.StreamWorkers,
 		"maxStreamBufferMB", cfg.MaxStreamBufferMB,
+		"verifyConcurrency", cfg.VerifyConcurrency,
 		"dryRun", cfg.DryRun,
 	)
 
@@ -155,6 +156,7 @@ func runDestination(cmd *cobra.Command, _ []string) error {
 		SavePath:             cfg.SavePath,
 		StreamWorkers:        cfg.StreamWorkers,
 		MaxStreamBufferBytes: int64(cfg.MaxStreamBufferMB) * grpcutil.BytesPerMB,
+		VerifyConcurrency:    cfg.VerifyConcurrency,
 		SyncedTag:            cfg.SyncedTag,
 		DryRun:               cfg.DryRun,
 	}

@@ -172,6 +172,7 @@ type DestinationConfig struct {
 	// Streaming tuning
 	StreamWorkers     int // Number of concurrent piece writers (0 = use default 8)
 	MaxStreamBufferMB int // Global memory budget in MB for buffered piece data (default: 512)
+	VerifyConcurrency int // Concurrent piece-read goroutines during finalize verification (0 = use default 4)
 }
 
 // Validate validates the destination configuration.
@@ -190,6 +191,9 @@ func (c *DestinationConfig) Validate() error {
 	}
 	if c.StreamWorkers < 0 {
 		return errors.New("stream workers cannot be negative")
+	}
+	if c.VerifyConcurrency < 0 {
+		return errors.New("verify concurrency cannot be negative")
 	}
 	if c.MaxStreamBufferMB < 0 {
 		return errors.New("max stream buffer cannot be negative")
@@ -297,6 +301,11 @@ func SetupDestinationFlags(cmd *cobra.Command) {
 		defaultMaxStreamBufferMB,
 		"Global memory budget in MB for buffered piece data across all streams",
 	)
+	flags.Int(
+		"verify-concurrency",
+		0,
+		"Concurrent piece-read goroutines during finalize verification (0 = default 4). Raise on healthy storage to speed finalize; lower if your NFS server can't handle the burst.",
+	)
 }
 
 // bindFlags configures viper with an env prefix and binds the given flag names.
@@ -331,7 +340,7 @@ func BindSourceFlags(cmd *cobra.Command, v *viper.Viper) error {
 func BindDestinationFlags(cmd *cobra.Command, v *viper.Viper) error {
 	return bindFlags(cmd, v, "QBSYNC_DESTINATION", []string{
 		"listen", flagData, "save-path", flagQBURL, flagQBUsername, flagQBPassword,
-		"poll-interval", "poll-timeout", "stream-workers", "max-stream-buffer",
+		"poll-interval", "poll-timeout", "stream-workers", "max-stream-buffer", "verify-concurrency",
 		flagHealthAddr, flagSyncedTag, flagDryRun, flagLogLevel,
 	})
 }
@@ -404,6 +413,7 @@ func LoadDestination(v *viper.Viper) (*DestinationConfig, error) {
 		PollTimeout:       seconds(v, "poll-timeout"),
 		StreamWorkers:     v.GetInt("stream-workers"),
 		MaxStreamBufferMB: v.GetInt("max-stream-buffer"),
+		VerifyConcurrency: v.GetInt("verify-concurrency"),
 	}
 
 	cfg.ListenAddr = applyEnvFallback(cfg.ListenAddr, defaultListenAddr, "GRPC_PORT", "PORT")

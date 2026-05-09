@@ -106,6 +106,7 @@ type ServerConfig struct {
 	SavePath           string        // Path as destination qBittorrent sees it (container mount, e.g., "/downloads"). Defaults to BasePath.
 	StateFlushInterval time.Duration // How often to flush dirty state (0 = use default)
 	StreamWorkers      int           // Number of concurrent piece writers (0 = use default)
+	VerifyConcurrency  int           // Concurrent piece-read goroutines during finalize verification (0 = use default 4). Raise on healthy storage to speed finalize; lower if your NFS server can't handle the burst.
 
 	// Orphan cleanup settings - clean up partial files when source disconnects unexpectedly.
 	OrphanCleanupInterval time.Duration // How often to scan for orphans (0 = use default 1h)
