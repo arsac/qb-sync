@@ -166,8 +166,11 @@ func (s *Server) runBackgroundFinalization(
 
 	// Work timeout starts after acquiring the semaphore — queue wait doesn't
 	// eat into the time budget for verification and qBittorrent operations.
-	// Derived from s.bgCtx so server shutdown cancels in-flight work.
-	ctx, cancel := context.WithTimeout(s.bgCtx, backgroundFinalizeTimeout)
+	// Scales with torrent size: base + per-GB, capped, so multi-hundred-GB
+	// torrents on slow storage aren't quarantined as sync-failed for
+	// legitimately long verification work. Derived from s.bgCtx so server
+	// shutdown cancels in-flight work.
+	ctx, cancel := context.WithTimeout(s.bgCtx, computeBackgroundFinalizeTimeout(state.totalSize))
 	defer cancel()
 
 	// Sync parent directories before verification to ensure NFS has flushed
@@ -212,9 +215,15 @@ func (s *Server) runBackgroundFinalization(
 				"hash", hash,
 				"error", qbErr,
 			)
+			// Pieces are written and verified on disk — the failure is in the
+			// hand-off to destination qB (qB unreachable, recheck didn't
+			// converge after auto-retry, addTorrent network error). These are
+			// recoverable by another attempt once qB is healthy. Emit
+			// TRANSIENT so source retries without quarantining the torrent
+			// as sync-failed for a brief qB hiccup.
 			storeFailure(
 				fmt.Sprintf("qBittorrent: %v", qbErr),
-				pb.FinalizeErrorCode_FINALIZE_ERROR_NONE,
+				pb.FinalizeErrorCode_FINALIZE_ERROR_TRANSIENT,
 			)
 			return
 		}
@@ -737,6 +746,20 @@ func (s *Server) verifyOnePiece(
 		return false
 	}
 	return true
+}
+
+// computeBackgroundFinalizeTimeout returns the wall-clock budget for one
+// torrent's background finalization work. Scales linearly by GB above a small
+// floor and is capped to prevent unbounded waits — same shape as
+// computePollTimeout for qB recheck.
+func computeBackgroundFinalizeTimeout(totalSize int64) time.Duration {
+	const bytesPerGB = 1024 * 1024 * 1024
+	gigabytes := totalSize / bytesPerGB
+	timeout := backgroundFinalizeTimeoutBase + time.Duration(gigabytes)*backgroundFinalizeTimeoutPerGB
+	if timeout > backgroundFinalizeTimeoutMax {
+		return backgroundFinalizeTimeoutMax
+	}
+	return timeout
 }
 
 // verifyConcurrency returns the operator-configured per-piece read concurrency

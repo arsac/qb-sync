@@ -53,7 +53,13 @@ type torrentState struct {
 	streamed   []bool // pieces successfully streamed
 	failed     []bool // pieces that failed (for retry logic)
 	idleTicks  int    // consecutive polls with no new pieces completed
-	mu         sync.RWMutex
+	// firstUnstreamedScanIdx is the lowest index that *might* still be
+	// un-streamed. queueCompletedPieces uses it to avoid re-scanning the
+	// long prefix of already-streamed pieces on every poll. Pieces complete
+	// monotonically once written, so the cursor only ever moves forward.
+	// Updated under mu (write) by queueCompletedPieces; read by the same.
+	firstUnstreamedScanIdx int
+	mu                     sync.RWMutex
 }
 
 // PieceMonitor monitors piece completion and queues pieces for streaming.
@@ -636,11 +642,25 @@ func (t *PieceMonitor) queueCompletedPieces(ctx context.Context, state *torrentS
 		return 0
 	}
 
-	state.mu.RLock()
-	defer state.mu.RUnlock()
+	// Take the write lock so we can advance firstUnstreamedScanIdx in the
+	// same critical section we read it. The work inside is index-bounded;
+	// no I/O happens under the lock — channel sends use a non-blocking
+	// trySendCompletedNonBlocking.
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	// Advance the cursor past any prefix that's already been streamed. This
+	// makes subsequent polls O(N - cursor) instead of O(N) — for a
+	// largely-complete torrent the scan body becomes near-empty.
+	startIdx := state.firstUnstreamedScanIdx
+	for startIdx < len(state.streamed) && state.streamed[startIdx] {
+		startIdx++
+	}
+	state.firstUnstreamedScanIdx = startIdx
 
 	var queued, skipped int
-	for i, pieceState := range current {
+	for i := startIdx; i < len(current); i++ {
+		pieceState := current[i]
 		if pieceState != PieceStateDownloaded {
 			continue
 		}
@@ -770,6 +790,18 @@ func (t *PieceMonitor) IsTracking(hash string) bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	_, ok := t.torrents[hash]
+	return ok
+}
+
+// IsTracked reports whether a torrent is currently being tracked by the
+// monitor. Used by the send path to drop queued pieces whose torrent was
+// untracked between queue time and dequeue time — sending them would
+// produce PIECE_ERROR_NOT_INITIALIZED on destination and inflate error
+// metrics for benign races.
+func (t *PieceMonitor) IsTracked(hash string) bool {
+	t.mu.RLock()
+	_, ok := t.torrents[hash]
+	t.mu.RUnlock()
 	return ok
 }
 

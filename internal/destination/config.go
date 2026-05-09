@@ -82,10 +82,17 @@ const (
 	// and each finalization can take up to backgroundFinalizeTimeout to complete.
 	finalizeQueueTimeout = 2 * time.Hour
 
-	// backgroundFinalizeTimeout is the upper-bound timeout for the actual
-	// finalization work (verification + inode registration + qBittorrent).
-	// Starts after the semaphore is acquired, so queue wait doesn't count.
-	backgroundFinalizeTimeout = 30 * time.Minute
+	// backgroundFinalizeTimeoutBase / PerGB / Max bound the actual finalization
+	// work (verification + inode registration + qBittorrent). Starts after the
+	// semaphore is acquired, so queue wait doesn't count.
+	//
+	// Verification reads back every piece, so wall-clock cost scales linearly
+	// with data volume — same shape as qB's recheck timeout. A flat 30 min
+	// caused 200 GB+ torrents on slow NFS to be quarantined as sync-failed
+	// despite valid data; the GB-based scale matches actual workload.
+	backgroundFinalizeTimeoutBase  = 10 * time.Minute
+	backgroundFinalizeTimeoutPerGB = 30 * time.Second
+	backgroundFinalizeTimeoutMax   = 6 * time.Hour
 )
 
 // QBConfig holds qBittorrent configuration for the destination server.

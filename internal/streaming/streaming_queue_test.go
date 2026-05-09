@@ -212,9 +212,16 @@ func TestSenderWorkersConcurrency(t *testing.T) {
 		},
 	}
 
-	// Tracker with no torrent state: IsPieceStreamed returns false,
-	// MarkFailed safely no-ops.
+	// Tracker with a stub torrent state for "testhash" — sendPiecePool
+	// drops pieces whose torrent isn't tracked (IsTracked check), so the
+	// test must register the torrent for piece flow to reach ReadPiece.
+	// IsPieceStreamed returns false for an empty streamed slice; MarkFailed
+	// safely no-ops because failed slice is sized to numPieces.
 	tracker := NewPieceMonitor(nil, nil, logger, DefaultPieceMonitorConfig())
+	tracker.torrents["testhash"] = &torrentState{
+		streamed: make([]bool, numPieces),
+		failed:   make([]bool, numPieces),
+	}
 
 	config := DefaultBidiQueueConfig()
 	config.NumSenders = numSenders
