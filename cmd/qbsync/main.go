@@ -144,6 +144,7 @@ func runDestination(cmd *cobra.Command, _ []string) error {
 		"streamWorkers", cfg.StreamWorkers,
 		"maxStreamBufferMB", cfg.MaxStreamBufferMB,
 		"qbFinalizeConcurrency", cfg.QBFinalizeConcurrency,
+		"verifyConcurrency", cfg.VerifyConcurrency,
 		"dryRun", cfg.DryRun,
 	)
 
@@ -157,6 +158,7 @@ func runDestination(cmd *cobra.Command, _ []string) error {
 		StreamWorkers:         cfg.StreamWorkers,
 		MaxStreamBufferBytes:  int64(cfg.MaxStreamBufferMB) * grpcutil.BytesPerMB,
 		QBFinalizeConcurrency: cfg.QBFinalizeConcurrency,
+		VerifyConcurrency:     cfg.VerifyConcurrency,
 		SyncedTag:             cfg.SyncedTag,
 		DryRun:                cfg.DryRun,
 	}

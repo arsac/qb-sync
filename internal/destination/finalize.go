@@ -741,7 +741,7 @@ func (s *Server) verifyFinalizedPieces(
 	// Verify pieces in parallel — all accessed state fields (pieceHashes,
 	// pieceLength, totalSize, files) are immutable at this point (finalizing=true).
 	g, gCtx := errgroup.WithContext(idleCtx)
-	g.SetLimit(maxVerifyConcurrency)
+	g.SetLimit(s.verifyConcurrency())
 
 	var verified atomic.Int64
 	var lastProgress atomic.Value // stores time.Time of last verified piece
@@ -855,6 +855,17 @@ func (s *Server) verifyOnePiece(
 		return false
 	}
 	return true
+}
+
+// verifyConcurrency returns the operator-configured per-piece read concurrency
+// for verifyFinalizedPieces, falling back to the default. Higher values speed
+// up finalize on healthy storage; on undersized NFS exports they can compound
+// queue depth on the server.
+func (s *Server) verifyConcurrency() int {
+	if s.config.VerifyConcurrency > 0 {
+		return s.config.VerifyConcurrency
+	}
+	return maxVerifyConcurrency
 }
 
 // verifyIdleWatchdog cancels verification if no progress within verifyIdleTimeout.
