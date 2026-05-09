@@ -259,17 +259,17 @@ func (t *QBTask) groupHardlinkedTorrents(ctx context.Context, torrents []qbittor
 	type fileKey struct{ dev, ino uint64 }
 	fileKeyToHashes := make(map[fileKey][]string)
 	for _, torrent := range torrents {
-		filesPtr, err := t.srcClient.GetFilesInformationCtx(ctx, torrent.Hash)
+		files, err := t.cycleFilesFor(ctx, torrent.Hash)
 		if err != nil {
 			t.logger.WarnContext(ctx, "failed to get files", "hash", torrent.Hash, "error", err)
 			continue
 		}
-		if filesPtr == nil {
+		if files == nil {
 			continue
 		}
 
 		contentDir := t.source.ResolveContentDir(torrent.SavePath)
-		for _, f := range *filesPtr {
+		for _, f := range files {
 			path := filepath.Join(contentDir, f.Name)
 			dev, ino, statErr := utils.GetFileID(path)
 			if statErr != nil || ino == 0 {
