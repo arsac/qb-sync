@@ -431,6 +431,18 @@ func (q *BidiQueue) sendPiecePool(ctx context.Context, pool *StreamPool, piece *
 	index := piece.GetIndex()
 	key := pieceKey(hash, index)
 
+	// Drop pieces whose torrent was untracked between queue time and now.
+	// queueCompletedPieces enqueues with a snapshot of the torrent state, so
+	// a concurrent Untrack (e.g., torrent removed from source mid-stream)
+	// can leave stale pieces in the channel. Sending them would re-init the
+	// torrent on destination and produce PIECE_ERROR_NOT_INITIALIZED noise.
+	if !q.tracker.IsTracked(hash) {
+		q.logger.DebugContext(ctx, "dropping queued piece for untracked torrent",
+			"hash", hash, "piece", index,
+		)
+		return nil
+	}
+
 	if err := q.ensureTorrentInitialized(ctx, hash); err != nil {
 		return err
 	}

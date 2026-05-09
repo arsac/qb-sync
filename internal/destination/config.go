@@ -82,12 +82,19 @@ const (
 	// once, and each stage occupant can hold its slot for a long time.
 	finalizeQueueTimeout = 2 * time.Hour
 
-	// diskStageTimeout is the upper-bound timeout for the disk-bound
-	// finalization stage (parent-dir sync + piece verification + inode
-	// registration). Complementary to verifyIdleTimeout: the watchdog catches
-	// a stalled verifier; this cap catches slow-but-continuous progress.
-	// Starts after the disk-stage semaphore is acquired.
-	diskStageTimeout = 30 * time.Minute
+	// diskStageTimeoutBase / PerGB / Max bound the disk-bound finalization
+	// stage (parent-dir sync + piece verification + inode registration).
+	// Starts after the disk-stage semaphore is acquired, so queue wait
+	// doesn't count. Complementary to verifyIdleTimeout: the watchdog
+	// catches a stalled verifier; this cap catches slow-but-continuous work.
+	//
+	// Verification reads back every piece, so wall-clock cost scales linearly
+	// with data volume — same shape as qB's recheck timeout. A flat 30 min
+	// caused 200 GB+ torrents on slow NFS to be quarantined as sync-failed
+	// despite valid data; the GB-based scale matches actual workload.
+	diskStageTimeoutBase  = 10 * time.Minute
+	diskStageTimeoutPerGB = 30 * time.Second
+	diskStageTimeoutMax   = 6 * time.Hour
 
 	// defaultQBStageTimeoutMargin pads the qB-stage budget beyond the two
 	// waitForTorrentReady poll budgets (initial + post-recheck). Covers

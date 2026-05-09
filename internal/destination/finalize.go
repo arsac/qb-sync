@@ -226,9 +226,11 @@ func (s *Server) runDiskStage(
 	stageStart := time.Now()
 
 	// Work timeout starts after acquiring the semaphore — queue wait doesn't
-	// eat into the verification budget. Derived from s.bgCtx so server
-	// shutdown cancels in-flight work.
-	ctx, cancel := context.WithTimeout(s.bgCtx, diskStageTimeout)
+	// eat into the verification budget. Scales with torrent size (base +
+	// per-GB, capped) so multi-hundred-GB torrents on slow storage aren't
+	// quarantined as sync-failed for legitimately long verification work.
+	// Derived from s.bgCtx so server shutdown cancels in-flight work.
+	ctx, cancel := context.WithTimeout(s.bgCtx, computeDiskStageTimeout(state.totalSize))
 	defer cancel()
 
 	// Sync parent directories before verification to ensure NFS has flushed
@@ -856,6 +858,20 @@ func (s *Server) verifyOnePiece(
 		return false
 	}
 	return true
+}
+
+// computeDiskStageTimeout returns the wall-clock budget for one torrent's
+// disk-stage work (sync + verify + inode registration). Scales linearly by GB
+// above a small floor and is capped to prevent unbounded waits — same shape
+// as computePollTimeout for qB recheck.
+func computeDiskStageTimeout(totalSize int64) time.Duration {
+	const bytesPerGB = 1024 * 1024 * 1024
+	gigabytes := totalSize / bytesPerGB
+	timeout := diskStageTimeoutBase + time.Duration(gigabytes)*diskStageTimeoutPerGB
+	if timeout > diskStageTimeoutMax {
+		return diskStageTimeoutMax
+	}
+	return timeout
 }
 
 // verifyConcurrency returns the operator-configured per-piece read concurrency

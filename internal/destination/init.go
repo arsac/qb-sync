@@ -135,6 +135,16 @@ func (s *Server) resumeTorrent(
 	if len(state.torrentFile) == 0 && len(req.GetTorrentFile()) > 0 {
 		state.torrentFile = req.GetTorrentFile()
 	}
+	// Drop a stale failure result from a prior session. The original source
+	// may have crashed mid-finalize before polling; the new source would
+	// otherwise inherit the old failure on its first FinalizeTorrent call
+	// and count it against the per-torrent retry budget. Success results
+	// survive — the new source claims them on its first poll. An in-progress
+	// finalization (result == nil, active == true) survives too; the bg
+	// goroutine is still running.
+	if state.finalization.result != nil && !state.finalization.result.success {
+		state.finalization.reset()
+	}
 	return state.buildReadyResponse()
 }
 

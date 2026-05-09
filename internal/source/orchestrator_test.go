@@ -662,6 +662,7 @@ func TestTryFinalizeFullyStreamed(t *testing.T) {
 			srcClient: src,
 			grpcDest:  dest,
 			source:    qbclient.NewSource(nil, ""),
+			completed: NewCompletionCache("", logger),
 		}
 	}
 
