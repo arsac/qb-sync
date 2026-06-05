@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/arsac/qb-sync/internal/grpcutil"
 	"github.com/arsac/qb-sync/internal/metrics"
@@ -122,9 +123,13 @@ func (s *Server) FinalizeTorrent(
 	}, nil
 }
 
-// runBackgroundFinalization runs piece verification and post-verification steps
-// (inode registration, qBittorrent integration) independently of the RPC context.
-// On completion, it stores the result in state.finalization and closes done.
+// runBackgroundFinalization runs the two finalization stages independently of
+// the RPC context. Stage 1 (disk): parent-dir sync, piece verification, inode
+// registration — serialized by finalizeSem. Stage 2 (qB): AddTorrent, recheck
+// wait, marker — bounded by qbStageSem. Splitting the stages lets the disk
+// verification of one torrent overlap the (mostly idle) qB recheck wait of
+// another. On completion, the result is stored in state.finalization and done
+// is closed.
 func (s *Server) runBackgroundFinalization(
 	hash string,
 	state *serverTorrentState,
@@ -144,34 +149,76 @@ func (s *Server) runBackgroundFinalization(
 		state.mu.Unlock()
 	}
 
-	// Serialize background finalizations to prevent disk I/O and qBittorrent
-	// API saturation when many torrents complete around the same time.
-	// Use a generous wait context — queue time doesn't count against actual work.
-	// Derived from s.bgCtx so server shutdown cancels queued goroutines.
-	waitCtx, waitCancel := context.WithTimeout(s.bgCtx, finalizeQueueTimeout)
-	if acquireErr := s.finalizeSem.Acquire(waitCtx, 1); acquireErr != nil {
-		waitCancel()
-		s.logger.WarnContext(s.bgCtx, "finalization queue timeout",
+	state.mu.Lock()
+	diskDone := state.finalization.diskStageDone
+	state.mu.Unlock()
+
+	if diskDone {
+		s.logger.InfoContext(s.bgCtx, "disk stage already complete, skipping re-verification",
 			"hash", hash,
-			"error", acquireErr,
 		)
-		storeFailure(
-			fmt.Sprintf("finalization queue timeout: %v", acquireErr),
-			pb.FinalizeErrorCode_FINALIZE_ERROR_NONE,
-		)
+	} else if !s.runDiskStage(hash, state, storeFailure) {
 		return
 	}
-	waitCancel()
-	defer s.finalizeSem.Release(1)
+
+	s.runQBStage(hash, state, req, startTime, storeFailure)
+}
+
+// acquireStageSlot waits for a slot on sem, tracking queue depth and wait time
+// for the given stage label. Returns false on queue timeout or shutdown; the
+// caller stores a BUSY failure so the source retries without penalty.
+func (s *Server) acquireStageSlot(sem *semaphore.Weighted, stage, hash string) bool {
+	queueTimeout := finalizeQueueTimeout
+	if s.finalizeQueueWait > 0 {
+		queueTimeout = s.finalizeQueueWait
+	}
+
+	queueStart := time.Now()
+	metrics.FinalizationQueueDepth.WithLabelValues(stage).Inc()
+	defer metrics.FinalizationQueueDepth.WithLabelValues(stage).Dec()
+
+	waitCtx, waitCancel := context.WithTimeout(s.bgCtx, queueTimeout)
+	defer waitCancel()
+	acquireErr := sem.Acquire(waitCtx, 1)
+	metrics.FinalizeQueueWaitSeconds.WithLabelValues(stage).Observe(time.Since(queueStart).Seconds())
+	if acquireErr != nil {
+		metrics.FinalizeBusyTotal.WithLabelValues(metrics.ReasonQueueTimeout).Inc()
+		s.logger.WarnContext(s.bgCtx, "finalization deferred: stage queue saturated, source will retry",
+			"hash", hash,
+			"stage", stage,
+			"waited", time.Since(queueStart).Round(time.Second),
+			"reason", "queue_timeout",
+		)
+		return false
+	}
 
 	s.logger.DebugContext(s.bgCtx, "acquired finalization slot",
 		"hash", hash,
-		"queueWait", time.Since(startTime).Round(time.Millisecond),
+		"stage", stage,
+		"queueWait", time.Since(queueStart).Round(time.Millisecond),
 	)
+	return true
+}
+
+// runDiskStage performs the disk-bound half of finalization under finalizeSem:
+// parent-dir sync, full piece verification, and inode registration. Returns
+// true when the qB stage may proceed.
+func (s *Server) runDiskStage(
+	hash string,
+	state *serverTorrentState,
+	storeFailure func(string, pb.FinalizeErrorCode),
+) bool {
+	if !s.acquireStageSlot(s.finalizeSem, metrics.StageDisk, hash) {
+		storeFailure("finalization queue timeout (disk stage)", pb.FinalizeErrorCode_FINALIZE_ERROR_BUSY)
+		return false
+	}
+	defer s.finalizeSem.Release(1)
+
+	stageStart := time.Now()
 
 	// Work timeout starts after acquiring the semaphore — queue wait doesn't
-	// eat into the time budget for verification and qBittorrent operations.
-	// Derived from s.bgCtx so server shutdown cancels in-flight work.
+	// eat into the verification budget. Derived from s.bgCtx so server
+	// shutdown cancels in-flight work.
 	ctx, cancel := context.WithTimeout(s.bgCtx, diskStageTimeout)
 	defer cancel()
 
@@ -188,59 +235,116 @@ func (s *Server) runBackgroundFinalization(
 			"hash", hash,
 			"error", verifyErr,
 		)
+		metrics.FinalizeStageDuration.WithLabelValues(metrics.StageDisk, metrics.ResultFailure).
+			Observe(time.Since(stageStart).Seconds())
 		storeFailure(
 			fmt.Sprintf("verification failed: %v", verifyErr),
 			pb.FinalizeErrorCode_FINALIZE_ERROR_NONE,
 		)
-		return
+		return false
 	}
 	if len(failedPieces) > 0 {
 		// Piece corruption — recover and signal incomplete to source.
 		s.recoverVerificationFailure(ctx, hash, state, failedPieces)
 		s.abortInProgressInodes(ctx, hash, state)
 		metrics.VerificationRecoveriesTotal.Inc()
+		metrics.FinalizeStageDuration.WithLabelValues(metrics.StageDisk, metrics.ResultFailure).
+			Observe(time.Since(stageStart).Seconds())
 		storeFailure(
 			fmt.Sprintf("verification failed: %d pieces corrupted, will re-stream", len(failedPieces)),
 			pb.FinalizeErrorCode_FINALIZE_ERROR_INCOMPLETE,
 		)
-		return
+		return false
 	}
 
 	// Register inodes for files we wrote (not hardlinked) and signal waiters.
+	// MUST stay in the disk stage: pending-hardlink torrents block on the
+	// doneCh signalled here, and making them wait through a qB recheck would
+	// exhaust their hardlink wait budget.
 	s.registerFinalizedInodes(ctx, hash, state)
 
-	// Add to qBittorrent if configured and not in dry-run mode.
-	if s.qbClient != nil && !s.config.DryRun {
-		finalState, qbErr := s.addAndVerifyTorrent(ctx, hash, state, req)
-		if qbErr != nil {
-			s.logger.ErrorContext(ctx, "background qBittorrent integration failed",
-				"hash", hash,
-				"error", qbErr,
-			)
-			storeFailure(
-				fmt.Sprintf("qBittorrent: %v", qbErr),
-				pb.FinalizeErrorCode_FINALIZE_ERROR_NONE,
-			)
-			return
-		}
+	state.mu.Lock()
+	state.finalization.diskStageDone = true
+	state.mu.Unlock()
 
-		// Apply synced tag for visibility (not used as source of truth).
-		if s.config.SyncedTag != "" {
-			if tagErr := s.qbClient.AddTagsCtx(ctx, []string{hash}, s.config.SyncedTag); tagErr != nil {
-				metrics.TagApplicationErrorsTotal.WithLabelValues(metrics.ModeDestination).Inc()
-				s.logger.ErrorContext(ctx, "failed to add synced tag",
-					"hash", hash,
-					"tag", s.config.SyncedTag,
-					"error", tagErr,
-				)
-			}
-		}
+	metrics.FinalizeStageDuration.WithLabelValues(metrics.StageDisk, metrics.ResultSuccess).
+		Observe(time.Since(stageStart).Seconds())
+	return true
+}
 
-		s.storeSuccessResult(ctx, hash, state, string(finalState), startTime)
+// runQBStage performs the qBittorrent integration half of finalization under
+// qbStageSem: AddTorrent, recheck wait, synced tag, and the finalized marker.
+func (s *Server) runQBStage(
+	hash string,
+	state *serverTorrentState,
+	req *pb.FinalizeTorrentRequest,
+	startTime time.Time,
+	storeFailure func(string, pb.FinalizeErrorCode),
+) {
+	// No qB integration configured (or dry-run): finalize immediately.
+	if s.qbClient == nil || s.config.DryRun {
+		s.storeSuccessResult(s.bgCtx, hash, state, "finalized", startTime)
 		return
 	}
 
-	s.storeSuccessResult(ctx, hash, state, "finalized", startTime)
+	if !s.acquireStageSlot(s.qbStageSem, metrics.StageQB, hash) {
+		storeFailure("finalization queue timeout (qB stage)", pb.FinalizeErrorCode_FINALIZE_ERROR_BUSY)
+		return
+	}
+	defer s.qbStageSem.Release(1)
+
+	stageStart := time.Now()
+
+	// Budget covers both waitForTorrentReady calls (initial + post-recheck).
+	ctx, cancel := context.WithTimeout(s.bgCtx, s.qbStageTimeout(state.totalSize))
+	defer cancel()
+
+	finalState, qbErr := s.addAndVerifyTorrent(ctx, hash, state, req)
+	if qbErr != nil {
+		metrics.FinalizeStageDuration.WithLabelValues(metrics.StageQB, metrics.ResultFailure).
+			Observe(time.Since(stageStart).Seconds())
+		if isBusyWaitError(finalState, qbErr) {
+			// qB was still actively checking when the budget expired —
+			// congestion, not failure. diskStageDone is set, so the retry
+			// goes straight back to this stage.
+			metrics.FinalizeBusyTotal.WithLabelValues(metrics.ReasonQBChecking).Inc()
+			s.logger.WarnContext(ctx, "finalization deferred: qB still checking at budget expiry, source will retry",
+				"hash", hash,
+				"lastState", finalState,
+				"reason", "qb_checking",
+			)
+			storeFailure(
+				fmt.Sprintf("qBittorrent still checking: %v", qbErr),
+				pb.FinalizeErrorCode_FINALIZE_ERROR_BUSY,
+			)
+			return
+		}
+		s.logger.ErrorContext(ctx, "background qBittorrent integration failed",
+			"hash", hash,
+			"error", qbErr,
+		)
+		storeFailure(
+			fmt.Sprintf("qBittorrent: %v", qbErr),
+			pb.FinalizeErrorCode_FINALIZE_ERROR_NONE,
+		)
+		return
+	}
+
+	// Apply synced tag for visibility (not used as source of truth).
+	if s.config.SyncedTag != "" {
+		if tagErr := s.qbClient.AddTagsCtx(ctx, []string{hash}, s.config.SyncedTag); tagErr != nil {
+			metrics.TagApplicationErrorsTotal.WithLabelValues(metrics.ModeDestination).Inc()
+			s.logger.ErrorContext(ctx, "failed to add synced tag",
+				"hash", hash,
+				"tag", s.config.SyncedTag,
+				"error", tagErr,
+			)
+		}
+	}
+
+	metrics.FinalizeStageDuration.WithLabelValues(metrics.StageQB, metrics.ResultSuccess).
+		Observe(time.Since(stageStart).Seconds())
+	s.storeSuccessResult(ctx, hash, state, string(finalState), startTime)
 }
 
 // storeSuccessResult records success metrics, writes the finalized marker,

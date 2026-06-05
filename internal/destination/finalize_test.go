@@ -1007,3 +1007,181 @@ func TestFinalizationStateDiskStageDoneSurvivesReset(t *testing.T) {
 		t.Error("diskStageDone must survive reset so retries skip re-verification")
 	}
 }
+
+// newTwoStageTestState writes deterministic file data to disk and returns a
+// serverTorrentState ready for finalization (mirrors the helper in
+// TestRunBackgroundFinalization_SerializesViaSemaphore).
+func newTwoStageTestState(t *testing.T, dir, hash string, numPieces int, pieceSize int64) *serverTorrentState {
+	t.Helper()
+	totalSize := int64(numPieces) * pieceSize
+	fileData := make([]byte, totalSize)
+	for j := range fileData {
+		fileData[j] = byte(j % 251)
+	}
+
+	pieceHashes := make([]string, numPieces)
+	for p := range numPieces {
+		offset := int64(p) * pieceSize
+		pieceHashes[p] = utils.ComputeSHA1(fileData[offset : offset+pieceSize])
+	}
+
+	filePath := filepath.Join(dir, hash+".bin")
+	if writeErr := os.WriteFile(filePath, fileData, 0o644); writeErr != nil {
+		t.Fatal(writeErr)
+	}
+
+	written := make([]bool, numPieces)
+	for p := range written {
+		written[p] = true
+	}
+
+	return &serverTorrentState{
+		torrentMeta: torrentMeta{
+			pieceHashes: pieceHashes,
+			pieceLength: pieceSize,
+			totalSize:   totalSize,
+			files:       []*serverFileInfo{{path: filePath, offset: 0, size: totalSize, selected: true}},
+		},
+		written:     boolSliceToBitSet(written),
+		statePath:   filepath.Join(dir, hash+".state"),
+		torrentFile: []byte("fake-torrent-data"),
+	}
+}
+
+func TestRunBackgroundFinalization_SkipsDiskStageWhenDone(t *testing.T) {
+	t.Parallel()
+
+	corruptDataFile := func(t *testing.T, state *serverTorrentState) {
+		t.Helper()
+		// Corrupt the on-disk data AFTER hashes were computed so verification,
+		// if it runs, must fail.
+		if err := os.WriteFile(state.files[0].path, []byte("corrupted!"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		state.files[0].size = int64(len("corrupted!"))
+	}
+
+	t.Run("diskStageDone skips verification entirely", func(t *testing.T) {
+		t.Parallel()
+		s, tmpDir := newTestDestServer(t)
+
+		hash := "skip-disk-stage"
+		state := newTwoStageTestState(t, tmpDir, hash, 2, 256)
+		state.finalization.diskStageDone = true
+		corruptDataFile(t, state)
+
+		s.store.mu.Lock()
+		s.store.entries[hash] = state
+		s.store.mu.Unlock()
+
+		done := make(chan struct{})
+		s.runBackgroundFinalization(hash, state, &pb.FinalizeTorrentRequest{TorrentHash: hash}, time.Now(), done)
+
+		state.mu.Lock()
+		result := state.finalization.result
+		state.mu.Unlock()
+		if result == nil || !result.success {
+			t.Fatalf("expected success (verification skipped via diskStageDone), got %+v", result)
+		}
+	})
+
+	t.Run("without diskStageDone corruption is detected", func(t *testing.T) {
+		t.Parallel()
+		s, tmpDir := newTestDestServer(t)
+
+		hash := "verify-disk-stage"
+		state := newTwoStageTestState(t, tmpDir, hash, 2, 256)
+		corruptDataFile(t, state)
+
+		s.store.mu.Lock()
+		s.store.entries[hash] = state
+		s.store.mu.Unlock()
+
+		done := make(chan struct{})
+		s.runBackgroundFinalization(hash, state, &pb.FinalizeTorrentRequest{TorrentHash: hash}, time.Now(), done)
+
+		state.mu.Lock()
+		result := state.finalization.result
+		state.mu.Unlock()
+		if result == nil || result.success {
+			t.Fatalf("expected verification failure, got %+v", result)
+		}
+		if result.errorCode != pb.FinalizeErrorCode_FINALIZE_ERROR_INCOMPLETE {
+			t.Errorf("expected INCOMPLETE, got %v", result.errorCode)
+		}
+	})
+}
+
+func TestRunBackgroundFinalization_DiskQueueTimeoutReturnsBusy(t *testing.T) {
+	t.Parallel()
+
+	s, tmpDir := newTestDestServer(t)
+	s.finalizeQueueWait = 50 * time.Millisecond
+
+	// Hold the disk-stage slot so the finalization queues and times out.
+	if err := s.finalizeSem.Acquire(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	defer s.finalizeSem.Release(1)
+
+	hash := "disk-queue-busy"
+	state := newTwoStageTestState(t, tmpDir, hash, 1, 256)
+
+	s.store.mu.Lock()
+	s.store.entries[hash] = state
+	s.store.mu.Unlock()
+
+	done := make(chan struct{})
+	s.runBackgroundFinalization(hash, state, &pb.FinalizeTorrentRequest{TorrentHash: hash}, time.Now(), done)
+
+	state.mu.Lock()
+	result := state.finalization.result
+	state.mu.Unlock()
+	if result == nil || result.success {
+		t.Fatalf("expected queue-timeout failure, got %+v", result)
+	}
+	if result.errorCode != pb.FinalizeErrorCode_FINALIZE_ERROR_BUSY {
+		t.Errorf("expected BUSY error code, got %v (%s)", result.errorCode, result.err)
+	}
+}
+
+func TestRunBackgroundFinalization_QBStageIndependentOfDiskSem(t *testing.T) {
+	t.Parallel()
+
+	s, tmpDir := newTestDestServer(t)
+
+	// Hold the disk-stage slot for the entire test. A torrent whose disk stage
+	// is already done must complete its qB stage without touching finalizeSem.
+	if err := s.finalizeSem.Acquire(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	defer s.finalizeSem.Release(1)
+
+	hash := "qb-stage-independent"
+	state := newTwoStageTestState(t, tmpDir, hash, 1, 256)
+	state.finalization.diskStageDone = true
+
+	s.store.mu.Lock()
+	s.store.entries[hash] = state
+	s.store.mu.Unlock()
+
+	finished := make(chan struct{})
+	go func() {
+		done := make(chan struct{})
+		s.runBackgroundFinalization(hash, state, &pb.FinalizeTorrentRequest{TorrentHash: hash}, time.Now(), done)
+		close(finished)
+	}()
+
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("qB stage blocked on the disk-stage semaphore")
+	}
+
+	state.mu.Lock()
+	result := state.finalization.result
+	state.mu.Unlock()
+	if result == nil || !result.success {
+		t.Fatalf("expected success, got %+v", result)
+	}
+}
