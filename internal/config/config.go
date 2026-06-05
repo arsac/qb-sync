@@ -412,11 +412,11 @@ func LoadSource(v *viper.Viper) (*SourceConfig, error) {
 // LoadDestination loads the destination server configuration from viper.
 func LoadDestination(v *viper.Viper) (*DestinationConfig, error) {
 	cfg := &DestinationConfig{
-		BaseConfig:        loadBase(v),
-		ListenAddr:        v.GetString("listen"),
-		SavePath:          v.GetString("save-path"),
-		PollInterval:      seconds(v, "poll-interval"),
-		PollTimeout:       seconds(v, "poll-timeout"),
+		BaseConfig:            loadBase(v),
+		ListenAddr:            v.GetString("listen"),
+		SavePath:              v.GetString("save-path"),
+		PollInterval:          seconds(v, "poll-interval"),
+		PollTimeout:           seconds(v, "poll-timeout"),
 		StreamWorkers:         v.GetInt("stream-workers"),
 		MaxStreamBufferMB:     v.GetInt("max-stream-buffer"),
 		QBFinalizeConcurrency: v.GetInt("qb-finalize-concurrency"),

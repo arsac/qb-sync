@@ -1011,8 +1011,9 @@ func TestFinalizationStateDiskStageDoneSurvivesReset(t *testing.T) {
 // newTwoStageTestState writes deterministic file data to disk and returns a
 // serverTorrentState ready for finalization (mirrors the helper in
 // TestRunBackgroundFinalization_SerializesViaSemaphore).
-func newTwoStageTestState(t *testing.T, dir, hash string, numPieces int, pieceSize int64) *serverTorrentState {
+func newTwoStageTestState(t *testing.T, dir, hash string, numPieces int) *serverTorrentState {
 	t.Helper()
+	const pieceSize = int64(256)
 	totalSize := int64(numPieces) * pieceSize
 	fileData := make([]byte, totalSize)
 	for j := range fileData {
@@ -1066,7 +1067,7 @@ func TestRunBackgroundFinalization_SkipsDiskStageWhenDone(t *testing.T) {
 		s, tmpDir := newTestDestServer(t)
 
 		hash := "skip-disk-stage"
-		state := newTwoStageTestState(t, tmpDir, hash, 2, 256)
+		state := newTwoStageTestState(t, tmpDir, hash, 2)
 		state.finalization.diskStageDone = true
 		corruptDataFile(t, state)
 
@@ -1090,7 +1091,7 @@ func TestRunBackgroundFinalization_SkipsDiskStageWhenDone(t *testing.T) {
 		s, tmpDir := newTestDestServer(t)
 
 		hash := "verify-disk-stage"
-		state := newTwoStageTestState(t, tmpDir, hash, 2, 256)
+		state := newTwoStageTestState(t, tmpDir, hash, 2)
 		corruptDataFile(t, state)
 
 		s.store.mu.Lock()
@@ -1125,7 +1126,7 @@ func TestRunBackgroundFinalization_DiskQueueTimeoutReturnsBusy(t *testing.T) {
 	defer s.finalizeSem.Release(1)
 
 	hash := "disk-queue-busy"
-	state := newTwoStageTestState(t, tmpDir, hash, 1, 256)
+	state := newTwoStageTestState(t, tmpDir, hash, 1)
 
 	s.store.mu.Lock()
 	s.store.entries[hash] = state
@@ -1158,7 +1159,7 @@ func TestRunBackgroundFinalization_QBStageIndependentOfDiskSem(t *testing.T) {
 	defer s.finalizeSem.Release(1)
 
 	hash := "qb-stage-independent"
-	state := newTwoStageTestState(t, tmpDir, hash, 1, 256)
+	state := newTwoStageTestState(t, tmpDir, hash, 1)
 	state.finalization.diskStageDone = true
 
 	s.store.mu.Lock()

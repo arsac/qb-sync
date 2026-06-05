@@ -1134,7 +1134,12 @@ func TestIsBusyWaitError(t *testing.T) {
 		{"timeout while checking is busy", qbittorrent.TorrentStateCheckingUp, utils.ErrTimeout, true},
 		{"deadline while checking is busy", qbittorrent.TorrentStateCheckingDl, context.DeadlineExceeded, true},
 		{"timeout in error state is not busy", qbittorrent.TorrentStateMissingFiles, utils.ErrTimeout, false},
-		{"error-state failure is not busy", qbittorrent.TorrentStateError, errors.New("torrent in error state: error"), false},
+		{
+			"error-state failure is not busy",
+			qbittorrent.TorrentStateError,
+			errors.New("torrent in error state: error"),
+			false,
+		},
 		{"timeout in stalled state is not busy", qbittorrent.TorrentStateStalledDl, utils.ErrTimeout, false},
 		{"nil error is not busy", qbittorrent.TorrentStateCheckingUp, nil, false},
 	}
