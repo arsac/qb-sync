@@ -20,6 +20,7 @@ const (
 	LabelConnection = "connection" // gRPC connection index
 	LabelDirection  = "direction"  // scaling direction (up, down)
 	LabelSelection  = "selection"  // partial, full
+	LabelStage      = "stage"      // finalization stage (disk, qb)
 )
 
 // Label value constants for consistent usage across the codebase.
@@ -51,6 +52,16 @@ const (
 	ReasonAbortInQB        = "in_qb"        // AbortFileDeletionsSkippedTotal: torrent already in destination qB
 	ReasonAbortPreExisting = "pre_existing" // AbortFileDeletionsSkippedTotal: setupFile reused operator data
 	ReasonAbortUnselected  = "unselected"   // AbortFileDeletionsSkippedTotal: deselected file we never wrote
+
+	// StageDisk is the disk-bound finalization stage (verify + inode registration).
+	StageDisk = "disk"
+	// StageQB is the qBittorrent integration stage (add + recheck wait).
+	StageQB = "qb"
+
+	// ReasonQueueTimeout marks BUSY caused by a stage-queue timeout.
+	ReasonQueueTimeout = "queue_timeout"
+	// ReasonQBChecking marks BUSY caused by qB still checking at budget expiry.
+	ReasonQBChecking = "qb_checking"
 )
 
 // Counters track cumulative values that only increase.
@@ -723,6 +734,16 @@ var (
 		},
 	)
 
+	// FinalizationQueueDepth tracks torrents currently waiting for a finalization stage slot.
+	FinalizationQueueDepth = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "finalization_queue_depth",
+			Help:      "Torrents currently waiting for a finalization stage slot",
+		},
+		[]string{LabelStage},
+	)
+
 	// Draining tracks whether the source server is currently draining (1=draining, 0=normal).
 	Draining = promauto.NewGauge(
 		prometheus.GaugeOpts{
@@ -803,15 +824,48 @@ var (
 		},
 	)
 
-	// FinalizationDuration tracks the time to finalize a torrent.
+	// FinalizationDuration tracks the total time to finalize a torrent,
+	// INCLUDING stage-queue wait. Use FinalizeStageDuration for work-only time.
 	FinalizationDuration = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: namespace,
 			Name:      "finalization_duration_seconds",
-			Help:      "Time to finalize a torrent",
-			Buckets:   []float64{0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120},
+			Help:      "Total time to finalize a torrent, including queue wait",
+			Buckets:   []float64{1, 5, 15, 60, 300, 900, 1800, 3600, 7200, 21600, 43200},
 		},
 		[]string{LabelResult},
+	)
+
+	// FinalizeQueueWaitSeconds tracks time spent waiting for a finalization stage slot.
+	FinalizeQueueWaitSeconds = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: namespace,
+			Name:      "finalize_queue_wait_seconds",
+			Help:      "Time a finalization waited for a stage slot",
+			Buckets:   []float64{1, 5, 15, 60, 300, 900, 1800, 3600, 7200},
+		},
+		[]string{LabelStage},
+	)
+
+	// FinalizeStageDuration tracks per-stage finalization work time (excludes queue wait).
+	FinalizeStageDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: namespace,
+			Name:      "finalize_stage_duration_seconds",
+			Help:      "Finalization stage work time, excluding queue wait",
+			Buckets:   []float64{1, 5, 15, 60, 300, 900, 1800, 3600, 7200, 21600},
+		},
+		[]string{LabelStage, LabelResult},
+	)
+
+	// FinalizeBusyTotal counts BUSY (congestion) responses returned to the source.
+	FinalizeBusyTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "finalize_busy_total",
+			Help:      "BUSY (congestion) responses returned to source, by reason",
+		},
+		[]string{LabelReason},
 	)
 
 	// QBAPICallDuration tracks qBittorrent API call latency (including retries).
