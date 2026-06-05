@@ -187,7 +187,7 @@ func (s *Server) acquireStageSlot(sem *semaphore.Weighted, stage, hash string) b
 			"hash", hash,
 			"stage", stage,
 			"waited", time.Since(queueStart).Round(time.Second),
-			"reason", "queue_timeout",
+			"reason", metrics.ReasonQueueTimeout,
 		)
 		return false
 	}
@@ -311,7 +311,7 @@ func (s *Server) runQBStage(
 			s.logger.WarnContext(ctx, "finalization deferred: qB still checking at budget expiry, source will retry",
 				"hash", hash,
 				"lastState", finalState,
-				"reason", "qb_checking",
+				"reason", metrics.ReasonQBChecking,
 			)
 			storeFailure(
 				fmt.Sprintf("qBittorrent still checking: %v", qbErr),
