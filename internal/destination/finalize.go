@@ -167,7 +167,7 @@ func (s *Server) runBackgroundFinalization(
 	// Work timeout starts after acquiring the semaphore — queue wait doesn't
 	// eat into the time budget for verification and qBittorrent operations.
 	// Derived from s.bgCtx so server shutdown cancels in-flight work.
-	ctx, cancel := context.WithTimeout(s.bgCtx, backgroundFinalizeTimeout)
+	ctx, cancel := context.WithTimeout(s.bgCtx, diskStageTimeout)
 	defer cancel()
 
 	// Sync parent directories before verification to ensure NFS has flushed

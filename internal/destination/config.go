@@ -78,14 +78,28 @@ const (
 	verifyIdleCheckDivisor = 2
 
 	// finalizeQueueTimeout is how long a finalization can wait for its turn
-	// in the semaphore queue. Generous because many torrents may finish at once,
-	// and each finalization can take up to backgroundFinalizeTimeout to complete.
+	// in a stage-semaphore queue. Generous because many torrents may finish at
+	// once, and each stage occupant can hold its slot for a long time.
 	finalizeQueueTimeout = 2 * time.Hour
 
-	// backgroundFinalizeTimeout is the upper-bound timeout for the actual
-	// finalization work (verification + inode registration + qBittorrent).
-	// Starts after the semaphore is acquired, so queue wait doesn't count.
-	backgroundFinalizeTimeout = 30 * time.Minute
+	// diskStageTimeout is the upper-bound timeout for the disk-bound
+	// finalization stage (parent-dir sync + piece verification + inode
+	// registration). Complementary to verifyIdleTimeout: the watchdog catches
+	// a stalled verifier; this cap catches slow-but-continuous progress.
+	// Starts after the disk-stage semaphore is acquired.
+	diskStageTimeout = 30 * time.Minute
+
+	// defaultQBStageTimeoutMargin pads the qB-stage budget beyond the two
+	// waitForTorrentReady poll budgets (initial + post-recheck). Covers
+	// AddTorrent itself, login retries, and the partial-selection
+	// priority-verify loop (priorityVerifyTimeout) — none of which are part
+	// of the poll budget.
+	defaultQBStageTimeoutMargin = 5 * time.Minute
+
+	// maxQBFinalizeConcurrency caps the qB-stage semaphore weight. Above this,
+	// concurrent qB rechecks compete for disk I/O and the API burst rate can
+	// trip the qbclient circuit breaker (5 failures / 30s).
+	maxQBFinalizeConcurrency = 8
 )
 
 // QBConfig holds qBittorrent configuration for the destination server.
@@ -126,6 +140,12 @@ type ServerConfig struct {
 	// across all streams (0 = use default).
 	MaxStreamBufferBytes int64
 
+	// QBFinalizeConcurrency is how many torrents may concurrently occupy the
+	// qBittorrent integration stage (add + recheck wait). 0 = default 1.
+	// Values >1 increase destination qB API and disk load; raising it is only
+	// recommended on SSD-backed storage. Capped at maxQBFinalizeConcurrency.
+	QBFinalizeConcurrency int
+
 	// DryRun prevents modifications (no writes, no qB changes).
 	DryRun bool
 }
@@ -139,6 +159,14 @@ func (c *ServerConfig) GetSavePath() string {
 	return c.BasePath
 }
 
+// GetQBFinalizeConcurrency returns the qB-stage semaphore weight, defaulting to 1.
+func (c *ServerConfig) GetQBFinalizeConcurrency() int {
+	if c.QBFinalizeConcurrency <= 0 {
+		return 1
+	}
+	return c.QBFinalizeConcurrency
+}
+
 // Validate validates the server configuration.
 func (c *ServerConfig) Validate() error {
 	if c.BasePath == "" {
@@ -150,6 +178,9 @@ func (c *ServerConfig) Validate() error {
 	// Validate orphan timeout is not too aggressive
 	if c.OrphanTimeout > 0 && c.OrphanTimeout < minOrphanTimeout {
 		return fmt.Errorf("orphan timeout must be at least %v to prevent accidental cleanup", minOrphanTimeout)
+	}
+	if c.QBFinalizeConcurrency < 0 || c.QBFinalizeConcurrency > maxQBFinalizeConcurrency {
+		return fmt.Errorf("qb finalize concurrency must be between 0 and %d (0 = default 1)", maxQBFinalizeConcurrency)
 	}
 	return nil
 }
