@@ -36,6 +36,14 @@ const (
 	// before the torrent is tagged as sync-failed and excluded from future syncs.
 	maxVerificationRetries = 3
 
+	// busyGuardDuration bounds how long BUSY (destination congested) responses
+	// are tolerated per torrent before they start counting toward
+	// maxVerificationRetries. Must exceed the destination's worst-case budget:
+	// finalizeQueueTimeout (2h) + qB-stage budget (up to ~2x the 6h poll cap).
+	// In-memory only — a source restart resets the streak (acceptable: the
+	// guard catches permanently wedged destinations, not crash recovery).
+	busyGuardDuration = 8 * time.Hour
+
 	// Timeout for unary RPCs to destination server during removal/handoff.
 	destRPCTimeout = 30 * time.Second
 

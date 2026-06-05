@@ -54,6 +54,28 @@ func (t *QBTask) finalizeCompletedStreams(ctx context.Context) error {
 // handler. Returns true if the caller should stop iterating (e.g. destination
 // is unreachable and remaining finalizations would just pile up errors).
 func (t *QBTask) handleFinalizeError(ctx context.Context, hash string, finalizeErr error) bool {
+	// BUSY = destination-wide congestion (finalize queue saturated, or qB
+	// still rechecking at budget expiry) — not a per-torrent fault. Poll
+	// again without burning the retry budget, but bound it with a wall-clock
+	// guard so a permanently wedged destination still surfaces as sync-failed.
+	if errors.Is(finalizeErr, streaming.ErrFinalizeBusy) {
+		if busyFor := t.backoffs.RecordBusy(hash); busyFor < busyGuardDuration {
+			t.logger.WarnContext(ctx, "destination finalization busy, will retry",
+				"hash", hash,
+				"busyFor", busyFor.Round(time.Second),
+				"guard", busyGuardDuration,
+			)
+			return false
+		}
+		t.logger.ErrorContext(ctx, "destination busy beyond wall-clock guard, counting as failure",
+			"hash", hash,
+			"guard", busyGuardDuration,
+		)
+		// Fall through to the generic failure accounting below. BUSY errors
+		// are plain wrapped errors (no gRPC status), so IsTransientError
+		// stays false and the failure reaches RecordFailure.
+	}
+
 	switch {
 	case errors.Is(finalizeErr, streaming.ErrFinalizeVerifying):
 		t.logger.InfoContext(ctx, "destination server still verifying, will poll again", "hash", hash)
