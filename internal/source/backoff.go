@@ -15,6 +15,7 @@ const (
 type finalizeBackoff struct {
 	failures    int
 	lastAttempt time.Time
+	firstBusy   time.Time // Start of a continuous BUSY streak; zero when not busy
 }
 
 // BackoffTracker manages exponential backoff for finalization retries.
@@ -22,13 +23,34 @@ type finalizeBackoff struct {
 type BackoffTracker struct {
 	backoffs map[string]*finalizeBackoff
 	mu       sync.Mutex
+	now      func() time.Time // Injectable for tests
 }
 
 // NewBackoffTracker creates a new BackoffTracker.
 func NewBackoffTracker() *BackoffTracker {
 	return &BackoffTracker{
 		backoffs: make(map[string]*finalizeBackoff),
+		now:      time.Now,
 	}
+}
+
+// RecordBusy notes a BUSY (destination congested) response and returns how
+// long this hash has been continuously busy. Busy streaks do not count toward
+// the failure cap and do not delay attempts (lastAttempt is untouched); the
+// streak resets when Clear removes the entry on success.
+func (b *BackoffTracker) RecordBusy(hash string) time.Duration {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	backoff, exists := b.backoffs[hash]
+	if !exists {
+		backoff = &finalizeBackoff{}
+		b.backoffs[hash] = backoff
+	}
+	if backoff.firstBusy.IsZero() {
+		backoff.firstBusy = b.now()
+	}
+	return b.now().Sub(backoff.firstBusy)
 }
 
 // ShouldAttempt checks if enough time has passed since the last failed
