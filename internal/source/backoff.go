@@ -69,7 +69,7 @@ func (b *BackoffTracker) ShouldAttempt(hash string) bool {
 		maxFinalizeBackoff,
 	)
 
-	return time.Since(backoff.lastAttempt) >= backoffDuration
+	return b.now().Sub(backoff.lastAttempt) >= backoffDuration
 }
 
 // RecordFailure records a finalization failure for backoff tracking.
@@ -85,7 +85,7 @@ func (b *BackoffTracker) RecordFailure(hash string) int {
 	}
 
 	backoff.failures++
-	backoff.lastAttempt = time.Now()
+	backoff.lastAttempt = b.now()
 	return backoff.failures
 }
 

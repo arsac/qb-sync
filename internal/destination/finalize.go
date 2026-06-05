@@ -182,6 +182,15 @@ func (s *Server) acquireStageSlot(sem *semaphore.Weighted, stage, hash string) b
 	acquireErr := sem.Acquire(waitCtx, 1)
 	metrics.FinalizeQueueWaitSeconds.WithLabelValues(stage).Observe(time.Since(queueStart).Seconds())
 	if acquireErr != nil {
+		// Shutdown (bgCtx cancelled) is not congestion — don't pollute the
+		// busy metric or alarm operators with a saturation warning.
+		if errors.Is(acquireErr, context.Canceled) {
+			s.logger.DebugContext(s.bgCtx, "finalization slot wait aborted by shutdown",
+				"hash", hash,
+				"stage", stage,
+			)
+			return false
+		}
 		metrics.FinalizeBusyTotal.WithLabelValues(metrics.ReasonQueueTimeout).Inc()
 		s.logger.WarnContext(s.bgCtx, "finalization deferred: stage queue saturated, source will retry",
 			"hash", hash,
