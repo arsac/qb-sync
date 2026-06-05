@@ -991,3 +991,19 @@ func TestFinalizeFiles_PendingHardlinkRejectsWrongSizedSource(t *testing.T) {
 		t.Errorf("hardlink should NOT have been created at %s", targetPath)
 	}
 }
+
+func TestFinalizationStateDiskStageDoneSurvivesReset(t *testing.T) {
+	var f finalizationState
+
+	f.start()
+	f.diskStageDone = true
+	f.storeResult(&finalizeResult{err: "queue timeout", errorCode: pb.FinalizeErrorCode_FINALIZE_ERROR_BUSY})
+	f.reset()
+
+	if f.active || f.result != nil || f.done != nil {
+		t.Error("reset must clear the active/result/done lifecycle fields")
+	}
+	if !f.diskStageDone {
+		t.Error("diskStageDone must survive reset so retries skip re-verification")
+	}
+}

@@ -75,6 +75,11 @@ func (s *Server) FinalizeTorrent(
 		if relocErr := s.relocateForSubPathChange(ctx, hash, state, newSubPath); relocErr != nil {
 			return failureResponse(relocErr.Error(), pb.FinalizeErrorCode_FINALIZE_ERROR_NONE), nil
 		}
+		// Files moved: prior disk-stage results (verified paths, registered
+		// inode paths) are stale. Force the disk stage to re-run.
+		state.mu.Lock()
+		state.finalization.diskStageDone = false
+		state.mu.Unlock()
 	}
 
 	// Verify all selected pieces are written.
