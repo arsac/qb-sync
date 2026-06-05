@@ -68,6 +68,13 @@ var (
 	// state for the torrent (metadata missing or data files deleted). The caller should
 	// untrack the torrent so it gets re-discovered and re-initialized from scratch.
 	ErrFinalizeNotFound = errors.New("finalization failed: torrent not found on destination")
+
+	// ErrFinalizeBusy is returned by FinalizeTorrent when the destination is
+	// congested: the finalization queue timed out, or destination qBittorrent
+	// was still rechecking when the wait budget expired. The caller should
+	// retry later without counting this toward the per-torrent failure cap —
+	// congestion is destination-wide, not a per-torrent fault.
+	ErrFinalizeBusy = errors.New("finalization deferred: destination busy")
 )
 
 // successResponse is implemented by gRPC response types that have Success/Error fields.
@@ -395,6 +402,10 @@ func (d *GRPCDestination) FinalizeTorrent(
 			// Destination has no state for this torrent (metadata missing or data
 			// files externally deleted). Caller should untrack and re-initialize.
 			return fmt.Errorf("%w: %s", ErrFinalizeNotFound, resp.GetError())
+		case pb.FinalizeErrorCode_FINALIZE_ERROR_BUSY:
+			// Destination congestion (queue saturated or qB still checking).
+			// Sentinel lets the orchestrator poll again without penalty.
+			return fmt.Errorf("%w: %s", ErrFinalizeBusy, resp.GetError())
 		default:
 			return respErr
 		}

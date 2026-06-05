@@ -3,6 +3,7 @@ package streaming
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"sync/atomic"
@@ -1283,5 +1284,15 @@ func TestClose_Idempotent(t *testing.T) {
 	}
 	if !errors.Is(err1, err2) {
 		t.Fatalf("Close not idempotent: first=%v, second=%v", err1, err2)
+	}
+}
+
+func TestErrFinalizeBusyIsDistinct(t *testing.T) {
+	wrapped := fmt.Errorf("%w: finalization queue timeout", ErrFinalizeBusy)
+	if !errors.Is(wrapped, ErrFinalizeBusy) {
+		t.Fatal("wrapped busy error must match ErrFinalizeBusy")
+	}
+	if errors.Is(wrapped, ErrFinalizeVerifying) || errors.Is(wrapped, ErrFinalizeIncomplete) {
+		t.Fatal("busy must not match other finalize sentinels")
 	}
 }
