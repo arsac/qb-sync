@@ -483,3 +483,22 @@ func TestLoadSource_EnvFallbacks(t *testing.T) {
 		assert.Equal(t, ":9090", cfg.HealthAddr)
 	})
 }
+
+// TestQBFinalizeConcurrencyEnvBinding covers the full env-var round trip:
+// flag registration -> viper bind -> LoadDestination. A missing entry in
+// BindDestinationFlags' bound-flag list is a silent bug (the flag exists, the
+// env var is documented, viper never reads it), so this asserts end to end.
+func TestQBFinalizeConcurrencyEnvBinding(t *testing.T) {
+	t.Setenv("QBSYNC_DESTINATION_QB_FINALIZE_CONCURRENCY", "2")
+	t.Setenv("QBSYNC_DESTINATION_DATA", t.TempDir())
+
+	cmd := &cobra.Command{Use: "destination"}
+	SetupDestinationFlags(cmd)
+
+	v := viper.New()
+	require.NoError(t, BindDestinationFlags(cmd, v))
+
+	cfg, err := LoadDestination(v)
+	require.NoError(t, err)
+	assert.Equal(t, 2, cfg.QBFinalizeConcurrency, "env var not bound?")
+}
