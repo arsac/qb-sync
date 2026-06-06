@@ -502,3 +502,27 @@ func TestQBFinalizeConcurrencyEnvBinding(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 2, cfg.QBFinalizeConcurrency, "env var not bound?")
 }
+
+// TestVerifyConcurrencyValidationBounds pins the startup-time range check —
+// the destination clamps defensively, but this is what gives operators a
+// clear error instead of a silent clamp.
+func TestVerifyConcurrencyValidationBounds(t *testing.T) {
+	t.Parallel()
+
+	base := DestinationConfig{
+		BaseConfig: BaseConfig{DataPath: "/data"},
+		ListenAddr: ":50051",
+	}
+
+	cfg := base
+	cfg.VerifyConcurrency = 17
+	require.Error(t, cfg.Validate(), "above-cap verify concurrency must fail validation")
+
+	cfg = base
+	cfg.VerifyConcurrency = -1
+	require.Error(t, cfg.Validate(), "negative verify concurrency must fail validation")
+
+	cfg = base
+	cfg.VerifyConcurrency = 16
+	require.NoError(t, cfg.Validate(), "cap value must validate")
+}
