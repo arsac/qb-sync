@@ -46,6 +46,8 @@ type mockQBClient struct {
 	getTorrentsResult []qbittorrent.Torrent
 	getTorrentsErr    error
 
+	getFilesCalls int
+
 	freeSpaceOnDisk int64
 	freeSpaceErr    error
 }
@@ -89,6 +91,7 @@ func (m *mockQBClient) GetFilesInformationCtx(
 	_ context.Context,
 	_ string,
 ) (*qbittorrent.TorrentFiles, error) {
+	m.getFilesCalls++
 	return &qbittorrent.TorrentFiles{}, nil
 }
 
@@ -3494,4 +3497,35 @@ func TestHandleFinalizeError_BusyDoesNotBurnRetryBudget(t *testing.T) {
 			t.Errorf("expected sync-failed tag after guard expiry; got %q", mockClient.addTagsTag)
 		}
 	})
+}
+
+// TestCycleFilesFor_CachesWithinCycleAndResets pins the per-cycle file-info
+// cache contract: repeat lookups within a cycle hit the cache (one API call),
+// and resetCycleFiles (fired at the top of each runOnce) forces a re-fetch.
+func TestCycleFilesFor_CachesWithinCycleAndResets(t *testing.T) {
+	mockClient := &mockQBClient{}
+	task := &QBTask{
+		cfg:       &config.SourceConfig{},
+		logger:    testLogger(t),
+		srcClient: mockClient,
+	}
+
+	ctx := context.Background()
+	for range 3 {
+		if _, err := task.cycleFilesFor(ctx, "hash-a"); err != nil {
+			t.Fatalf("cycleFilesFor: %v", err)
+		}
+	}
+	if mockClient.getFilesCalls != 1 {
+		t.Errorf("expected 1 API call for 3 same-cycle lookups, got %d", mockClient.getFilesCalls)
+	}
+
+	task.resetCycleFiles()
+
+	if _, err := task.cycleFilesFor(ctx, "hash-a"); err != nil {
+		t.Fatalf("cycleFilesFor after reset: %v", err)
+	}
+	if mockClient.getFilesCalls != 2 {
+		t.Errorf("expected re-fetch after cycle reset, got %d total calls", mockClient.getFilesCalls)
+	}
 }

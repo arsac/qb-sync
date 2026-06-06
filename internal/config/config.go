@@ -196,8 +196,11 @@ func (c *DestinationConfig) Validate() error {
 	if c.StreamWorkers < 0 {
 		return errors.New("stream workers cannot be negative")
 	}
-	if c.VerifyConcurrency < 0 {
-		return errors.New("verify concurrency cannot be negative")
+	// Keep the bound in sync with maxVerifyConcurrencyCap in
+	// internal/destination (the server clamps defensively, but this is the
+	// check that produces a clear startup error for operators).
+	if c.VerifyConcurrency < 0 || c.VerifyConcurrency > 16 {
+		return errors.New("verify concurrency must be between 0 and 16 (0 = default 4)")
 	}
 	if c.MaxStreamBufferMB < 0 {
 		return errors.New("max stream buffer cannot be negative")
@@ -321,7 +324,7 @@ func SetupDestinationFlags(cmd *cobra.Command) {
 	flags.Int(
 		"verify-concurrency",
 		0,
-		"Concurrent piece-read goroutines during finalize verification (0 = default 4). Raise on healthy storage to speed finalize; lower if your NFS server can't handle the burst.",
+		"Concurrent piece-read goroutines during finalize verification (0 = default 4, max 16). Raise on healthy storage to speed finalize; lower if your NFS server can't handle the burst.",
 	)
 }
 

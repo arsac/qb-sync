@@ -116,6 +116,10 @@ func NewFdCache() *FdCache {
 // Open returns a cached file handle, opening the file on first access. The
 // returned [os.File] belongs to the cache; do not Close() it directly.
 func (c *FdCache) Open(path string) (*os.File, error) {
+	if c.fds == nil {
+		// Close() was called; re-init so a late Open doesn't panic on a nil map.
+		c.fds = make(map[string]*os.File)
+	}
 	if f, ok := c.fds[path]; ok {
 		return f, nil
 	}

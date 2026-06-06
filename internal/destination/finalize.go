@@ -796,7 +796,10 @@ func (s *Server) verifyFinalizedPieces(
 				if offset+size > totalSize {
 					size = totalSize - offset
 				}
-				if !s.verifyOnePiece(ctx, cache, hash, state, i, offset, size, state.pieceHashes[i]) {
+				// gCtx (not ctx): the idle watchdog cancels gCtx, and
+				// ReadPieceFromFilesCached checks it between file regions —
+				// using ctx would let a hung NFS read outlive the watchdog.
+				if !s.verifyOnePiece(gCtx, cache, hash, state, i, offset, size, state.pieceHashes[i]) {
 					failedMu.Lock()
 					failedPieces = append(failedPieces, i)
 					failedMu.Unlock()
@@ -878,9 +881,12 @@ func computeDiskStageTimeout(totalSize int64) time.Duration {
 // for verifyFinalizedPieces, falling back to the default. Higher values speed
 // up finalize on healthy storage; on undersized NFS exports they can compound
 // queue depth on the server.
+// Clamped to maxVerifyConcurrencyCap defensively: ServerConfig.Validate is
+// not on the startup path (internal/config validates there), so an
+// out-of-range value must not spawn an unbounded worker pool.
 func (s *Server) verifyConcurrency() int {
 	if s.config.VerifyConcurrency > 0 {
-		return s.config.VerifyConcurrency
+		return min(s.config.VerifyConcurrency, maxVerifyConcurrencyCap)
 	}
 	return maxVerifyConcurrency
 }

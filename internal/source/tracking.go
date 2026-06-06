@@ -302,19 +302,40 @@ func (t *QBTask) findTorrentByHash(hash string) *qbittorrent.Torrent {
 // cycle. Eliminates redundant GetFilesInformationCtx round-trips that
 // previously fired 3-4 times per finalize (finalize, fingerprint, label,
 // cleanup) — single-threaded qBittorrent pays for each one in series.
+//
+// Locked: besides the runOnce goroutine, finalizeTorrent reaches here from
+// the listenForRemovals goroutine (via tryFinalizeFullyStreamed), so the map
+// must not be touched unsynchronized. The API call itself happens outside the
+// lock — a duplicate fetch on a lost race is cheaper than serializing every
+// caller behind one slow qB round-trip.
 func (t *QBTask) cycleFilesFor(ctx context.Context, hash string) (qbittorrent.TorrentFiles, error) {
-	if cached, ok := t.cycleFiles[hash]; ok {
+	t.cycleFilesMu.Lock()
+	cached, ok := t.cycleFiles[hash]
+	t.cycleFilesMu.Unlock()
+	if ok {
 		return cached, nil
 	}
+
 	filesPtr, err := t.srcClient.GetFilesInformationCtx(ctx, hash)
 	if err != nil {
 		return nil, err
 	}
+
+	t.cycleFilesMu.Lock()
 	if t.cycleFiles == nil {
 		t.cycleFiles = make(map[string]qbittorrent.TorrentFiles)
 	}
 	t.cycleFiles[hash] = *filesPtr
+	t.cycleFilesMu.Unlock()
 	return *filesPtr, nil
+}
+
+// resetCycleFiles clears the per-cycle file-information cache. Called at the
+// top of each runOnce cycle.
+func (t *QBTask) resetCycleFiles() {
+	t.cycleFilesMu.Lock()
+	t.cycleFiles = nil
+	t.cycleFilesMu.Unlock()
 }
 
 // checkExcludedTorrents scans cycleTorrents for any tracked or completed torrents

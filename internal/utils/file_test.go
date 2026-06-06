@@ -135,3 +135,23 @@ func TestReadPieceFromFilesCached_MatchesUncachedResult(t *testing.T) {
 
 	assert.Equal(t, uncached, cached, "cached read must match uncached for boundary-spanning piece")
 }
+
+func TestFdCache_OpenAfterCloseReinitializes(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.bin")
+	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
+
+	cache := NewFdCache()
+	_, err := cache.Open(path)
+	require.NoError(t, err)
+	cache.Close()
+
+	// A late Open after Close must not panic on the nil'd map; it should
+	// hand back a fresh fd (deferred Close patterns can race a final read).
+	f, err := cache.Open(path)
+	require.NoError(t, err)
+	require.NotNil(t, f)
+	cache.Close()
+}

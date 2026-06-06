@@ -66,8 +66,14 @@ const (
 
 	// Memory management.
 	defaultMaxStreamBufferMB = 512 // Default global memory budget for buffered piece data
-	maxVerifyConcurrency     = 4   // Limit concurrent piece reads during finalization to cap transient memory
-	parentDirSyncConcurrency = 8   // Concurrent fsyncs of unique parent dirs during finalize (each is a separate NFS commit RTT)
+	maxVerifyConcurrency     = 4   // Default concurrent piece reads during finalization (caps transient memory)
+	// maxVerifyConcurrencyCap bounds the --verify-concurrency knob. Each worker
+	// holds up to one max-size (32 MB) piece buffer: 16 workers = 512 MB
+	// transient worst case, matching the default stream memory budget. Keep in
+	// sync with the bound in internal/config DestinationConfig.Validate;
+	// verifyConcurrency() clamps defensively in case the two ever drift.
+	maxVerifyConcurrencyCap  = 16
+	parentDirSyncConcurrency = 8 // Concurrent fsyncs of unique parent dirs during finalize (each is a separate NFS commit RTT)
 
 	// verifyIdleTimeout is how long verification can go without verifying a piece
 	// before it is considered stalled. Resets on each successfully verified piece.
@@ -195,6 +201,10 @@ func (c *ServerConfig) Validate() error {
 	}
 	if c.QBFinalizeConcurrency < 0 || c.QBFinalizeConcurrency > maxQBFinalizeConcurrency {
 		return fmt.Errorf("qb finalize concurrency must be between 0 and %d (0 = default 1)", maxQBFinalizeConcurrency)
+	}
+	if c.VerifyConcurrency < 0 || c.VerifyConcurrency > maxVerifyConcurrencyCap {
+		return fmt.Errorf("verify concurrency must be between 0 and %d (0 = default %d)",
+			maxVerifyConcurrencyCap, maxVerifyConcurrency)
 	}
 	return nil
 }
