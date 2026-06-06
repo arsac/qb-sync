@@ -1176,4 +1176,12 @@ func TestQBFinalizeConcurrencyValidation(t *testing.T) {
 	if got := cfg.GetQBFinalizeConcurrency(); got != 1 {
 		t.Errorf("zero must normalize to 1, got %d", got)
 	}
+
+	// Defensive clamp: ServerConfig.Validate is not on the startup path, so an
+	// out-of-range value must never reach the semaphore.
+	cfg = base
+	cfg.QBFinalizeConcurrency = 99
+	if got := cfg.GetQBFinalizeConcurrency(); got != maxQBFinalizeConcurrency {
+		t.Errorf("out-of-range value must clamp to %d, got %d", maxQBFinalizeConcurrency, got)
+	}
 }

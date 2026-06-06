@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/autobrr/go-qbittorrent"
 	"github.com/bits-and-blooms/bitset"
 	"golang.org/x/sync/semaphore"
 
@@ -1054,12 +1055,13 @@ func TestRunBackgroundFinalization_SkipsDiskStageWhenDone(t *testing.T) {
 
 	corruptDataFile := func(t *testing.T, state *serverTorrentState) {
 		t.Helper()
-		// Corrupt the on-disk data AFTER hashes were computed so verification,
-		// if it runs, must fail.
-		if err := os.WriteFile(state.files[0].path, []byte("corrupted!"), 0o644); err != nil {
+		// Corrupt the on-disk data in place (same length) AFTER hashes were
+		// computed, so verification — if it runs — fails with a clean hash
+		// mismatch rather than a short read.
+		corrupted := make([]byte, state.totalSize)
+		if err := os.WriteFile(state.files[0].path, corrupted, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		state.files[0].size = int64(len("corrupted!"))
 	}
 
 	t.Run("diskStageDone skips verification entirely", func(t *testing.T) {
@@ -1185,4 +1187,123 @@ func TestRunBackgroundFinalization_QBStageIndependentOfDiskSem(t *testing.T) {
 	if result == nil || !result.success {
 		t.Fatalf("expected success, got %+v", result)
 	}
+}
+
+// TestRunQBStage_BusyClassification exercises the qB stage with a real mock
+// qB client (unlike the nil-client short-circuit tests above), pinning the two
+// BUSY-producing paths: qB stuck in a checking state at budget expiry, and the
+// qB-stage queue timing out.
+func TestRunQBStage_BusyClassification(t *testing.T) {
+	t.Parallel()
+
+	newQBServer := func(t *testing.T, mock *mockQBClient) (*Server, string) {
+		t.Helper()
+		s, tmpDir := newTestDestServer(t)
+		s.qbClient = mock
+		s.config.QB = &QBConfig{
+			PollInterval: 10 * time.Millisecond,
+			PollTimeout:  50 * time.Millisecond,
+		}
+		return s, tmpDir
+	}
+
+	t.Run("qB stuck checking at budget expiry stores BUSY", func(t *testing.T) {
+		t.Parallel()
+		hash := "qb-checking-busy"
+		mock := &mockQBClient{
+			torrents: []qbittorrent.Torrent{
+				{Hash: hash, State: qbittorrent.TorrentStateCheckingUp, Progress: 0.5},
+			},
+		}
+		s, tmpDir := newQBServer(t, mock)
+
+		state := newTwoStageTestState(t, tmpDir, hash, 1)
+		state.finalization.diskStageDone = true // isolate the qB stage
+
+		s.store.mu.Lock()
+		s.store.entries[hash] = state
+		s.store.mu.Unlock()
+
+		done := make(chan struct{})
+		s.runBackgroundFinalization(hash, state, &pb.FinalizeTorrentRequest{TorrentHash: hash}, time.Now(), done)
+
+		state.mu.Lock()
+		result := state.finalization.result
+		state.mu.Unlock()
+		if result == nil || result.success {
+			t.Fatalf("expected qB-checking timeout failure, got %+v", result)
+		}
+		if result.errorCode != pb.FinalizeErrorCode_FINALIZE_ERROR_BUSY {
+			t.Errorf("expected BUSY for qB-still-checking timeout, got %v (%s)", result.errorCode, result.err)
+		}
+	})
+
+	t.Run("qB in genuine error state stores NONE, not BUSY", func(t *testing.T) {
+		t.Parallel()
+		hash := "qb-error-not-busy"
+		mock := &mockQBClient{
+			torrents: []qbittorrent.Torrent{
+				{Hash: hash, State: qbittorrent.TorrentStateMissingFiles, Progress: 0.5},
+			},
+		}
+		s, tmpDir := newQBServer(t, mock)
+
+		state := newTwoStageTestState(t, tmpDir, hash, 1)
+		state.finalization.diskStageDone = true
+
+		s.store.mu.Lock()
+		s.store.entries[hash] = state
+		s.store.mu.Unlock()
+
+		done := make(chan struct{})
+		s.runBackgroundFinalization(hash, state, &pb.FinalizeTorrentRequest{TorrentHash: hash}, time.Now(), done)
+
+		state.mu.Lock()
+		result := state.finalization.result
+		state.mu.Unlock()
+		if result == nil || result.success {
+			t.Fatalf("expected error-state failure, got %+v", result)
+		}
+		if result.errorCode != pb.FinalizeErrorCode_FINALIZE_ERROR_NONE {
+			t.Errorf("genuine qB error states must burn the retry budget (NONE), got %v", result.errorCode)
+		}
+	})
+
+	t.Run("qB-stage queue timeout stores BUSY", func(t *testing.T) {
+		t.Parallel()
+		hash := "qb-queue-busy"
+		mock := &mockQBClient{
+			torrents: []qbittorrent.Torrent{
+				{Hash: hash, State: qbittorrent.TorrentStateStoppedUp, Progress: 1.0},
+			},
+		}
+		s, tmpDir := newQBServer(t, mock)
+		s.finalizeQueueWait = 50 * time.Millisecond
+
+		// Hold the qB-stage slot so the finalization queues and times out.
+		if err := s.qbStageSem.Acquire(context.Background(), 1); err != nil {
+			t.Fatal(err)
+		}
+		defer s.qbStageSem.Release(1)
+
+		state := newTwoStageTestState(t, tmpDir, hash, 1)
+		state.finalization.diskStageDone = true
+
+		s.store.mu.Lock()
+		s.store.entries[hash] = state
+		s.store.mu.Unlock()
+
+		done := make(chan struct{})
+		s.runBackgroundFinalization(hash, state, &pb.FinalizeTorrentRequest{TorrentHash: hash}, time.Now(), done)
+
+		state.mu.Lock()
+		result := state.finalization.result
+		state.mu.Unlock()
+		if result == nil || result.success {
+			t.Fatalf("expected qB-stage queue-timeout failure, got %+v", result)
+		}
+		if result.errorCode != pb.FinalizeErrorCode_FINALIZE_ERROR_BUSY {
+			t.Errorf("expected BUSY for qB-stage queue timeout, got %v (%s)", result.errorCode, result.err)
+		}
+	})
 }

@@ -64,6 +64,12 @@ func (b *BackoffTracker) ShouldAttempt(hash string) bool {
 		return true
 	}
 
+	// Entries created by RecordBusy alone have no failures — busy streaks
+	// must not delay attempts. Also keeps the shift below well-defined.
+	if backoff.failures <= 0 {
+		return true
+	}
+
 	backoffDuration := min(
 		minFinalizeBackoff*time.Duration(1<<uint(backoff.failures-1)),
 		maxFinalizeBackoff,

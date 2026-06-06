@@ -198,6 +198,9 @@ func (c *DestinationConfig) Validate() error {
 	if c.MaxStreamBufferMB < 0 {
 		return errors.New("max stream buffer cannot be negative")
 	}
+	// Keep the bound in sync with maxQBFinalizeConcurrency in
+	// internal/destination (the server clamps defensively, but this is the
+	// check that produces a clear startup error for operators).
 	if c.QBFinalizeConcurrency < 0 || c.QBFinalizeConcurrency > 8 {
 		return errors.New("qb finalize concurrency must be between 0 and 8 (0 = default 1)")
 	}

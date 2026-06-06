@@ -99,6 +99,9 @@ const (
 	// maxQBFinalizeConcurrency caps the qB-stage semaphore weight. Above this,
 	// concurrent qB rechecks compete for disk I/O and the API burst rate can
 	// trip the qbclient circuit breaker (5 failures / 30s).
+	// Keep in sync with the bound in internal/config DestinationConfig.Validate
+	// (the startup-time check); GetQBFinalizeConcurrency clamps defensively in
+	// case the two ever drift.
 	maxQBFinalizeConcurrency = 8
 )
 
@@ -159,12 +162,15 @@ func (c *ServerConfig) GetSavePath() string {
 	return c.BasePath
 }
 
-// GetQBFinalizeConcurrency returns the qB-stage semaphore weight, defaulting to 1.
+// GetQBFinalizeConcurrency returns the qB-stage semaphore weight, defaulting
+// to 1 and clamping to maxQBFinalizeConcurrency. The clamp is defensive:
+// ServerConfig.Validate is not on the startup path (internal/config validates
+// there), so an out-of-range value must not reach the semaphore.
 func (c *ServerConfig) GetQBFinalizeConcurrency() int {
 	if c.QBFinalizeConcurrency <= 0 {
 		return 1
 	}
-	return c.QBFinalizeConcurrency
+	return min(c.QBFinalizeConcurrency, maxQBFinalizeConcurrency)
 }
 
 // Validate validates the server configuration.

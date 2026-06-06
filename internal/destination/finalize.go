@@ -377,6 +377,7 @@ func (s *Server) storeSuccessResult(
 	state.mu.Unlock()
 
 	selection := metrics.SelectionFull
+	// Safe outside state.mu: fi.selected is immutable after init (see torrentMeta docs).
 	if deselectedFileIDs(state.files) != "" {
 		selection = metrics.SelectionPartial
 	}
@@ -1026,6 +1027,9 @@ func (s *Server) handleExistingFinalization(
 	// before clearing state, preventing concurrent background goroutines.
 	<-done
 	state.mu.Lock()
+	// Re-snapshot under lock after the goroutine exited: don't depend on the
+	// finalizeResult struct staying immutable behind the pre-lock pointer.
+	result = state.finalization.result
 	state.finalization.reset()
 	state.mu.Unlock()
 	return &pb.FinalizeTorrentResponse{
