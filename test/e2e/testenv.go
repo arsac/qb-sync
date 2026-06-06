@@ -74,6 +74,7 @@ type SetupOption func(*setupConfig)
 
 type setupConfig struct {
 	sourceTempPath bool
+	mutateServer   func(*destination.ServerConfig)
 }
 
 // WithSourceTempPath enables temp_path on the source qBittorrent instance.
@@ -82,6 +83,15 @@ type setupConfig struct {
 func WithSourceTempPath() SetupOption {
 	return func(cfg *setupConfig) {
 		cfg.sourceTempPath = true
+	}
+}
+
+// WithDestinationServerConfig mutates the destination ServerConfig before the
+// gRPC server starts — used to exercise operator knobs (finalize/verify
+// concurrency) end to end.
+func WithDestinationServerConfig(mutate func(*destination.ServerConfig)) SetupOption {
+	return func(cfg *setupConfig) {
+		cfg.mutateServer = mutate
 	}
 }
 
@@ -233,6 +243,9 @@ services:
 			Username: testUsername,
 			Password: testPassword,
 		},
+	}
+	if sc.mutateServer != nil {
+		sc.mutateServer(&destinationServerConfig)
 	}
 	destinationServer := destination.NewServer(destinationServerConfig, logger)
 
