@@ -226,9 +226,11 @@ func (s *Server) runDiskStage(
 	stageStart := time.Now()
 
 	// Work timeout starts after acquiring the semaphore — queue wait doesn't
-	// eat into the verification budget. Derived from s.bgCtx so server
-	// shutdown cancels in-flight work.
-	ctx, cancel := context.WithTimeout(s.bgCtx, diskStageTimeout)
+	// eat into the verification budget. Scales with torrent size (base +
+	// per-GB, capped) so multi-hundred-GB torrents on slow storage aren't
+	// quarantined as sync-failed for legitimately long verification work.
+	// Derived from s.bgCtx so server shutdown cancels in-flight work.
+	ctx, cancel := context.WithTimeout(s.bgCtx, computeDiskStageTimeout(state.totalSize))
 	defer cancel()
 
 	// Sync parent directories before verification to ensure NFS has flushed
@@ -740,74 +742,75 @@ func (s *Server) verifyFinalizedPieces(
 
 	// Verify pieces in parallel — all accessed state fields (pieceHashes,
 	// pieceLength, totalSize, files) are immutable at this point (finalizing=true).
+	//
+	// Worker-pool pattern (rather than one goroutine per piece) so each worker
+	// holds a per-goroutine FdCache that reuses file handles across all the
+	// pieces it processes. Reusing fds removes one open+close (LOOKUP+OPEN+
+	// CLOSE) RTT per piece per file region — the dominant verify cost on NFS
+	// for multi-file torrents.
 	g, gCtx := errgroup.WithContext(idleCtx)
-	g.SetLimit(maxVerifyConcurrency)
 
 	var verified atomic.Int64
 	var lastProgress atomic.Value // stores time.Time of last verified piece
 	lastProgress.Store(time.Now())
 
-	// Collect failed piece indices under a mutex (multiple goroutines may append).
 	var failedMu sync.Mutex
 	var failedPieces []int
 
 	go s.verifyIdleWatchdog(ctx, gCtx, hash, numPieces, &verified, &lastProgress, idleCancel)
 
+	pieceCh := make(chan int, len(state.pieceHashes))
 	for i, expectedHash := range state.pieceHashes {
 		if expectedHash == "" {
 			continue
 		}
-
-		// Skip pieces not fully covered by selected files — boundary pieces
-		// (spanning selected + unselected) can't be read back because the
-		// unselected file's data doesn't exist on disk. Those were hash-verified
-		// at write time.
+		// Boundary pieces (spanning selected + unselected) can't be read back
+		// — the unselected file's data doesn't exist on disk. Those were
+		// hash-verified at write time.
 		if state.classifyPiece(i) != pieceFullySelected {
 			continue
 		}
-
-		// Skip pieces already verified post-flush via earlyFinalizeFile. Pieces
-		// not in this set still need a finalize-time read-back: hardlinked-file
-		// pieces (skipForWriteData skipped writePiece's hash check) and pieces in
-		// files that didn't go through earlyFinalizeFile (e.g., the file's last
-		// piece arrived during finalization itself).
+		// Pieces already verified post-flush via earlyFinalizeFile are skipped.
+		// Pieces NOT in that set still need a finalize-time read-back:
+		// hardlinked-file pieces (skipForWriteData skipped writePiece's hash
+		// check) and pieces in files that didn't go through earlyFinalizeFile.
 		if state.verified != nil && state.verified.Test(uint(i)) {
 			verified.Add(1)
 			lastProgress.Store(time.Now())
 			continue
 		}
+		pieceCh <- i
+	}
+	close(pieceCh)
 
+	for range s.verifyConcurrency() {
 		g.Go(func() error {
-			if gCtx.Err() != nil {
-				return gCtx.Err()
+			cache := utils.NewFdCache()
+			defer cache.Close()
+			for i := range pieceCh {
+				if err := gCtx.Err(); err != nil {
+					return err
+				}
+				offset := int64(i) * pieceSize
+				size := pieceSize
+				if offset+size > totalSize {
+					size = totalSize - offset
+				}
+				// gCtx (not ctx): the idle watchdog cancels gCtx, and
+				// ReadPieceFromFilesCached checks it between file regions —
+				// using ctx would let a hung NFS read outlive the watchdog.
+				if !s.verifyOnePiece(gCtx, cache, hash, state, i, offset, size, state.pieceHashes[i]) {
+					failedMu.Lock()
+					failedPieces = append(failedPieces, i)
+					failedMu.Unlock()
+				}
+				lastProgress.Store(time.Now())
+				if count := verified.Add(1); count%50 == 0 || count == int64(numPieces) {
+					s.logger.DebugContext(ctx, "verification progress",
+						"hash", hash, "verified", count, "total", numPieces,
+					)
+				}
 			}
-
-			// Calculate piece offset and size
-			offset := int64(i) * pieceSize
-			size := pieceSize
-			if offset+size > totalSize {
-				size = totalSize - offset
-			}
-
-			// Read and verify piece hash. Failures are collected (not fail-fast)
-			// so all corrupted pieces are found in a single pass.
-			if !s.verifyOnePiece(ctx, hash, state, i, offset, size, expectedHash) {
-				failedMu.Lock()
-				failedPieces = append(failedPieces, i)
-				failedMu.Unlock()
-			}
-
-			// Record progress for idle watchdog.
-			lastProgress.Store(time.Now())
-
-			if count := verified.Add(1); count%50 == 0 || count == int64(numPieces) {
-				s.logger.DebugContext(ctx, "verification progress",
-					"hash", hash,
-					"verified", count,
-					"total", numPieces,
-				)
-			}
-
 			return nil
 		})
 	}
@@ -831,15 +834,18 @@ func (s *Server) verifyFinalizedPieces(
 
 // verifyOnePiece reads a single piece from finalized files and verifies its hash.
 // Returns true if the piece is valid, false if it's corrupted or unreadable.
+// The cache is used to reuse fds across pieces processed by the same worker
+// goroutine — must be the worker's own cache, not shared.
 func (s *Server) verifyOnePiece(
 	ctx context.Context,
+	cache *utils.FdCache,
 	hash string,
 	state *serverTorrentState,
 	pieceIdx int,
 	offset, size int64,
 	expectedHash string,
 ) bool {
-	data, readErr := s.readPieceFromFinalizedFiles(state, offset, size)
+	data, readErr := s.readPieceFromFinalizedFiles(ctx, cache, state, offset, size)
 	if readErr != nil {
 		metrics.VerificationErrorsTotal.WithLabelValues(metrics.ModeDestination).Inc()
 		s.logger.WarnContext(ctx, "piece read failed during verification",
@@ -855,6 +861,34 @@ func (s *Server) verifyOnePiece(
 		return false
 	}
 	return true
+}
+
+// computeDiskStageTimeout returns the wall-clock budget for one torrent's
+// disk-stage work (sync + verify + inode registration). Scales linearly by GB
+// above a small floor and is capped to prevent unbounded waits — same shape
+// as computePollTimeout for qB recheck.
+func computeDiskStageTimeout(totalSize int64) time.Duration {
+	const bytesPerGB = 1024 * 1024 * 1024
+	gigabytes := totalSize / bytesPerGB
+	timeout := diskStageTimeoutBase + time.Duration(gigabytes)*diskStageTimeoutPerGB
+	if timeout > diskStageTimeoutMax {
+		return diskStageTimeoutMax
+	}
+	return timeout
+}
+
+// verifyConcurrency returns the operator-configured per-piece read concurrency
+// for verifyFinalizedPieces, falling back to the default. Higher values speed
+// up finalize on healthy storage; on undersized NFS exports they can compound
+// queue depth on the server.
+// Clamped to maxVerifyConcurrencyCap defensively: ServerConfig.Validate is
+// not on the startup path (internal/config validates there), so an
+// out-of-range value must not spawn an unbounded worker pool.
+func (s *Server) verifyConcurrency() int {
+	if s.config.VerifyConcurrency > 0 {
+		return min(s.config.VerifyConcurrency, maxVerifyConcurrencyCap)
+	}
+	return maxVerifyConcurrency
 }
 
 // verifyIdleWatchdog cancels verification if no progress within verifyIdleTimeout.
@@ -1039,11 +1073,14 @@ func (s *Server) handleExistingFinalization(
 	}, nil
 }
 
-// readPieceFromFinalizedFiles reads piece data from finalized (non-.partial) files.
-func (s *Server) readPieceFromFinalizedFiles(state *serverTorrentState, offset, size int64) ([]byte, error) {
+// readPieceFromFinalizedFiles reads piece data from finalized (non-.partial)
+// files using the supplied cache for fd reuse.
+func (s *Server) readPieceFromFinalizedFiles(
+	ctx context.Context, cache *utils.FdCache, state *serverTorrentState, offset, size int64,
+) ([]byte, error) {
 	regions := make([]utils.FileRegion, len(state.files))
 	for i, fi := range state.files {
 		regions[i] = utils.FileRegion{Path: targetPath(fi), Offset: fi.offset, Size: fi.size}
 	}
-	return utils.ReadPieceFromFiles(regions, offset, size)
+	return utils.ReadPieceFromFilesCached(ctx, cache, regions, offset, size)
 }

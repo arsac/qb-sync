@@ -66,8 +66,14 @@ const (
 
 	// Memory management.
 	defaultMaxStreamBufferMB = 512 // Default global memory budget for buffered piece data
-	maxVerifyConcurrency     = 4   // Limit concurrent piece reads during finalization to cap transient memory
-	parentDirSyncConcurrency = 8   // Concurrent fsyncs of unique parent dirs during finalize (each is a separate NFS commit RTT)
+	maxVerifyConcurrency     = 4   // Default concurrent piece reads during finalization (caps transient memory)
+	// maxVerifyConcurrencyCap bounds the --verify-concurrency knob. Each worker
+	// holds up to one max-size (32 MB) piece buffer: 16 workers = 512 MB
+	// transient worst case, matching the default stream memory budget. Keep in
+	// sync with the bound in internal/config DestinationConfig.Validate;
+	// verifyConcurrency() clamps defensively in case the two ever drift.
+	maxVerifyConcurrencyCap  = 16
+	parentDirSyncConcurrency = 8 // Concurrent fsyncs of unique parent dirs during finalize (each is a separate NFS commit RTT)
 
 	// verifyIdleTimeout is how long verification can go without verifying a piece
 	// before it is considered stalled. Resets on each successfully verified piece.
@@ -82,12 +88,19 @@ const (
 	// once, and each stage occupant can hold its slot for a long time.
 	finalizeQueueTimeout = 2 * time.Hour
 
-	// diskStageTimeout is the upper-bound timeout for the disk-bound
-	// finalization stage (parent-dir sync + piece verification + inode
-	// registration). Complementary to verifyIdleTimeout: the watchdog catches
-	// a stalled verifier; this cap catches slow-but-continuous progress.
-	// Starts after the disk-stage semaphore is acquired.
-	diskStageTimeout = 30 * time.Minute
+	// diskStageTimeoutBase / PerGB / Max bound the disk-bound finalization
+	// stage (parent-dir sync + piece verification + inode registration).
+	// Starts after the disk-stage semaphore is acquired, so queue wait
+	// doesn't count. Complementary to verifyIdleTimeout: the watchdog
+	// catches a stalled verifier; this cap catches slow-but-continuous work.
+	//
+	// Verification reads back every piece, so wall-clock cost scales linearly
+	// with data volume — same shape as qB's recheck timeout. A flat 30 min
+	// caused 200 GB+ torrents on slow NFS to be quarantined as sync-failed
+	// despite valid data; the GB-based scale matches actual workload.
+	diskStageTimeoutBase  = 10 * time.Minute
+	diskStageTimeoutPerGB = 30 * time.Second
+	diskStageTimeoutMax   = 6 * time.Hour
 
 	// defaultQBStageTimeoutMargin pads the qB-stage budget beyond the two
 	// waitForTorrentReady poll budgets (initial + post-recheck). Covers
@@ -123,6 +136,7 @@ type ServerConfig struct {
 	SavePath           string        // Path as destination qBittorrent sees it (container mount, e.g., "/downloads"). Defaults to BasePath.
 	StateFlushInterval time.Duration // How often to flush dirty state (0 = use default)
 	StreamWorkers      int           // Number of concurrent piece writers (0 = use default)
+	VerifyConcurrency  int           // Concurrent piece-read goroutines during finalize verification (0 = use default 4). Raise on healthy storage to speed finalize; lower if your NFS server can't handle the burst.
 
 	// Orphan cleanup settings - clean up partial files when source disconnects unexpectedly.
 	OrphanCleanupInterval time.Duration // How often to scan for orphans (0 = use default 1h)
@@ -187,6 +201,10 @@ func (c *ServerConfig) Validate() error {
 	}
 	if c.QBFinalizeConcurrency < 0 || c.QBFinalizeConcurrency > maxQBFinalizeConcurrency {
 		return fmt.Errorf("qb finalize concurrency must be between 0 and %d (0 = default 1)", maxQBFinalizeConcurrency)
+	}
+	if c.VerifyConcurrency < 0 || c.VerifyConcurrency > maxVerifyConcurrencyCap {
+		return fmt.Errorf("verify concurrency must be between 0 and %d (0 = default %d)",
+			maxVerifyConcurrencyCap, maxVerifyConcurrency)
 	}
 	return nil
 }

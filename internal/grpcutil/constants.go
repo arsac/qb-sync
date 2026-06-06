@@ -14,8 +14,21 @@ const (
 	MaxGRPCMessageSize = MaxPieceDataSize + 4*1024 // 32 MB + 4 KB proto overhead
 
 	// InitialStreamWindowSize is the HTTP/2 per-stream flow control window.
-	// The default 64 KB window throttles bulk piece transfers.
-	InitialStreamWindowSize = 16 * 1024 * 1024 // 16 MB
+	// The default 64 KB window throttles bulk piece transfers; 16 MB caused
+	// flow-control stop-and-go mid-piece for max-size pieces. Sized to fit a
+	// single MaxPieceDataSize payload so a single in-flight piece never has
+	// to wait for a WINDOW_UPDATE in the middle of its transfer.
+	//
+	// Memory cost: MaxPoolSize * InitialStreamWindowSize per connection's
+	// receive-side kernel buffer. With MaxPoolSize=32 streams that's ~1 GB
+	// worst-case per connection, comparable to the per-stream memBudget
+	// semaphore that already gates work-channel data.
+	//
+	// Setting any explicit value here disables gRPC-Go's BDP estimator. We
+	// keep the explicit setting because the BDP estimator is hard-capped at
+	// 4 MB internally, which is smaller than our max piece — so dynamic
+	// sizing would produce worse outcomes for our workload.
+	InitialStreamWindowSize = MaxPieceDataSize // 32 MB
 
 	// InitialConnWindowSize is the HTTP/2 connection-level flow control window.
 	InitialConnWindowSize = 64 * 1024 * 1024 // 64 MB

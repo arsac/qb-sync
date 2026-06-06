@@ -84,6 +84,7 @@ All flags can be set via environment variables with the prefix `QBSYNC_SOURCE_` 
 | `QBSYNC_DESTINATION_STREAM_WORKERS` | `--stream-workers` | Concurrent piece writers (0 = auto: 8) | `0` |
 | `QBSYNC_DESTINATION_MAX_STREAM_BUFFER` | `--max-stream-buffer` | Global memory budget for buffered pieces (MB) | `512` |
 | `QBSYNC_DESTINATION_QB_FINALIZE_CONCURRENCY` | `--qb-finalize-concurrency` | Max torrents concurrently in the qB add/recheck stage (0 = default 1, max 8). Raise only on SSD-backed storage | `0` |
+| `QBSYNC_DESTINATION_VERIFY_CONCURRENCY` | `--verify-concurrency` | Concurrent piece-read goroutines during finalize verification (0 = default 4). Raise on healthy storage; lower if your NFS server can't handle the burst | `0` |
 | `QBSYNC_DESTINATION_SYNCED_TAG` | `--synced-tag` | Tag for synced torrents (empty to disable) | `synced` |
 | `QBSYNC_DESTINATION_HEALTH_ADDR` | `--health-addr` | Health/metrics endpoint | `:8080` |
 | `QBSYNC_DESTINATION_LOG_LEVEL` | `--log-level` | Log level: debug, info, warn, error | `info` |

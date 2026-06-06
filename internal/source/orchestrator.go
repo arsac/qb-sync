@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -85,6 +86,16 @@ type QBTask struct {
 	// Set by trackNewTorrents, consumed by fetchTorrentsCompletedOnDest, reset each cycle.
 	// nil means not yet fetched this cycle; non-nil (even empty) means cached.
 	cycleTorrents []qbittorrent.Torrent
+
+	// Per-cycle cache of file-information results to avoid redundant
+	// GetFilesInformationCtx calls. A finalize cycle previously issued 3-4
+	// round-trips per torrent (finalize, fingerprint, label, cleanup); on a
+	// 50-torrent burst that's 200 sequential WebUI calls against
+	// single-threaded qBittorrent. Reset each cycle alongside cycleTorrents.
+	// Guarded by cycleFilesMu: finalizeTorrent reaches the cache from the
+	// listenForRemovals goroutine as well as the runOnce goroutine.
+	cycleFiles   map[string]qbittorrent.TorrentFiles
+	cycleFilesMu sync.Mutex
 
 	// trackingOrderHook is called with each hash when tracking starts. Test-only.
 	trackingOrderHook func(hash string)
@@ -222,6 +233,7 @@ func (t *QBTask) Run(ctx context.Context) error {
 
 func (t *QBTask) runOnce(ctx context.Context) {
 	t.cycleTorrents = nil
+	t.resetCycleFiles()
 
 	if err := t.trackNewTorrents(ctx); err != nil {
 		t.logger.ErrorContext(ctx, "failed to track torrents", "error", err)

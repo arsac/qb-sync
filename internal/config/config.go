@@ -172,6 +172,7 @@ type DestinationConfig struct {
 	// Streaming tuning
 	StreamWorkers     int // Number of concurrent piece writers (0 = use default 8)
 	MaxStreamBufferMB int // Global memory budget in MB for buffered piece data (default: 512)
+	VerifyConcurrency int // Concurrent piece-read goroutines during finalize verification (0 = use default 4)
 
 	// QBFinalizeConcurrency is how many torrents may concurrently occupy the
 	// destination qB add/recheck stage (0 = default 1, max 8).
@@ -194,6 +195,12 @@ func (c *DestinationConfig) Validate() error {
 	}
 	if c.StreamWorkers < 0 {
 		return errors.New("stream workers cannot be negative")
+	}
+	// Keep the bound in sync with maxVerifyConcurrencyCap in
+	// internal/destination (the server clamps defensively, but this is the
+	// check that produces a clear startup error for operators).
+	if c.VerifyConcurrency < 0 || c.VerifyConcurrency > 16 {
+		return errors.New("verify concurrency must be between 0 and 16 (0 = default 4)")
 	}
 	if c.MaxStreamBufferMB < 0 {
 		return errors.New("max stream buffer cannot be negative")
@@ -314,6 +321,11 @@ func SetupDestinationFlags(cmd *cobra.Command) {
 			"Values >1 increase qB API and disk load; on NFS/spinning rust concurrent rechecks compete "+
 			"for I/O — raise only on SSD-backed storage",
 	)
+	flags.Int(
+		"verify-concurrency",
+		0,
+		"Concurrent piece-read goroutines during finalize verification (0 = default 4, max 16). Raise on healthy storage to speed finalize; lower if your NFS server can't handle the burst.",
+	)
 }
 
 // bindFlags configures viper with an env prefix and binds the given flag names.
@@ -349,7 +361,7 @@ func BindDestinationFlags(cmd *cobra.Command, v *viper.Viper) error {
 	return bindFlags(cmd, v, "QBSYNC_DESTINATION", []string{
 		"listen", flagData, "save-path", flagQBURL, flagQBUsername, flagQBPassword,
 		"poll-interval", "poll-timeout", "stream-workers", "max-stream-buffer",
-		"qb-finalize-concurrency",
+		"qb-finalize-concurrency", "verify-concurrency",
 		flagHealthAddr, flagSyncedTag, flagDryRun, flagLogLevel,
 	})
 }
@@ -423,6 +435,7 @@ func LoadDestination(v *viper.Viper) (*DestinationConfig, error) {
 		StreamWorkers:         v.GetInt("stream-workers"),
 		MaxStreamBufferMB:     v.GetInt("max-stream-buffer"),
 		QBFinalizeConcurrency: v.GetInt("qb-finalize-concurrency"),
+		VerifyConcurrency:     v.GetInt("verify-concurrency"),
 	}
 
 	cfg.ListenAddr = applyEnvFallback(cfg.ListenAddr, defaultListenAddr, "GRPC_PORT", "PORT")

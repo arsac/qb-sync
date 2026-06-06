@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/arsac/qb-sync/internal/destination"
 	"github.com/arsac/qb-sync/internal/utils"
 	pb "github.com/arsac/qb-sync/proto"
 )
@@ -2567,4 +2568,101 @@ func TestE2E_StuckAtFullStreamedQBIntegrationFailureCapsAtMaxRetries(t *testing.
 	<-orchestratorDone
 
 	t.Log("Stuck-at-100% retry cap test completed successfully!")
+}
+
+// TestE2E_ConcurrentBatchFinalization syncs three torrents that finish
+// together, with both new concurrency knobs raised: QBFinalizeConcurrency=2
+// (two torrents may occupy the qB add/recheck stage at once) and
+// VerifyConcurrency=8 (verify worker pool above its default). This is the
+// scenario the two-stage finalization split exists for — nothing else
+// exercises stage overlap, a qB-stage semaphore weight above 1, or the knobs
+// against real qBittorrent. All three torrents must finalize and none may be
+// quarantined as sync-failed (congestion between batch members must surface
+// as BUSY/waiting, never as a per-torrent failure).
+func TestE2E_ConcurrentBatchFinalization(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+
+	t.Parallel()
+
+	env := SetupTestEnv(t, WithDestinationServerConfig(func(cfg *destination.ServerConfig) {
+		cfg.QBFinalizeConcurrency = 2
+		cfg.VerifyConcurrency = 8
+	}))
+	ctx := context.Background()
+
+	batch := []struct {
+		url  string
+		hash string
+		name string
+	}{
+		{bigBuckBunnyURL, bigBuckBunnyHash, "Big Buck Bunny"},
+		{testTorrentURL, wiredCDHash, "WIRED CD"},
+		{sintelTorrentURL, sintelHash, "Sintel"},
+	}
+
+	for _, tor := range batch {
+		env.CleanupBothSides(ctx, tor.hash)
+		defer env.CleanupBothSides(ctx, tor.hash)
+	}
+
+	// Add all three first so the webseed downloads overlap, then wait for
+	// each — the batch must COMPLETE together to contend for finalization.
+	t.Log("Adding batch of 3 torrents to source...")
+	for _, tor := range batch {
+		require.NoError(t, env.AddTorrentToSource(ctx, tor.url, nil), tor.name)
+	}
+	for _, tor := range batch {
+		t.Logf("Waiting for %s to finish downloading...", tor.name)
+		env.WaitForTorrentComplete(env.SourceClient(), tor.hash, 10*time.Minute)
+	}
+
+	cfg := env.CreateSourceConfig()
+	cfg.SyncFailedTag = "sync-failed"
+	task, dest, err := env.CreateSourceTask(cfg)
+	require.NoError(t, err)
+	defer dest.Close()
+
+	orchestratorCtx, cancelOrchestrator := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancelOrchestrator()
+
+	orchestratorDone := make(chan error, 1)
+	go func() {
+		orchestratorDone <- task.Run(orchestratorCtx)
+	}()
+
+	// All three must land on destination qB, fully verified.
+	for _, tor := range batch {
+		t.Logf("Waiting for %s on destination...", tor.name)
+		env.WaitForTorrentCompleteOnDestination(ctx, tor.hash, 8*time.Minute,
+			tor.name+" should be complete on destination")
+	}
+
+	// Wait for post-finalization tagging before shutting the orchestrator down.
+	for _, tor := range batch {
+		env.WaitForSyncedTagOnSource(ctx, tor.hash, time.Minute,
+			tor.name+" should have synced tag on source")
+	}
+
+	cancelOrchestrator()
+	<-orchestratorDone
+
+	// Congestion between batch members must never quarantine a torrent:
+	// the sync-failed tag is reserved for genuine per-torrent failures.
+	hashes := make([]string, len(batch))
+	for i, tor := range batch {
+		hashes[i] = tor.hash
+	}
+	sourceTorrents, err := env.SourceClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+		Hashes: hashes,
+	})
+	require.NoError(t, err)
+	require.Len(t, sourceTorrents, len(batch))
+	for _, tor := range sourceTorrents {
+		assert.NotContains(t, tor.Tags, "sync-failed",
+			"batch congestion must surface as BUSY, never sync-failed (torrent %s)", tor.Name)
+	}
+
+	t.Log("Concurrent batch finalization completed successfully!")
 }

@@ -256,11 +256,11 @@ func selectedFingerprint(files qbittorrent.TorrentFiles) string {
 // computeSelectionFingerprint fetches file info from qBittorrent and returns
 // the selection fingerprint. Returns "" on error (will re-check next cycle).
 func (t *QBTask) computeSelectionFingerprint(ctx context.Context, hash string) string {
-	qbFiles, err := t.srcClient.GetFilesInformationCtx(ctx, hash)
+	qbFiles, err := t.cycleFilesFor(ctx, hash)
 	if err != nil {
 		return ""
 	}
-	return selectedFingerprint(*qbFiles)
+	return selectedFingerprint(qbFiles)
 }
 
 // selectionLabel returns the metrics.SelectionPartial / SelectionFull value
@@ -280,11 +280,11 @@ func selectionLabel(files qbittorrent.TorrentFiles) string {
 // Defaults to SelectionFull on error (safe assumption; selection-conditional
 // code paths only fire when the explicit partial signal exists elsewhere).
 func (t *QBTask) computeSelectionLabel(ctx context.Context, hash string) string {
-	qbFiles, err := t.srcClient.GetFilesInformationCtx(ctx, hash)
+	qbFiles, err := t.cycleFilesFor(ctx, hash)
 	if err != nil {
 		return metrics.SelectionFull
 	}
-	return selectionLabel(*qbFiles)
+	return selectionLabel(qbFiles)
 }
 
 // findTorrentByHash looks up a torrent from the per-cycle cache.
@@ -295,6 +295,47 @@ func (t *QBTask) findTorrentByHash(hash string) *qbittorrent.Torrent {
 		}
 	}
 	return nil
+}
+
+// cycleFilesFor returns the file-information result for a torrent, fetching
+// from source qB on first miss and caching for the rest of the orchestrator
+// cycle. Eliminates redundant GetFilesInformationCtx round-trips that
+// previously fired 3-4 times per finalize (finalize, fingerprint, label,
+// cleanup) — single-threaded qBittorrent pays for each one in series.
+//
+// Locked: besides the runOnce goroutine, finalizeTorrent reaches here from
+// the listenForRemovals goroutine (via tryFinalizeFullyStreamed), so the map
+// must not be touched unsynchronized. The API call itself happens outside the
+// lock — a duplicate fetch on a lost race is cheaper than serializing every
+// caller behind one slow qB round-trip.
+func (t *QBTask) cycleFilesFor(ctx context.Context, hash string) (qbittorrent.TorrentFiles, error) {
+	t.cycleFilesMu.Lock()
+	cached, ok := t.cycleFiles[hash]
+	t.cycleFilesMu.Unlock()
+	if ok {
+		return cached, nil
+	}
+
+	filesPtr, err := t.srcClient.GetFilesInformationCtx(ctx, hash)
+	if err != nil {
+		return nil, err
+	}
+
+	t.cycleFilesMu.Lock()
+	if t.cycleFiles == nil {
+		t.cycleFiles = make(map[string]qbittorrent.TorrentFiles)
+	}
+	t.cycleFiles[hash] = *filesPtr
+	t.cycleFilesMu.Unlock()
+	return *filesPtr, nil
+}
+
+// resetCycleFiles clears the per-cycle file-information cache. Called at the
+// top of each runOnce cycle.
+func (t *QBTask) resetCycleFiles() {
+	t.cycleFilesMu.Lock()
+	t.cycleFiles = nil
+	t.cycleFilesMu.Unlock()
 }
 
 // checkExcludedTorrents scans cycleTorrents for any tracked or completed torrents
@@ -402,12 +443,12 @@ func (t *QBTask) recheckFileSelections(ctx context.Context) {
 			}
 		}
 
-		qbFiles, err := t.srcClient.GetFilesInformationCtx(ctx, hash)
+		qbFiles, err := t.cycleFilesFor(ctx, hash)
 		if err != nil {
 			continue // torrent may have been removed; pruneCompletedOnDest handles that
 		}
 
-		currentFingerprint := selectedFingerprint(*qbFiles)
+		currentFingerprint := selectedFingerprint(qbFiles)
 		if currentFingerprint == storedFingerprint {
 			continue
 		}

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -45,6 +46,8 @@ type mockQBClient struct {
 
 	getTorrentsResult []qbittorrent.Torrent
 	getTorrentsErr    error
+
+	getFilesCalls atomic.Int64
 
 	freeSpaceOnDisk int64
 	freeSpaceErr    error
@@ -89,6 +92,7 @@ func (m *mockQBClient) GetFilesInformationCtx(
 	_ context.Context,
 	_ string,
 ) (*qbittorrent.TorrentFiles, error) {
+	m.getFilesCalls.Add(1)
 	return &qbittorrent.TorrentFiles{}, nil
 }
 
@@ -662,6 +666,7 @@ func TestTryFinalizeFullyStreamed(t *testing.T) {
 			srcClient: src,
 			grpcDest:  dest,
 			source:    qbclient.NewSource(nil, ""),
+			completed: NewCompletionCache("", logger),
 		}
 	}
 
@@ -3493,4 +3498,74 @@ func TestHandleFinalizeError_BusyDoesNotBurnRetryBudget(t *testing.T) {
 			t.Errorf("expected sync-failed tag after guard expiry; got %q", mockClient.addTagsTag)
 		}
 	})
+}
+
+// TestCycleFilesFor_CachesWithinCycleAndResets pins the per-cycle file-info
+// cache contract: repeat lookups within a cycle hit the cache (one API call),
+// and resetCycleFiles (fired at the top of each runOnce) forces a re-fetch.
+func TestCycleFilesFor_CachesWithinCycleAndResets(t *testing.T) {
+	mockClient := &mockQBClient{}
+	task := &QBTask{
+		cfg:       &config.SourceConfig{},
+		logger:    testLogger(t),
+		srcClient: mockClient,
+	}
+
+	ctx := context.Background()
+	for range 3 {
+		if _, err := task.cycleFilesFor(ctx, "hash-a"); err != nil {
+			t.Fatalf("cycleFilesFor: %v", err)
+		}
+	}
+	if got := mockClient.getFilesCalls.Load(); got != 1 {
+		t.Errorf("expected 1 API call for 3 same-cycle lookups, got %d", got)
+	}
+
+	task.resetCycleFiles()
+
+	if _, err := task.cycleFilesFor(ctx, "hash-a"); err != nil {
+		t.Fatalf("cycleFilesFor after reset: %v", err)
+	}
+	if got := mockClient.getFilesCalls.Load(); got != 2 {
+		t.Errorf("expected re-fetch after cycle reset, got %d total calls", got)
+	}
+}
+
+// TestCycleFilesFor_ConcurrentAccessIsRaceSafe pins the locking contract on
+// the per-cycle file-info cache: besides the runOnce goroutine, the
+// listenForRemovals goroutine reaches cycleFilesFor via
+// tryFinalizeFullyStreamed -> finalizeTorrent. This test only proves its
+// worth under -race (CI runs it): remove cycleFilesMu and it fails with a
+// concurrent map read/write report.
+func TestCycleFilesFor_ConcurrentAccessIsRaceSafe(t *testing.T) {
+	t.Parallel()
+
+	mockClient := &mockQBClient{}
+	task := &QBTask{
+		cfg:       &config.SourceConfig{},
+		logger:    testLogger(t),
+		srcClient: mockClient,
+	}
+
+	ctx := context.Background()
+	var wg sync.WaitGroup
+
+	// Goroutine A: the orchestrator cycle — resets the cache and looks up
+	// hashes, like runOnce -> trackNewTorrents/finalizeCompletedStreams.
+	wg.Go(func() {
+		for i := range 200 {
+			task.resetCycleFiles()
+			_, _ = task.cycleFilesFor(ctx, fmt.Sprintf("hash-%d", i%5))
+		}
+	})
+
+	// Goroutine B: the removals path — tryFinalizeFullyStreamed ->
+	// finalizeTorrent -> cycleFilesFor, off-cycle by definition.
+	wg.Go(func() {
+		for i := range 200 {
+			_, _ = task.cycleFilesFor(ctx, fmt.Sprintf("hash-%d", i%5))
+		}
+	})
+
+	wg.Wait()
 }

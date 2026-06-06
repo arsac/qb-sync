@@ -3,6 +3,7 @@ package destination
 import (
 	"fmt"
 	"os"
+	"sort"
 
 	"github.com/bits-and-blooms/bitset"
 
@@ -63,7 +64,15 @@ func (s *serverTorrentState) writePieceData(offset int64, data []byte) error {
 	remaining := data
 	currentOffset := offset
 
-	for _, fi := range s.files {
+	// Files are constructed sorted by offset (qbclient/source.go assigns
+	// monotonically-increasing offsets). Binary-search past every file whose
+	// end is at or before currentOffset — for many-file torrents (season
+	// packs, archives) this turns the per-piece scan from O(F) into O(log F).
+	startIdx := sort.Search(len(s.files), func(i int) bool {
+		return s.files[i].offset+s.files[i].size > currentOffset
+	})
+
+	for _, fi := range s.files[startIdx:] {
 		if len(remaining) == 0 {
 			break
 		}

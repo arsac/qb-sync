@@ -1307,3 +1307,32 @@ func TestRunQBStage_BusyClassification(t *testing.T) {
 		}
 	})
 }
+
+// TestVerifyConcurrency_HonorsConfigAndClamps pins the operator knob: the
+// configured value is used, zero falls back to the default, and out-of-range
+// values clamp to the cap (ServerConfig.Validate is not on the startup path,
+// so the clamp is the only runtime guard against an unbounded worker pool).
+func TestVerifyConcurrency_HonorsConfigAndClamps(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		cfg  int
+		want int
+	}{
+		{"zero falls back to default", 0, maxVerifyConcurrency},
+		{"configured value honored", 2, 2},
+		{"cap value honored", maxVerifyConcurrencyCap, maxVerifyConcurrencyCap},
+		{"out-of-range clamps to cap", 500, maxVerifyConcurrencyCap},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s := &Server{config: ServerConfig{VerifyConcurrency: tt.cfg}}
+			if got := s.verifyConcurrency(); got != tt.want {
+				t.Errorf("verifyConcurrency() with config %d = %d, want %d", tt.cfg, got, tt.want)
+			}
+		})
+	}
+}

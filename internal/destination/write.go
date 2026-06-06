@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"time"
 
 	"github.com/arsac/qb-sync/internal/metrics"
@@ -239,11 +240,20 @@ func (s *Server) checkFileCompletions(
 	pieceIndex int32,
 ) {
 	idx := int(pieceIndex)
-	for i, fi := range state.files {
-		if fi.earlyFinalized || fi.size <= 0 || fi.skipForWriteData() {
-			continue
+	// Files are sorted by offset, so firstPiece is monotonically non-decreasing.
+	// Binary-search past every file whose lastPiece is below idx — turns the
+	// per-piece scan from O(F) into O(log F) for many-file torrents. Any piece
+	// overlaps at most a small contiguous range of files; iteration stops as
+	// soon as we encounter a file whose firstPiece exceeds idx.
+	startIdx := sort.Search(len(state.files), func(i int) bool {
+		return state.files[i].lastPiece >= idx
+	})
+	for i := startIdx; i < len(state.files); i++ {
+		fi := state.files[i]
+		if fi.firstPiece > idx {
+			break
 		}
-		if !fi.overlaps(idx) {
+		if fi.earlyFinalized || fi.size <= 0 || fi.skipForWriteData() {
 			continue
 		}
 		fi.piecesWritten++
@@ -330,6 +340,14 @@ func (s *Server) earlyFinalizeFile(
 
 	if err := s.renamePartialFile(ctx, hash, fi); err != nil {
 		fi.earlyFinalized = false
+		// Sync succeeded, rename didn't. fi.file is nil (closed by
+		// syncVerifyClose). Reopen so a concurrent WritePiece doesn't
+		// race with finalizeFiles' retry on a nil handle, and so the
+		// state machine matches the syncCloseErr path above.
+		if reopenErr := fi.openForWrite(); reopenErr != nil {
+			s.logger.ErrorContext(ctx, "failed to reopen file after rename failure",
+				"hash", hash, "file", fi.path, "error", reopenErr)
+		}
 		s.logger.WarnContext(ctx, "early finalization rename failed, deferring",
 			"hash", hash, "file", fi.path, "error", err)
 		return
