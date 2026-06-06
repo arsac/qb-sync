@@ -165,6 +165,14 @@ type finalizationState struct {
 	active bool            // True during FinalizeTorrent to prevent concurrent writes
 	done   chan struct{}   // Closed when background finalization completes
 	result *finalizeResult // Result of background finalization (nil = not started)
+
+	// diskStageDone records that the disk stage (sync + verify + inode
+	// registration) completed for the current on-disk file layout. It
+	// intentionally SURVIVES reset() so a retry after a qB-stage failure
+	// skips straight to the qB stage instead of re-reading every piece.
+	// Invalidated when files move (relocateForSubPathChange). In-memory only:
+	// a destination restart re-verifies once, which is safe.
+	diskStageDone bool
 }
 
 // start marks finalization as active and returns the done channel.

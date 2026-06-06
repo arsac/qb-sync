@@ -83,6 +83,7 @@ All flags can be set via environment variables with the prefix `QBSYNC_SOURCE_` 
 | `QBSYNC_DESTINATION_POLL_TIMEOUT` | `--poll-timeout` | Verification timeout (seconds) | `300` |
 | `QBSYNC_DESTINATION_STREAM_WORKERS` | `--stream-workers` | Concurrent piece writers (0 = auto: 8) | `0` |
 | `QBSYNC_DESTINATION_MAX_STREAM_BUFFER` | `--max-stream-buffer` | Global memory budget for buffered pieces (MB) | `512` |
+| `QBSYNC_DESTINATION_QB_FINALIZE_CONCURRENCY` | `--qb-finalize-concurrency` | Max torrents concurrently in the qB add/recheck stage (0 = default 1, max 8). Raise only on SSD-backed storage | `0` |
 | `QBSYNC_DESTINATION_SYNCED_TAG` | `--synced-tag` | Tag for synced torrents (empty to disable) | `synced` |
 | `QBSYNC_DESTINATION_HEALTH_ADDR` | `--health-addr` | Health/metrics endpoint | `:8080` |
 | `QBSYNC_DESTINATION_LOG_LEVEL` | `--log-level` | Log level: debug, info, warn, error | `info` |
@@ -96,6 +97,24 @@ These standard variables are also supported as fallbacks:
 |----------|----------|
 | `HTTP_PORT` / `HEALTH_PORT` | Health/metrics endpoint |
 | `GRPC_PORT` / `PORT` | Destination server listen address |
+
+## Upgrading
+
+### Two-stage finalization (BUSY semantics)
+
+- **Deploy order:** upgrade the **destination first**, then the source. The new
+  `FINALIZE_ERROR_BUSY` congestion signal only takes effect once both sides are
+  upgraded; an old source talking to a new destination behaves exactly as before.
+- **Behavior change:** congestion (finalization queue timeouts, qB rechecks that
+  outlast their budget) no longer counts toward the `sync-failed` retry cap. A
+  torrent waiting on a saturated destination shows WARN logs
+  (`destination finalization busy, will retry`) and increments
+  `qbsync_finalize_busy_total` — it will NOT get the sync-failed tag unless it
+  has been continuously busy for over 8 hours.
+- **New knob:** `--qb-finalize-concurrency` / `QBSYNC_DESTINATION_QB_FINALIZE_CONCURRENCY`
+  (default 1) controls how many torrents may concurrently occupy the destination
+  qB add/recheck stage. The default preserves existing behavior; raise it only on
+  SSD-backed storage.
 
 ## Health & Metrics
 

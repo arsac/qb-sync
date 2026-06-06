@@ -74,10 +74,18 @@ type Server struct {
 	// Global memory budget for buffered piece data
 	memBudget *semaphore.Weighted
 
-	// finalizeSem serializes background finalizations so only one torrent
-	// is verified/added to qBittorrent at a time. This prevents disk I/O
-	// and qBittorrent API saturation when many torrents complete together.
+	// finalizeSem serializes the disk-bound finalization stage (parent-dir
+	// sync + piece verification + inode registration) so concurrent torrents
+	// don't saturate disk I/O when many complete together.
 	finalizeSem *semaphore.Weighted
+
+	// qbStageSem bounds the qBittorrent integration stage (AddTorrent +
+	// recheck wait). Separate from finalizeSem so the mostly-idle qB recheck
+	// wait of torrent N doesn't block the disk verification of torrent N+1.
+	qbStageSem *semaphore.Weighted
+
+	// finalizeQueueWait overrides finalizeQueueTimeout in tests (0 = default).
+	finalizeQueueWait time.Duration
 
 	// bgCtx is cancelled during shutdown to interrupt in-flight background
 	// finalizations. bgWg tracks all running background finalization goroutines
@@ -110,6 +118,7 @@ func NewServer(config ServerConfig, logger *slog.Logger) *Server {
 		store:       newTorrentStore(config.BasePath, logger),
 		memBudget:   semaphore.NewWeighted(bufferBytes),
 		finalizeSem: semaphore.NewWeighted(1),
+		qbStageSem:  semaphore.NewWeighted(int64(config.GetQBFinalizeConcurrency())),
 		bgCtx:       bgCtx,
 		bgCancel:    bgCancel,
 	}

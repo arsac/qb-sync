@@ -10,6 +10,7 @@ import (
 	"github.com/autobrr/go-qbittorrent"
 
 	"github.com/arsac/qb-sync/internal/qbclient"
+	"github.com/arsac/qb-sync/internal/utils"
 	pb "github.com/arsac/qb-sync/proto"
 )
 
@@ -1084,4 +1085,103 @@ func TestAddAndVerifyTorrent_AutoRechecksOnErrorState(t *testing.T) {
 			t.Error("stopTorrentBestEffort must run before returning to keep the torrent quiescent")
 		}
 	})
+}
+
+func TestQBStageTimeout(t *testing.T) {
+	const gb = int64(1024 * 1024 * 1024)
+
+	tests := []struct {
+		name      string
+		totalSize int64
+		qbCfg     *QBConfig
+		want      time.Duration
+	}{
+		{
+			name:      "small torrent uses base floor plus per-GB, doubled, plus margin",
+			totalSize: 1 * gb,
+			want:      2*(defaultQBPollTimeoutBase+1*defaultQBPollTimeoutPerGB) + defaultQBStageTimeoutMargin,
+		},
+		{
+			name:      "huge torrent capped at 2x max plus margin",
+			totalSize: 1000 * gb,
+			want:      2*defaultQBPollTimeoutMax + defaultQBStageTimeoutMargin,
+		},
+		{
+			name:      "explicit PollTimeout override is doubled plus margin",
+			totalSize: 1000 * gb,
+			qbCfg:     &QBConfig{PollTimeout: 10 * time.Minute},
+			want:      2*(10*time.Minute) + defaultQBStageTimeoutMargin,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Server{config: ServerConfig{QB: tt.qbCfg}}
+			if got := s.qbStageTimeout(tt.totalSize); got != tt.want {
+				t.Errorf("qbStageTimeout(%d) = %v, want %v", tt.totalSize, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsBusyWaitError(t *testing.T) {
+	tests := []struct {
+		name       string
+		finalState qbittorrent.TorrentState
+		err        error
+		want       bool
+	}{
+		{"timeout while checking is busy", qbittorrent.TorrentStateCheckingUp, utils.ErrTimeout, true},
+		{"deadline while checking is busy", qbittorrent.TorrentStateCheckingDl, context.DeadlineExceeded, true},
+		{"timeout in error state is not busy", qbittorrent.TorrentStateMissingFiles, utils.ErrTimeout, false},
+		{
+			"error-state failure is not busy",
+			qbittorrent.TorrentStateError,
+			errors.New("torrent in error state: error"),
+			false,
+		},
+		{"timeout in stalled state is not busy", qbittorrent.TorrentStateStalledDl, utils.ErrTimeout, false},
+		{"nil error is not busy", qbittorrent.TorrentStateCheckingUp, nil, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isBusyWaitError(tt.finalState, tt.err); got != tt.want {
+				t.Errorf("isBusyWaitError(%q, %v) = %v, want %v", tt.finalState, tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestQBFinalizeConcurrencyValidation(t *testing.T) {
+	base := ServerConfig{BasePath: "/tmp/x", ListenAddr: ":1"}
+
+	cfg := base
+	cfg.QBFinalizeConcurrency = 9
+	if err := cfg.Validate(); err == nil {
+		t.Error("concurrency above the cap must fail validation")
+	}
+
+	cfg = base
+	cfg.QBFinalizeConcurrency = -1
+	if err := cfg.Validate(); err == nil {
+		t.Error("negative concurrency must fail validation")
+	}
+
+	cfg = base
+	cfg.QBFinalizeConcurrency = 0
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("zero (default) must validate: %v", err)
+	}
+	if got := cfg.GetQBFinalizeConcurrency(); got != 1 {
+		t.Errorf("zero must normalize to 1, got %d", got)
+	}
+
+	// Defensive clamp: ServerConfig.Validate is not on the startup path, so an
+	// out-of-range value must never reach the semaphore.
+	cfg = base
+	cfg.QBFinalizeConcurrency = 99
+	if got := cfg.GetQBFinalizeConcurrency(); got != maxQBFinalizeConcurrency {
+		t.Errorf("out-of-range value must clamp to %d, got %d", maxQBFinalizeConcurrency, got)
+	}
 }

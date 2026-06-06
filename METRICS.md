@@ -15,6 +15,7 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `hash` | torrent info hash | Per-torrent identifier |
 | `name` | torrent name | Per-torrent human-readable name |
 | `direction` | `up`, `down` | Connection scaling direction |
+| `stage` | `disk`, `qb` | Finalization stage (disk verify vs qB add/recheck) |
 
 ## Counters
 
@@ -70,6 +71,7 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_partial_selection_recovery_total` | `result` | Recovery attempts for stuck partial-selection torrents — `success` if priorities persisted on retry, `failure` if budget exhausted (destination) |
 | `qbsync_post_add_rechecks_total` | | Auto-triggered qB rechecks for torrents that landed in an error state right after AddTorrent — typically NFS attribute-cache staleness on destination qB's mount (destination) |
 | `qbsync_abort_file_deletions_skipped_total` | `reason` | AbortTorrent file deletions suppressed by safety guards — `in_qb` (per call: torrent already in destination qB), `pre_existing` (per file: setupFile reused operator data), `unselected` (per file: deselected file we never wrote) (destination) |
+| `qbsync_finalize_busy_total` | `reason` | BUSY (congestion) responses returned to source — `queue_timeout` (stage queue saturated) or `qb_checking` (qB still rechecking at budget expiry). BUSY torrents are waiting, NOT failed: they don't get the sync-failed tag and don't count toward the retry cap (destination) |
 
 ## Gauges
 
@@ -84,7 +86,8 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_stream_pool_scaling_paused` | | Pool scaling paused: 1=paused, 0=active |
 | `qbsync_transfer_throughput_bytes_per_second` | | Current transfer throughput |
 | `qbsync_torrents_with_dirty_state` | | Torrents with state not yet flushed to disk (destination) |
-| `qbsync_active_finalization_backoffs` | | Torrents in finalization backoff (source) |
+| `qbsync_active_finalization_backoffs` | | Torrents in finalization backoff (source). BUSY-deferred torrents may not appear here — watch `qbsync_finalize_busy_total` for congestion |
+| `qbsync_finalization_queue_depth` | `stage` | Torrents currently waiting for a finalization stage slot (destination) |
 | `qbsync_oldest_pending_sync_seconds` | `hash`, `name` | Age of each torrent waiting to sync |
 | `qbsync_torrent_pieces` | `hash`, `name` | Total pieces per tracked torrent |
 | `qbsync_torrent_pieces_streamed` | `hash`, `name` | Pieces synced to destination per tracked torrent |
@@ -108,7 +111,9 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_piece_send_duration_seconds` | `connection` | 10ms .. 10s | Time to send a piece from source |
 | `qbsync_piece_write_duration_seconds` | | 1ms .. 5s | Time to verify and write a piece on destination |
 | `qbsync_piece_rtt_seconds` | | 10ms .. 5s | Round-trip time for piece acknowledgment |
-| `qbsync_finalization_duration_seconds` | `result` | 100ms .. 120s | Time to finalize a torrent on destination |
+| `qbsync_finalization_duration_seconds` | `result` | 1s .. 12h | Total time to finalize a torrent on destination, INCLUDING stage-queue wait |
+| `qbsync_finalize_queue_wait_seconds` | `stage` | 1s .. 2h | Time a finalization waited for a stage slot (destination) |
+| `qbsync_finalize_stage_duration_seconds` | `stage`, `result` | 1s .. 6h | Per-stage finalization work time, excluding queue wait (destination) |
 | `qbsync_qb_api_call_duration_seconds` | `mode`, `operation` | 10ms .. 10s | qBittorrent API call latency (including retries) |
 | `qbsync_state_flush_duration_seconds` | | 1ms .. 2.5s | Time to flush dirty torrent state to disk (destination) |
 | `qbsync_torrent_sync_latency_seconds` | | 10s .. 7200s | End-to-end sync duration from download completion to destination finalization |
@@ -145,6 +150,7 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 
 - `rate(qbsync_finalization_errors_total[5m]) > 0` -- finalization failing
 - `qbsync_active_finalization_backoffs > 3` -- multiple torrents stuck
+- `rate(qbsync_finalize_busy_total[10m]) > 0` sustained for >30m -- destination finalization saturated (torrents waiting, NOT failed: no sync-failed tag will appear)
 - `qbsync_circuit_breaker_state == 1` -- circuit breaker open
 - `rate(qbsync_piece_hash_mismatch_total[5m]) > 0.1` -- data integrity issues
 - `qbsync_oldest_pending_sync_seconds > 3600` -- torrent stuck syncing for over an hour

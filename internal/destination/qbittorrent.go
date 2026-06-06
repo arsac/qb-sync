@@ -267,6 +267,29 @@ func computePollTimeout(totalSize int64) time.Duration {
 	return timeout
 }
 
+// qbStageTimeout bounds the qB integration stage. addAndVerifyTorrent can run
+// waitForTorrentReady twice (initial wait + post-error-state recheck wait), so
+// the budget is two poll timeouts plus a margin for AddTorrent, login retries,
+// and the partial-selection priority-verify loop.
+func (s *Server) qbStageTimeout(totalSize int64) time.Duration {
+	poll := computePollTimeout(totalSize)
+	if s.config.QB != nil && s.config.QB.PollTimeout > 0 {
+		poll = s.config.QB.PollTimeout
+	}
+	return 2*poll + defaultQBStageTimeoutMargin
+}
+
+// isBusyWaitError reports whether a qB-stage failure is congestion — qB was
+// still actively checking when the wait budget expired — rather than a real
+// failure. Error states and non-timeout failures are genuine.
+func isBusyWaitError(finalState qbittorrent.TorrentState, err error) bool {
+	if err == nil {
+		return false
+	}
+	timedOut := errors.Is(err, utils.ErrTimeout) || errors.Is(err, context.DeadlineExceeded)
+	return timedOut && isCheckingState(finalState)
+}
+
 // waitForTorrentReady polls until the torrent is verified and ready.
 // totalSize is used to size the poll timeout when QBConfig.PollTimeout is unset.
 func (s *Server) waitForTorrentReady(

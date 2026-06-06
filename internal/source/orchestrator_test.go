@@ -3424,3 +3424,73 @@ func TestExcludeSyncTagReactive(t *testing.T) {
 		}
 	})
 }
+
+// TestHandleFinalizeError_BusyDoesNotBurnRetryBudget covers the BUSY
+// (destination congested) contract: queue timeouts and qB-still-checking
+// timeouts are destination-wide congestion, not per-torrent faults, so they
+// must not count toward maxVerificationRetries — until the wall-clock guard
+// (busyGuardDuration) expires, after which a permanently wedged destination
+// must still surface as sync-failed.
+func TestHandleFinalizeError_BusyDoesNotBurnRetryBudget(t *testing.T) {
+	logger := testLogger(t)
+
+	newBusyTask := func(hash, name string) (*QBTask, *mockQBClient) {
+		mockClient := &mockQBClient{}
+		task := &QBTask{
+			cfg:       &config.SourceConfig{SyncFailedTag: "sync-failed"},
+			logger:    logger,
+			srcClient: mockClient,
+			grpcDest:  &mockDest{},
+			source:    qbclient.NewSource(nil, ""),
+			tracker: streaming.NewPieceMonitor(
+				nil, &mockPieceSource{numPieces: 1}, logger, streaming.DefaultPieceMonitorConfig(),
+			),
+			tracked:  NewTrackedSet(),
+			backoffs: NewBackoffTracker(),
+		}
+		task.tracked.Add(hash, TrackedTorrent{Name: name})
+		return task, mockClient
+	}
+
+	t.Run("BUSY within guard never counts toward the cap", func(t *testing.T) {
+		hash := "busy-hash"
+		task, mockClient := newBusyTask(hash, "busy-torrent")
+
+		busyErr := fmt.Errorf("%w: finalization queue timeout", streaming.ErrFinalizeBusy)
+
+		for range maxVerificationRetries * 5 {
+			task.handleFinalizeError(context.Background(), hash, busyErr)
+		}
+
+		if !task.tracked.Has(hash) {
+			t.Error("BUSY must not untrack the torrent")
+		}
+		if mockClient.addTagsCalled {
+			t.Error("BUSY must not trigger sync-failed tagging")
+		}
+	})
+
+	t.Run("BUSY beyond the wall-clock guard counts as failure", func(t *testing.T) {
+		hash := "wedged-hash"
+		task, mockClient := newBusyTask(hash, "wedged-torrent")
+
+		// Simulate a streak that started busyGuardDuration+1h ago.
+		now := time.Now()
+		task.backoffs.now = func() time.Time { return now }
+		task.backoffs.RecordBusy(hash) // starts streak at `now`
+		task.backoffs.now = func() time.Time { return now.Add(busyGuardDuration + time.Hour) }
+
+		busyErr := fmt.Errorf("%w: finalization queue timeout", streaming.ErrFinalizeBusy)
+
+		for range maxVerificationRetries {
+			task.handleFinalizeError(context.Background(), hash, busyErr)
+		}
+
+		if task.tracked.Has(hash) {
+			t.Errorf("torrent must be untracked after %d post-guard BUSY failures", maxVerificationRetries)
+		}
+		if mockClient.addTagsTag != "sync-failed" {
+			t.Errorf("expected sync-failed tag after guard expiry; got %q", mockClient.addTagsTag)
+		}
+	})
+}

@@ -172,6 +172,10 @@ type DestinationConfig struct {
 	// Streaming tuning
 	StreamWorkers     int // Number of concurrent piece writers (0 = use default 8)
 	MaxStreamBufferMB int // Global memory budget in MB for buffered piece data (default: 512)
+
+	// QBFinalizeConcurrency is how many torrents may concurrently occupy the
+	// destination qB add/recheck stage (0 = default 1, max 8).
+	QBFinalizeConcurrency int
 }
 
 // Validate validates the destination configuration.
@@ -193,6 +197,12 @@ func (c *DestinationConfig) Validate() error {
 	}
 	if c.MaxStreamBufferMB < 0 {
 		return errors.New("max stream buffer cannot be negative")
+	}
+	// Keep the bound in sync with maxQBFinalizeConcurrency in
+	// internal/destination (the server clamps defensively, but this is the
+	// check that produces a clear startup error for operators).
+	if c.QBFinalizeConcurrency < 0 || c.QBFinalizeConcurrency > 8 {
+		return errors.New("qb finalize concurrency must be between 0 and 8 (0 = default 1)")
 	}
 	return nil
 }
@@ -297,6 +307,13 @@ func SetupDestinationFlags(cmd *cobra.Command) {
 		defaultMaxStreamBufferMB,
 		"Global memory budget in MB for buffered piece data across all streams",
 	)
+	flags.Int(
+		"qb-finalize-concurrency",
+		0,
+		"Max torrents concurrently in the destination qB add/recheck stage (0 = default 1, max 8). "+
+			"Values >1 increase qB API and disk load; on NFS/spinning rust concurrent rechecks compete "+
+			"for I/O — raise only on SSD-backed storage",
+	)
 }
 
 // bindFlags configures viper with an env prefix and binds the given flag names.
@@ -332,6 +349,7 @@ func BindDestinationFlags(cmd *cobra.Command, v *viper.Viper) error {
 	return bindFlags(cmd, v, "QBSYNC_DESTINATION", []string{
 		"listen", flagData, "save-path", flagQBURL, flagQBUsername, flagQBPassword,
 		"poll-interval", "poll-timeout", "stream-workers", "max-stream-buffer",
+		"qb-finalize-concurrency",
 		flagHealthAddr, flagSyncedTag, flagDryRun, flagLogLevel,
 	})
 }
@@ -397,13 +415,14 @@ func LoadSource(v *viper.Viper) (*SourceConfig, error) {
 // LoadDestination loads the destination server configuration from viper.
 func LoadDestination(v *viper.Viper) (*DestinationConfig, error) {
 	cfg := &DestinationConfig{
-		BaseConfig:        loadBase(v),
-		ListenAddr:        v.GetString("listen"),
-		SavePath:          v.GetString("save-path"),
-		PollInterval:      seconds(v, "poll-interval"),
-		PollTimeout:       seconds(v, "poll-timeout"),
-		StreamWorkers:     v.GetInt("stream-workers"),
-		MaxStreamBufferMB: v.GetInt("max-stream-buffer"),
+		BaseConfig:            loadBase(v),
+		ListenAddr:            v.GetString("listen"),
+		SavePath:              v.GetString("save-path"),
+		PollInterval:          seconds(v, "poll-interval"),
+		PollTimeout:           seconds(v, "poll-timeout"),
+		StreamWorkers:         v.GetInt("stream-workers"),
+		MaxStreamBufferMB:     v.GetInt("max-stream-buffer"),
+		QBFinalizeConcurrency: v.GetInt("qb-finalize-concurrency"),
 	}
 
 	cfg.ListenAddr = applyEnvFallback(cfg.ListenAddr, defaultListenAddr, "GRPC_PORT", "PORT")

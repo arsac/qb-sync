@@ -143,6 +143,7 @@ func runDestination(cmd *cobra.Command, _ []string) error {
 		"healthAddr", cfg.HealthAddr,
 		"streamWorkers", cfg.StreamWorkers,
 		"maxStreamBufferMB", cfg.MaxStreamBufferMB,
+		"qbFinalizeConcurrency", cfg.QBFinalizeConcurrency,
 		"dryRun", cfg.DryRun,
 	)
 
@@ -150,13 +151,14 @@ func runDestination(cmd *cobra.Command, _ []string) error {
 	defer cancel()
 
 	serverCfg := destination.ServerConfig{
-		ListenAddr:           cfg.ListenAddr,
-		BasePath:             cfg.DataPath,
-		SavePath:             cfg.SavePath,
-		StreamWorkers:        cfg.StreamWorkers,
-		MaxStreamBufferBytes: int64(cfg.MaxStreamBufferMB) * grpcutil.BytesPerMB,
-		SyncedTag:            cfg.SyncedTag,
-		DryRun:               cfg.DryRun,
+		ListenAddr:            cfg.ListenAddr,
+		BasePath:              cfg.DataPath,
+		SavePath:              cfg.SavePath,
+		StreamWorkers:         cfg.StreamWorkers,
+		MaxStreamBufferBytes:  int64(cfg.MaxStreamBufferMB) * grpcutil.BytesPerMB,
+		QBFinalizeConcurrency: cfg.QBFinalizeConcurrency,
+		SyncedTag:             cfg.SyncedTag,
+		DryRun:                cfg.DryRun,
 	}
 
 	if cfg.QBURL != "" {
