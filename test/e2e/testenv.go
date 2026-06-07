@@ -409,7 +409,8 @@ func (env *TestEnv) AddTorrentToDestination(ctx context.Context, url string, opt
 	if err != nil {
 		return err
 	}
-	return env.destinationClient.AddTorrentFromMemoryCtx(ctx, body, opts)
+	_, addErr := env.destinationClient.AddTorrentFromMemoryCtx(ctx, body, opts)
+	return addErr
 }
 
 // addTorrent fetches the .torrent body once and adds it via the memory API.
@@ -434,7 +435,8 @@ func (env *TestEnv) addTorrent(
 	if err != nil {
 		return err
 	}
-	return client.AddTorrentFromMemoryCtx(ctx, body, opts)
+	_, addErr := client.AddTorrentFromMemoryCtx(ctx, body, opts)
+	return addErr
 }
 
 // torrentBytesByURL caches downloaded .torrent bodies for the lifetime of the

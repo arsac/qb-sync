@@ -270,7 +270,11 @@ func (r *ResilientClient) AddTorrentFromMemoryCtx(
 	options map[string]string,
 ) error {
 	return r.runVoid(ctx, "AddTorrentFromMemory", func(ctx context.Context) error {
-		return r.client.AddTorrentFromMemoryCtx(ctx, buf, options)
+		// v1.16.0 returns per-add counts (qB Web API 2.13); qb-sync adds one
+		// torrent at a time and confirms via waitForTorrentReady polling, so
+		// the response carries no signal we use.
+		_, addErr := r.client.AddTorrentFromMemoryCtx(ctx, buf, options)
+		return addErr
 	})
 }
 
