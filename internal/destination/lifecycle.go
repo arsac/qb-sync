@@ -8,6 +8,8 @@ import (
 	"runtime/debug"
 	"time"
 
+	"github.com/autobrr/go-qbittorrent"
+
 	"github.com/arsac/qb-sync/internal/metrics"
 )
 
@@ -240,7 +242,7 @@ func (s *Server) cleanupOrphan(ctx context.Context, hash string) {
 	// Metric is labeled by reason so operators can distinguish "qB owns it"
 	// (healthy skip) from "qB unreachable, orphans accumulating" (broken).
 	if s.qbClient != nil {
-		_, found, qbErr := s.getQBTorrent(ctx, hash)
+		torrent, found, qbErr := s.getQBTorrent(ctx, hash)
 		switch {
 		case qbErr != nil:
 			metrics.OrphanCleanupSkippedTotal.WithLabelValues(metrics.ReasonOrphanQBUnreachable).Inc()
@@ -248,10 +250,17 @@ func (s *Server) cleanupOrphan(ctx context.Context, hash string) {
 				"hash", hash, "error", qbErr,
 			)
 			return
+		case found && isReadyState(torrent.State) && torrent.Progress >= 1.0:
+			s.healOrphan(ctx, hash, torrent)
+			return
 		case found:
+			// Download-side, checking, or error states: qB owns the entry but
+			// the data is not known-good — never write the marker, never
+			// delete. The source's retry/sync-failed flow owns recovery.
 			metrics.OrphanCleanupSkippedTotal.WithLabelValues(metrics.ReasonOrphanInQB).Inc()
 			s.logger.InfoContext(ctx, "skipping orphan cleanup, torrent exists in destination qBittorrent",
 				"hash", hash,
+				"state", torrent.State,
 			)
 			return
 		}
@@ -324,4 +333,57 @@ func (s *Server) runInodeCleaner(ctx context.Context) {
 	runPeriodic(ctx, interval, s.logger, "inode-cleaner", func(ctx context.Context) {
 		s.store.Inodes().CleanupStale(ctx)
 	})
+}
+
+// healOrphan converts a stale unfinalized orphan into a finalized torrent
+// when destination qB demonstrably owns qb-sync's copy of the data: the
+// torrent is seeding-side complete (caller checked) AND its savepath is
+// exactly where qb-sync streamed the files. That combination is the crash
+// window between addAndVerifyTorrent and markFinalized — qB has verified the
+// data, so the .finalized marker is truthful. Healing converts the eternal
+// hourly skip into a one-time event and lets a later source re-discovery
+// return COMPLETE instantly. Seeding-side includes stopped/paused: qb-sync's
+// success posture leaves torrents stopped until handoff.
+//
+// The savepath comparison is the false-positive guard: an operator or
+// cross-seed tool may have added the same hash at a DIFFERENT path. Healing
+// there would delete .meta — foreclosing the only path that can ever clean
+// up qb-sync's own copy (skip keeps .meta so a later "qB entry removed" scan
+// can still reclaim the files). Mismatches keep the old skip behavior.
+func (s *Server) healOrphan(ctx context.Context, hash string, torrent *qbittorrent.Torrent) {
+	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
+
+	meta, loadErr := loadPersistedMeta(filepath.Join(metaDir, metaFileName))
+	if loadErr != nil {
+		// Can't prove the qB copy is ours — fail closed to the skip.
+		metrics.OrphanCleanupSkippedTotal.WithLabelValues(metrics.ReasonOrphanInQB).Inc()
+		s.logger.WarnContext(ctx, "skipping orphan heal, cannot load metadata to verify savepath",
+			"hash", hash, "error", loadErr,
+		)
+		return
+	}
+
+	expectedSavePath := filepath.Join(s.config.GetSavePath(), meta.GetSaveSubPath())
+	if filepath.Clean(torrent.SavePath) != filepath.Clean(expectedSavePath) {
+		metrics.OrphanCleanupSkippedTotal.WithLabelValues(metrics.ReasonOrphanInQB).Inc()
+		s.logger.InfoContext(ctx, "skipping orphan heal, qB torrent savepath is not qb-sync's copy",
+			"hash", hash,
+			"qbSavePath", torrent.SavePath,
+			"expectedSavePath", expectedSavePath,
+		)
+		return
+	}
+
+	s.markFinalized(metaDir, hash)
+	if !s.isFinalized(hash) {
+		// Marker write failed (markFinalized logs the cause). Don't count a
+		// heal that didn't happen — the next orphan scan will retry.
+		return
+	}
+
+	metrics.OrphanCleanupHealedTotal.Inc()
+	s.logger.InfoContext(ctx, "healed orphan: torrent complete in destination qBittorrent, wrote finalized marker",
+		"hash", hash,
+		"state", torrent.State,
+	)
 }

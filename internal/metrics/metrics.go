@@ -63,7 +63,7 @@ const (
 	// ReasonQBChecking marks BUSY caused by qB still checking at budget expiry.
 	ReasonQBChecking = "qb_checking"
 
-	ReasonOrphanInQB          = "in_qb"          // OrphanCleanupSkippedTotal: torrent currently registered in destination qB
+	ReasonOrphanInQB          = "in_qb"          // OrphanCleanupSkippedTotal: torrent in destination qB but not healable (non-seeding state, <100%, or savepath is not qb-sync's copy)
 	ReasonOrphanQBUnreachable = "qb_unreachable" // OrphanCleanupSkippedTotal: destination qB unreachable during safety check
 )
 
@@ -137,6 +137,19 @@ var (
 			Help:      "Orphan-cleanup attempts suppressed by safety checks (reason: in_qb / qb_unreachable)",
 		},
 		[]string{LabelReason},
+	)
+
+	// OrphanCleanupHealedTotal counts orphans self-healed to finalized: stale
+	// unfinalized metadata whose torrent destination qB reports complete on the
+	// seeding side at qb-sync's own savepath (qB verified qb-sync's data, so
+	// the marker is truthful). Typically the crash window between
+	// addAndVerifyTorrent and markFinalized.
+	OrphanCleanupHealedTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "orphan_cleanup_healed_total",
+			Help:      "Orphans self-healed to finalized because destination qB reports the torrent complete",
+		},
 	)
 
 	// PiecesSentTotal counts pieces sent from source server, per gRPC connection.
