@@ -240,7 +240,7 @@ func (s *Server) cleanupOrphan(ctx context.Context, hash string) {
 	// Metric is labeled by reason so operators can distinguish "qB owns it"
 	// (healthy skip) from "qB unreachable, orphans accumulating" (broken).
 	if s.qbClient != nil {
-		_, found, qbErr := s.getQBTorrent(ctx, hash)
+		torrent, found, qbErr := s.getQBTorrent(ctx, hash)
 		switch {
 		case qbErr != nil:
 			metrics.OrphanCleanupSkippedTotal.WithLabelValues(metrics.ReasonOrphanQBUnreachable).Inc()
@@ -248,10 +248,34 @@ func (s *Server) cleanupOrphan(ctx context.Context, hash string) {
 				"hash", hash, "error", qbErr,
 			)
 			return
+		case found && isReadyState(torrent.State) && torrent.Progress >= 1.0:
+			// Self-heal: qB reports the torrent complete on the seeding side,
+			// so qB has verified that data — the .finalized marker is truthful.
+			// Writing it converts the eternal hourly skip into a one-time heal
+			// and lets a later source re-discovery return COMPLETE instantly.
+			// Seeding-side includes stopped/paused: qb-sync's success posture
+			// leaves torrents stopped until handoff, so the crash window
+			// between addAndVerifyTorrent and markFinalized is exactly a
+			// stoppedUP torrent.
+			s.markFinalized(filepath.Join(s.config.BasePath, metaDirName, hash), hash)
+			metrics.OrphanCleanupHealedTotal.Inc()
+			s.logger.InfoContext(
+				ctx,
+				"healed orphan: torrent complete in destination qBittorrent, wrote finalized marker",
+				"hash",
+				hash,
+				"state",
+				torrent.State,
+			)
+			return
 		case found:
+			// Download-side, checking, or error states: qB owns the entry but
+			// the data is not known-good — never write the marker, never
+			// delete. The source's retry/sync-failed flow owns recovery.
 			metrics.OrphanCleanupSkippedTotal.WithLabelValues(metrics.ReasonOrphanInQB).Inc()
 			s.logger.InfoContext(ctx, "skipping orphan cleanup, torrent exists in destination qBittorrent",
 				"hash", hash,
+				"state", torrent.State,
 			)
 			return
 		}
