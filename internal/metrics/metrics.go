@@ -139,6 +139,18 @@ var (
 		[]string{LabelReason},
 	)
 
+	// OrphanCleanupHealedTotal counts orphans self-healed to finalized: stale
+	// unfinalized metadata whose torrent destination qB reports complete on the
+	// seeding side (qB verified the data, so the marker is truthful). Typically
+	// the crash window between addAndVerifyTorrent and markFinalized.
+	OrphanCleanupHealedTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "orphan_cleanup_healed_total",
+			Help:      "Orphans self-healed to finalized because destination qB reports the torrent complete",
+		},
+	)
+
 	// PiecesSentTotal counts pieces sent from source server, per gRPC connection.
 	PiecesSentTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
