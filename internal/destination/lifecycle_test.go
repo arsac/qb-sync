@@ -2,6 +2,7 @@ package destination
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -11,6 +12,8 @@ import (
 	"github.com/autobrr/go-qbittorrent"
 	"github.com/bits-and-blooms/bitset"
 	"github.com/stretchr/testify/require"
+
+	pb "github.com/arsac/qb-sync/proto"
 )
 
 // TestFlushDirtyStates_ReleasesLockDuringIO verifies that flushDirtyStates
@@ -169,81 +172,175 @@ func TestFlushDirtyStates_ConcurrentWritesDuringIO(t *testing.T) {
 }
 
 // TestCleanupOrphan_HealsQBOwnedCompleteTorrent pins the orphan self-heal:
-// when stale unfinalized metadata exists but destination qB reports the
-// torrent complete on the seeding side, the cleaner writes the .finalized
-// marker (qB has verified that data — the marker is truthful) instead of
-// skipping forever. Seeding-side INCLUDES stopped/paused: qb-sync's own
-// success posture leaves torrents stopped until handoff, so the
-// crash-window-between-add-and-marker case is exactly a stoppedUP torrent.
-// Download-side, error, or sub-100% states must keep the skip-only behavior.
+// when stale unfinalized metadata exists and destination qB reports the
+// torrent complete on the seeding side AT QB-SYNC'S OWN SAVEPATH, the cleaner
+// writes the .finalized marker (qB has verified that data — the marker is
+// truthful) instead of skipping forever. Seeding-side INCLUDES stopped/paused:
+// qb-sync's success posture leaves torrents stopped until handoff, so the
+// crash window between add and marker is exactly a stoppedUP torrent.
+//
+// Everything else must keep the skip-only behavior: download-side / error /
+// sub-100% states (data not known-good), savepath mismatches (qB's copy is
+// not ours — healing would delete .meta and foreclose the only path that can
+// ever reclaim qb-sync's files), and unreachable qB (fail closed).
 func TestCleanupOrphan_HealsQBOwnedCompleteTorrent(t *testing.T) {
 	t.Parallel()
 
-	newOrphanEnv := func(t *testing.T, mock *mockQBClient) (*Server, string, string) {
+	const hash = "orphan-heal-test"
+	const subPath = "movies"
+
+	// newOrphanEnv stages stale unfinalized metadata (.state + .meta with
+	// SaveSubPath) for hash. The qB-visible savepath for qb-sync's copy is
+	// <SavePath>/<subPath>.
+	newOrphanEnv := func(t *testing.T, mock *mockQBClient) (*Server, string) {
 		t.Helper()
 		s, tmpDir := newTestDestServer(t)
 		s.qbClient = mock
+		s.config.SavePath = "/destination-data"
 
-		hash := "orphan-heal-test"
 		metaDir := filepath.Join(tmpDir, metaDirName, hash)
 		require.NoError(t, os.MkdirAll(metaDir, 0o755))
-		// Stale state file, no .finalized marker.
 		require.NoError(t, os.WriteFile(filepath.Join(metaDir, stateFileName), []byte("x"), 0o644))
-		return s, hash, metaDir
+		require.NoError(t, savePersistedMeta(filepath.Join(metaDir, metaFileName), &pb.PersistedTorrentMeta{
+			SchemaVersion: currentSchemaVersion,
+			TorrentHash:   hash,
+			SaveSubPath:   subPath,
+		}))
+		return s, metaDir
 	}
 
-	t.Run("seeding-side complete (stopped) heals to finalized", func(t *testing.T) {
-		t.Parallel()
-		mock := &mockQBClient{torrents: []qbittorrent.Torrent{
-			{Hash: "orphan-heal-test", State: qbittorrent.TorrentStateStoppedUp, Progress: 1.0},
-		}}
-		s, hash, metaDir := newOrphanEnv(t, mock)
+	qbTorrent := func(state qbittorrent.TorrentState, progress float64, savePath string) []qbittorrent.Torrent {
+		return []qbittorrent.Torrent{{Hash: hash, State: state, Progress: progress, SavePath: savePath}}
+	}
+	ownPath := filepath.Join("/destination-data", subPath)
 
-		s.cleanupOrphan(context.Background(), hash)
-
-		require.True(t, s.isFinalized(hash),
-			"qB-owned seeding-side complete torrent must self-heal to finalized")
+	assertSkipped := func(t *testing.T, s *Server, metaDir string) {
+		t.Helper()
+		require.False(t, s.isFinalized(hash), "must not be marked finalized")
 		_, statErr := os.Stat(filepath.Join(metaDir, stateFileName))
-		require.True(t, os.IsNotExist(statErr),
-			"markFinalized must clear working files, leaving only the marker")
-	})
+		require.NoError(t, statErr, "skip must not touch working files")
+		_, statErr = os.Stat(filepath.Join(metaDir, metaFileName))
+		require.NoError(t, statErr, "skip must preserve .meta — it is the only map to the data files")
+	}
 
-	t.Run("actively seeding complete heals to finalized", func(t *testing.T) {
+	assertHealed := func(t *testing.T, s *Server, metaDir string) {
+		t.Helper()
+		require.True(t, s.isFinalized(hash), "must self-heal to finalized")
+		_, statErr := os.Stat(filepath.Join(metaDir, stateFileName))
+		require.True(t, os.IsNotExist(statErr), "markFinalized must clear working files")
+	}
+
+	t.Run("seeding-side complete (stopped) at own savepath heals", func(t *testing.T) {
 		t.Parallel()
-		mock := &mockQBClient{torrents: []qbittorrent.Torrent{
-			{Hash: "orphan-heal-test", State: qbittorrent.TorrentStateUploading, Progress: 1.0},
-		}}
-		s, hash, _ := newOrphanEnv(t, mock)
+		mock := &mockQBClient{torrents: qbTorrent(qbittorrent.TorrentStateStoppedUp, 1.0, ownPath)}
+		s, metaDir := newOrphanEnv(t, mock)
 
 		s.cleanupOrphan(context.Background(), hash)
 
-		require.True(t, s.isFinalized(hash))
+		assertHealed(t, s, metaDir)
 	})
 
-	t.Run("error state skips without healing", func(t *testing.T) {
+	t.Run("actively seeding complete at own savepath heals", func(t *testing.T) {
 		t.Parallel()
-		mock := &mockQBClient{torrents: []qbittorrent.Torrent{
-			{Hash: "orphan-heal-test", State: qbittorrent.TorrentStateMissingFiles, Progress: 1.0},
-		}}
-		s, hash, metaDir := newOrphanEnv(t, mock)
+		mock := &mockQBClient{torrents: qbTorrent(qbittorrent.TorrentStateUploading, 1.0, ownPath)}
+		s, metaDir := newOrphanEnv(t, mock)
+
+		s.cleanupOrphan(context.Background(), hash)
+
+		assertHealed(t, s, metaDir)
+	})
+
+	t.Run("savepath mismatch skips: qB copy is not ours", func(t *testing.T) {
+		t.Parallel()
+		mock := &mockQBClient{torrents: qbTorrent(qbittorrent.TorrentStateStoppedUp, 1.0, "/somewhere-else")}
+		s, metaDir := newOrphanEnv(t, mock)
+
+		s.cleanupOrphan(context.Background(), hash)
+
+		assertSkipped(t, s, metaDir)
+	})
+
+	t.Run("seeding-side below 100 percent skips", func(t *testing.T) {
+		t.Parallel()
+		mock := &mockQBClient{torrents: qbTorrent(qbittorrent.TorrentStateStoppedUp, 0.99, ownPath)}
+		s, metaDir := newOrphanEnv(t, mock)
+
+		s.cleanupOrphan(context.Background(), hash)
+
+		assertSkipped(t, s, metaDir)
+	})
+
+	t.Run("error state skips", func(t *testing.T) {
+		t.Parallel()
+		mock := &mockQBClient{torrents: qbTorrent(qbittorrent.TorrentStateMissingFiles, 1.0, ownPath)}
+		s, metaDir := newOrphanEnv(t, mock)
+
+		s.cleanupOrphan(context.Background(), hash)
+
+		assertSkipped(t, s, metaDir)
+	})
+
+	t.Run("download-side stopped below 100 percent skips", func(t *testing.T) {
+		t.Parallel()
+		mock := &mockQBClient{torrents: qbTorrent(qbittorrent.TorrentStateStoppedDl, 0.5, ownPath)}
+		s, metaDir := newOrphanEnv(t, mock)
+
+		s.cleanupOrphan(context.Background(), hash)
+
+		assertSkipped(t, s, metaDir)
+	})
+
+	t.Run("qB unreachable fails closed", func(t *testing.T) {
+		t.Parallel()
+		mock := &mockQBClient{loginErr: errors.New("connection refused")}
+		s, metaDir := newOrphanEnv(t, mock)
+
+		s.cleanupOrphan(context.Background(), hash)
+
+		assertSkipped(t, s, metaDir)
+	})
+
+	t.Run("missing .meta fails closed to skip", func(t *testing.T) {
+		t.Parallel()
+		mock := &mockQBClient{torrents: qbTorrent(qbittorrent.TorrentStateStoppedUp, 1.0, ownPath)}
+		s, metaDir := newOrphanEnv(t, mock)
+		require.NoError(t, os.Remove(filepath.Join(metaDir, metaFileName)))
+
+		s.cleanupOrphan(context.Background(), hash)
+
+		require.False(t, s.isFinalized(hash), "cannot verify savepath without .meta — must not heal")
+	})
+
+	t.Run("healed torrent is skipped by the next full scan", func(t *testing.T) {
+		t.Parallel()
+		mock := &mockQBClient{torrents: qbTorrent(qbittorrent.TorrentStateStoppedUp, 1.0, ownPath)}
+		s, metaDir := newOrphanEnv(t, mock)
+		s.config.OrphanTimeout = time.Nanosecond // everything counts as stale
+
+		// First scan heals via the full path (isOrphanedTorrent -> cleanupOrphan).
+		s.cleanupOrphanedTorrents(context.Background())
+		assertHealed(t, s, metaDir)
+
+		// Second scan: isFinalized short-circuits isOrphanedTorrent — the heal
+		// must be a one-time event, not re-attempted hourly.
+		require.False(t, s.isOrphanedTorrent(context.Background(), hash, time.Nanosecond),
+			"finalized torrent must never be an orphan candidate again")
+	})
+
+	t.Run("concurrent cleanup is single-flight via BeginCleanup", func(t *testing.T) {
+		t.Parallel()
+		mock := &mockQBClient{torrents: qbTorrent(qbittorrent.TorrentStateStoppedUp, 1.0, ownPath)}
+		s, _ := newOrphanEnv(t, mock)
+
+		// Hold the cleanup registration, as a concurrent cleanupOrphan would.
+		ch := make(chan struct{})
+		require.True(t, s.store.BeginCleanup(hash, ch))
 
 		s.cleanupOrphan(context.Background(), hash)
 
 		require.False(t, s.isFinalized(hash),
-			"error-state torrent must NOT be marked finalized")
-		_, statErr := os.Stat(filepath.Join(metaDir, stateFileName))
-		require.NoError(t, statErr, "skip must not touch metadata")
-	})
-
-	t.Run("download-side stopped below 100% skips without healing", func(t *testing.T) {
-		t.Parallel()
-		mock := &mockQBClient{torrents: []qbittorrent.Torrent{
-			{Hash: "orphan-heal-test", State: qbittorrent.TorrentStateStoppedDl, Progress: 0.5},
-		}}
-		s, hash, _ := newOrphanEnv(t, mock)
-
-		s.cleanupOrphan(context.Background(), hash)
-
-		require.False(t, s.isFinalized(hash))
+			"second cleanup must bail at BeginCleanup, not heal concurrently")
+		close(ch)
+		s.store.EndCleanup(hash)
 	})
 }
