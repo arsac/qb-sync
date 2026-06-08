@@ -250,14 +250,17 @@ func TestCleanupOrphan_HealsQBOwnedCompleteTorrent(t *testing.T) {
 		assertHealed(t, s, metaDir)
 	})
 
-	t.Run("savepath mismatch skips: qB copy is not ours", func(t *testing.T) {
+	t.Run("savepath mismatch still heals: qB-complete anywhere counts as synced", func(t *testing.T) {
 		t.Parallel()
+		// Same hash present in qB seeding-complete at a DIFFERENT path (cross-seed).
+		// The sync objective is met — heal, matching checkQBCompletion's
+		// path-independent COMPLETE. No data is deleted; our copy just lingers.
 		mock := &mockQBClient{torrents: qbTorrent(qbittorrent.TorrentStateStoppedUp, 1.0, "/somewhere-else")}
 		s, metaDir := newOrphanEnv(t, mock)
 
 		s.cleanupOrphan(context.Background(), hash)
 
-		assertSkipped(t, s, metaDir)
+		assertHealed(t, s, metaDir)
 	})
 
 	t.Run("seeding-side below 100 percent skips", func(t *testing.T) {
@@ -300,15 +303,18 @@ func TestCleanupOrphan_HealsQBOwnedCompleteTorrent(t *testing.T) {
 		assertSkipped(t, s, metaDir)
 	})
 
-	t.Run("missing .meta fails closed to skip", func(t *testing.T) {
+	t.Run("missing .meta still heals: old-format dir, qB reports complete", func(t *testing.T) {
 		t.Parallel()
+		// Legacy dir with no .meta. Heal no longer needs it (no savepath check);
+		// qB-complete is sufficient. Nothing to foreclose — deleteOrphanFiles
+		// couldn't reclaim without .meta either.
 		mock := &mockQBClient{torrents: qbTorrent(qbittorrent.TorrentStateStoppedUp, 1.0, ownPath)}
 		s, metaDir := newOrphanEnv(t, mock)
 		require.NoError(t, os.Remove(filepath.Join(metaDir, metaFileName)))
 
 		s.cleanupOrphan(context.Background(), hash)
 
-		require.False(t, s.isFinalized(hash), "cannot verify savepath without .meta — must not heal")
+		require.True(t, s.isFinalized(hash), "old-format dir with qB-complete torrent must heal")
 	})
 
 	t.Run("healed torrent is skipped by the next full scan", func(t *testing.T) {
