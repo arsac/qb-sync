@@ -38,6 +38,7 @@ const (
 	defaultHealthAddr           = ":8080"
 	defaultSyncedTag            = "synced"
 	defaultSyncFailedTag        = "sync-failed"
+	defaultSyncFailedGuard      = 4 * time.Hour
 	defaultSourceRemovedTag     = "source-removed"
 	defaultReconnectMaxDelaySec = 30
 	defaultNumSenders           = 4
@@ -97,7 +98,12 @@ type SourceConfig struct {
 	SourceRemovedTag   string        // Tag applied on destination when torrent is removed from source (empty to disable)
 	ExcludeCleanupTag  string        // Tag that prevents torrents from being cleaned up from source (empty to disable)
 	SyncFailedTag      string        // Tag applied on source when verification fails repeatedly (empty to disable; remove tag to retry)
-	ExcludeSyncTag     string        // Tag that prevents torrents from being synced (empty to disable)
+	// SyncFailedGuard is how long a torrent must fail continuously before it is
+	// quarantined. Quarantine is duration-based, not attempt-based: a brief
+	// destination outage must not permanently sideline every torrent that
+	// happened to be finalizing. See docs/adr/0001.
+	SyncFailedGuard time.Duration
+	ExcludeSyncTag  string // Tag that prevents torrents from being synced (empty to disable)
 }
 
 // Validate validates the base configuration shared by source and destination.
@@ -293,6 +299,11 @@ func SetupSourceFlags(cmd *cobra.Command) {
 		"",
 		"Tag that prevents torrents from being synced (empty to disable)",
 	)
+	flags.Int(
+		"sync-failed-guard",
+		int(defaultSyncFailedGuard.Seconds()),
+		"How long a torrent must fail continuously (seconds) before it is tagged sync-failed",
+	)
 }
 
 // SetupDestinationFlags sets up flags for the destination command.
@@ -351,6 +362,7 @@ func BindSourceFlags(cmd *cobra.Command, v *viper.Viper) error {
 		"rate-limit", "piece-timeout", "reconnect-max-delay",
 		"num-senders", "min-connections", "max-connections",
 		"source-removed-tag", "exclude-cleanup-tag", "sync-failed-tag", "exclude-sync-tag",
+		"sync-failed-guard",
 		flagHealthAddr, flagSyncedTag,
 		flagDryRun, flagLogLevel, "drain-annotation", "drain-timeout",
 	})
@@ -413,6 +425,7 @@ func LoadSource(v *viper.Viper) (*SourceConfig, error) {
 		SourceRemovedTag:   v.GetString("source-removed-tag"),
 		ExcludeCleanupTag:  v.GetString("exclude-cleanup-tag"),
 		SyncFailedTag:      v.GetString("sync-failed-tag"),
+		SyncFailedGuard:    seconds(v, "sync-failed-guard"),
 		ExcludeSyncTag:     v.GetString("exclude-sync-tag"),
 	}
 

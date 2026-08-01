@@ -6,9 +6,13 @@ import (
 	"time"
 )
 
+func testStoreLogger() *slog.Logger {
+	return slog.New(slog.DiscardHandler)
+}
+
 func newTestStore(t *testing.T) *torrentStore {
 	t.Helper()
-	return newTorrentStore("", slog.New(slog.DiscardHandler))
+	return newTorrentStore("", testStoreLogger())
 }
 
 // --- Finalization retry accounting ------------------------------------------
@@ -41,7 +45,7 @@ func TestRecordBusyDoesNotAffectFailureCapOrBackoff(t *testing.T) {
 	if !s.ShouldAttempt("h1") {
 		t.Fatal("busy streak must not delay finalize attempts")
 	}
-	if got := s.RecordFailure("h1"); got != 1 {
+	if got, _ := s.RecordFailure("h1"); got != 1 {
 		t.Fatalf("first real failure after busy must be 1, got %d", got)
 	}
 }
@@ -221,5 +225,151 @@ func TestStoreUntrackAndGetOnUntrackedTorrent(t *testing.T) {
 	}
 	if !s.IsComplete("h1") {
 		t.Error("UntrackAndGet must not clear completion")
+	}
+}
+
+// --- Quarantine clocks --------------------------------------------------------
+
+// TestRecordFailureNeedsBothAttemptsAndTime is the core of ADR-0001. Quarantine
+// used to be reachable on attempt count alone, and because the backoff was
+// shorter than the orchestrator cycle those attempts spanned about ninety
+// seconds, so any two-minute fault sidelined every finalizing torrent.
+func TestRecordFailureNeedsBothAttemptsAndTime(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	s.guard = time.Hour
+	now := time.Now()
+	s.now = func() time.Time { return now }
+
+	for range 50 {
+		now = now.Add(time.Second)
+		if _, quarantine := s.RecordFailure("h1"); quarantine {
+			t.Fatal("50 failures inside one minute must not quarantine")
+		}
+	}
+
+	now = now.Add(time.Hour)
+	if _, quarantine := s.RecordFailure("h1"); !quarantine {
+		t.Fatal("a streak past the guard must quarantine")
+	}
+}
+
+func TestRecordFailureNeedsEnoughAttempts(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	s.guard = time.Hour
+	now := time.Now()
+	s.now = func() time.Time { return now }
+
+	// One failure, then a long silence. Time alone is not enough: a single
+	// failure long ago says nothing about whether the torrent is still broken.
+	s.RecordFailure("h1")
+	now = now.Add(10 * time.Hour)
+
+	if _, quarantine := s.RecordFailure("h1"); quarantine {
+		t.Fatal("two failures must not quarantine even long past the guard")
+	}
+	if _, quarantine := s.RecordFailure("h1"); !quarantine {
+		t.Fatal("the attempt threshold plus elapsed guard should quarantine")
+	}
+}
+
+func TestObserveStallQuarantinesOnDuration(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	s.guard = time.Hour
+	now := time.Now()
+	s.now = func() time.Time { return now }
+
+	// First observation only establishes the baseline count.
+	s.ObserveStall("h1", 5, true)
+
+	if _, q := s.ObserveStall("h1", 5, true); q {
+		t.Fatal("a stall that just started must not quarantine")
+	}
+	now = now.Add(30 * time.Minute)
+	if _, q := s.ObserveStall("h1", 5, true); q {
+		t.Fatal("a stall inside the guard must not quarantine")
+	}
+	now = now.Add(31 * time.Minute)
+	stalledFor, q := s.ObserveStall("h1", 5, true)
+	if !q {
+		t.Fatal("a stall past the guard must quarantine")
+	}
+	if stalledFor < time.Hour {
+		t.Errorf("stalledFor = %v, want at least the guard", stalledFor)
+	}
+}
+
+// TestObserveStallForgivesProgress covers the difference between a wedged
+// torrent and a slow one: any genuine advance resets the clock entirely.
+func TestObserveStallForgivesProgress(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	s.guard = time.Hour
+	now := time.Now()
+	s.now = func() time.Time { return now }
+
+	s.ObserveStall("h1", 5, true) // baseline
+	s.ObserveStall("h1", 5, true) // clock starts
+	now = now.Add(59 * time.Minute)
+
+	// One piece moved.
+	if _, q := s.ObserveStall("h1", 6, true); q {
+		t.Fatal("an advance must not quarantine")
+	}
+
+	// The clock restarted, so the old 59 minutes no longer count.
+	now = now.Add(30 * time.Minute)
+	if _, q := s.ObserveStall("h1", 6, true); q {
+		t.Fatal("progress must reset the stall clock, not merely pause it")
+	}
+}
+
+// TestObserveStallSurvivesRestart is why progress is judged by piece count
+// rather than a timestamp. On restart a torrent resumes from the destination's
+// bitmap, which against a timestamp would look like it had just advanced and
+// would clear a streak that should have persisted.
+func TestObserveStallSurvivesRestart(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	logger := testStoreLogger()
+	path := dir + "/completed_on_dest.json"
+
+	s := newTorrentStore(path, logger)
+	s.guard = time.Hour
+	now := time.Now()
+	s.now = func() time.Time { return now }
+
+	s.ObserveStall("h1", 40, true) // baseline at 40 of N pieces
+	s.ObserveStall("h1", 40, true) // clock starts
+	s.SaveStreaks()
+
+	// New process: clocks reloaded, the torrent resumes at the same 40 pieces.
+	s2 := newTorrentStore(path, logger)
+	s2.guard = time.Hour
+	s2.now = func() time.Time { return now.Add(2 * time.Hour) }
+	s2.LoadStreaks()
+
+	_, q := s2.ObserveStall("h1", 40, true)
+	if !q {
+		t.Fatal("a stall streak must survive a restart: resuming is not progress")
+	}
+}
+
+func TestPruneStreaksDropsDepartedTorrents(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	s.RecordFailure("gone")
+	s.ObserveStall("stays", 1, true) // baseline
+	s.ObserveStall("stays", 1, true) // clock starts
+
+	s.PruneStreaks(map[string]struct{}{"stays": {}})
+
+	if s.count(func(r *torrentRecord) bool { return !r.firstFailure.IsZero() }) != 0 {
+		t.Error("streaks for departed torrents should be dropped")
+	}
+	if s.StalledCount() != 1 {
+		t.Error("streaks for present torrents must survive pruning")
 	}
 }

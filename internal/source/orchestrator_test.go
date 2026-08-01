@@ -232,7 +232,7 @@ func TestFinalizeBackoff(t *testing.T) {
 		// Record multiple failures — RecordFailure returns the count
 		var failures int
 		for range 5 {
-			failures = task.store.RecordFailure(hash)
+			failures, _ = task.store.RecordFailure(hash)
 		}
 
 		if failures != 5 {
@@ -251,9 +251,9 @@ func TestFinalizeBackoff(t *testing.T) {
 		tracker.record(hash).lastAttempt = time.Now()
 		tracker.mu.Unlock()
 
-		// The computed backoff should be capped, so waiting maxFinalizeBackoff should allow retry
+		// The computed backoff should be capped, so waiting the cap should allow retry
 		tracker.mu.Lock()
-		tracker.record(hash).lastAttempt = time.Now().Add(-maxFinalizeBackoff - time.Second)
+		tracker.record(hash).lastAttempt = time.Now().Add(-tracker.backoffCap() - time.Second)
 		tracker.mu.Unlock()
 
 		if !tracker.ShouldAttempt(hash) {
@@ -342,12 +342,24 @@ func TestConstants(t *testing.T) {
 		}
 	})
 
-	t.Run("backoff constants are valid", func(t *testing.T) {
+	t.Run("backoff cap is derived from the guard", func(t *testing.T) {
 		if minFinalizeBackoff <= 0 {
 			t.Error("minFinalizeBackoff should be positive")
 		}
-		if maxFinalizeBackoff <= minFinalizeBackoff {
-			t.Error("maxFinalizeBackoff should be greater than minFinalizeBackoff")
+		// The cap scales with the guard so a shrunken guard shrinks the whole
+		// mechanism, which is what lets end-to-end tests exercise the failure
+		// path without a second knob.
+		s := newTorrentStore("", testLogger(t))
+		s.guard = 4 * time.Hour
+		if got, want := s.backoffCap(), 30*time.Minute; got != want {
+			t.Errorf("backoffCap at the 4h default = %v, want %v", got, want)
+		}
+		s.guard = 8 * time.Second
+		if got, want := s.backoffCap(), time.Second; got != want {
+			t.Errorf("backoffCap at an 8s guard = %v, want %v", got, want)
+		}
+		if s.backoffCap() <= minFinalizeBackoff {
+			t.Log("cap below the minimum is fine: min wins on the first attempt")
 		}
 	})
 }
@@ -2853,7 +2865,7 @@ func TestSyncFailedTag(t *testing.T) {
 
 		hash := "count-hash"
 		for i := 1; i <= 5; i++ {
-			count := task.store.RecordFailure(hash)
+			count, _ := task.store.RecordFailure(hash)
 			if count != i {
 				t.Errorf("attempt %d: expected count %d, got %d", i, i, count)
 			}
@@ -2891,9 +2903,12 @@ func TestHandleFinalizeError_DefaultBranchCapsAtMaxRetries(t *testing.T) {
 		return task, mockClient
 	}
 
-	t.Run("persistent qB-integration error marks sync-failed at the cap", func(t *testing.T) {
+	t.Run("persistent qB-integration error marks sync-failed once past the guard", func(t *testing.T) {
 		hash := "stuck-hash"
 		task, mockClient := newCapTask(hash, "stuck-torrent")
+
+		now := time.Now()
+		task.store.now = func() time.Time { return now }
 
 		// Mirror the exact wrapped error runBackgroundFinalization stores when
 		// addAndVerifyTorrent fails (e.g. existing torrent in missingFiles).
@@ -2903,12 +2918,44 @@ func TestHandleFinalizeError_DefaultBranchCapsAtMaxRetries(t *testing.T) {
 			task.handleFinalizeError(context.Background(), hash, qbErr)
 		}
 
+		if !task.store.IsTracked(hash) {
+			t.Error("attempts alone must not quarantine: the fault has lasted no time at all")
+		}
+
+		// Same fault, still failing, now past the guard.
+		now = now.Add(task.store.guard + time.Minute)
+		task.handleFinalizeError(context.Background(), hash, qbErr)
+
 		if task.store.IsTracked(hash) {
-			t.Errorf("torrent must be untracked after %d generic-error retries — "+
-				"otherwise ActiveTorrents stays elevated forever", maxVerificationRetries)
+			t.Error("torrent must be untracked once the streak outlasts the guard - " +
+				"otherwise ActiveTorrents stays elevated forever")
 		}
 		if mockClient.addTagsTag != "sync-failed" {
-			t.Errorf("expected sync-failed tag to be applied at cap; got %q", mockClient.addTagsTag)
+			t.Errorf("expected sync-failed tag past the guard; got %q", mockClient.addTagsTag)
+		}
+	})
+
+	t.Run("a brief outage never quarantines however many attempts it burns", func(t *testing.T) {
+		// The reason quarantine became duration-based. A destination restart or
+		// a storage blip used to sideline every torrent that happened to be
+		// finalizing, recoverable only by hand.
+		hash := "blip-hash"
+		task, mockClient := newCapTask(hash, "blip-torrent")
+
+		now := time.Now()
+		task.store.now = func() time.Time { return now }
+		qbErr := errors.New("qBittorrent: torrent in error state: missingFiles")
+
+		for range maxVerificationRetries * 20 {
+			now = now.Add(5 * time.Second) // two minutes of failures, densely packed
+			task.handleFinalizeError(context.Background(), hash, qbErr)
+		}
+
+		if !task.store.IsTracked(hash) {
+			t.Error("a two-minute fault must not quarantine, no matter how many attempts fit in it")
+		}
+		if mockClient.addTagsCalled {
+			t.Error("a two-minute fault must not apply the sync-failed tag")
 		}
 	})
 
@@ -2941,12 +2988,21 @@ func TestHandleFinalizeError_DefaultBranchCapsAtMaxRetries(t *testing.T) {
 
 		incompleteErr := fmt.Errorf("%w: incomplete: 50/100 pieces", streaming.ErrFinalizeIncomplete)
 
+		now := time.Now()
+		task.store.now = func() time.Time { return now }
+
 		for range maxVerificationRetries {
 			task.handleFinalizeError(context.Background(), hash, incompleteErr)
 		}
 
+		// The INCOMPLETE path re-streams between attempts, so its streak clock
+		// is deliberately NOT cleared by that progress - otherwise repeated
+		// verification failures could never quarantine.
+		now = now.Add(task.store.guard + time.Minute)
+		task.handleFinalizeError(context.Background(), hash, incompleteErr)
+
 		if task.store.IsTracked(hash) {
-			t.Errorf("torrent must be untracked after %d INCOMPLETE retries", maxVerificationRetries)
+			t.Error("torrent must be untracked once INCOMPLETE failures outlast the guard")
 		}
 		if mockClient.addTagsTag != "sync-failed" {
 			t.Errorf("expected sync-failed tag at INCOMPLETE cap; got %q", mockClient.addTagsTag)
@@ -3432,8 +3488,16 @@ func TestHandleFinalizeError_BusyDoesNotBurnRetryBudget(t *testing.T) {
 			task.handleFinalizeError(context.Background(), hash, busyErr)
 		}
 
+		// Past the busy guard these fall through to the failure path, which has
+		// its own guard: congestion that outlasts one still has to outlast the
+		// other before the torrent is quarantined.
+		task.store.now = func() time.Time {
+			return now.Add(busyGuardDuration + time.Hour + task.store.guard + time.Minute)
+		}
+		task.handleFinalizeError(context.Background(), hash, busyErr)
+
 		if task.store.IsTracked(hash) {
-			t.Errorf("torrent must be untracked after %d post-guard BUSY failures", maxVerificationRetries)
+			t.Error("torrent must be untracked once post-guard BUSY failures outlast the failure guard")
 		}
 		if mockClient.addTagsTag != "sync-failed" {
 			t.Errorf("expected sync-failed tag after guard expiry; got %q", mockClient.addTagsTag)

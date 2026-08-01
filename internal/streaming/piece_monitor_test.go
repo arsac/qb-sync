@@ -835,3 +835,71 @@ func TestPieceMonitor_RemovalNotification_Integration(t *testing.T) {
 		}
 	})
 }
+
+// stallProbeSource is a minimal PieceSource whose pieces are all downloaded on
+// the source but which never yields any data - the wedged shape.
+type stallProbeSource struct{ numPieces int }
+
+func (s *stallProbeSource) GetPieceStates(context.Context, string) ([]PieceState, error) {
+	states := make([]PieceState, s.numPieces)
+	for i := range states {
+		states[i] = PieceStateDownloaded
+	}
+	return states, nil
+}
+
+func (s *stallProbeSource) GetPieceHashes(context.Context, string) ([]string, error) {
+	return make([]string, s.numPieces), nil
+}
+
+func (s *stallProbeSource) GetTorrentMetadata(context.Context, string) (*TorrentMetadata, error) {
+	return &TorrentMetadata{InitTorrentRequest: &pb.InitTorrentRequest{
+		TorrentHash: "h1",
+		NumPieces:   int32(s.numPieces),
+		PieceSize:   1,
+		TotalSize:   int64(s.numPieces),
+	}}, nil
+}
+
+func (s *stallProbeSource) ReadPiece(context.Context, *pb.Piece) ([]byte, error) {
+	return nil, errors.New("unreadable")
+}
+
+// TestGetProgress_ReportsTheStallSignal guards the wedged case.
+//
+// lastAdvance only moves when a piece transitions to streamed, so a torrent
+// whose source data cannot be read never sets it. Left at the zero time, the
+// orchestrator could not distinguish "never advanced" from "no information" -
+// and torrents that never advance at all are exactly what stall detection
+// exists to quarantine. An earlier version of this feature excluded them.
+func TestGetProgress_ReportsTheStallSignal(t *testing.T) {
+	t.Parallel()
+
+	const numPieces = 4
+	monitor := newTestMonitor(0)
+	monitor.source = &stallProbeSource{numPieces: numPieces}
+
+	before := time.Now()
+	if err := monitor.startTracking(context.Background(), "h1", nil); err != nil {
+		t.Fatalf("startTracking: %v", err)
+	}
+
+	progress, err := monitor.GetProgress("h1")
+	if err != nil {
+		t.Fatalf("GetProgress: %v", err)
+	}
+
+	if progress.LastAdvance.IsZero() {
+		t.Error("a torrent that has never streamed a piece must still carry a start time")
+	}
+	if progress.LastAdvance.Before(before) {
+		t.Error("lastAdvance should be stamped when tracking begins")
+	}
+	if progress.Streamed != 0 {
+		t.Errorf("Streamed = %d, want 0", progress.Streamed)
+	}
+	if progress.Available != numPieces {
+		t.Errorf("Available = %d, want %d: every piece is downloaded on the source and unstreamed",
+			progress.Available, numPieces)
+	}
+}

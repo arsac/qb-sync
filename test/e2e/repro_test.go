@@ -24,10 +24,14 @@ import (
 // motivate.
 
 const (
-	// reproObservationWindow is how long we watch a torrent that should be
-	// making progress but is not. Long enough that a merely slow transfer
-	// would have advanced, short enough to keep the suite usable.
-	reproObservationWindow = 45 * time.Second
+	// reproObservationWindow bounds how long we wait for the stall to be
+	// noticed and quarantined. It must comfortably exceed reproGuard plus the
+	// stall grace period, which is two orchestrator cycles.
+	reproObservationWindow = 3 * time.Minute
+
+	// reproGuard shrinks the quarantine guard from its 4h default. The retry
+	// backoff is derived from it, so this one knob shrinks the whole mechanism.
+	reproGuard = 10 * time.Second
 
 	// reproRateLimit throttles streaming so a 53 MB torrent cannot complete
 	// before the test has a chance to observe or intervene mid-transfer.
@@ -109,17 +113,19 @@ func countPartialFiles(t *testing.T, env *TestEnv) int {
 	return n
 }
 
-// TestE2E_Repro_UnreadableSourcePieceWedgesTorrent characterises the wedge.
+// TestE2E_Repro_UnreadableSourcePieceWedgesTorrent verifies that a torrent
+// whose source data cannot be read is quarantined rather than retried forever.
 //
-// When source data cannot be read, every send fails and the piece is simply
-// re-queued by the next poll. Nothing counts those failures: the failed bitmap
-// is never read and RetryFailed is never called. The torrent therefore never
-// reaches full streaming, never reaches finalization, and so never reaches the
-// retry cap that would quarantine it. It stays tracked indefinitely.
+// Before the stall clock existed, every send failed and the next poll simply
+// re-queued the piece. Nothing counted those failures - the failed bitmap is
+// never read and RetryFailed is never called - so the torrent never completed
+// streaming, never reached finalization, and therefore never reached the
+// failure streak that would quarantine it. It stayed tracked indefinitely,
+// which the first version of this test pinned.
 //
-// This test pins that behaviour so the fix has something to invert. It is
-// expected to PASS against the current code, demonstrating the bug, and should
-// be rewritten to assert quarantine once the guard exists.
+// The guard is shrunk to seconds here. That works through the single
+// --sync-failed-guard knob because the retry backoff is derived from it rather
+// than being an independent constant.
 func TestE2E_Repro_UnreadableSourcePieceWedgesTorrent(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")
@@ -142,11 +148,17 @@ func TestE2E_Repro_UnreadableSourcePieceWedgesTorrent(t *testing.T) {
 
 	cfg := env.CreateSourceConfig()
 	cfg.MaxBytesPerSec = reproRateLimit
+	cfg.SyncFailedGuard = reproGuard
+	// CreateSourceConfig leaves SyncFailedTag empty, while production defaults
+	// it to "sync-failed". Without it markSyncFailed untracks the torrent but
+	// applies no tag, so nothing excludes it and the next cycle re-tracks it.
+	cfg.SyncFailedTag = "sync-failed"
+
 	task, dest, err := env.CreateSourceTask(cfg)
 	require.NoError(t, err)
 	defer dest.Close()
 
-	orchestratorCtx, cancel := context.WithTimeout(ctx, reproObservationWindow+30*time.Second)
+	orchestratorCtx, cancel := context.WithTimeout(ctx, reproObservationWindow+time.Minute)
 	defer cancel()
 
 	go func() { _ = task.Run(orchestratorCtx) }()
@@ -157,30 +169,24 @@ func TestE2E_Repro_UnreadableSourcePieceWedgesTorrent(t *testing.T) {
 		return progressErr == nil
 	}, time.Minute, 250*time.Millisecond, "torrent should be tracked despite unreadable data")
 
-	t.Logf("Observing for %s...", reproObservationWindow)
-	time.Sleep(reproObservationWindow)
+	t.Logf("Waiting up to %s for the stall to outlast the %s guard...",
+		reproObservationWindow, reproGuard)
 
-	progress, err := task.Progress(ctx, wiredCDHash)
-	require.NoError(t, err, "torrent should STILL be tracked: this is the wedge")
-	t.Logf("After %s: streamed=%d/%d complete=%v failed=%d",
-		reproObservationWindow, progress.Streamed, progress.TotalPieces, progress.Complete, progress.Failed)
+	require.Eventually(t, func() bool {
+		torrents, listErr := env.SourceClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+			Hashes: []string{wiredCDHash},
+		})
+		if listErr != nil || len(torrents) != 1 {
+			return false
+		}
+		return strings.Contains(torrents[0].Tags, "sync-failed")
+	}, reproObservationWindow, 2*time.Second,
+		"an unreadable torrent must be quarantined once the stall outlasts the guard, not wedge forever")
 
-	assert.False(t, progress.Complete,
-		"torrent cannot complete: its source data is unreadable")
-	assert.Less(t, progress.Streamed, progress.TotalPieces,
-		"streaming must be stuck short of the total")
-
-	// The heart of the bug: no terminal state is ever reached. The torrent is
-	// still tracked, and the source torrent carries no sync-failed tag, so it
-	// will be retried forever with no operator signal.
-	torrents, err := env.SourceClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
-		Hashes: []string{wiredCDHash},
-	})
-	require.NoError(t, err)
-	require.Len(t, torrents, 1)
-
-	assert.NotContains(t, torrents[0].Tags, "sync-failed",
-		"BUG: an unreadable torrent is never quarantined, it wedges in tracked forever")
+	// Quarantine must also release it: a torrent left in tracked keeps the
+	// active-torrents gauge elevated and keeps consuming sync capacity.
+	_, progressErr := task.Progress(ctx, wiredCDHash)
+	assert.Error(t, progressErr, "a quarantined torrent must be untracked")
 }
 
 // TestE2E_Repro_AbandonedTransferIsNotReclaimed demonstrates that the

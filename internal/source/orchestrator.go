@@ -157,7 +157,12 @@ func NewQBTask(
 		store:     newTorrentStore(cachePath, logger),
 	}
 
+	if cfg.SyncFailedGuard > 0 {
+		t.store.guard = cfg.SyncFailedGuard
+	}
+
 	t.store.Load()
+	t.store.LoadStreaks()
 
 	return t, nil
 }
@@ -239,15 +244,19 @@ func (t *QBTask) runOnce(ctx context.Context) {
 	if err := t.finalizeCompletedStreams(ctx); err != nil {
 		t.logger.ErrorContext(ctx, "failed to finalize streams", "error", err)
 	}
+	t.checkStalledStreams(ctx)
 	if !t.Draining() {
 		if err := t.maybeMoveToDest(ctx); err != nil {
 			t.logger.ErrorContext(ctx, "failed to move torrents", "error", err)
 		}
 	}
 
+	t.store.SaveStreaks()
+
 	t.pruneCycleCount++
 	if t.pruneCycleCount >= pruneCycleInterval {
 		t.pruneCycleCount = 0
+		t.pruneStreaks()
 		t.pruneCompletedOnDest(ctx)
 		t.recheckFileSelections(ctx)
 		t.pruneStaleMonitorEntries(ctx)
@@ -358,6 +367,19 @@ func (t *QBTask) handoffRemovedCompleted(ctx context.Context, hash string) bool 
 		"hash", hash, "tag", t.cfg.SourceRemovedTag,
 	)
 	return true
+}
+
+// pruneStreaks drops quarantine clocks for torrents that have left the source,
+// so the sidecar cannot grow without bound.
+func (t *QBTask) pruneStreaks() {
+	if t.cycleTorrents == nil {
+		return
+	}
+	present := make(map[string]struct{}, len(t.cycleTorrents))
+	for i := range t.cycleTorrents {
+		present[t.cycleTorrents[i].Hash] = struct{}{}
+	}
+	t.store.PruneStreaks(present)
 }
 
 // pruneStaleMonitorEntries removes PieceMonitor entries for torrents that the

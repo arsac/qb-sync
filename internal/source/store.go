@@ -16,7 +16,30 @@ import (
 // Finalization retry settings - exponential backoff.
 const (
 	minFinalizeBackoff = 2 * time.Second
-	maxFinalizeBackoff = 30 * time.Second
+
+	// maxFinalizeBackoffCeiling caps the derived backoff. The cap is computed
+	// from the guard rather than fixed (see backoffCap): the backoff exists
+	// only to bound how many attempts fit inside the guard window, so the two
+	// must move together. A fixed 30s cap was shorter than the orchestrator
+	// cycle interval, which made the backoff vestigial.
+	maxFinalizeBackoffCeiling = 30 * time.Minute
+
+	// backoffGuardDivisor sets how many backoff periods fit in a guard window,
+	// and therefore roughly how many attempts a torrent gets before it is
+	// quarantined.
+	backoffGuardDivisor = 8
+
+	// maxBackoffShift bounds the exponential so a long streak cannot overflow
+	// the duration.
+	maxBackoffShift = 32
+
+	// defaultSyncFailedGuard is used when no guard is configured, so a store
+	// built outside the orchestrator still behaves sanely.
+	defaultSyncFailedGuard = 4 * time.Hour
+
+	// streakFileName holds the persisted failure and stall clocks, alongside
+	// the completion cache.
+	streakFileName = "failure_streaks.json"
 )
 
 // torrentRecord is everything the source knows about one torrent. A torrent
@@ -45,19 +68,54 @@ type torrentRecord struct {
 	failures    int
 	lastAttempt time.Time
 	firstBusy   time.Time
+
+	// firstFailure starts the clock on a finalization failure streak, and
+	// firstStalled on a stall. Quarantine is duration-based, so these are what
+	// actually decide it; failures only gates how many attempts were made.
+	//
+	// They are modelled separately because they are different conditions. A
+	// stall is one continuous state with no attempts to count, so "three
+	// failures" is meaningless for it. Both are persisted: with in-memory
+	// clocks, a source restarting more often than the guard could never
+	// quarantine anything.
+	//
+	// firstStalled is cleared by any streaming advance. firstFailure is not,
+	// because the INCOMPLETE path re-streams pieces between attempts and
+	// clearing on advance would mean repeated verification failures never
+	// quarantine at all.
+	firstFailure time.Time
+	firstStalled time.Time
+
+	// lastStreamed is the highest streamed piece count seen for this torrent.
+	// Persisted alongside firstStalled so a source restart cannot mistake a
+	// resumed torrent for one that just made progress.
+	lastStreamed int
 }
 
-// hasBackoff reports whether any finalization retry state is recorded. This is
+// hasBackoff reports whether finalization retry state is recorded. This is
 // what the old BackoffTracker expressed by the presence or absence of a map
-// entry.
+// entry, and it is what the active-backoffs gauge counts. A stall is
+// deliberately excluded: a stalled torrent is not retrying a finalization.
 func (r *torrentRecord) hasBackoff() bool {
-	return r.failures > 0 || !r.firstBusy.IsZero()
+	return r.failures > 0 || !r.firstBusy.IsZero() || !r.firstFailure.IsZero()
+}
+
+// isStalled reports whether a stall clock is running.
+func (r *torrentRecord) isStalled() bool {
+	return !r.firstStalled.IsZero()
+}
+
+// hasStallState reports whether any stall bookkeeping is present. lastStreamed
+// must keep a record alive on its own: dropping it would let a resumed torrent
+// look like it had just advanced.
+func (r *torrentRecord) hasStallState() bool {
+	return r.isStalled() || r.lastStreamed > 0
 }
 
 // isEmpty reports whether the record carries no remaining state and can be
 // dropped.
 func (r *torrentRecord) isEmpty() bool {
-	return !r.tracked && !r.complete && !r.hasBackoff()
+	return !r.tracked && !r.complete && !r.hasBackoff() && !r.hasStallState()
 }
 
 // torrentStore holds per-torrent source state behind a single lock, and
@@ -69,20 +127,45 @@ type torrentStore struct {
 	mu      sync.RWMutex
 	records map[string]*torrentRecord
 
-	path   string // completion cache path; empty disables persistence
-	logger *slog.Logger
+	path       string // completion cache path; empty disables persistence
+	streakPath string // streak sidecar path; empty disables persistence
+	logger     *slog.Logger
+
+	// guard is how long a fault must persist continuously before it
+	// quarantines the torrent. It also derives the finalization backoff cap.
+	guard time.Duration
+
+	// streaksDirty records that a streak clock changed since the last save, so
+	// the sidecar is written on transitions rather than every cycle. Stalls are
+	// set and cleared constantly under normal congestion.
+	streaksDirty bool
 
 	now func() time.Time // injectable for tests
 }
 
 // newTorrentStore creates a store. Pass an empty path to disable persistence.
 func newTorrentStore(path string, logger *slog.Logger) *torrentStore {
-	return &torrentStore{
-		records: make(map[string]*torrentRecord),
-		path:    path,
-		logger:  logger,
-		now:     time.Now,
+	streakPath := ""
+	if path != "" {
+		streakPath = filepath.Join(filepath.Dir(path), streakFileName)
 	}
+	return &torrentStore{
+		records:    make(map[string]*torrentRecord),
+		path:       path,
+		streakPath: streakPath,
+		logger:     logger,
+		guard:      defaultSyncFailedGuard,
+		now:        time.Now,
+	}
+}
+
+// backoffCap derives the finalization backoff ceiling from the guard so that
+// roughly backoffGuardDivisor attempts fit inside a guard window at any guard
+// value. Without this the guard window would permit hundreds of attempts, and
+// the disk-stage-error path re-verifies every piece while holding the
+// destination's disk-stage semaphore.
+func (s *torrentStore) backoffCap() time.Duration {
+	return min(maxFinalizeBackoffCeiling, s.guard/backoffGuardDivisor)
 }
 
 // record returns the existing record for hash, creating it if absent.
@@ -313,23 +396,107 @@ func (s *torrentStore) ShouldAttempt(hash string) bool {
 		return true
 	}
 
+	// Shift is bounded so a long streak cannot overflow the duration.
+	shift := min(r.failures-1, maxBackoffShift)
 	backoff := min(
-		minFinalizeBackoff*time.Duration(1<<uint(r.failures-1)),
-		maxFinalizeBackoff,
+		minFinalizeBackoff*time.Duration(1<<uint(shift)),
+		s.backoffCap(),
 	)
 	return s.now().Sub(r.lastAttempt) >= backoff
 }
 
-// RecordFailure records a finalization failure and returns the number of
-// consecutive failures for this torrent.
-func (s *torrentStore) RecordFailure(hash string) int {
+// RecordFailure records a finalization failure. It returns the number of
+// consecutive failures and whether the torrent should now be quarantined.
+//
+// Quarantine needs both: enough attempts to show the failure is not a one-off,
+// and enough elapsed time to show it is not a passing outage. The attempt count
+// alone used to decide this, and because the backoff was shorter than the
+// orchestrator cycle, three attempts spanned about ninety seconds.
+func (s *torrentStore) RecordFailure(hash string) (int, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	r := s.record(hash)
 	r.failures++
 	r.lastAttempt = s.now()
-	return r.failures
+	if r.firstFailure.IsZero() {
+		r.firstFailure = s.now()
+		s.streaksDirty = true
+	}
+
+	quarantine := r.failures >= maxVerificationRetries &&
+		s.now().Sub(r.firstFailure) >= s.guard
+	return r.failures, quarantine
 }
+
+// ObserveStall reports a torrent's streaming position and whether it currently
+// meets the stall condition, and returns how long it has been stalled and
+// whether it should now be quarantined.
+//
+// There is no attempt count here: a stall is one continuous condition, not a
+// series of failed attempts, so only its duration is meaningful.
+//
+// Progress is judged by the streamed piece count rather than a timestamp.
+// A timestamp would break across a source restart, where a torrent resumes
+// from the destination's bitmap and so appears to have just advanced; the
+// count is persisted, so a resumed torrent has to exceed what it had reached
+// before to count as advancing.
+//
+// The first observation of a torrent with pieces already streamed reads as an
+// advance, because there is no earlier count to compare against. It only
+// establishes the baseline, costing one cycle before the clock can start -
+// immaterial against a guard measured in hours.
+func (s *torrentStore) ObserveStall(
+	hash string,
+	streamed int,
+	stalling bool,
+) (time.Duration, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	r := s.record(hash)
+
+	if streamed > r.lastStreamed {
+		r.lastStreamed = streamed
+		s.streaksDirty = true
+		if !r.firstStalled.IsZero() {
+			r.firstStalled = time.Time{}
+		}
+		s.gc(hash, r)
+		return 0, false
+	}
+
+	if !stalling {
+		s.gc(hash, r)
+		return 0, false
+	}
+
+	if r.firstStalled.IsZero() {
+		r.firstStalled = s.now()
+		s.streaksDirty = true
+	}
+
+	stalledFor := s.now().Sub(r.firstStalled)
+	return stalledFor, stalledFor >= s.guard
+}
+
+// ClearStall forgets the stall clock and streaming position. Called when a
+// torrent stops being tracked, so a later re-track starts clean.
+func (s *torrentStore) ClearStall(hash string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.records[hash]
+	if !ok || (r.firstStalled.IsZero() && r.lastStreamed == 0) {
+		return
+	}
+	r.firstStalled = time.Time{}
+	r.lastStreamed = 0
+	s.streaksDirty = true
+	s.gc(hash, r)
+}
+
+// StalledCount returns how many torrents currently have a stall clock running.
+func (s *torrentStore) StalledCount() int { return s.count((*torrentRecord).isStalled) }
 
 // RecordBusy notes a destination-congestion response and returns how long this
 // torrent has been continuously busy. Busy streaks do not count toward the
@@ -345,7 +512,9 @@ func (s *torrentStore) RecordBusy(hash string) time.Duration {
 	return s.now().Sub(r.firstBusy)
 }
 
-// ClearBackoff drops finalization retry state for a torrent.
+// ClearBackoff drops finalization retry state for a torrent, including the
+// failure clock. Called when a torrent finalizes successfully or stops being
+// tracked.
 func (s *torrentStore) ClearBackoff(hash string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -353,9 +522,13 @@ func (s *torrentStore) ClearBackoff(hash string) {
 	if !ok {
 		return
 	}
+	if !r.firstFailure.IsZero() {
+		s.streaksDirty = true
+	}
 	r.failures = 0
 	r.lastAttempt = time.Time{}
 	r.firstBusy = time.Time{}
+	r.firstFailure = time.Time{}
 	s.gc(hash, r)
 }
 
@@ -430,5 +603,115 @@ func (s *torrentStore) Save() {
 
 	if writeErr := utils.AtomicWriteFile(s.path, data, cacheFilePermissions); writeErr != nil {
 		s.logger.Warn("failed to write completed cache", "error", writeErr)
+	}
+}
+
+// persistedStreak is the on-disk form of a torrent's quarantine clocks.
+type persistedStreak struct {
+	FirstFailure time.Time `json:"firstFailure,omitzero"`
+	FirstStalled time.Time `json:"firstStalled,omitzero"`
+	LastStreamed int       `json:"lastStreamed,omitempty"`
+}
+
+// LoadStreaks restores the persisted quarantine clocks. Without this a source
+// restarting more often than the guard could never quarantine anything, which
+// would silently deliver "never terminal" while the guard claims otherwise.
+func (s *torrentStore) LoadStreaks() {
+	if s.streakPath == "" {
+		return
+	}
+
+	data, err := os.ReadFile(s.streakPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			s.logger.Warn("failed to read streak file, starting fresh",
+				"path", s.streakPath, "error", err)
+		}
+		return
+	}
+
+	var streaks map[string]persistedStreak
+	if jsonErr := json.Unmarshal(data, &streaks); jsonErr != nil {
+		s.logger.Warn("failed to parse streak file, starting fresh",
+			"path", s.streakPath, "error", jsonErr)
+		return
+	}
+
+	s.mu.Lock()
+	for hash, st := range streaks {
+		if st.FirstFailure.IsZero() && st.FirstStalled.IsZero() && st.LastStreamed == 0 {
+			continue
+		}
+		r := s.record(hash)
+		r.firstFailure = st.FirstFailure
+		r.firstStalled = st.FirstStalled
+		r.lastStreamed = st.LastStreamed
+	}
+	s.mu.Unlock()
+
+	s.logger.Info("loaded quarantine streak clocks",
+		"count", len(streaks), "path", s.streakPath)
+}
+
+// SaveStreaks persists the quarantine clocks, but only when one has changed
+// since the last save. Stall clocks are set and cleared frequently during
+// normal congestion, so writing every cycle would be pointless disk traffic.
+func (s *torrentStore) SaveStreaks() {
+	if s.streakPath == "" {
+		return
+	}
+
+	s.mu.Lock()
+	if !s.streaksDirty {
+		s.mu.Unlock()
+		return
+	}
+	streaks := make(map[string]persistedStreak)
+	for hash, r := range s.records {
+		if r.firstFailure.IsZero() && r.firstStalled.IsZero() && r.lastStreamed == 0 {
+			continue
+		}
+		streaks[hash] = persistedStreak{
+			FirstFailure: r.firstFailure,
+			FirstStalled: r.firstStalled,
+			LastStreamed: r.lastStreamed,
+		}
+	}
+	s.streaksDirty = false
+	s.mu.Unlock()
+
+	data, err := json.Marshal(streaks)
+	if err != nil {
+		s.logger.Warn("failed to marshal streak file", "error", err)
+		return
+	}
+
+	if mkErr := os.MkdirAll(filepath.Dir(s.streakPath), 0o750); mkErr != nil {
+		s.logger.Warn("failed to create cache directory", "error", mkErr)
+		return
+	}
+
+	if writeErr := utils.AtomicWriteFile(s.streakPath, data, cacheFilePermissions); writeErr != nil {
+		s.logger.Warn("failed to write streak file", "error", writeErr)
+	}
+}
+
+// PruneStreaks drops streak clocks for torrents no longer present on the
+// source, so the sidecar cannot grow without bound.
+func (s *torrentStore) PruneStreaks(present map[string]struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for hash, r := range s.records {
+		if _, ok := present[hash]; ok {
+			continue
+		}
+		if r.firstFailure.IsZero() && r.firstStalled.IsZero() && r.lastStreamed == 0 {
+			continue
+		}
+		r.firstFailure = time.Time{}
+		r.firstStalled = time.Time{}
+		r.lastStreamed = 0
+		s.streaksDirty = true
+		s.gc(hash, r)
 	}
 }
