@@ -321,11 +321,45 @@ func (t *QBTask) markSyncFailed(ctx context.Context, hash string) {
 	// behavior where sync_failed_total had no label distinction.
 	selection := t.computeSelectionLabel(ctx, hash)
 
+	t.releaseDestination(ctx, hash)
+
 	// Stop tracking so the torrent is not re-streamed.
 	// It will be picked up again if the user removes the tag.
 	t.stopTracking(hash)
 
 	metrics.SyncOutcomesTotal.WithLabelValues(metrics.ModeSource, metrics.ResultFailed, selection).Inc()
+}
+
+// releaseDestination tells the destination to drop its in-memory hold on a
+// quarantined torrent while keeping the bytes it has already received.
+//
+// Quarantine previously told the destination nothing at all, so its partial
+// data sat there with no path to reclamation. Deleting it here would be worse:
+// the common cause of quarantine is a long transient fault, where the partial
+// data is perfectly good, and a release would then re-copy the whole torrent.
+// Keeping the bytes means a release within the reclamation window resumes from
+// the persisted piece bitmap instead.
+//
+// Best-effort. If the call fails the tag is still applied, and the
+// destination's own reclamation is the backstop.
+func (t *QBTask) releaseDestination(ctx context.Context, hash string) {
+	if t.cfg.DryRun {
+		return
+	}
+
+	abortCtx, cancel := withDestRPCTimeout(ctx)
+	defer cancel()
+
+	if _, abortErr := t.grpcDest.AbortTorrent(abortCtx, hash, false); abortErr != nil {
+		t.logger.WarnContext(ctx, "failed to release quarantined torrent on destination, reclamation will handle it",
+			"hash", hash,
+			"error", abortErr,
+		)
+		return
+	}
+	t.logger.InfoContext(ctx, "released quarantined torrent on destination, data preserved for retry",
+		"hash", hash,
+	)
 }
 
 // stopTracking tears down all tracking state for a torrent: unregisters from the

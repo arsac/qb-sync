@@ -35,9 +35,17 @@ func newTorrentStore(basePath string, logger *slog.Logger) *torrentStore {
 	}
 }
 
-// Get returns a torrent's state, safe to use outside the lock.
+// Get returns a torrent's state, safe to use outside the lock, and stamps it
+// as contacted.
 // Sentinel entries (initializing=true) are filtered out — callers see (nil, false).
 // Use GetWithSentinel when the distinction between "not found" and "initializing" matters.
+//
+// The contact stamp lives here rather than at each RPC entry point on purpose:
+// every request path resolves state through these accessors, so a new RPC gets
+// it for free. Forgetting to stamp would make a live transfer look abandoned
+// and have its data reclaimed, so a safe default matters more than the
+// accessor being free of side effects. Scanning callers that must NOT refresh
+// the stamp use peek.
 func (ts *torrentStore) Get(hash string) (*serverTorrentState, bool) {
 	ts.mu.RLock()
 	state, ok := ts.entries[hash]
@@ -45,12 +53,28 @@ func (ts *torrentStore) Get(hash string) (*serverTorrentState, bool) {
 	if ok && state.initializing.Load() {
 		return nil, false
 	}
+	if ok {
+		state.touch()
+	}
 	return state, ok
 }
 
-// GetWithSentinel returns a torrent's state including sentinel entries.
+// GetWithSentinel returns a torrent's state including sentinel entries, and
+// stamps it as contacted.
 // Only use when distinguishing "not found" from "initializing" is required (e.g., InitTorrent).
 func (ts *torrentStore) GetWithSentinel(hash string) (*serverTorrentState, bool) {
+	ts.mu.RLock()
+	state, ok := ts.entries[hash]
+	ts.mu.RUnlock()
+	if ok {
+		state.touch()
+	}
+	return state, ok
+}
+
+// peek returns a torrent's state without stamping contact. Used by orphan
+// scanning, which would otherwise refresh the very timestamp it is testing.
+func (ts *torrentStore) peek(hash string) (*serverTorrentState, bool) {
 	ts.mu.RLock()
 	state, ok := ts.entries[hash]
 	ts.mu.RUnlock()
@@ -191,6 +215,41 @@ func (ts *torrentStore) BeginAbort(hash string, ch chan struct{}) (*serverTorren
 	}
 
 	return state, nil
+}
+
+// BeginAbortIf atomically removes the torrent and registers a cleanup channel,
+// but only when pred still holds for its state.
+//
+// Orphan cleanup needs this because store membership no longer decides
+// orphan-ness: an orphan may hold in-memory state, and between the scan
+// deciding it is stale and the cleanup running, a source can resume it. Testing
+// staleness outside the lock and then removing would delete files from under an
+// active transfer. pred runs while the store lock is held, so no request can
+// interleave.
+//
+// Returns (state, true) when the torrent was removed and cleanup registered.
+func (ts *torrentStore) BeginAbortIf(
+	hash string,
+	ch chan struct{},
+	pred func(*serverTorrentState) bool,
+) (*serverTorrentState, bool) {
+	ts.mu.Lock()
+	if _, alreadyAborting := ts.aborting[hash]; alreadyAborting {
+		ts.mu.Unlock()
+		return nil, false
+	}
+	state, exists := ts.entries[hash]
+	if !exists || !pred(state) {
+		ts.mu.Unlock()
+		return nil, false
+	}
+	ts.aborting[hash] = ch
+	unregisterFilePaths(ts.filePaths, hash, state.files)
+	delete(ts.entries, hash)
+	ts.mu.Unlock()
+
+	ts.abortInodesForFiles(hash, state.files)
+	return state, true
 }
 
 // BeginCleanup registers a cleanup channel for an untracked hash (orphan cleanup).

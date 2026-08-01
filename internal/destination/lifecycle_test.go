@@ -235,7 +235,7 @@ func TestCleanupOrphan_HealsQBOwnedCompleteTorrent(t *testing.T) {
 		mock := &mockQBClient{torrents: qbTorrent(qbittorrent.TorrentStateStoppedUp, 1.0, ownPath)}
 		s, metaDir := newOrphanEnv(t, mock)
 
-		s.cleanupOrphan(context.Background(), hash)
+		s.cleanupOrphan(context.Background(), hash, defaultOrphanTimeout)
 
 		assertHealed(t, s, metaDir)
 	})
@@ -245,7 +245,7 @@ func TestCleanupOrphan_HealsQBOwnedCompleteTorrent(t *testing.T) {
 		mock := &mockQBClient{torrents: qbTorrent(qbittorrent.TorrentStateUploading, 1.0, ownPath)}
 		s, metaDir := newOrphanEnv(t, mock)
 
-		s.cleanupOrphan(context.Background(), hash)
+		s.cleanupOrphan(context.Background(), hash, defaultOrphanTimeout)
 
 		assertHealed(t, s, metaDir)
 	})
@@ -258,7 +258,7 @@ func TestCleanupOrphan_HealsQBOwnedCompleteTorrent(t *testing.T) {
 		mock := &mockQBClient{torrents: qbTorrent(qbittorrent.TorrentStateStoppedUp, 1.0, "/somewhere-else")}
 		s, metaDir := newOrphanEnv(t, mock)
 
-		s.cleanupOrphan(context.Background(), hash)
+		s.cleanupOrphan(context.Background(), hash, defaultOrphanTimeout)
 
 		assertHealed(t, s, metaDir)
 	})
@@ -268,7 +268,7 @@ func TestCleanupOrphan_HealsQBOwnedCompleteTorrent(t *testing.T) {
 		mock := &mockQBClient{torrents: qbTorrent(qbittorrent.TorrentStateStoppedUp, 0.99, ownPath)}
 		s, metaDir := newOrphanEnv(t, mock)
 
-		s.cleanupOrphan(context.Background(), hash)
+		s.cleanupOrphan(context.Background(), hash, defaultOrphanTimeout)
 
 		assertSkipped(t, s, metaDir)
 	})
@@ -278,7 +278,7 @@ func TestCleanupOrphan_HealsQBOwnedCompleteTorrent(t *testing.T) {
 		mock := &mockQBClient{torrents: qbTorrent(qbittorrent.TorrentStateMissingFiles, 1.0, ownPath)}
 		s, metaDir := newOrphanEnv(t, mock)
 
-		s.cleanupOrphan(context.Background(), hash)
+		s.cleanupOrphan(context.Background(), hash, defaultOrphanTimeout)
 
 		assertSkipped(t, s, metaDir)
 	})
@@ -288,7 +288,7 @@ func TestCleanupOrphan_HealsQBOwnedCompleteTorrent(t *testing.T) {
 		mock := &mockQBClient{torrents: qbTorrent(qbittorrent.TorrentStateStoppedDl, 0.5, ownPath)}
 		s, metaDir := newOrphanEnv(t, mock)
 
-		s.cleanupOrphan(context.Background(), hash)
+		s.cleanupOrphan(context.Background(), hash, defaultOrphanTimeout)
 
 		assertSkipped(t, s, metaDir)
 	})
@@ -298,7 +298,7 @@ func TestCleanupOrphan_HealsQBOwnedCompleteTorrent(t *testing.T) {
 		mock := &mockQBClient{loginErr: errors.New("connection refused")}
 		s, metaDir := newOrphanEnv(t, mock)
 
-		s.cleanupOrphan(context.Background(), hash)
+		s.cleanupOrphan(context.Background(), hash, defaultOrphanTimeout)
 
 		assertSkipped(t, s, metaDir)
 	})
@@ -312,7 +312,7 @@ func TestCleanupOrphan_HealsQBOwnedCompleteTorrent(t *testing.T) {
 		s, metaDir := newOrphanEnv(t, mock)
 		require.NoError(t, os.Remove(filepath.Join(metaDir, metaFileName)))
 
-		s.cleanupOrphan(context.Background(), hash)
+		s.cleanupOrphan(context.Background(), hash, defaultOrphanTimeout)
 
 		require.True(t, s.isFinalized(hash), "old-format dir with qB-complete torrent must heal")
 	})
@@ -342,7 +342,7 @@ func TestCleanupOrphan_HealsQBOwnedCompleteTorrent(t *testing.T) {
 		ch := make(chan struct{})
 		require.True(t, s.store.BeginCleanup(hash, ch))
 
-		s.cleanupOrphan(context.Background(), hash)
+		s.cleanupOrphan(context.Background(), hash, defaultOrphanTimeout)
 
 		require.False(t, s.isFinalized(hash),
 			"second cleanup must bail at BeginCleanup, not heal concurrently")

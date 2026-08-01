@@ -151,28 +151,66 @@ func (s *Server) cleanupOrphanedTorrents(ctx context.Context) {
 
 		hash := entry.Name()
 		if s.isOrphanedTorrent(ctx, hash, timeout) {
-			s.cleanupOrphan(ctx, hash)
+			s.cleanupOrphan(ctx, hash, timeout)
 		}
 	}
 }
 
-// isOrphanedTorrent checks if a torrent should be considered orphaned.
-func (s *Server) isOrphanedTorrent(ctx context.Context, hash string, timeout time.Duration) bool {
-	// Check if actively tracked in memory
-	_, tracked := s.store.Get(hash)
+// isStaleState reports whether in-memory state shows no source interest for
+// longer than timeout. Shared by the orphan scan and the re-test taken under
+// the store lock, so the two cannot drift apart.
+func (s *Server) isStaleState(state *serverTorrentState, timeout time.Duration) bool {
+	if state.initializing.Load() {
+		return false // mid-init; its files are being created right now
+	}
 
-	if tracked {
+	state.mu.Lock()
+	finalizing := state.finalization.active
+	state.mu.Unlock()
+	if finalizing {
+		// Verification of a large torrent can run for a long time with no
+		// source contact. Reclaiming it would delete data mid-check.
 		return false
 	}
 
-	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
+	return state.contactAge(s.processStart) > timeout
+}
 
+// isOrphanedTorrent checks if a torrent should be considered orphaned.
+//
+// Orphan-ness is judged on how long it has been since a source asked about the
+// torrent, not on whether it is present in the store. Membership cannot answer
+// the question: startup recovery repopulates the store from every unfinalized
+// metadata directory, so an abandoned transfer is put straight back and
+// shielded again. That made this check unable to fire for the very case it was
+// written for - a source that crashed or was decommissioned.
+//
+// Metadata mtime is only a fallback for torrents with no in-memory state. It
+// cannot be the primary signal because it records flushes, not activity: a
+// healthy, fully streamed torrent has a frozen mtime while it waits through the
+// finalization queue and a congestion streak, which can run to hours.
+func (s *Server) isOrphanedTorrent(ctx context.Context, hash string, timeout time.Duration) bool {
 	// Finalized marker means the torrent was successfully synced — not an orphan.
 	if s.isFinalized(hash) {
 		return false
 	}
 
-	// Check state file modification time
+	// peek, not Get: Get stamps contact, which would refresh the very timestamp
+	// this check is testing and guarantee nothing is ever reclaimed.
+	if state, present := s.store.peek(hash); present {
+		if !s.isStaleState(state, timeout) {
+			return false
+		}
+		s.logger.InfoContext(ctx, "found orphaned torrent",
+			"hash", hash,
+			"sinceLastContact", state.contactAge(s.processStart).Round(time.Second),
+			"timeout", timeout,
+		)
+		return true
+	}
+
+	// No in-memory state: fall back to metadata mtime.
+	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
 	info, statErr := s.statOrphanMetadata(metaDir)
 	if statErr != nil {
 		if !os.IsNotExist(statErr) {
@@ -192,7 +230,7 @@ func (s *Server) isOrphanedTorrent(ctx context.Context, hash string, timeout tim
 	s.logger.InfoContext(ctx, "found orphaned torrent",
 		"hash", hash,
 		"lastModified", info.ModTime(),
-		"age", age.Round(time.Minute),
+		"age", age.Round(time.Second),
 		"timeout", timeout,
 	)
 	return true
@@ -217,12 +255,28 @@ func (s *Server) statOrphanMetadata(metaDir string) (os.FileInfo, error) {
 
 // cleanupOrphan removes all data associated with an orphaned torrent.
 // Uses abortingHashes to prevent race with concurrent InitTorrent calls.
-func (s *Server) cleanupOrphan(ctx context.Context, hash string) {
+func (s *Server) cleanupOrphan(ctx context.Context, hash string, timeout time.Duration) {
 	// Register cleanup to prevent concurrent InitTorrent from creating files
 	// that we're about to delete. Uses same pattern as AbortTorrent.
+	//
+	// An orphan may still hold in-memory state, because store membership no
+	// longer decides orphan-ness (see isOrphanedTorrent). BeginCleanup refuses
+	// entries that are present, so for those we take BeginAbort instead, which
+	// atomically drops the entry and registers the same cleanup channel.
+	// Without this, the store entry would shield the orphan exactly as it did
+	// before - the predicate would be fixed but nothing would ever be reclaimed.
 	cleanupCh := make(chan struct{})
-	if !s.store.BeginCleanup(hash, cleanupCh) {
-		s.logger.DebugContext(ctx, "skipping orphan cleanup, torrent tracked or already cleaning",
+	registered := s.store.BeginCleanup(hash, cleanupCh)
+	if !registered {
+		// Still holds state. Re-test staleness under the store lock: a source
+		// may have resumed the torrent since the scan decided it was stale, and
+		// deleting its files now would pull them from under an active transfer.
+		_, registered = s.store.BeginAbortIf(hash, cleanupCh, func(st *serverTorrentState) bool {
+			return s.isStaleState(st, timeout)
+		})
+	}
+	if !registered {
+		s.logger.DebugContext(ctx, "skipping orphan cleanup, torrent is active or already cleaning",
 			"hash", hash,
 		)
 		return

@@ -184,22 +184,75 @@ func TestIsOrphanedTorrent(t *testing.T) {
 	ctx := context.Background()
 	logger := testLogger(t)
 
-	t.Run("tracked torrent is not orphaned", func(t *testing.T) {
+	t.Run("recently contacted torrent is not orphaned", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		s := &Server{
-			config: ServerConfig{BasePath: tmpDir},
-			logger: logger,
-			store:  newTorrentStore(tmpDir, logger),
+			config:       ServerConfig{BasePath: tmpDir},
+			logger:       logger,
+			store:        newTorrentStore(tmpDir, logger),
+			processStart: time.Now(),
 		}
 
 		hash := "abc123"
-		s.store.entries[hash] = &serverTorrentState{}
+		state := &serverTorrentState{}
+		state.touch()
+		s.store.entries[hash] = state
 
-		// Create metadata even though it shouldn't be checked
+		// Stale metadata: a source is clearly still interested, so the mtime
+		// must not override that. It records flushes, not activity.
 		createTestMetadata(t, tmpDir, hash, time.Now().Add(-48*time.Hour))
 
 		if s.isOrphanedTorrent(ctx, hash, 24*time.Hour) {
-			t.Error("tracked torrent should not be orphaned")
+			t.Error("a torrent a source just asked about must not be orphaned")
+		}
+	})
+
+	t.Run("torrent in the store with no recent contact IS orphaned", func(t *testing.T) {
+		// Presence in the store used to be an absolute shield. Startup recovery
+		// repopulates the store from every unfinalized metadata directory, so
+		// that made reclamation impossible for the case it was written for: a
+		// source that crashed or was decommissioned.
+		tmpDir := t.TempDir()
+		s := &Server{
+			config:       ServerConfig{BasePath: tmpDir},
+			logger:       logger,
+			store:        newTorrentStore(tmpDir, logger),
+			processStart: time.Now().Add(-48 * time.Hour),
+		}
+
+		hash := "abc123"
+		state := &serverTorrentState{}
+		state.lastContact.Store(time.Now().Add(-48 * time.Hour).UnixNano())
+		s.store.entries[hash] = state
+
+		createTestMetadata(t, tmpDir, hash, time.Now().Add(-48*time.Hour))
+
+		if !s.isOrphanedTorrent(ctx, hash, 24*time.Hour) {
+			t.Error("store membership must not shield a transfer no source has touched in 48h")
+		}
+	})
+
+	t.Run("torrent mid-finalization is never orphaned", func(t *testing.T) {
+		// Verifying a large torrent can run for hours with no source contact.
+		// Reclaiming it would delete the data being verified.
+		tmpDir := t.TempDir()
+		s := &Server{
+			config:       ServerConfig{BasePath: tmpDir},
+			logger:       logger,
+			store:        newTorrentStore(tmpDir, logger),
+			processStart: time.Now().Add(-48 * time.Hour),
+		}
+
+		hash := "abc123"
+		state := &serverTorrentState{}
+		state.lastContact.Store(time.Now().Add(-48 * time.Hour).UnixNano())
+		state.finalization.active = true
+		s.store.entries[hash] = state
+
+		createTestMetadata(t, tmpDir, hash, time.Now().Add(-48*time.Hour))
+
+		if s.isOrphanedTorrent(ctx, hash, 24*time.Hour) {
+			t.Error("a torrent being finalized must never be reclaimed, however stale its contact")
 		}
 	})
 
@@ -293,10 +346,16 @@ func TestCleanupOrphan(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// Add to tracked torrents (simulating race with InitTorrent)
-		s.store.entries[hash] = &serverTorrentState{}
+		// Simulate a source resuming the torrent between the scan deciding it
+		// was stale and this cleanup running. The re-test under the store lock
+		// must see the fresh contact and back off, or we would delete files
+		// from under an active transfer.
+		state := &serverTorrentState{}
+		state.touch()
+		s.store.entries[hash] = state
+		s.processStart = time.Now()
 
-		s.cleanupOrphan(ctx, hash)
+		s.cleanupOrphan(ctx, hash, defaultOrphanTimeout)
 
 		// Files should still exist
 		if _, err := os.Stat(partialFile); os.IsNotExist(err) {
@@ -328,7 +387,7 @@ func TestCleanupOrphan(t *testing.T) {
 
 		createTestTorrentFileWithPaths(t, tmpDir, hash, []string{"data/test.txt"})
 
-		s.cleanupOrphan(ctx, hash)
+		s.cleanupOrphan(ctx, hash, defaultOrphanTimeout)
 
 		// Partial file should be deleted
 		if _, err := os.Stat(partialFile); !os.IsNotExist(err) {
@@ -375,7 +434,7 @@ func TestCleanupOrphan(t *testing.T) {
 
 		createTestTorrentFileWithPaths(t, tmpDir, hash, []string{"data/test.txt"})
 
-		s.cleanupOrphan(ctx, hash)
+		s.cleanupOrphan(ctx, hash, defaultOrphanTimeout)
 
 		if _, err := os.Stat(partialFile); !os.IsNotExist(err) {
 			t.Error("partial file should be deleted: qb-sync wrote it")
@@ -404,7 +463,7 @@ func TestCleanupOrphan(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		s.cleanupOrphan(ctx, hash)
+		s.cleanupOrphan(ctx, hash, defaultOrphanTimeout)
 
 		// Meta directory should be deleted to prevent unbounded growth.
 		// Partial files can't be located without a valid .torrent file but are
@@ -443,7 +502,7 @@ func TestCleanupOrphan(t *testing.T) {
 
 		createTestTorrentFileWithPaths(t, tmpDir, hash, []string{"data/test.txt"})
 
-		s.cleanupOrphan(ctx, hash)
+		s.cleanupOrphan(ctx, hash, defaultOrphanTimeout)
 
 		// Files should NOT be deleted — torrent exists in QB
 		if _, err := os.Stat(partialFile); os.IsNotExist(err) {
@@ -484,7 +543,7 @@ func TestCleanupOrphan(t *testing.T) {
 
 		createTestTorrentFileWithPaths(t, tmpDir, hash, []string{"data/test.txt"})
 
-		s.cleanupOrphan(ctx, hash)
+		s.cleanupOrphan(ctx, hash, defaultOrphanTimeout)
 
 		// Files should NOT be deleted — QB unreachable, fail-closed
 		if _, err := os.Stat(finalFile); os.IsNotExist(err) {

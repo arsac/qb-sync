@@ -94,6 +94,12 @@ type Server struct {
 	bgCancel context.CancelFunc
 	bgWg     sync.WaitGroup
 
+	// processStart anchors contact age for torrents rebuilt by startup
+	// recovery, which carry no contact stamp until a source asks about them.
+	// Measuring their age from the epoch instead would make every recovered
+	// torrent look abandoned the instant the server came up.
+	processStart time.Time
+
 	// Health server for K8s probes
 	healthServer *health.Server
 
@@ -113,14 +119,15 @@ func NewServer(config ServerConfig, logger *slog.Logger) *Server {
 	)
 
 	s := &Server{
-		config:      config,
-		logger:      logger,
-		store:       newTorrentStore(config.BasePath, logger),
-		memBudget:   semaphore.NewWeighted(bufferBytes),
-		finalizeSem: semaphore.NewWeighted(1),
-		qbStageSem:  semaphore.NewWeighted(int64(config.GetQBFinalizeConcurrency())),
-		bgCtx:       bgCtx,
-		bgCancel:    bgCancel,
+		config:       config,
+		logger:       logger,
+		store:        newTorrentStore(config.BasePath, logger),
+		memBudget:    semaphore.NewWeighted(bufferBytes),
+		finalizeSem:  semaphore.NewWeighted(1),
+		qbStageSem:   semaphore.NewWeighted(int64(config.GetQBFinalizeConcurrency())),
+		bgCtx:        bgCtx,
+		bgCancel:     bgCancel,
+		processStart: time.Now(),
 	}
 
 	if config.QB != nil && config.QB.URL != "" {

@@ -44,5 +44,23 @@ files.
   timeout resumes from the persisted piece bitmap instead of re-streaming the
   whole torrent. If that abort fails, the tag still applies and the cleaner is
   the backstop.
-- **Every RPC naming a torrent hash must stamp the contact timestamp.** A new
-  RPC that omits the stamp would make its torrents look abandoned.
+- **The contact stamp lives in the store's `Get` accessors, not at each RPC
+  entry point.** Every request path resolves state through them, so a new RPC
+  gets the stamp for free rather than having to remember a convention. The
+  failure modes are asymmetric and decide the direction: a missed stamp makes a
+  live transfer look abandoned and deletes its data, while a scanner that
+  forgets to bypass the stamp only leaks disk. Orphan scanning uses a separate
+  non-stamping accessor, because stamping there would refresh the very
+  timestamp being tested.
+- **Removing store membership as the gate is not sufficient on its own.** The
+  cleanup registration also refused entries present in the store, so the shield
+  existed at two layers. Fixing only the predicate would look correct and still
+  reclaim nothing.
+- **Staleness is re-tested while the store lock is held.** The refusal that
+  formed the shield was also protecting a race: a source can resume a torrent
+  between the scan judging it stale and the cleanup deleting files. Testing
+  staleness outside the lock and then removing would delete files from under an
+  active transfer, so removal and re-test are one atomic operation.
+- **Torrents mid-finalization are never reclaimed.** Verifying a large torrent
+  runs for a long time with no source contact, and reclaiming it would delete
+  the data being verified.
