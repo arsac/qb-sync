@@ -149,10 +149,6 @@ func TestE2E_Repro_UnreadableSourcePieceWedgesTorrent(t *testing.T) {
 	cfg := env.CreateSourceConfig()
 	cfg.MaxBytesPerSec = reproRateLimit
 	cfg.SyncFailedGuard = reproGuard
-	// CreateSourceConfig leaves SyncFailedTag empty, while production defaults
-	// it to "sync-failed". Without it markSyncFailed untracks the torrent but
-	// applies no tag, so nothing excludes it and the next cycle re-tracks it.
-	cfg.SyncFailedTag = "sync-failed"
 
 	task, dest, err := env.CreateSourceTask(cfg)
 	require.NoError(t, err)

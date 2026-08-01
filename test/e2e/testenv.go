@@ -43,17 +43,22 @@ const (
 
 	// Shared test constants used by both testenv.go and test files.
 	torrentAppearTimeout = 30 * time.Second
-	progressTolerance    = 0.001 // For float comparisons
+
+	// Mirror production defaults so the harness does not silently disable
+	// behaviour under test. Individual tests shrink the guard.
+	defaultSyncFailedTag   = "sync-failed"
+	defaultSyncFailedGuard = 4 * time.Hour
+	progressTolerance      = 0.001 // For float comparisons
 )
 
 // TestEnv holds the complete test environment for source/destination e2e tests.
 type TestEnv struct {
-	compose          compose.ComposeStack
-	sourceURL        string
-	destinationURL   string
-	sourcePath       string
-	destinationPath  string
-	sourceClient     *qbittorrent.Client
+	compose           compose.ComposeStack
+	sourceURL         string
+	destinationURL    string
+	sourcePath        string
+	destinationPath   string
+	sourceClient      *qbittorrent.Client
 	destinationClient *qbittorrent.Client
 	destinationServer *destination.Server
 	grpcAddr          string
@@ -674,6 +679,12 @@ func (env *TestEnv) CreateSourceConfig(opts ...SourceConfigOption) *config.Sourc
 			DataPath:   env.sourcePath,
 			SyncedTag:  "synced",
 		},
+		// Production defaults these; leaving them unset meant no E2E test ever
+		// exercised quarantine, because markSyncFailed skips tagging when the
+		// tag is empty and nothing then excludes the torrent from re-tracking.
+		SyncFailedTag:   defaultSyncFailedTag,
+		SyncFailedGuard: defaultSyncFailedGuard,
+
 		MinSpaceGB:         1,
 		MinSeedingTime:     0,
 		SleepInterval:      time.Second,

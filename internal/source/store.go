@@ -65,6 +65,10 @@ type torrentRecord struct {
 	// Finalization retry accounting. failures and lastAttempt drive the
 	// exponential backoff; firstBusy bounds how long destination congestion
 	// is tolerated before it counts as a failure.
+	//
+	// firstBusy is persisted alongside the quarantine clocks for the same
+	// reason: with it in memory only, a source restarting more often than the
+	// busy guard could never surface a permanently wedged destination.
 	failures    int
 	lastAttempt time.Time
 	firstBusy   time.Time
@@ -508,6 +512,7 @@ func (s *torrentStore) RecordBusy(hash string) time.Duration {
 	r := s.record(hash)
 	if r.firstBusy.IsZero() {
 		r.firstBusy = s.now()
+		s.streaksDirty = true
 	}
 	return s.now().Sub(r.firstBusy)
 }
@@ -522,7 +527,7 @@ func (s *torrentStore) ClearBackoff(hash string) {
 	if !ok {
 		return
 	}
-	if !r.firstFailure.IsZero() {
+	if !r.firstFailure.IsZero() || !r.firstBusy.IsZero() {
 		s.streaksDirty = true
 	}
 	r.failures = 0
@@ -610,6 +615,7 @@ func (s *torrentStore) Save() {
 type persistedStreak struct {
 	FirstFailure time.Time `json:"firstFailure,omitzero"`
 	FirstStalled time.Time `json:"firstStalled,omitzero"`
+	FirstBusy    time.Time `json:"firstBusy,omitzero"`
 	LastStreamed int       `json:"lastStreamed,omitempty"`
 }
 
@@ -639,12 +645,14 @@ func (s *torrentStore) LoadStreaks() {
 
 	s.mu.Lock()
 	for hash, st := range streaks {
-		if st.FirstFailure.IsZero() && st.FirstStalled.IsZero() && st.LastStreamed == 0 {
+		if st.FirstFailure.IsZero() && st.FirstStalled.IsZero() &&
+			st.FirstBusy.IsZero() && st.LastStreamed == 0 {
 			continue
 		}
 		r := s.record(hash)
 		r.firstFailure = st.FirstFailure
 		r.firstStalled = st.FirstStalled
+		r.firstBusy = st.FirstBusy
 		r.lastStreamed = st.LastStreamed
 	}
 	s.mu.Unlock()
@@ -668,12 +676,14 @@ func (s *torrentStore) SaveStreaks() {
 	}
 	streaks := make(map[string]persistedStreak)
 	for hash, r := range s.records {
-		if r.firstFailure.IsZero() && r.firstStalled.IsZero() && r.lastStreamed == 0 {
+		if r.firstFailure.IsZero() && r.firstStalled.IsZero() &&
+			r.firstBusy.IsZero() && r.lastStreamed == 0 {
 			continue
 		}
 		streaks[hash] = persistedStreak{
 			FirstFailure: r.firstFailure,
 			FirstStalled: r.firstStalled,
+			FirstBusy:    r.firstBusy,
 			LastStreamed: r.lastStreamed,
 		}
 	}
@@ -705,11 +715,13 @@ func (s *torrentStore) PruneStreaks(present map[string]struct{}) {
 		if _, ok := present[hash]; ok {
 			continue
 		}
-		if r.firstFailure.IsZero() && r.firstStalled.IsZero() && r.lastStreamed == 0 {
+		if r.firstFailure.IsZero() && r.firstStalled.IsZero() &&
+			r.firstBusy.IsZero() && r.lastStreamed == 0 {
 			continue
 		}
 		r.firstFailure = time.Time{}
 		r.firstStalled = time.Time{}
+		r.firstBusy = time.Time{}
 		r.lastStreamed = 0
 		s.streaksDirty = true
 		s.gc(hash, r)

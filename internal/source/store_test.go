@@ -540,3 +540,30 @@ func TestReleaseTorrentLeavesNoRecord(t *testing.T) {
 		}
 	})
 }
+
+// TestBusyStreakSurvivesRestart pins the reason firstBusy is persisted. The
+// busy guard bounds how long destination congestion is tolerated before it
+// counts as a failure. With the clock in memory only, a source restarting more
+// often than that guard could never surface a permanently wedged destination —
+// the same weakness the failure and stall clocks are persisted to avoid.
+func TestBusyStreakSurvivesRestart(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	logger := testStoreLogger()
+	path := dir + "/completed_on_dest.json"
+
+	now := time.Now()
+	s := newTorrentStore(path, logger)
+	s.now = func() time.Time { return now }
+	s.RecordBusy("h1")
+	s.SaveStreaks()
+
+	// New process, three hours later.
+	s2 := newTorrentStore(path, logger)
+	s2.now = func() time.Time { return now.Add(3 * time.Hour) }
+	s2.LoadStreaks()
+
+	if got := s2.RecordBusy("h1"); got < 3*time.Hour {
+		t.Fatalf("busy streak must survive a restart: got %v, want at least 3h", got)
+	}
+}
