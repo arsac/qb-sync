@@ -425,7 +425,7 @@ func (t *QBTask) abortExcludedTracked(ctx context.Context, excludedHashes map[st
 			}
 		}
 
-		t.stopTracking(hash)
+		t.releaseTorrent(hash)
 
 		metrics.ExcludeSyncAbortTotal.Inc()
 	}

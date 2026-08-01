@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/arsac/qb-sync/internal/config"
 	"github.com/arsac/qb-sync/internal/utils"
 )
 
@@ -32,10 +33,6 @@ const (
 	// maxBackoffShift bounds the exponential so a long streak cannot overflow
 	// the duration.
 	maxBackoffShift = 32
-
-	// defaultSyncFailedGuard is used when no guard is configured, so a store
-	// built outside the orchestrator still behaves sanely.
-	defaultSyncFailedGuard = 4 * time.Hour
 
 	// streakFileName holds the persisted failure and stall clocks, alongside
 	// the completion cache.
@@ -116,6 +113,22 @@ func (r *torrentRecord) hasStallState() bool {
 	return r.isStalled() || r.lastStreamed > 0
 }
 
+// hasStreakState reports whether any persisted clock or streaming position is
+// recorded. Spelled once so adding a clock cannot silently skip one of the
+// load, save and prune sites that all need to agree.
+func (r *torrentRecord) hasStreakState() bool {
+	return !r.firstFailure.IsZero() || !r.firstStalled.IsZero() ||
+		!r.firstBusy.IsZero() || r.lastStreamed > 0
+}
+
+// clearStreaks drops every persisted clock and the streaming position.
+func (r *torrentRecord) clearStreaks() {
+	r.firstFailure = time.Time{}
+	r.firstStalled = time.Time{}
+	r.firstBusy = time.Time{}
+	r.lastStreamed = 0
+}
+
 // isEmpty reports whether the record carries no remaining state and can be
 // dropped.
 func (r *torrentRecord) isEmpty() bool {
@@ -139,9 +152,11 @@ type torrentStore struct {
 	// quarantines the torrent. It also derives the finalization backoff cap.
 	guard time.Duration
 
-	// streaksDirty records that a streak clock changed since the last save, so
-	// the sidecar is written on transitions rather than every cycle. Stalls are
-	// set and cleared constantly under normal congestion.
+	// streaksDirty records that a clock or streaming position changed since the
+	// last save. It suppresses the write only on a genuinely idle cycle: any
+	// torrent that advances marks the store dirty, so an active sync still
+	// writes the sidecar every cycle. That is cheap and correct — it is not the
+	// per-transition optimisation the name might suggest.
 	streaksDirty bool
 
 	now func() time.Time // injectable for tests
@@ -158,10 +173,15 @@ func newTorrentStore(path string, logger *slog.Logger) *torrentStore {
 		path:       path,
 		streakPath: streakPath,
 		logger:     logger,
-		guard:      defaultSyncFailedGuard,
+		guard:      config.DefaultSyncFailedGuard,
 		now:        time.Now,
 	}
 }
+
+// Guard returns the duration a fault must persist before it quarantines a
+// torrent. Callers log this rather than re-deriving it from config, so the
+// value reported is always the one the decision used.
+func (s *torrentStore) Guard() time.Duration { return s.guard }
 
 // backoffCap derives the finalization backoff ceiling from the guard so that
 // roughly backoffGuardDivisor attempts fit inside a guard window at any guard
@@ -226,7 +246,6 @@ func (s *torrentStore) TrackIfAbsent(hash string, info TrackedTorrent) bool {
 	defer s.mu.Unlock()
 	r := s.record(hash)
 	if r.tracked {
-		s.gc(hash, r)
 		return false
 	}
 	r.tracked = true
@@ -285,10 +304,13 @@ func (s *torrentStore) TrackedSnapshot() map[string]TrackedTorrent {
 
 // TrackedHashes returns the tracked hashes as a set, for membership checks.
 func (s *torrentStore) TrackedHashes() map[string]struct{} {
-	snapshot := s.TrackedSnapshot()
-	out := make(map[string]struct{}, len(snapshot))
-	for hash := range snapshot {
-		out[hash] = struct{}{}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]struct{}, len(s.records))
+	for hash, r := range s.records {
+		if r.tracked {
+			out[hash] = struct{}{}
+		}
 	}
 	return out
 }
@@ -428,7 +450,7 @@ func (s *torrentStore) RecordFailure(hash string) (int, bool) {
 		s.streaksDirty = true
 	}
 
-	quarantine := r.failures >= maxVerificationRetries &&
+	quarantine := r.failures >= minQuarantineAttempts &&
 		s.now().Sub(r.firstFailure) >= s.guard
 	return r.failures, quarantine
 }
@@ -463,9 +485,7 @@ func (s *torrentStore) ObserveStall(
 	if streamed > r.lastStreamed {
 		r.lastStreamed = streamed
 		s.streaksDirty = true
-		if !r.firstStalled.IsZero() {
-			r.firstStalled = time.Time{}
-		}
+		r.firstStalled = time.Time{}
 		s.gc(hash, r)
 		return 0, false
 	}
@@ -490,7 +510,7 @@ func (s *torrentStore) ClearStall(hash string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r, ok := s.records[hash]
-	if !ok || (r.firstStalled.IsZero() && r.lastStreamed == 0) {
+	if !ok || !r.hasStallState() {
 		return
 	}
 	r.firstStalled = time.Time{}
@@ -645,15 +665,13 @@ func (s *torrentStore) LoadStreaks() {
 
 	s.mu.Lock()
 	for hash, st := range streaks {
-		if st.FirstFailure.IsZero() && st.FirstStalled.IsZero() &&
-			st.FirstBusy.IsZero() && st.LastStreamed == 0 {
-			continue
-		}
 		r := s.record(hash)
 		r.firstFailure = st.FirstFailure
 		r.firstStalled = st.FirstStalled
 		r.firstBusy = st.FirstBusy
 		r.lastStreamed = st.LastStreamed
+		// A row carrying nothing would otherwise leave an empty record behind.
+		s.gc(hash, r)
 	}
 	s.mu.Unlock()
 
@@ -676,8 +694,7 @@ func (s *torrentStore) SaveStreaks() {
 	}
 	streaks := make(map[string]persistedStreak)
 	for hash, r := range s.records {
-		if r.firstFailure.IsZero() && r.firstStalled.IsZero() &&
-			r.firstBusy.IsZero() && r.lastStreamed == 0 {
+		if !r.hasStreakState() {
 			continue
 		}
 		streaks[hash] = persistedStreak{
@@ -715,14 +732,10 @@ func (s *torrentStore) PruneStreaks(present map[string]struct{}) {
 		if _, ok := present[hash]; ok {
 			continue
 		}
-		if r.firstFailure.IsZero() && r.firstStalled.IsZero() &&
-			r.firstBusy.IsZero() && r.lastStreamed == 0 {
+		if !r.hasStreakState() {
 			continue
 		}
-		r.firstFailure = time.Time{}
-		r.firstStalled = time.Time{}
-		r.firstBusy = time.Time{}
-		r.lastStreamed = 0
+		r.clearStreaks()
 		s.streaksDirty = true
 		s.gc(hash, r)
 	}

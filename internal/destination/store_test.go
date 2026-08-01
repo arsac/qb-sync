@@ -345,28 +345,46 @@ func TestTorrentStore_InodeDelegation(t *testing.T) {
 	}
 }
 
-func TestTorrentStore_BeginCleanup(t *testing.T) {
+func TestTorrentStore_BeginReclaim(t *testing.T) {
 	t.Parallel()
 	ts := newTestStore(t)
 
-	// Succeeds for an untracked, unaborting hash.
+	stale := func(*serverTorrentState) bool { return true }
+	active := func(*serverTorrentState) bool { return false }
+
+	// Succeeds for a hash with no entry; pred is not consulted because there is
+	// nothing to re-test.
 	ch := make(chan struct{})
-	if !ts.BeginCleanup("orphan", ch) {
-		t.Fatal("BeginCleanup: expected true for untracked hash")
+	if !ts.BeginReclaim("orphan", ch, func(*serverTorrentState) bool {
+		t.Error("pred must not run for a hash with no entry")
+		return true
+	}) {
+		t.Fatal("BeginReclaim: expected true for a hash with no entry")
 	}
 
 	// Returns false if already cleaning.
-	ch2 := make(chan struct{})
-	if ts.BeginCleanup("orphan", ch2) {
-		t.Fatal("BeginCleanup: expected false when already cleaning")
+	if ts.BeginReclaim("orphan", make(chan struct{}), stale) {
+		t.Fatal("BeginReclaim: expected false when already cleaning")
 	}
-
 	ts.EndCleanup("orphan")
 
-	// Returns false if hash is tracked in entries.
-	commitTestTorrent(t, ts, "tracked", "tracked/file.txt")
-	if ts.BeginCleanup("tracked", make(chan struct{})) {
-		t.Fatal("BeginCleanup: expected false for tracked torrent")
+	// An entry that pred rejects is left alone: this is the resume race, where
+	// a source picked the torrent back up after the scan judged it stale.
+	commitTestTorrent(t, ts, "resumed", "resumed/file.txt")
+	if ts.BeginReclaim("resumed", make(chan struct{}), active) {
+		t.Fatal("BeginReclaim: must refuse an entry pred rejects")
+	}
+	if _, present := ts.peek("resumed"); !present {
+		t.Fatal("a refused reclaim must leave the entry in place")
+	}
+
+	// An entry pred accepts is dropped and registered in one step.
+	commitTestTorrent(t, ts, "abandoned", "abandoned/file.txt")
+	if !ts.BeginReclaim("abandoned", make(chan struct{}), stale) {
+		t.Fatal("BeginReclaim: expected true for a stale entry")
+	}
+	if _, present := ts.peek("abandoned"); present {
+		t.Fatal("an accepted reclaim must drop the entry")
 	}
 }
 

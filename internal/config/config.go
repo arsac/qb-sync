@@ -38,7 +38,7 @@ const (
 	defaultHealthAddr           = ":8080"
 	defaultSyncedTag            = "synced"
 	defaultSyncFailedTag        = "sync-failed"
-	defaultSyncFailedGuard      = 4 * time.Hour
+	DefaultSyncFailedGuard      = 4 * time.Hour
 	defaultSourceRemovedTag     = "source-removed"
 	defaultReconnectMaxDelaySec = 30
 	defaultNumSenders           = 4
@@ -301,7 +301,7 @@ func SetupSourceFlags(cmd *cobra.Command) {
 	)
 	flags.Int(
 		"sync-failed-guard",
-		int(defaultSyncFailedGuard.Seconds()),
+		int(DefaultSyncFailedGuard.Seconds()),
 		"How long a torrent must fail continuously (seconds) before it is tagged sync-failed",
 	)
 }

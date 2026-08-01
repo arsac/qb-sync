@@ -47,25 +47,19 @@ func newTorrentStore(basePath string, logger *slog.Logger) *torrentStore {
 // accessor being free of side effects. Scanning callers that must NOT refresh
 // the stamp use peek.
 func (ts *torrentStore) Get(hash string) (*serverTorrentState, bool) {
-	ts.mu.RLock()
-	state, ok := ts.entries[hash]
-	ts.mu.RUnlock()
-	if ok && state.initializing.Load() {
+	state, ok := ts.peek(hash)
+	if !ok || state.initializing.Load() {
 		return nil, false
 	}
-	if ok {
-		state.touch()
-	}
-	return state, ok
+	state.touch()
+	return state, true
 }
 
 // GetWithSentinel returns a torrent's state including sentinel entries, and
 // stamps it as contacted.
 // Only use when distinguishing "not found" from "initializing" is required (e.g., InitTorrent).
 func (ts *torrentStore) GetWithSentinel(hash string) (*serverTorrentState, bool) {
-	ts.mu.RLock()
-	state, ok := ts.entries[hash]
-	ts.mu.RUnlock()
+	state, ok := ts.peek(hash)
 	if ok {
 		state.touch()
 	}
@@ -217,53 +211,47 @@ func (ts *torrentStore) BeginAbort(hash string, ch chan struct{}) (*serverTorren
 	return state, nil
 }
 
-// BeginAbortIf atomically removes the torrent and registers a cleanup channel,
-// but only when pred still holds for its state.
+// BeginReclaim registers a cleanup channel for orphan reclamation, dropping the
+// torrent's in-memory entry when it has one.
 //
-// Orphan cleanup needs this because store membership no longer decides
-// orphan-ness: an orphan may hold in-memory state, and between the scan
-// deciding it is stale and the cleanup running, a source can resume it. Testing
-// staleness outside the lock and then removing would delete files from under an
-// active transfer. pred runs while the store lock is held, so no request can
-// interleave.
+// Orphan-ness no longer depends on store membership, so a reclaimable torrent
+// may or may not hold state. Both cases register the same channel, which is
+// what blocks a concurrent InitTorrent from recreating files about to be
+// deleted.
 //
-// Returns (state, true) when the torrent was removed and cleanup registered.
-func (ts *torrentStore) BeginAbortIf(
+// pred runs while the store lock is held. That is the point: a source can
+// resume a torrent between the scan judging it stale and this call, and testing
+// staleness outside the lock would delete files from under an active transfer.
+// A torrent with no entry has nothing to re-test, so pred is not consulted.
+//
+// Returns false when another cleanup or abort is already registered, or when
+// pred rejects the entry.
+func (ts *torrentStore) BeginReclaim(
 	hash string,
 	ch chan struct{},
 	pred func(*serverTorrentState) bool,
-) (*serverTorrentState, bool) {
+) bool {
 	ts.mu.Lock()
-	if _, alreadyAborting := ts.aborting[hash]; alreadyAborting {
+	if _, busy := ts.aborting[hash]; busy {
 		ts.mu.Unlock()
-		return nil, false
+		return false
 	}
+
 	state, exists := ts.entries[hash]
-	if !exists || !pred(state) {
-		ts.mu.Unlock()
-		return nil, false
+	if exists {
+		if !pred(state) {
+			ts.mu.Unlock()
+			return false
+		}
+		unregisterFilePaths(ts.filePaths, hash, state.files)
+		delete(ts.entries, hash)
 	}
 	ts.aborting[hash] = ch
-	unregisterFilePaths(ts.filePaths, hash, state.files)
-	delete(ts.entries, hash)
 	ts.mu.Unlock()
 
-	ts.abortInodesForFiles(hash, state.files)
-	return state, true
-}
-
-// BeginCleanup registers a cleanup channel for an untracked hash (orphan cleanup).
-// Returns false if the hash is tracked or already being cleaned.
-func (ts *torrentStore) BeginCleanup(hash string, ch chan struct{}) bool {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-	if _, tracked := ts.entries[hash]; tracked {
-		return false
+	if exists {
+		ts.abortInodesForFiles(hash, state.files)
 	}
-	if _, cleaning := ts.aborting[hash]; cleaning {
-		return false
-	}
-	ts.aborting[hash] = ch
 	return true
 }
 

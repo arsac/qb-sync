@@ -333,19 +333,19 @@ func TestCleanupOrphan_HealsQBOwnedCompleteTorrent(t *testing.T) {
 			"finalized torrent must never be an orphan candidate again")
 	})
 
-	t.Run("concurrent cleanup is single-flight via BeginCleanup", func(t *testing.T) {
+	t.Run("concurrent cleanup is single-flight via BeginReclaim", func(t *testing.T) {
 		t.Parallel()
 		mock := &mockQBClient{torrents: qbTorrent(qbittorrent.TorrentStateStoppedUp, 1.0, ownPath)}
 		s, _ := newOrphanEnv(t, mock)
 
 		// Hold the cleanup registration, as a concurrent cleanupOrphan would.
 		ch := make(chan struct{})
-		require.True(t, s.store.BeginCleanup(hash, ch))
+		require.True(t, s.store.BeginReclaim(hash, ch, func(*serverTorrentState) bool { return true }))
 
 		s.cleanupOrphan(context.Background(), hash, defaultOrphanTimeout)
 
 		require.False(t, s.isFinalized(hash),
-			"second cleanup must bail at BeginCleanup, not heal concurrently")
+			"second cleanup must bail at BeginReclaim, not heal concurrently")
 		close(ch)
 		s.store.EndCleanup(hash)
 	})

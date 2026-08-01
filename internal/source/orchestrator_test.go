@@ -2905,7 +2905,7 @@ func TestSyncFailedTag(t *testing.T) {
 // calling markSyncFailed. The torrent stayed in tracked indefinitely, keeping
 // the qbsync_active_torrents Prometheus gauge elevated and producing the
 // Grafana symptom: rows where TorrentPiecesStreamed == TorrentPieces, never
-// dropping. This mirrors the existing maxVerificationRetries cap that
+// dropping. This mirrors the existing minQuarantineAttempts cap that
 // handleIncompleteFinalization already applies for INCOMPLETE failures.
 func TestHandleFinalizeError_DefaultBranchCapsAtMaxRetries(t *testing.T) {
 	logger := testLogger(t)
@@ -2938,7 +2938,7 @@ func TestHandleFinalizeError_DefaultBranchCapsAtMaxRetries(t *testing.T) {
 		// addAndVerifyTorrent fails (e.g. existing torrent in missingFiles).
 		qbErr := errors.New("qBittorrent: torrent in error state: missingFiles")
 
-		for range maxVerificationRetries {
+		for range minQuarantineAttempts {
 			task.handleFinalizeError(context.Background(), hash, qbErr)
 		}
 
@@ -2970,7 +2970,7 @@ func TestHandleFinalizeError_DefaultBranchCapsAtMaxRetries(t *testing.T) {
 		task.store.now = func() time.Time { return now }
 		qbErr := errors.New("qBittorrent: torrent in error state: missingFiles")
 
-		for range maxVerificationRetries * 20 {
+		for range minQuarantineAttempts * 20 {
 			now = now.Add(5 * time.Second) // two minutes of failures, densely packed
 			task.handleFinalizeError(context.Background(), hash, qbErr)
 		}
@@ -2992,7 +2992,7 @@ func TestHandleFinalizeError_DefaultBranchCapsAtMaxRetries(t *testing.T) {
 
 		transientErr := status.Error(codes.Unavailable, "destination unreachable")
 
-		for range maxVerificationRetries * 5 {
+		for range minQuarantineAttempts * 5 {
 			task.handleFinalizeError(context.Background(), hash, transientErr)
 		}
 
@@ -3015,7 +3015,7 @@ func TestHandleFinalizeError_DefaultBranchCapsAtMaxRetries(t *testing.T) {
 		now := time.Now()
 		task.store.now = func() time.Time { return now }
 
-		for range maxVerificationRetries {
+		for range minQuarantineAttempts {
 			task.handleFinalizeError(context.Background(), hash, incompleteErr)
 		}
 
@@ -3455,7 +3455,7 @@ func TestExcludeSyncTagReactive(t *testing.T) {
 // TestHandleFinalizeError_BusyDoesNotBurnRetryBudget covers the BUSY
 // (destination congested) contract: queue timeouts and qB-still-checking
 // timeouts are destination-wide congestion, not per-torrent faults, so they
-// must not count toward maxVerificationRetries — until the wall-clock guard
+// must not count toward minQuarantineAttempts — until the wall-clock guard
 // (busyGuardDuration) expires, after which a permanently wedged destination
 // must still surface as sync-failed.
 func TestHandleFinalizeError_BusyDoesNotBurnRetryBudget(t *testing.T) {
@@ -3484,7 +3484,7 @@ func TestHandleFinalizeError_BusyDoesNotBurnRetryBudget(t *testing.T) {
 
 		busyErr := fmt.Errorf("%w: finalization queue timeout", streaming.ErrFinalizeBusy)
 
-		for range maxVerificationRetries * 5 {
+		for range minQuarantineAttempts * 5 {
 			task.handleFinalizeError(context.Background(), hash, busyErr)
 		}
 
@@ -3508,7 +3508,7 @@ func TestHandleFinalizeError_BusyDoesNotBurnRetryBudget(t *testing.T) {
 
 		busyErr := fmt.Errorf("%w: finalization queue timeout", streaming.ErrFinalizeBusy)
 
-		for range maxVerificationRetries {
+		for range minQuarantineAttempts {
 			task.handleFinalizeError(context.Background(), hash, busyErr)
 		}
 

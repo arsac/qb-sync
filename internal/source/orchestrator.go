@@ -33,9 +33,12 @@ const (
 	// Streaming queue configuration defaults.
 	defaultRetryDelay = 5 * time.Second
 
-	// maxVerificationRetries is the number of consecutive verification failures
-	// before the torrent is tagged as sync-failed and excluded from future syncs.
-	maxVerificationRetries = 3
+	// minQuarantineAttempts is the minimum number of consecutive failures before
+	// the guard is even consulted. It is a floor, not a cap: on its own it never
+	// quarantines anything. The wall-clock guard decides that — a torrent can
+	// fail far more than this many times and still not be quarantined, which is
+	// the whole point. See docs/adr/0001-quarantine-requires-a-wall-clock-guard.md.
+	minQuarantineAttempts = 3
 
 	// busyGuardDuration bounds how long BUSY (destination congested) responses
 	// are tolerated per torrent before they start counting toward the failure

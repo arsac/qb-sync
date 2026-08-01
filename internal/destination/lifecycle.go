@@ -260,21 +260,16 @@ func (s *Server) cleanupOrphan(ctx context.Context, hash string, timeout time.Du
 	// that we're about to delete. Uses same pattern as AbortTorrent.
 	//
 	// An orphan may still hold in-memory state, because store membership no
-	// longer decides orphan-ness (see isOrphanedTorrent). BeginCleanup refuses
-	// entries that are present, so for those we take BeginAbort instead, which
-	// atomically drops the entry and registers the same cleanup channel.
-	// Without this, the store entry would shield the orphan exactly as it did
-	// before - the predicate would be fixed but nothing would ever be reclaimed.
+	// longer decides orphan-ness (see isOrphanedTorrent). BeginReclaim drops
+	// the entry when there is one, so the store cannot shield an orphan the way
+	// it did before this change.
 	cleanupCh := make(chan struct{})
-	registered := s.store.BeginCleanup(hash, cleanupCh)
-	if !registered {
-		// Still holds state. Re-test staleness under the store lock: a source
-		// may have resumed the torrent since the scan decided it was stale, and
-		// deleting its files now would pull them from under an active transfer.
-		_, registered = s.store.BeginAbortIf(hash, cleanupCh, func(st *serverTorrentState) bool {
-			return s.isStaleState(st, timeout)
-		})
-	}
+	registered := s.store.BeginReclaim(hash, cleanupCh, func(st *serverTorrentState) bool {
+		// Re-tested under the store lock: a source may have resumed the torrent
+		// since the scan decided it was stale, and deleting its files now would
+		// pull them from under an active transfer.
+		return s.isStaleState(st, timeout)
+	})
 	if !registered {
 		s.logger.DebugContext(ctx, "skipping orphan cleanup, torrent is active or already cleaning",
 			"hash", hash,

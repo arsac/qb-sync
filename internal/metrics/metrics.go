@@ -753,6 +753,10 @@ var (
 	// QuarantinedTorrents is the standing population carrying the sync-failed
 	// tag. sync_outcomes_total gives the rate of new failures but never how
 	// many are sitting quarantined right now, which is what needs an alert.
+	//
+	// This deliberately mirrors SkippedTorrents{reason="quarantined"}. It is
+	// kept as a separate, label-free series so the alert rule in METRICS.md does
+	// not depend on a label value that a future refactor could rename.
 	QuarantinedTorrents = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: namespace,

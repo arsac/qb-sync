@@ -189,15 +189,23 @@ func (t *PieceMonitor) MarkStreamedBatch(hash string, written []bool) int {
 	defer state.mu.Unlock()
 
 	count := 0
+	advanced := false
 	for i, isWritten := range written {
 		if isWritten && i < len(state.streamed) {
 			if !state.streamed[i] {
-				state.noteAdvance()
+				advanced = true
 			}
 			state.streamed[i] = true
 			state.failed[i] = false
 			count++
 		}
+	}
+
+	// Once for the batch, not once per piece: a resync of a large torrent would
+	// otherwise take tens of thousands of clock readings under the write lock,
+	// and only the last one survives anyway.
+	if advanced {
+		state.noteAdvance()
 	}
 
 	return count

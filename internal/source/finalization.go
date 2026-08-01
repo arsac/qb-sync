@@ -110,21 +110,12 @@ func (t *QBTask) handleFinalizeError(ctx context.Context, hash string, finalizeE
 		t.logger.ErrorContext(ctx, "finalize failing past the guard, marking torrent as sync-failed",
 			"hash", hash,
 			"failures", failures,
-			"guard", t.syncFailedGuard(),
+			"guard", t.store.Guard(),
 			"error", finalizeErr,
 		)
 		t.markSyncFailed(ctx, hash)
 	}
 	return false
-}
-
-// syncFailedGuard returns the configured quarantine guard, falling back to the
-// default when unset (tests construct QBTask directly).
-func (t *QBTask) syncFailedGuard() time.Duration {
-	if t.cfg != nil && t.cfg.SyncFailedGuard > 0 {
-		return t.cfg.SyncFailedGuard
-	}
-	return defaultSyncFailedGuard
 }
 
 // stallGracePeriod is how long a tracked torrent may sit without advancing
@@ -179,7 +170,7 @@ func (t *QBTask) checkStalledStreams(ctx context.Context) {
 		t.logger.ErrorContext(ctx, "torrent stalled past the guard, marking as sync-failed",
 			"hash", hash,
 			"stalledFor", stalledFor.Round(time.Second),
-			"guard", t.syncFailedGuard(),
+			"guard", t.store.Guard(),
 			"streamed", progress.Streamed,
 			"total", progress.TotalPieces,
 			"available", progress.Available,
@@ -277,7 +268,7 @@ func (t *QBTask) handleIncompleteFinalization(ctx context.Context, hash string) 
 		t.logger.ErrorContext(ctx, "verification failing past the guard, marking torrent as sync-failed",
 			"hash", hash,
 			"failures", failures,
-			"guard", t.syncFailedGuard(),
+			"guard", t.store.Guard(),
 		)
 		t.markSyncFailed(ctx, hash)
 		return
@@ -285,7 +276,7 @@ func (t *QBTask) handleIncompleteFinalization(ctx context.Context, hash string) 
 	t.logger.WarnContext(ctx, "destination reports incomplete, re-syncing streamed state",
 		"hash", hash,
 		"attempt", failures,
-		"maxRetries", maxVerificationRetries,
+		"maxRetries", minQuarantineAttempts,
 	)
 	t.resyncWithDest(ctx, hash)
 }
@@ -299,7 +290,7 @@ func (t *QBTask) handleNotFoundFinalization(ctx context.Context, hash string) {
 	t.logger.WarnContext(ctx, "destination has no state for torrent, untracking for re-init",
 		"hash", hash,
 	)
-	t.stopTracking(hash)
+	t.releaseTorrent(hash)
 }
 
 // markSyncFailed tags the torrent as sync-failed on source qBittorrent and stops
@@ -325,7 +316,7 @@ func (t *QBTask) markSyncFailed(ctx context.Context, hash string) {
 
 	// Stop tracking so the torrent is not re-streamed.
 	// It will be picked up again if the user removes the tag.
-	t.stopTracking(hash)
+	t.releaseTorrent(hash)
 
 	metrics.SyncOutcomesTotal.WithLabelValues(metrics.ModeSource, metrics.ResultFailed, selection).Inc()
 }
@@ -360,13 +351,6 @@ func (t *QBTask) releaseDestination(ctx context.Context, hash string) {
 	t.logger.InfoContext(ctx, "released quarantined torrent on destination, data preserved for retry",
 		"hash", hash,
 	)
-}
-
-// stopTracking tears down all tracking state for a torrent: unregisters from the
-// piece monitor, evicts file-handle and init caches, removes from TrackedTorrents,
-// and clears finalization backoff. Callers handle their own metrics and RPC cleanup.
-func (t *QBTask) stopTracking(hash string) {
-	t.releaseTorrent(hash)
 }
 
 // releaseTorrent tears down every piece of per-torrent streaming state in one
