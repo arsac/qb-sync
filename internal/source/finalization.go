@@ -17,7 +17,7 @@ import (
 //
 //nolint:unparam // error return kept for interface consistency
 func (t *QBTask) finalizeCompletedStreams(ctx context.Context) error {
-	tracked := t.tracked.Snapshot()
+	tracked := t.store.TrackedSnapshot()
 
 	for hash := range tracked {
 		progress, err := t.tracker.GetProgress(hash)
@@ -33,7 +33,7 @@ func (t *QBTask) finalizeCompletedStreams(ctx context.Context) error {
 			"complete", progress.Complete,
 		)
 
-		if !progress.Complete || !t.backoffs.ShouldAttempt(hash) {
+		if !progress.Complete || !t.store.ShouldAttempt(hash) {
 			continue
 		}
 
@@ -59,7 +59,7 @@ func (t *QBTask) handleFinalizeError(ctx context.Context, hash string, finalizeE
 	// again without burning the retry budget, but bound it with a wall-clock
 	// guard so a permanently wedged destination still surfaces as sync-failed.
 	if errors.Is(finalizeErr, streaming.ErrFinalizeBusy) {
-		if busyFor := t.backoffs.RecordBusy(hash); busyFor < busyGuardDuration {
+		if busyFor := t.store.RecordBusy(hash); busyFor < busyGuardDuration {
 			t.logger.WarnContext(ctx, "destination finalization busy, will retry",
 				"hash", hash,
 				"busyFor", busyFor.Round(time.Second),
@@ -105,7 +105,7 @@ func (t *QBTask) handleFinalizeError(ctx context.Context, hash string, finalizeE
 	// Persistent per-torrent failure (e.g. destination qB stuck in missingFiles).
 	// Share the maxVerificationRetries budget with handleIncompleteFinalization so
 	// the torrent surfaces as sync-failed instead of looping in tracked forever.
-	failures := t.backoffs.RecordFailure(hash)
+	failures := t.store.RecordFailure(hash)
 	if failures >= maxVerificationRetries {
 		t.logger.ErrorContext(ctx, "finalize failed repeatedly, marking torrent as sync-failed",
 			"hash", hash,
@@ -124,15 +124,15 @@ func (t *QBTask) markTorrentSynced(ctx context.Context, hash string, tt TrackedT
 	// Compute fingerprint before evicting source cache
 	fingerprint := t.computeSelectionFingerprint(ctx, hash)
 
-	t.backoffs.Clear(hash)
+	t.store.ClearBackoff(hash)
 
 	metrics.TorrentSyncLatencySeconds.Observe(time.Since(tt.CompletionTime).Seconds())
-	t.completed.MarkWithFingerprint(hash, fingerprint)
-	t.completed.Save()
+	t.store.MarkComplete(hash, fingerprint)
+	t.store.Save()
 
 	t.tracker.Untrack(hash)
 	t.source.EvictCache(hash)
-	t.tracked.Delete(hash)
+	t.store.Untrack(hash)
 
 	selection := t.computeSelectionLabel(ctx, hash)
 	metrics.SyncOutcomesTotal.WithLabelValues(metrics.ModeSource, metrics.ResultSynced, selection).Inc()
@@ -202,7 +202,7 @@ func (t *QBTask) finalizeTorrent(ctx context.Context, hash string) error {
 // loops. After maxVerificationRetries, tags the torrent as sync-failed so the user
 // can investigate. Removing the tag re-enables sync.
 func (t *QBTask) handleIncompleteFinalization(ctx context.Context, hash string) {
-	failures := t.backoffs.RecordFailure(hash)
+	failures := t.store.RecordFailure(hash)
 	if failures >= maxVerificationRetries {
 		t.logger.ErrorContext(ctx, "verification failed repeatedly, marking torrent as sync-failed",
 			"hash", hash,
@@ -265,8 +265,8 @@ func (t *QBTask) stopTracking(hash string) {
 	t.tracker.Untrack(hash)
 	t.source.EvictCache(hash)
 	t.grpcDest.ClearInitResult(hash)
-	t.tracked.Delete(hash)
-	t.backoffs.Clear(hash)
+	t.store.Untrack(hash)
+	t.store.ClearBackoff(hash)
 }
 
 // invertPiecesNeeded converts PiecesNeeded (true=missing) to written (true=have).

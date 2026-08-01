@@ -28,13 +28,13 @@ func (t *QBTask) handleTorrentRemoval(ctx context.Context, hash string) {
 		"hash", hash,
 	)
 
-	_, wasTracked := t.tracked.DeleteAndGet(hash)
+	_, wasTracked := t.store.UntrackAndGet(hash)
 
 	// Read completedOnDest but don't delete yet -- only remove after
 	// StartTorrent succeeds so pruneCompletedOnDest can retry on failure.
-	wasCompletedOnDest := t.completed.IsComplete(hash)
+	wasCompletedOnDest := t.store.IsComplete(hash)
 
-	t.backoffs.Clear(hash)
+	t.store.ClearBackoff(hash)
 
 	if !wasTracked {
 		t.logger.DebugContext(ctx, "removed torrent was not in tracked list",
@@ -65,8 +65,8 @@ func (t *QBTask) handleTorrentRemoval(ctx context.Context, hash string) {
 			return
 		}
 
-		t.completed.Remove(hash)
-		t.completed.Save()
+		t.store.ForgetComplete(hash)
+		t.store.Save()
 
 		t.logger.InfoContext(ctx, "started and tagged torrent on destination after source removal",
 			"hash", hash, "tag", t.cfg.SourceRemovedTag,
@@ -141,8 +141,8 @@ func (t *QBTask) tryFinalizeFullyStreamed(ctx context.Context, hash string) bool
 	// leave the torrent finalized on disk but never seeding in destination
 	// qB, with no retry path (the existing prune cycle only iterates
 	// hashes already in the completion cache).
-	t.completed.MarkWithFingerprint(hash, "")
-	t.completed.Save()
+	t.store.MarkComplete(hash, "")
+	t.store.Save()
 
 	startCtx, startCancel := withDestRPCTimeout(ctx)
 	defer startCancel()

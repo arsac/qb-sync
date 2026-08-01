@@ -34,19 +34,20 @@ func (c *MetricsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- metrics.ActiveFinalizationBackoffsDesc
 }
 
-// Collect implements prometheus.Collector. Iterations over c.task.tracked use
-// [sync.Map.Range] so this is safe to call alongside ongoing finalize/track/untrack.
+// Collect implements prometheus.Collector. RangeTracked iterates a snapshot
+// taken under the store lock, so scraping is safe alongside ongoing
+// finalize/track/untrack and cannot block them for the duration of a scrape.
 func (c *MetricsCollector) Collect(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(metrics.ActiveTorrentsDesc, prometheus.GaugeValue,
-		float64(c.task.tracked.Count()), metrics.ModeSource)
+		float64(c.task.store.TrackedCount()), metrics.ModeSource)
 
 	ch <- prometheus.MustNewConstMetric(metrics.CompletedOnDestCacheSizeDesc, prometheus.GaugeValue,
-		float64(c.task.completed.Count()))
+		float64(c.task.store.CompletedCount()))
 
 	ch <- prometheus.MustNewConstMetric(metrics.ActiveFinalizationBackoffsDesc, prometheus.GaugeValue,
-		float64(c.task.backoffs.Count()))
+		float64(c.task.store.BackoffCount()))
 
-	c.task.tracked.Range(func(hash string, tt TrackedTorrent) bool {
+	c.task.store.RangeTracked(func(hash string, tt TrackedTorrent) bool {
 		c.emitPerTorrent(ch, hash, tt)
 		return true
 	})

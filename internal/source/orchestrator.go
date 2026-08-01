@@ -74,10 +74,9 @@ type QBTask struct {
 	tracker *streaming.PieceMonitor
 	queue   *streaming.BidiQueue
 
-	// Extracted sub-components with internal locking
-	tracked   *TrackedSet      // torrents currently being streamed
-	completed *CompletionCache // torrents known to be complete on destination
-	backoffs  *BackoffTracker  // finalization retry backoff per torrent
+	// All per-torrent source state behind one lock: what is being streamed,
+	// what the destination has finalized, and finalization retry accounting.
+	store *torrentStore
 
 	// Cycle counter for periodic pruning of completedOnDest
 	pruneCycleCount int
@@ -155,12 +154,10 @@ func NewQBTask(
 		source:    source,
 		tracker:   tracker,
 		queue:     queue,
-		tracked:   NewTrackedSet(),
-		completed: NewCompletionCache(cachePath, logger),
-		backoffs:  NewBackoffTracker(),
+		store:     newTorrentStore(cachePath, logger),
 	}
 
-	t.completed.Load()
+	t.store.Load()
 
 	return t, nil
 }
@@ -266,13 +263,13 @@ func (t *QBTask) Progress(_ context.Context, hash string) (streaming.StreamProgr
 // FetchCompletedOnDestination returns torrents known to be complete on destination.
 // Exported for testing (used by E2E tests).
 func (t *QBTask) FetchCompletedOnDestination() []string {
-	return t.completed.Keys()
+	return t.store.CompletedKeys()
 }
 
 // MarkCompletedOnDestination marks a torrent as complete on destination.
 // Exported for testing only - allows tests to simulate synced state.
 func (t *QBTask) MarkCompletedOnDestination(hash string) {
-	t.completed.Mark(hash)
+	t.store.MarkComplete(hash, "")
 }
 
 // withDestRPCTimeout derives a context with destRPCTimeout from the parent
@@ -317,7 +314,7 @@ func (t *QBTask) pruneCompletedOnDest(ctx context.Context) {
 	}
 
 	var prunable []string
-	for hash := range t.completed.Snapshot() {
+	for hash := range t.store.CompletedSnapshot() {
 		if _, stillInSource := sourceHashes[hash]; stillInSource {
 			continue
 		}
@@ -336,11 +333,11 @@ func (t *QBTask) pruneCompletedOnDest(ctx context.Context) {
 		return
 	}
 
-	t.completed.RemoveAll(prunable)
-	t.completed.Save()
+	t.store.ForgetCompleteAll(prunable)
+	t.store.Save()
 	t.logger.InfoContext(ctx, "pruned completed-on-destination cache",
 		"pruned", len(prunable),
-		"remaining", t.completed.Count(),
+		"remaining", t.store.CompletedCount(),
 	)
 }
 
@@ -367,7 +364,7 @@ func (t *QBTask) handoffRemovedCompleted(ctx context.Context, hash string) bool 
 // orchestrator no longer tracks. This is a safety net for cases where Untrack
 // was missed due to an error path.
 func (t *QBTask) pruneStaleMonitorEntries(ctx context.Context) {
-	pruned := t.tracker.PruneStale(t.tracked.Hashes())
+	pruned := t.tracker.PruneStale(t.store.TrackedHashes())
 	if pruned > 0 {
 		t.logger.WarnContext(ctx, "pruned stale PieceMonitor entries",
 			"pruned", pruned,
