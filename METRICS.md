@@ -89,6 +89,9 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_transfer_throughput_bytes_per_second` | | Current transfer throughput |
 | `qbsync_torrents_with_dirty_state` | | Torrents with state not yet flushed to disk (destination) |
 | `qbsync_active_finalization_backoffs` | | Torrents in finalization backoff (source). BUSY-deferred torrents may not appear here — watch `qbsync_finalize_busy_total` for congestion |
+| `qbsync_stalled_torrents` | | Torrents with pieces available on source but not advancing (source). Reaching `--sync-failed-guard` quarantines them, so this is the early warning |
+| `qbsync_quarantined_torrents` | | Standing population carrying the `sync-failed` tag (source). `qbsync_sync_outcomes_total` gives the rate of new failures; this gives how many are sitting quarantined now |
+| `qbsync_skipped_torrents` | `reason` | Source torrents not eligible for sync: `not_syncable_state`, `zero_progress`, `exclude_tag`, `quarantined`, `already_synced` |
 | `qbsync_finalization_queue_depth` | `stage` | Torrents currently waiting for a finalization stage slot (destination) |
 | `qbsync_oldest_pending_sync_seconds` | `hash`, `name` | Age of each torrent waiting to sync |
 | `qbsync_torrent_pieces` | `hash`, `name` | Total pieces per tracked torrent |
@@ -156,4 +159,7 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 - `qbsync_circuit_breaker_state == 1` -- circuit breaker open
 - `rate(qbsync_piece_hash_mismatch_total[5m]) > 0.1` -- data integrity issues
 - `qbsync_oldest_pending_sync_seconds > 3600` -- torrent stuck syncing for over an hour
+- `qbsync_stalled_torrents > 0` sustained -- pieces are available on the source but not moving; these quarantine once the stall outlasts `--sync-failed-guard`
+- `qbsync_quarantined_torrents > 0` -- torrents need a human. Removing the `sync-failed` tag releases them
+- `qbsync_skipped_torrents{reason="not_syncable_state"} > 0` sustained -- torrents broken on the source (error, missingFiles) that will never sync and produce no other signal
 - `qbsync_draining == 1` for > 5m -- shutdown drain taking too long

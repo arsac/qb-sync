@@ -240,6 +240,7 @@ func (t *QBTask) runOnce(ctx context.Context) {
 	if err := t.trackNewTorrents(ctx); err != nil {
 		t.logger.ErrorContext(ctx, "failed to track torrents", "error", err)
 	}
+	t.recordEligibilityMetrics()
 	t.checkExcludedTorrents(ctx)
 	if err := t.finalizeCompletedStreams(ctx); err != nil {
 		t.logger.ErrorContext(ctx, "failed to finalize streams", "error", err)

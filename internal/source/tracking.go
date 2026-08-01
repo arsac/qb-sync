@@ -113,26 +113,60 @@ func (t *QBTask) trackNewTorrents(ctx context.Context) error {
 	return nil
 }
 
+// exclusionReason returns the metrics reason a torrent is skipped during
+// tracking, or "" when it is eligible.
+//
+// Reported as a gauge because these torrents were otherwise invisible: a
+// torrent sitting in error or missingFiles on the source is silently never
+// synced, with no log and no metric to say so.
+func (t *QBTask) exclusionReason(torrent qbittorrent.Torrent) string {
+	switch {
+	case !isSyncableState(torrent.State):
+		return metrics.ReasonSkipNotSyncable
+	case torrent.Progress <= 0:
+		return metrics.ReasonSkipZeroProgress
+	case t.cfg.ExcludeSyncTag != "" && hasTag(torrent.Tags, t.cfg.ExcludeSyncTag):
+		return metrics.ReasonSkipExcludeTag
+	case t.cfg.SyncFailedTag != "" && hasTag(torrent.Tags, t.cfg.SyncFailedTag):
+		return metrics.ReasonSkipQuarantined
+	case t.store.IsComplete(torrent.Hash):
+		return metrics.ReasonSkipAlreadySynced
+	}
+	return ""
+}
+
 // isExcludedFromTracking returns true if the torrent should be skipped during tracking:
 // non-syncable state, zero progress, excluded/sync-failed tag, already complete, or already tracked.
 func (t *QBTask) isExcludedFromTracking(torrent qbittorrent.Torrent) bool {
-	if !isSyncableState(torrent.State) || torrent.Progress <= 0 {
+	if t.exclusionReason(torrent) != "" {
 		return true
 	}
 
-	if t.cfg.ExcludeSyncTag != "" && hasTag(torrent.Tags, t.cfg.ExcludeSyncTag) {
-		return true
-	}
-
-	if t.cfg.SyncFailedTag != "" && hasTag(torrent.Tags, t.cfg.SyncFailedTag) {
-		return true
-	}
-
-	if t.store.IsComplete(torrent.Hash) {
-		return true
-	}
-
+	// Already tracked is not an exclusion worth reporting: it is the steady
+	// state of a healthy sync, not a torrent being left behind.
 	return t.store.IsTracked(torrent.Hash)
+}
+
+// recordEligibilityMetrics publishes the standing population of skipped and
+// quarantined torrents. Every reason is set every cycle, including zero, so a
+// series that stops applying reads as 0 rather than going stale.
+func (t *QBTask) recordEligibilityMetrics() {
+	counts := map[string]int{
+		metrics.ReasonSkipNotSyncable:   0,
+		metrics.ReasonSkipZeroProgress:  0,
+		metrics.ReasonSkipExcludeTag:    0,
+		metrics.ReasonSkipQuarantined:   0,
+		metrics.ReasonSkipAlreadySynced: 0,
+	}
+	for i := range t.cycleTorrents {
+		if reason := t.exclusionReason(t.cycleTorrents[i]); reason != "" {
+			counts[reason]++
+		}
+	}
+	for reason, n := range counts {
+		metrics.SkippedTorrents.WithLabelValues(reason).Set(float64(n))
+	}
+	metrics.QuarantinedTorrents.Set(float64(counts[metrics.ReasonSkipQuarantined]))
 }
 
 // queryDestStatus checks a torrent's status on destination without starting tracking.

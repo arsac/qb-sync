@@ -4,6 +4,11 @@ import (
 	"log/slog"
 	"testing"
 	"time"
+
+	"github.com/autobrr/go-qbittorrent"
+
+	"github.com/arsac/qb-sync/internal/config"
+	"github.com/arsac/qb-sync/internal/metrics"
 )
 
 func testStoreLogger() *slog.Logger {
@@ -371,5 +376,99 @@ func TestPruneStreaksDropsDepartedTorrents(t *testing.T) {
 	}
 	if s.StalledCount() != 1 {
 		t.Error("streaks for present torrents must survive pruning")
+	}
+}
+
+// --- Eligibility reporting ----------------------------------------------------
+
+// TestExclusionReason pins the reason a torrent is reported as skipped. These
+// torrents were previously invisible: one sitting in error or missingFiles on
+// the source is silently never synced, with no log and no metric. A wrong label
+// here is a silent observability bug, so the mapping is worth pinning.
+func TestExclusionReason(t *testing.T) {
+	t.Parallel()
+
+	newTask := func() *QBTask {
+		return &QBTask{
+			cfg: &config.SourceConfig{
+				SyncFailedTag:  "sync-failed",
+				ExcludeSyncTag: "no-sync",
+			},
+			logger: testStoreLogger(),
+			store:  newTorrentStore("", testStoreLogger()),
+		}
+	}
+
+	// seeding is the eligible baseline; each case varies one thing from it.
+	seeding := func(tags string) qbittorrent.Torrent {
+		return qbittorrent.Torrent{
+			Hash:     "a",
+			State:    qbittorrent.TorrentStateUploading,
+			Progress: 1,
+			Tags:     tags,
+		}
+	}
+
+	tests := []struct {
+		name    string
+		torrent qbittorrent.Torrent
+		setup   func(*QBTask)
+		want    string
+	}{
+		{
+			name:    "error state",
+			torrent: qbittorrent.Torrent{Hash: "a", State: qbittorrent.TorrentStateError, Progress: 1},
+			want:    metrics.ReasonSkipNotSyncable,
+		},
+		{
+			name:    "missing files",
+			torrent: qbittorrent.Torrent{Hash: "a", State: qbittorrent.TorrentStateMissingFiles, Progress: 1},
+			want:    metrics.ReasonSkipNotSyncable,
+		},
+		{
+			name:    "nothing downloaded yet",
+			torrent: qbittorrent.Torrent{Hash: "a", State: qbittorrent.TorrentStateDownloading, Progress: 0},
+			want:    metrics.ReasonSkipZeroProgress,
+		},
+		{
+			name:    "operator opted out",
+			torrent: seeding("no-sync"),
+			want:    metrics.ReasonSkipExcludeTag,
+		},
+		{
+			name:    "quarantined",
+			torrent: seeding("sync-failed"),
+			want:    metrics.ReasonSkipQuarantined,
+		},
+		{
+			name:    "already synced",
+			torrent: seeding(""),
+			setup:   func(task *QBTask) { task.store.MarkComplete("a", "") },
+			want:    metrics.ReasonSkipAlreadySynced,
+		},
+		{
+			name:    "eligible",
+			torrent: seeding(""),
+			want:    "",
+		},
+		{
+			name:    "already tracked is not reported as skipped",
+			torrent: seeding(""),
+			setup:   func(task *QBTask) { task.store.Track("a", TrackedTorrent{}) },
+			want:    "", // the steady state of a healthy sync, not a torrent left behind
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			task := newTask()
+			if tc.setup != nil {
+				tc.setup(task)
+			}
+			if got := task.exclusionReason(tc.torrent); got != tc.want {
+				t.Errorf("exclusionReason = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

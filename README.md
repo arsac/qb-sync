@@ -63,6 +63,9 @@ All flags can be set via environment variables with the prefix `QBSYNC_SOURCE_` 
 | `QBSYNC_SOURCE_SYNCED_TAG` | `--synced-tag` | Tag for synced torrents (empty to disable) | `synced` |
 | `QBSYNC_SOURCE_SOURCE_REMOVED_TAG` | `--source-removed-tag` | Tag on destination when source removed (empty to disable) | `source-removed` |
 | `QBSYNC_SOURCE_EXCLUDE_CLEANUP_TAG` | `--exclude-cleanup-tag` | Tag that prevents cleanup from source (empty to disable) | |
+| `QBSYNC_SOURCE_EXCLUDE_SYNC_TAG` | `--exclude-sync-tag` | Tag that prevents a torrent from being synced at all (empty to disable) | |
+| `QBSYNC_SOURCE_SYNC_FAILED_TAG` | `--sync-failed-tag` | Tag applied on source when a torrent is quarantined (empty to disable; remove the tag to release) | `sync-failed` |
+| `QBSYNC_SOURCE_SYNC_FAILED_GUARD` | `--sync-failed-guard` | How long (seconds) a torrent must fail continuously before it is quarantined | `14400` (4h) |
 | `QBSYNC_SOURCE_DRAIN_ANNOTATION` | `--drain-annotation` | Pod annotation key to gate shutdown drain (empty to drain unconditionally) | `qbsync/drain` |
 | `QBSYNC_SOURCE_DRAIN_TIMEOUT` | `--drain-timeout` | Shutdown drain timeout (seconds) | `300` |
 | `QBSYNC_SOURCE_HEALTH_ADDR` | `--health-addr` | Health/metrics endpoint | `:8080` |
@@ -116,6 +119,35 @@ These standard variables are also supported as fallbacks:
   (default 1) controls how many torrents may concurrently occupy the destination
   qB add/recheck stage. The default preserves existing behavior; raise it only on
   SSD-backed storage.
+
+## Quarantine
+
+A torrent that keeps failing is eventually **quarantined**: tagged `sync-failed`
+on the source and excluded from further sync attempts until a human intervenes.
+Removing the tag **releases** it and sync resumes.
+
+Quarantine is based on how long a fault has lasted, not on how many attempts
+failed. A torrent is quarantined only once it has been failing continuously for
+longer than `--sync-failed-guard` (default 4h), so a destination restart or a
+brief storage stall is retried and recovered from rather than sidelining every
+torrent that happened to be finalizing at the time.
+
+Two conditions reach it:
+
+- **Failing finalization** - repeated attempts that keep failing, for longer
+  than the guard.
+- **Stalled streaming** - the source has pieces ready but none are moving, for
+  longer than the guard. This catches torrents whose source data has become
+  unreadable. A torrent that is merely slow to download is never quarantined,
+  because it has no pieces available to move.
+
+Quarantining releases the destination's hold on the torrent but **keeps the data
+already transferred**. Releasing it within `--orphan-timeout` (default 24h)
+resumes from where it left off instead of re-copying. After that the destination
+reclaims the disk on its own.
+
+Watch `qbsync_quarantined_torrents` for the standing population and
+`qbsync_stalled_torrents` as the early warning. See [METRICS.md](METRICS.md).
 
 ## Health & Metrics
 

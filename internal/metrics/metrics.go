@@ -63,6 +63,16 @@ const (
 	// ReasonQBChecking marks BUSY caused by qB still checking at budget expiry.
 	ReasonQBChecking = "qb_checking"
 
+	// ReasonSkipNotSyncable and its siblings label SkippedTorrents: why a source
+	// torrent is not eligible for sync. Torrents dropped for these reasons were
+	// previously invisible - one broken on the source would simply never sync,
+	// with no log and no metric to say so.
+	ReasonSkipNotSyncable   = "not_syncable_state" // error, missingFiles, download-side paused
+	ReasonSkipZeroProgress  = "zero_progress"      // nothing downloaded yet
+	ReasonSkipExcludeTag    = "exclude_tag"        // operator opted the torrent out
+	ReasonSkipQuarantined   = "quarantined"        // carries the sync-failed tag
+	ReasonSkipAlreadySynced = "already_synced"     // destination already has it
+
 	ReasonOrphanInQB          = "in_qb"          // OrphanCleanupSkippedTotal: torrent in destination qB but not healable (non-seeding state, <100%, or savepath is not qb-sync's copy)
 	ReasonOrphanQBUnreachable = "qb_unreachable" // OrphanCleanupSkippedTotal: destination qB unreachable during safety check
 )
@@ -662,6 +672,15 @@ var (
 		nil, nil,
 	)
 
+	// StalledTorrentsDesc counts torrents whose stall clock is running: pieces
+	// are available on the source but nothing is moving. Reaching the guard
+	// quarantines them, so a rising value is the early warning.
+	StalledTorrentsDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "", "stalled_torrents"),
+		"Torrents with pieces available on source but not advancing",
+		nil, nil,
+	)
+
 	ActiveFinalizationBackoffsDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "", "active_finalization_backoffs"),
 		"Torrents currently in finalization backoff on source server",
@@ -729,6 +748,27 @@ var (
 			Help:      "Circuit breaker state (0=closed, 1=open, 2=half-open)",
 		},
 		[]string{LabelMode, LabelComponent},
+	)
+
+	// QuarantinedTorrents is the standing population carrying the sync-failed
+	// tag. sync_outcomes_total gives the rate of new failures but never how
+	// many are sitting quarantined right now, which is what needs an alert.
+	QuarantinedTorrents = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "quarantined_torrents",
+			Help:      "Source torrents currently carrying the sync-failed tag",
+		},
+	)
+
+	// SkippedTorrents counts source torrents excluded from sync, by reason.
+	SkippedTorrents = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "skipped_torrents",
+			Help:      "Source torrents not eligible for sync, by reason",
+		},
+		[]string{LabelReason},
 	)
 
 	// StreamPoolScalingPaused tracks whether pool scaling is paused (1=paused, 0=active).

@@ -32,6 +32,7 @@ func (c *MetricsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- metrics.TorrentBytesStreamedDesc
 	ch <- metrics.CompletedOnDestCacheSizeDesc
 	ch <- metrics.ActiveFinalizationBackoffsDesc
+	ch <- metrics.StalledTorrentsDesc
 }
 
 // Collect implements prometheus.Collector. RangeTracked iterates a snapshot
@@ -46,6 +47,9 @@ func (c *MetricsCollector) Collect(ch chan<- prometheus.Metric) {
 
 	ch <- prometheus.MustNewConstMetric(metrics.ActiveFinalizationBackoffsDesc, prometheus.GaugeValue,
 		float64(c.task.store.BackoffCount()))
+
+	ch <- prometheus.MustNewConstMetric(metrics.StalledTorrentsDesc, prometheus.GaugeValue,
+		float64(c.task.store.StalledCount()))
 
 	c.task.store.RangeTracked(func(hash string, tt TrackedTorrent) bool {
 		c.emitPerTorrent(ch, hash, tt)
