@@ -34,7 +34,9 @@ func (t *QBTask) handleTorrentRemoval(ctx context.Context, hash string) {
 	// StartTorrent succeeds so pruneCompletedOnDest can retry on failure.
 	wasCompletedOnDest := t.store.IsComplete(hash)
 
-	t.store.ClearBackoff(hash)
+	// Full release: the torrent is gone from the source, so every piece of
+	// streaming state for it is stale. Completion is handled separately below.
+	t.releaseTorrent(hash)
 
 	if !wasTracked {
 		t.logger.DebugContext(ctx, "removed torrent was not in tracked list",

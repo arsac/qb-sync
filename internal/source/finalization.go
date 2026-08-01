@@ -183,6 +183,10 @@ func (t *QBTask) checkStalledStreams(ctx context.Context) {
 			"streamed", progress.Streamed,
 			"total", progress.TotalPieces,
 			"available", progress.Available,
+			// Failed is the count of pieces whose send or read failed. It is
+			// the first thing to look at when diagnosing a stall: a high count
+			// points at unreadable source data rather than a wedged pipeline.
+			"failed", progress.Failed,
 		)
 		t.markSyncFailed(ctx, hash)
 	}
@@ -194,15 +198,11 @@ func (t *QBTask) markTorrentSynced(ctx context.Context, hash string, tt TrackedT
 	// Compute fingerprint before evicting source cache
 	fingerprint := t.computeSelectionFingerprint(ctx, hash)
 
-	t.store.ClearBackoff(hash)
-
 	metrics.TorrentSyncLatencySeconds.Observe(time.Since(tt.CompletionTime).Seconds())
 	t.store.MarkComplete(hash, fingerprint)
 	t.store.Save()
 
-	t.tracker.Untrack(hash)
-	t.source.EvictCache(hash)
-	t.store.Untrack(hash)
+	t.releaseTorrent(hash)
 
 	selection := t.computeSelectionLabel(ctx, hash)
 	metrics.SyncOutcomesTotal.WithLabelValues(metrics.ModeSource, metrics.ResultSynced, selection).Inc()
@@ -366,12 +366,35 @@ func (t *QBTask) releaseDestination(ctx context.Context, hash string) {
 // piece monitor, evicts file-handle and init caches, removes from TrackedTorrents,
 // and clears finalization backoff. Callers handle their own metrics and RPC cleanup.
 func (t *QBTask) stopTracking(hash string) {
+	t.releaseTorrent(hash)
+}
+
+// releaseTorrent tears down every piece of per-torrent streaming state in one
+// operation.
+//
+// These six releases used to be spelled out at each lifecycle transition in
+// five different combinations, so every new path had to remember which subset
+// applied. That is not a hypothetical hazard: markTorrentSynced omitted the
+// stall release, which left lastStreamed set on every successfully synced
+// torrent and kept its record alive for the lifetime of the process.
+//
+// Completion state is deliberately NOT released here. Whether a torrent stays
+// known-complete genuinely differs by caller — quiesceExcludedCompleted must
+// preserve it so a later removal takes the safe handoff path, while
+// resyncFileSelection must drop it — so it stays explicit at each site.
+func (t *QBTask) releaseTorrent(hash string) {
 	t.tracker.Untrack(hash)
-	t.source.EvictCache(hash)
-	t.grpcDest.ClearInitResult(hash)
 	t.store.Untrack(hash)
 	t.store.ClearBackoff(hash)
 	t.store.ClearStall(hash)
+	t.releaseCaches(hash)
+}
+
+// releaseCaches drops the source-side memos for a torrent without untracking
+// it, so the next cycle re-derives them from scratch.
+func (t *QBTask) releaseCaches(hash string) {
+	t.source.EvictCache(hash)
+	t.grpcDest.ClearInitResult(hash)
 }
 
 // invertPiecesNeeded converts PiecesNeeded (true=missing) to written (true=have).

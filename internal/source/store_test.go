@@ -9,6 +9,8 @@ import (
 
 	"github.com/arsac/qb-sync/internal/config"
 	"github.com/arsac/qb-sync/internal/metrics"
+	"github.com/arsac/qb-sync/internal/qbclient"
+	"github.com/arsac/qb-sync/internal/streaming"
 )
 
 func testStoreLogger() *slog.Logger {
@@ -471,4 +473,70 @@ func TestExclusionReason(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- Teardown -----------------------------------------------------------------
+
+// TestReleaseTorrentLeavesNoRecord covers the hazard that made the teardown
+// worth unifying.
+//
+// The six releases were previously spelled out at each lifecycle transition in
+// five different combinations. markTorrentSynced omitted the stall release, so
+// lastStreamed stayed set on every successfully synced torrent and its record
+// outlived the completion entry - a leak per synced torrent for the lifetime of
+// the process. TestStoreRecordIsDroppedWhenEmpty could not catch it, because it
+// exercises the store directly rather than the paths that call it.
+func TestReleaseTorrentLeavesNoRecord(t *testing.T) {
+	t.Parallel()
+
+	newTask := func() *QBTask {
+		return &QBTask{
+			cfg:      &config.SourceConfig{},
+			logger:   testStoreLogger(),
+			grpcDest: &mockDest{},
+			source:   qbclient.NewSource(nil, ""),
+			tracker: streaming.NewPieceMonitor(
+				nil, &mockPieceSource{numPieces: 1}, testStoreLogger(), streaming.DefaultPieceMonitorConfig(),
+			),
+			store: newTorrentStore("", testStoreLogger()),
+		}
+	}
+
+	t.Run("a torrent that stalled then synced leaves nothing behind", func(t *testing.T) {
+		t.Parallel()
+		task := newTask()
+
+		task.store.Track("h1", TrackedTorrent{})
+		task.store.ObserveStall("h1", 5, false) // every tracked torrent gets this
+		task.store.MarkComplete("h1", "")
+
+		task.releaseTorrent("h1")
+		task.store.ForgetComplete("h1") // later pruned
+
+		task.store.mu.RLock()
+		n := len(task.store.records)
+		task.store.mu.RUnlock()
+		if n != 0 {
+			t.Fatalf("record leaked: %d survive a fully synced and pruned torrent", n)
+		}
+	})
+
+	t.Run("a quarantined torrent leaves nothing behind", func(t *testing.T) {
+		t.Parallel()
+		task := newTask()
+
+		task.store.Track("h1", TrackedTorrent{})
+		task.store.RecordFailure("h1")
+		task.store.ObserveStall("h1", 2, true)
+		task.store.ObserveStall("h1", 2, true)
+
+		task.releaseTorrent("h1")
+
+		task.store.mu.RLock()
+		n := len(task.store.records)
+		task.store.mu.RUnlock()
+		if n != 0 {
+			t.Fatalf("record leaked: %d survive a quarantined torrent", n)
+		}
+	})
 }

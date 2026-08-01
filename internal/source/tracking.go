@@ -454,8 +454,7 @@ func (t *QBTask) quiesceExcludedCompleted(ctx context.Context, excludedHashes ma
 			"name", name,
 			"hash", hash,
 		)
-		t.source.EvictCache(hash)
-		t.grpcDest.ClearInitResult(hash)
+		t.releaseCaches(hash)
 	}
 }
 
@@ -508,8 +507,7 @@ func (t *QBTask) recheckFileSelections(ctx context.Context) {
 func (t *QBTask) resyncFileSelection(ctx context.Context, hash, fingerprint string) {
 	// Evict caches so next InitTorrent gets fresh metadata
 	t.store.ForgetComplete(hash)
-	t.source.EvictCache(hash)
-	t.grpcDest.ClearInitResult(hash)
+	t.releaseCaches(hash)
 
 	// Get fresh metadata with updated file selection
 	meta, metaErr := t.source.GetTorrentMetadata(ctx, hash)

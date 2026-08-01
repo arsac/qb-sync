@@ -2479,16 +2479,18 @@ func TestE2E_FinalizedTorrentSkippedOnRecovery(t *testing.T) {
 // the "stuck at 100% never finalize" symptom: when destination qBittorrent has
 // the torrent in a non-recoverable state (here: missingFiles), addAndVerifyTorrent
 // returns an error wrapped as FINALIZE_ERROR_NONE. Source's handleFinalizeError
-// default branch must cap retries at maxVerificationRetries and apply the
-// sync-failed tag, otherwise the torrent loops forever in tracked and the
-// qbsync_active_torrents gauge stays elevated.
+// default branch must quarantine the torrent, otherwise it loops forever in
+// tracked and the qbsync_active_torrents gauge stays elevated.
 //
 // Reproduction: pre-stage destination qB with the torrent at a non-existent
 // savepath so qB parks it in missingFiles. Streaming still succeeds (the piece
 // store is independent of dest qB), but addAndVerifyTorrent fails on the
-// pre-existing torrent. With the cap, sync-failed lands within a few backoff
-// cycles; without it, the test times out.
-func TestE2E_StuckAtFullStreamedQBIntegrationFailureCapsAtMaxRetries(t *testing.T) {
+// pre-existing torrent.
+//
+// Quarantine is duration-based, so the guard is shrunk here. That works through
+// the single knob because the retry backoff is derived from the guard rather
+// than being an independent constant — see docs/adr/0001.
+func TestE2E_StuckAtFullStreamedQBIntegrationQuarantinesPastTheGuard(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")
 	}
@@ -2529,6 +2531,7 @@ func TestE2E_StuckAtFullStreamedQBIntegrationFailureCapsAtMaxRetries(t *testing.
 
 	cfg := env.CreateSourceConfig()
 	cfg.SyncFailedTag = "sync-failed"
+	cfg.SyncFailedGuard = reproGuard
 	task, dest, err := env.CreateSourceTask(cfg)
 	require.NoError(t, err)
 	defer dest.Close()
@@ -2541,7 +2544,7 @@ func TestE2E_StuckAtFullStreamedQBIntegrationFailureCapsAtMaxRetries(t *testing.
 		orchestratorDone <- task.Run(orchestratorCtx)
 	}()
 
-	// 3. Without the cap, the Eventually times out instead of seeing sync-failed.
+	// 3. Without quarantine, the Eventually times out instead of seeing sync-failed.
 	t.Log("Waiting for source torrent to be marked sync-failed...")
 	require.Eventually(t, func() bool {
 		torrents, getErr := env.SourceClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
@@ -2552,7 +2555,7 @@ func TestE2E_StuckAtFullStreamedQBIntegrationFailureCapsAtMaxRetries(t *testing.
 		}
 		return strings.Contains(torrents[0].Tags, "sync-failed")
 	}, 2*time.Minute, pollInterval,
-		"source torrent must reach sync-failed within retry cap; without the cap fix "+
+		"source torrent must be quarantined once the failure streak outlasts the guard; "+
 			"this loops forever and is the chart's stuck-at-100% symptom")
 
 	// Sanity check: torrent must NOT have the synced tag (since finalize failed).

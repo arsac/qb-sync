@@ -447,17 +447,20 @@ func TestHandleTorrentRemoval(t *testing.T) {
 
 	t.Run("calls StartTorrent when completedOnDest", func(t *testing.T) {
 		dest := &mockDest{}
-		tracked := newTorrentStore("", logger)
-		tracked.Track("abc123", TrackedTorrent{CompletionTime: time.Now()})
-		completed := newTorrentStore("", logger)
-		completed.MarkComplete("abc123", "")
+		store := newTorrentStore("", logger)
+		store.Track("abc123", TrackedTorrent{CompletionTime: time.Now()})
+		store.MarkComplete("abc123", "")
 		task := &QBTask{
 			cfg: &config.SourceConfig{
 				SourceRemovedTag: "source-removed",
 			},
 			logger:   logger,
 			grpcDest: dest,
-			store:    completed,
+			source:   qbclient.NewSource(nil, ""),
+			tracker: streaming.NewPieceMonitor(
+				nil, &mockPieceSource{numPieces: 1}, logger, streaming.DefaultPieceMonitorConfig(),
+			),
+			store: store,
 		}
 
 		task.handleTorrentRemoval(context.Background(), "abc123")
@@ -486,13 +489,17 @@ func TestHandleTorrentRemoval(t *testing.T) {
 
 	t.Run("handles AbortTorrent error gracefully", func(t *testing.T) {
 		dest := &mockDest{abortErr: errors.New("destination server down")}
-		tracked := newTorrentStore("", logger)
-		tracked.Track("abc123", TrackedTorrent{CompletionTime: time.Now()})
+		store := newTorrentStore("", logger)
+		store.Track("abc123", TrackedTorrent{CompletionTime: time.Now()})
 		task := &QBTask{
 			cfg:      &config.SourceConfig{},
 			logger:   logger,
 			grpcDest: dest,
-			store:    tracked,
+			source:   qbclient.NewSource(nil, ""),
+			tracker: streaming.NewPieceMonitor(
+				nil, &mockPieceSource{numPieces: 1}, logger, streaming.DefaultPieceMonitorConfig(),
+			),
+			store: store,
 		}
 
 		// Should not panic
@@ -510,15 +517,18 @@ func TestHandleTorrentRemoval(t *testing.T) {
 
 	t.Run("respects dry run mode", func(t *testing.T) {
 		dest := &mockDest{}
-		tracked := newTorrentStore("", logger)
-		tracked.Track("abc123", TrackedTorrent{CompletionTime: time.Now()})
-		completed := newTorrentStore("", logger)
-		completed.MarkComplete("abc123", "")
+		store := newTorrentStore("", logger)
+		store.Track("abc123", TrackedTorrent{CompletionTime: time.Now()})
+		store.MarkComplete("abc123", "")
 		task := &QBTask{
 			cfg:      &config.SourceConfig{BaseConfig: config.BaseConfig{DryRun: true}},
 			logger:   logger,
 			grpcDest: dest,
-			store:    completed,
+			source:   qbclient.NewSource(nil, ""),
+			tracker: streaming.NewPieceMonitor(
+				nil, &mockPieceSource{numPieces: 1}, logger, streaming.DefaultPieceMonitorConfig(),
+			),
+			store: store,
 		}
 
 		task.handleTorrentRemoval(context.Background(), "abc123")
@@ -544,13 +554,17 @@ func TestHandleTorrentRemoval(t *testing.T) {
 
 	t.Run("calls AbortTorrent when not completedOnDest", func(t *testing.T) {
 		dest := &mockDest{abortResult: 3}
-		tracked := newTorrentStore("", logger)
-		tracked.Track("abc123", TrackedTorrent{CompletionTime: time.Now()})
+		store := newTorrentStore("", logger)
+		store.Track("abc123", TrackedTorrent{CompletionTime: time.Now()})
 		task := &QBTask{
 			cfg:      &config.SourceConfig{},
 			logger:   logger,
 			grpcDest: dest,
-			store:    tracked,
+			source:   qbclient.NewSource(nil, ""),
+			tracker: streaming.NewPieceMonitor(
+				nil, &mockPieceSource{numPieces: 1}, logger, streaming.DefaultPieceMonitorConfig(),
+			),
+			store: store,
 		}
 
 		task.handleTorrentRemoval(context.Background(), "abc123")
@@ -568,17 +582,20 @@ func TestHandleTorrentRemoval(t *testing.T) {
 
 	t.Run("passes empty tag when SourceRemovedTag is empty", func(t *testing.T) {
 		dest := &mockDest{}
-		tracked := newTorrentStore("", logger)
-		tracked.Track("abc123", TrackedTorrent{CompletionTime: time.Now()})
-		completed := newTorrentStore("", logger)
-		completed.MarkComplete("abc123", "")
+		store := newTorrentStore("", logger)
+		store.Track("abc123", TrackedTorrent{CompletionTime: time.Now()})
+		store.MarkComplete("abc123", "")
 		task := &QBTask{
 			cfg: &config.SourceConfig{
 				SourceRemovedTag: "",
 			},
 			logger:   logger,
 			grpcDest: dest,
-			store:    completed,
+			source:   qbclient.NewSource(nil, ""),
+			tracker: streaming.NewPieceMonitor(
+				nil, &mockPieceSource{numPieces: 1}, logger, streaming.DefaultPieceMonitorConfig(),
+			),
+			store: store,
 		}
 
 		task.handleTorrentRemoval(context.Background(), "abc123")
@@ -593,17 +610,20 @@ func TestHandleTorrentRemoval(t *testing.T) {
 
 	t.Run("keeps completedOnDest when StartTorrent fails", func(t *testing.T) {
 		dest := &mockDest{startErr: errors.New("destination unreachable")}
-		tracked := newTorrentStore("", logger)
-		tracked.Track("abc123", TrackedTorrent{CompletionTime: time.Now()})
-		completed := newTorrentStore("", logger)
-		completed.MarkComplete("abc123", "")
+		store := newTorrentStore("", logger)
+		store.Track("abc123", TrackedTorrent{CompletionTime: time.Now()})
+		store.MarkComplete("abc123", "")
 		task := &QBTask{
 			cfg: &config.SourceConfig{
 				SourceRemovedTag: "source-removed",
 			},
 			logger:   logger,
 			grpcDest: dest,
-			store:    completed,
+			source:   qbclient.NewSource(nil, ""),
+			tracker: streaming.NewPieceMonitor(
+				nil, &mockPieceSource{numPieces: 1}, logger, streaming.DefaultPieceMonitorConfig(),
+			),
+			store: store,
 		}
 
 		task.handleTorrentRemoval(context.Background(), "abc123")
@@ -629,7 +649,11 @@ func TestHandleTorrentRemoval(t *testing.T) {
 			cfg:      &config.SourceConfig{},
 			logger:   logger,
 			grpcDest: dest,
-			store:    newTorrentStore("", logger),
+			source:   qbclient.NewSource(nil, ""),
+			tracker: streaming.NewPieceMonitor(
+				nil, &mockPieceSource{numPieces: 1}, logger, streaming.DefaultPieceMonitorConfig(),
+			),
+			store: newTorrentStore("", logger),
 		}
 
 		task.handleTorrentRemoval(context.Background(), "unknown_hash")

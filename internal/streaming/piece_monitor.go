@@ -754,43 +754,6 @@ func (t *PieceMonitor) buildPiece(state *torrentState, index int) *pb.Piece {
 	}
 }
 
-// RetryFailed re-queues failed pieces for retry.
-func (t *PieceMonitor) RetryFailed(ctx context.Context, hash string) error {
-	if t.closed.Load() {
-		return ctx.Err()
-	}
-
-	t.mu.RLock()
-	state, ok := t.torrents[hash]
-	t.mu.RUnlock()
-
-	if !ok {
-		return ErrTorrentNotTracked
-	}
-
-	state.mu.Lock()
-	defer state.mu.Unlock()
-
-	for i, failed := range state.failed {
-		if !failed {
-			continue
-		}
-
-		piece := t.buildPiece(state, i)
-
-		switch {
-		case t.trySendCompletedNonBlocking(ctx, piece):
-			state.failed[i] = false
-		case ctx.Err() != nil:
-			return ctx.Err()
-		case !t.closed.Load():
-			// Channel full — piece stays failed, will retry next cycle
-		}
-	}
-
-	return nil
-}
-
 // TrackedCount returns the number of torrents being tracked.
 func (t *PieceMonitor) TrackedCount() int {
 	t.mu.RLock()
