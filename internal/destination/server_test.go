@@ -342,7 +342,15 @@ func TestCleanupOrphan(t *testing.T) {
 		}
 	})
 
-	t.Run("also deletes non-partial version of files", func(t *testing.T) {
+	// Previously this asserted the opposite: that cleanup also removed the file
+	// at its final path, on the reasoning that finalization might have been
+	// interrupted mid-rename. ADR-0002 reverses that. On an unfinalized torrent
+	// a file at its final path is indistinguishable from pre-existing operator
+	// data or a hardlink, and the persisted metadata records no provenance to
+	// tell them apart, so deleting it risks destroying data qb-sync never wrote.
+	// The interrupted-rename case is not lost: those files are adopted as
+	// PreExisting on the next attempt.
+	t.Run("preserves files at their final path", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		s := &Server{
 			config: ServerConfig{BasePath: tmpDir},
@@ -369,12 +377,11 @@ func TestCleanupOrphan(t *testing.T) {
 
 		s.cleanupOrphan(ctx, hash)
 
-		// Both files should be deleted
 		if _, err := os.Stat(partialFile); !os.IsNotExist(err) {
-			t.Error("partial file should be deleted")
+			t.Error("partial file should be deleted: qb-sync wrote it")
 		}
-		if _, err := os.Stat(finalFile); !os.IsNotExist(err) {
-			t.Error("final file should be deleted")
+		if _, err := os.Stat(finalFile); err != nil {
+			t.Error("file at final path must survive: it may be operator data or a hardlink")
 		}
 	})
 

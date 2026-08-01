@@ -287,8 +287,26 @@ func (s *Server) cleanupOrphan(ctx context.Context, hash string) {
 	)
 }
 
-// deleteOrphanFiles loads the .meta file in metaDir to locate and remove
-// data files (both .partial and finalized versions). Returns the number of files deleted.
+// deleteOrphanFiles loads the .meta file in metaDir to locate and remove the
+// torrent's .partial files. Returns the number of files deleted.
+//
+// Only .partial paths are removed, never a file at its final path. Everything
+// this server writes lives at a .partial path until finalizeFiles renames it,
+// so on an unfinalized torrent — and an orphan is by definition unfinalized —
+// a file sitting at its final path is one of:
+//
+//   - pre-existing operator data that setupFile adopted at the right size,
+//   - a hardlink to another torrent's file, or
+//   - a deselected file we never created.
+//
+// None of those are ours to delete. AbortTorrent can be more precise because it
+// holds the in-memory hardlink results; orphan cleanup only has the persisted
+// metadata, which does not record provenance, so it stays conservative. See
+// docs/adr/0002-destination-reclamation.md.
+//
+// The cost is that files left at their final path by a crashed mid-finalization
+// rename are not reclaimed here. They are adopted as pre-existing on any retry,
+// so they are reusable rather than garbage.
 func (s *Server) deleteOrphanFiles(ctx context.Context, hash, metaDir string) int {
 	metaPath := filepath.Join(metaDir, metaFileName)
 	meta, loadErr := loadPersistedMeta(metaPath)
@@ -301,20 +319,13 @@ func (s *Server) deleteOrphanFiles(ctx context.Context, hash, metaDir string) in
 	var deleted int
 	subPath := meta.GetSaveSubPath()
 	for _, f := range meta.GetFiles() {
-		filePath := filepath.Join(s.config.BasePath, subPath, f.GetPath())
+		partialPath := filepath.Join(s.config.BasePath, subPath, f.GetPath()) + partialSuffix
 
-		// Try to remove .partial version
-		partialPath := filePath + partialSuffix
 		if err := os.Remove(partialPath); err == nil {
 			deleted++
 		} else if !os.IsNotExist(err) {
 			s.logger.DebugContext(ctx, "failed to remove orphan partial file",
 				"hash", hash, "path", partialPath, "error", err)
-		}
-
-		// Also try to remove the finalized version (may have been partially finalized)
-		if err := os.Remove(filePath); err == nil {
-			deleted++
 		}
 	}
 
