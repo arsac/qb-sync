@@ -1172,6 +1172,235 @@ func (x *Piece) GetHash() string {
 	return ""
 }
 
+// ArrCheckItem identifies one torrent to check.
+type ArrCheckItem struct {
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	TorrentHash string                 `protobuf:"bytes,1,opt,name=torrent_hash,json=torrentHash,proto3" json:"torrent_hash,omitempty"`
+	// qBittorrent category. The destination owns category-to-instance routing, so
+	// the source passes the raw category and never needs to know which *arr
+	// instance, if any, claims it.
+	Category      string `protobuf:"bytes,2,opt,name=category,proto3" json:"category,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ArrCheckItem) Reset() {
+	*x = ArrCheckItem{}
+	mi := &file_qbsync_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ArrCheckItem) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ArrCheckItem) ProtoMessage() {}
+
+func (x *ArrCheckItem) ProtoReflect() protoreflect.Message {
+	mi := &file_qbsync_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ArrCheckItem.ProtoReflect.Descriptor instead.
+func (*ArrCheckItem) Descriptor() ([]byte, []int) {
+	return file_qbsync_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *ArrCheckItem) GetTorrentHash() string {
+	if x != nil {
+		return x.TorrentHash
+	}
+	return ""
+}
+
+func (x *ArrCheckItem) GetCategory() string {
+	if x != nil {
+		return x.Category
+	}
+	return ""
+}
+
+type CheckArrRejectionsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Items         []*ArrCheckItem        `protobuf:"bytes,1,rep,name=items,proto3" json:"items,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CheckArrRejectionsRequest) Reset() {
+	*x = CheckArrRejectionsRequest{}
+	mi := &file_qbsync_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CheckArrRejectionsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CheckArrRejectionsRequest) ProtoMessage() {}
+
+func (x *CheckArrRejectionsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_qbsync_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CheckArrRejectionsRequest.ProtoReflect.Descriptor instead.
+func (*CheckArrRejectionsRequest) Descriptor() ([]byte, []int) {
+	return file_qbsync_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *CheckArrRejectionsRequest) GetItems() []*ArrCheckItem {
+	if x != nil {
+		return x.Items
+	}
+	return nil
+}
+
+type ArrVerdict struct {
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	TorrentHash string                 `protobuf:"bytes,1,opt,name=torrent_hash,json=torrentHash,proto3" json:"torrent_hash,omitempty"`
+	Sync        bool                   `protobuf:"varint,2,opt,name=sync,proto3" json:"sync,omitempty"`
+	// Reason is an open set carried as a string rather than an enum, so adding a
+	// new one does not require both sides to upgrade in lockstep. The fail-open
+	// contract never depends on recognising the value.
+	Reason string `protobuf:"bytes,3,opt,name=reason,proto3" json:"reason,omitempty"`
+	// Instance that decided ("radarr", "sonarr"), empty when the category routes
+	// to neither. The source uses it only to label metrics.
+	Instance      string `protobuf:"bytes,4,opt,name=instance,proto3" json:"instance,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ArrVerdict) Reset() {
+	*x = ArrVerdict{}
+	mi := &file_qbsync_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ArrVerdict) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ArrVerdict) ProtoMessage() {}
+
+func (x *ArrVerdict) ProtoReflect() protoreflect.Message {
+	mi := &file_qbsync_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ArrVerdict.ProtoReflect.Descriptor instead.
+func (*ArrVerdict) Descriptor() ([]byte, []int) {
+	return file_qbsync_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *ArrVerdict) GetTorrentHash() string {
+	if x != nil {
+		return x.TorrentHash
+	}
+	return ""
+}
+
+func (x *ArrVerdict) GetSync() bool {
+	if x != nil {
+		return x.Sync
+	}
+	return false
+}
+
+func (x *ArrVerdict) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+func (x *ArrVerdict) GetInstance() string {
+	if x != nil {
+		return x.Instance
+	}
+	return ""
+}
+
+type CheckArrRejectionsResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// FilterEnabled is false when the destination has no *arr configured. That is
+	// a configuration state rather than an error, and it lets the source stop
+	// asking without needing a second flag of its own.
+	FilterEnabled bool `protobuf:"varint,1,opt,name=filter_enabled,json=filterEnabled,proto3" json:"filter_enabled,omitempty"`
+	// Verdicts are index-aligned with the request items.
+	Verdicts      []*ArrVerdict `protobuf:"bytes,2,rep,name=verdicts,proto3" json:"verdicts,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CheckArrRejectionsResponse) Reset() {
+	*x = CheckArrRejectionsResponse{}
+	mi := &file_qbsync_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CheckArrRejectionsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CheckArrRejectionsResponse) ProtoMessage() {}
+
+func (x *CheckArrRejectionsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_qbsync_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CheckArrRejectionsResponse.ProtoReflect.Descriptor instead.
+func (*CheckArrRejectionsResponse) Descriptor() ([]byte, []int) {
+	return file_qbsync_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *CheckArrRejectionsResponse) GetFilterEnabled() bool {
+	if x != nil {
+		return x.FilterEnabled
+	}
+	return false
+}
+
+func (x *CheckArrRejectionsResponse) GetVerdicts() []*ArrVerdict {
+	if x != nil {
+		return x.Verdicts
+	}
+	return nil
+}
+
 var File_qbsync_proto protoreflect.FileDescriptor
 
 const file_qbsync_proto_rawDesc = "" +
@@ -1265,7 +1494,21 @@ const file_qbsync_proto_rawDesc = "" +
 	"\x05index\x18\x02 \x01(\x05R\x05index\x12\x16\n" +
 	"\x06offset\x18\x03 \x01(\x03R\x06offset\x12\x12\n" +
 	"\x04size\x18\x04 \x01(\x03R\x04size\x12\x12\n" +
-	"\x04hash\x18\x05 \x01(\tR\x04hash*\x96\x01\n" +
+	"\x04hash\x18\x05 \x01(\tR\x04hash\"M\n" +
+	"\fArrCheckItem\x12!\n" +
+	"\ftorrent_hash\x18\x01 \x01(\tR\vtorrentHash\x12\x1a\n" +
+	"\bcategory\x18\x02 \x01(\tR\bcategory\"G\n" +
+	"\x19CheckArrRejectionsRequest\x12*\n" +
+	"\x05items\x18\x01 \x03(\v2\x14.qbsync.ArrCheckItemR\x05items\"w\n" +
+	"\n" +
+	"ArrVerdict\x12!\n" +
+	"\ftorrent_hash\x18\x01 \x01(\tR\vtorrentHash\x12\x12\n" +
+	"\x04sync\x18\x02 \x01(\bR\x04sync\x12\x16\n" +
+	"\x06reason\x18\x03 \x01(\tR\x06reason\x12\x1a\n" +
+	"\binstance\x18\x04 \x01(\tR\binstance\"s\n" +
+	"\x1aCheckArrRejectionsResponse\x12%\n" +
+	"\x0efilter_enabled\x18\x01 \x01(\bR\rfilterEnabled\x12.\n" +
+	"\bverdicts\x18\x02 \x03(\v2\x12.qbsync.ArrVerdictR\bverdicts*\x96\x01\n" +
 	"\x0ePieceErrorCode\x12\x14\n" +
 	"\x10PIECE_ERROR_NONE\x10\x00\x12\x12\n" +
 	"\x0ePIECE_ERROR_IO\x10\x01\x12\x1d\n" +
@@ -1280,13 +1523,14 @@ const file_qbsync_proto_rawDesc = "" +
 	"\x11TorrentSyncStatus\x12\x15\n" +
 	"\x11SYNC_STATUS_READY\x10\x00\x12\x18\n" +
 	"\x14SYNC_STATUS_COMPLETE\x10\x01\x12\x19\n" +
-	"\x15SYNC_STATUS_VERIFYING\x10\x022\x86\x03\n" +
+	"\x15SYNC_STATUS_VERIFYING\x10\x022\xe3\x03\n" +
 	"\rQBSyncService\x12C\n" +
 	"\x10StreamPiecesBidi\x12\x19.qbsync.WritePieceRequest\x1a\x10.qbsync.PieceAck(\x010\x01\x12F\n" +
 	"\vInitTorrent\x12\x1a.qbsync.InitTorrentRequest\x1a\x1b.qbsync.InitTorrentResponse\x12R\n" +
 	"\x0fFinalizeTorrent\x12\x1e.qbsync.FinalizeTorrentRequest\x1a\x1f.qbsync.FinalizeTorrentResponse\x12I\n" +
 	"\fAbortTorrent\x12\x1b.qbsync.AbortTorrentRequest\x1a\x1c.qbsync.AbortTorrentResponse\x12I\n" +
-	"\fStartTorrent\x12\x1b.qbsync.StartTorrentRequest\x1a\x1c.qbsync.StartTorrentResponseB Z\x1egithub.com/arsac/qb-sync/protob\x06proto3"
+	"\fStartTorrent\x12\x1b.qbsync.StartTorrentRequest\x1a\x1c.qbsync.StartTorrentResponse\x12[\n" +
+	"\x12CheckArrRejections\x12!.qbsync.CheckArrRejectionsRequest\x1a\".qbsync.CheckArrRejectionsResponseB Z\x1egithub.com/arsac/qb-sync/protob\x06proto3"
 
 var (
 	file_qbsync_proto_rawDescOnce sync.Once
@@ -1301,24 +1545,28 @@ func file_qbsync_proto_rawDescGZIP() []byte {
 }
 
 var file_qbsync_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_qbsync_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
+var file_qbsync_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
 var file_qbsync_proto_goTypes = []any{
-	(PieceErrorCode)(0),             // 0: qbsync.PieceErrorCode
-	(FinalizeErrorCode)(0),          // 1: qbsync.FinalizeErrorCode
-	(TorrentSyncStatus)(0),          // 2: qbsync.TorrentSyncStatus
-	(*WritePieceRequest)(nil),       // 3: qbsync.WritePieceRequest
-	(*PieceAck)(nil),                // 4: qbsync.PieceAck
-	(*InitTorrentRequest)(nil),      // 5: qbsync.InitTorrentRequest
-	(*FileInfo)(nil),                // 6: qbsync.FileInfo
-	(*InitTorrentResponse)(nil),     // 7: qbsync.InitTorrentResponse
-	(*HardlinkResult)(nil),          // 8: qbsync.HardlinkResult
-	(*FinalizeTorrentRequest)(nil),  // 9: qbsync.FinalizeTorrentRequest
-	(*FinalizeTorrentResponse)(nil), // 10: qbsync.FinalizeTorrentResponse
-	(*AbortTorrentRequest)(nil),     // 11: qbsync.AbortTorrentRequest
-	(*AbortTorrentResponse)(nil),    // 12: qbsync.AbortTorrentResponse
-	(*StartTorrentRequest)(nil),     // 13: qbsync.StartTorrentRequest
-	(*StartTorrentResponse)(nil),    // 14: qbsync.StartTorrentResponse
-	(*Piece)(nil),                   // 15: qbsync.Piece
+	(PieceErrorCode)(0),                // 0: qbsync.PieceErrorCode
+	(FinalizeErrorCode)(0),             // 1: qbsync.FinalizeErrorCode
+	(TorrentSyncStatus)(0),             // 2: qbsync.TorrentSyncStatus
+	(*WritePieceRequest)(nil),          // 3: qbsync.WritePieceRequest
+	(*PieceAck)(nil),                   // 4: qbsync.PieceAck
+	(*InitTorrentRequest)(nil),         // 5: qbsync.InitTorrentRequest
+	(*FileInfo)(nil),                   // 6: qbsync.FileInfo
+	(*InitTorrentResponse)(nil),        // 7: qbsync.InitTorrentResponse
+	(*HardlinkResult)(nil),             // 8: qbsync.HardlinkResult
+	(*FinalizeTorrentRequest)(nil),     // 9: qbsync.FinalizeTorrentRequest
+	(*FinalizeTorrentResponse)(nil),    // 10: qbsync.FinalizeTorrentResponse
+	(*AbortTorrentRequest)(nil),        // 11: qbsync.AbortTorrentRequest
+	(*AbortTorrentResponse)(nil),       // 12: qbsync.AbortTorrentResponse
+	(*StartTorrentRequest)(nil),        // 13: qbsync.StartTorrentRequest
+	(*StartTorrentResponse)(nil),       // 14: qbsync.StartTorrentResponse
+	(*Piece)(nil),                      // 15: qbsync.Piece
+	(*ArrCheckItem)(nil),               // 16: qbsync.ArrCheckItem
+	(*CheckArrRejectionsRequest)(nil),  // 17: qbsync.CheckArrRejectionsRequest
+	(*ArrVerdict)(nil),                 // 18: qbsync.ArrVerdict
+	(*CheckArrRejectionsResponse)(nil), // 19: qbsync.CheckArrRejectionsResponse
 }
 var file_qbsync_proto_depIdxs = []int32{
 	0,  // 0: qbsync.PieceAck.error_code:type_name -> qbsync.PieceErrorCode
@@ -1326,21 +1574,25 @@ var file_qbsync_proto_depIdxs = []int32{
 	2,  // 2: qbsync.InitTorrentResponse.status:type_name -> qbsync.TorrentSyncStatus
 	8,  // 3: qbsync.InitTorrentResponse.hardlink_results:type_name -> qbsync.HardlinkResult
 	1,  // 4: qbsync.FinalizeTorrentResponse.error_code:type_name -> qbsync.FinalizeErrorCode
-	3,  // 5: qbsync.QBSyncService.StreamPiecesBidi:input_type -> qbsync.WritePieceRequest
-	5,  // 6: qbsync.QBSyncService.InitTorrent:input_type -> qbsync.InitTorrentRequest
-	9,  // 7: qbsync.QBSyncService.FinalizeTorrent:input_type -> qbsync.FinalizeTorrentRequest
-	11, // 8: qbsync.QBSyncService.AbortTorrent:input_type -> qbsync.AbortTorrentRequest
-	13, // 9: qbsync.QBSyncService.StartTorrent:input_type -> qbsync.StartTorrentRequest
-	4,  // 10: qbsync.QBSyncService.StreamPiecesBidi:output_type -> qbsync.PieceAck
-	7,  // 11: qbsync.QBSyncService.InitTorrent:output_type -> qbsync.InitTorrentResponse
-	10, // 12: qbsync.QBSyncService.FinalizeTorrent:output_type -> qbsync.FinalizeTorrentResponse
-	12, // 13: qbsync.QBSyncService.AbortTorrent:output_type -> qbsync.AbortTorrentResponse
-	14, // 14: qbsync.QBSyncService.StartTorrent:output_type -> qbsync.StartTorrentResponse
-	10, // [10:15] is the sub-list for method output_type
-	5,  // [5:10] is the sub-list for method input_type
-	5,  // [5:5] is the sub-list for extension type_name
-	5,  // [5:5] is the sub-list for extension extendee
-	0,  // [0:5] is the sub-list for field type_name
+	16, // 5: qbsync.CheckArrRejectionsRequest.items:type_name -> qbsync.ArrCheckItem
+	18, // 6: qbsync.CheckArrRejectionsResponse.verdicts:type_name -> qbsync.ArrVerdict
+	3,  // 7: qbsync.QBSyncService.StreamPiecesBidi:input_type -> qbsync.WritePieceRequest
+	5,  // 8: qbsync.QBSyncService.InitTorrent:input_type -> qbsync.InitTorrentRequest
+	9,  // 9: qbsync.QBSyncService.FinalizeTorrent:input_type -> qbsync.FinalizeTorrentRequest
+	11, // 10: qbsync.QBSyncService.AbortTorrent:input_type -> qbsync.AbortTorrentRequest
+	13, // 11: qbsync.QBSyncService.StartTorrent:input_type -> qbsync.StartTorrentRequest
+	17, // 12: qbsync.QBSyncService.CheckArrRejections:input_type -> qbsync.CheckArrRejectionsRequest
+	4,  // 13: qbsync.QBSyncService.StreamPiecesBidi:output_type -> qbsync.PieceAck
+	7,  // 14: qbsync.QBSyncService.InitTorrent:output_type -> qbsync.InitTorrentResponse
+	10, // 15: qbsync.QBSyncService.FinalizeTorrent:output_type -> qbsync.FinalizeTorrentResponse
+	12, // 16: qbsync.QBSyncService.AbortTorrent:output_type -> qbsync.AbortTorrentResponse
+	14, // 17: qbsync.QBSyncService.StartTorrent:output_type -> qbsync.StartTorrentResponse
+	19, // 18: qbsync.QBSyncService.CheckArrRejections:output_type -> qbsync.CheckArrRejectionsResponse
+	13, // [13:19] is the sub-list for method output_type
+	7,  // [7:13] is the sub-list for method input_type
+	7,  // [7:7] is the sub-list for extension type_name
+	7,  // [7:7] is the sub-list for extension extendee
+	0,  // [0:7] is the sub-list for field type_name
 }
 
 func init() { file_qbsync_proto_init() }
@@ -1354,7 +1606,7 @@ func file_qbsync_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_qbsync_proto_rawDesc), len(file_qbsync_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   13,
+			NumMessages:   17,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

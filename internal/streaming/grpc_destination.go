@@ -573,3 +573,17 @@ func (d *GRPCDestination) CleanupStaleEntries(activeHashes map[string]struct{}) 
 	}
 	return removed
 }
+
+// CheckArrRejections asks the destination for *arr verdicts on a batch of
+// torrents. The raw response is returned so the caller owns the fail-open
+// policy: this layer cannot decide what an unreachable destination means.
+func (d *GRPCDestination) CheckArrRejections(
+	ctx context.Context,
+	req *pb.CheckArrRejectionsRequest,
+) (*pb.CheckArrRejectionsResponse, error) {
+	resp, err := d.client().CheckArrRejections(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("check arr rejections RPC failed: %w", err)
+	}
+	return resp, nil
+}

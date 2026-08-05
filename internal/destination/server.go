@@ -18,6 +18,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/semaphore"
 
+	"github.com/arsac/qb-sync/internal/arr"
 	"github.com/arsac/qb-sync/internal/grpcutil"
 	"github.com/arsac/qb-sync/internal/health"
 	"github.com/arsac/qb-sync/internal/metrics"
@@ -70,6 +71,12 @@ type Server struct {
 
 	// qBittorrent client for adding verified torrents (destination server only)
 	qbClient qbclient.Client
+
+	// arrFilter answers CheckArrRejections. Never nil: with nothing configured
+	// it is a no-op filter, and arrEnabled records which it is so the response
+	// can tell an unconfigured destination apart from one that decided to sync.
+	arrFilter  arr.Filter
+	arrEnabled bool
 
 	// Global memory budget for buffered piece data
 	memBudget *semaphore.Weighted
@@ -129,6 +136,8 @@ func NewServer(config ServerConfig, logger *slog.Logger) *Server {
 		bgCancel:     bgCancel,
 		processStart: time.Now(),
 	}
+
+	s.arrFilter, s.arrEnabled = buildArrFilter(config.Arr, logger)
 
 	if config.QB != nil && config.QB.URL != "" {
 		rawClient := qbittorrent.NewClient(qbittorrent.Config{

@@ -34,6 +34,19 @@ service QBSyncService {
   // Called by source during disk pressure cleanup after stopping the torrent on source,
   // ensuring destination takes over seeding before source deletes the torrent.
   rpc StartTorrent(StartTorrentRequest) returns (StartTorrentResponse);
+
+  // CheckArrRejections asks the destination whether Sonarr/Radarr rejected each
+  // torrent, so the source can skip syncing it.
+  //
+  // The lookup runs on the destination because that is where the *arr instances
+  // live. A history response can carry a hundred records; relaying returns one
+  // verdict per torrent instead, and reuses the connection already streaming
+  // pieces rather than opening an HTTP call across the link.
+  //
+  // Fail-open by contract: every error path, on either side, yields sync=true.
+  // The filter is an optimisation, and refusing to sync because *arr is
+  // unreachable would be worse than syncing something unwanted.
+  rpc CheckArrRejections(CheckArrRejectionsRequest) returns (CheckArrRejectionsResponse);
 }
 
 // PieceErrorCode categorizes piece-level failures for retry decisions.
@@ -189,4 +202,38 @@ message Piece {
   int64 offset = 3;
   int64 size = 4;
   string hash = 5;  // SHA1 hash for verification
+}
+
+// ArrCheckItem identifies one torrent to check.
+message ArrCheckItem {
+  string torrent_hash = 1;
+  // qBittorrent category. The destination owns category-to-instance routing, so
+  // the source passes the raw category and never needs to know which *arr
+  // instance, if any, claims it.
+  string category = 2;
+}
+
+message CheckArrRejectionsRequest {
+  repeated ArrCheckItem items = 1;
+}
+
+message ArrVerdict {
+  string torrent_hash = 1;
+  bool sync = 2;
+  // Reason is an open set carried as a string rather than an enum, so adding a
+  // new one does not require both sides to upgrade in lockstep. The fail-open
+  // contract never depends on recognising the value.
+  string reason = 3;
+  // Instance that decided ("radarr", "sonarr"), empty when the category routes
+  // to neither. The source uses it only to label metrics.
+  string instance = 4;
+}
+
+message CheckArrRejectionsResponse {
+  // FilterEnabled is false when the destination has no *arr configured. That is
+  // a configuration state rather than an error, and it lets the source stop
+  // asking without needing a second flag of its own.
+  bool filter_enabled = 1;
+  // Verdicts are index-aligned with the request items.
+  repeated ArrVerdict verdicts = 2;
 }

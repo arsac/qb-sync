@@ -98,6 +98,8 @@ func (m *mockQBClient) AddTagsCtx(_ context.Context, hashes []string, tags strin
 	return m.addTagsErr
 }
 
+func (m *mockQBClient) RemoveTagsCtx(context.Context, []string, string) error { return nil }
+
 // Unused methods — satisfy the interface.
 func (m *mockQBClient) GetAppPreferencesCtx(context.Context) (qbittorrent.AppPreferences, error) {
 	return qbittorrent.AppPreferences{}, nil

@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/arsac/qb-sync/internal/arr"
 )
 
 const (
@@ -137,6 +139,11 @@ type ServerConfig struct {
 	StateFlushInterval time.Duration // How often to flush dirty state (0 = use default)
 	StreamWorkers      int           // Number of concurrent piece writers (0 = use default)
 	VerifyConcurrency  int           // Concurrent piece-read goroutines during finalize verification (0 = use default 4). Raise on healthy storage to speed finalize; lower if your NFS server can't handle the burst.
+
+	// Arr configures the Sonarr/Radarr instances consulted by
+	// CheckArrRejections. Zero instances disable the filter, and the server then
+	// reports filter_enabled=false so the source stops asking.
+	Arr arr.Config
 
 	// Orphan cleanup settings - clean up partial files when source disconnects unexpectedly.
 	OrphanCleanupInterval time.Duration // How often to scan for orphans (0 = use default 1h)
