@@ -11,7 +11,7 @@ import (
 func TestInstanceConfigRedactsAPIKey(t *testing.T) {
 	t.Parallel()
 
-	c := InstanceConfig{URL: "http://radarr:7878", APIKey: "secret-12345", Categories: []string{"radarr"}}
+	c := InstanceConfig{URL: "http://radarr:7878", APIKey: "secret-12345"}
 
 	got := c.String()
 	if strings.Contains(got, "secret-12345") {
@@ -35,7 +35,7 @@ func TestInstanceConfigRedactsAPIKey(t *testing.T) {
 func TestConfigValidate(t *testing.T) {
 	t.Parallel()
 
-	full := InstanceConfig{URL: "http://radarr:7878", APIKey: "k", Categories: []string{"radarr"}}
+	full := InstanceConfig{URL: "http://radarr:7878", APIKey: "k"}
 
 	tests := []struct {
 		name    string
@@ -44,42 +44,6 @@ func TestConfigValidate(t *testing.T) {
 	}{
 		{name: "nothing configured is valid", cfg: Config{}},
 		{name: "one complete instance", cfg: Config{Radarr: full}},
-		{
-			name: "both instances with distinct categories",
-			cfg: Config{
-				Radarr: full,
-				Sonarr: InstanceConfig{URL: "http://sonarr:8989", APIKey: "k", Categories: []string{"tv"}},
-			},
-		},
-		{
-			name:    "url without key",
-			cfg:     Config{Radarr: InstanceConfig{URL: "http://radarr:7878", Categories: []string{"radarr"}}},
-			wantErr: true,
-		},
-		{
-			name:    "key without url",
-			cfg:     Config{Radarr: InstanceConfig{APIKey: "k", Categories: []string{"radarr"}}},
-			wantErr: true,
-		},
-		{
-			name:    "configured but no categories never routes anything",
-			cfg:     Config{Radarr: InstanceConfig{URL: "http://radarr:7878", APIKey: "k"}},
-			wantErr: true,
-		},
-		{
-			name:    "blank category",
-			cfg:     Config{Radarr: InstanceConfig{URL: "http://radarr:7878", APIKey: "k", Categories: []string{" "}}},
-			wantErr: true,
-		},
-		{
-			// No correct answer at lookup time, so it is rejected at startup.
-			name: "same category routed to both",
-			cfg: Config{
-				Radarr: full,
-				Sonarr: InstanceConfig{URL: "http://sonarr:8989", APIKey: "k", Categories: []string{"radarr"}},
-			},
-			wantErr: true,
-		},
 	}
 
 	for _, tc := range tests {

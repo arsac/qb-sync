@@ -862,7 +862,14 @@ func (env *TestEnv) CreateSourceTask(cfg *config.SourceConfig) (*source.QBTask, 
 
 	// Relay verdicts to the destination exactly as production does, so a test
 	// that configures *arr on the destination exercises the real RPC path.
-	task, err := source.NewQBTask(cfg, dest, source.NewRemoteArrFilter(dest.CheckArrRejections, env.logger), env.logger)
+	//
+	// Deliberately not pre-refreshed here. runOnce discovers the routing before
+	// it tracks, so the first cycle already has it, and doing it here would put
+	// a blocking round trip in the setup of every test in the suite - including
+	// the great majority that never configure *arr.
+	arrFilter := source.NewRemoteArrFilter(dest.CheckArrRejections, env.logger)
+
+	task, err := source.NewQBTask(cfg, dest, arrFilter, env.logger)
 	if err != nil {
 		dest.Close()
 		return nil, nil, fmt.Errorf("creating source task: %w", err)

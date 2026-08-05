@@ -3,6 +3,7 @@ package source
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -195,17 +196,15 @@ func TestBuildArrFilterPicksModeFromConfig(t *testing.T) {
 	t.Parallel()
 
 	radarrCfg := arr.InstanceConfig{
-		URL:        "http://127.0.0.1:1",
-		APIKey:     "k",
-		Categories: []string{"radarr"},
+		URL:    "http://127.0.0.1:1",
+		APIKey: "k",
 	}
 	// A distinct category: routing the same one to both instances is a conflict
 	// that arr.New rejects, which would fall back to relaying and make the
 	// "both configured" case pass for the wrong reason.
 	sonarrCfg := arr.InstanceConfig{
-		URL:        "http://127.0.0.1:2",
-		APIKey:     "k",
-		Categories: []string{"tv-sonarr"},
+		URL:    "http://127.0.0.1:2",
+		APIKey: "k",
 	}
 
 	tests := []struct {
@@ -228,9 +227,9 @@ func TestBuildArrFilterPicksModeFromConfig(t *testing.T) {
 			cfg.Sonarr = tc.sonarr
 			runner := &Runner{cfg: cfg, logger: testStoreLogger()}
 
-			// dest is only dereferenced for its method value, which the remote
-			// filter stores without calling.
-			filter := runner.buildArrFilter(context.Background(), nil)
+			// newArrFilter is pure selection, so a nil destination is safe:
+			// only its method value is taken, never called.
+			filter := runner.newArrFilter(nil, testStoreLogger())
 
 			// Assert on the direct type: the relay is wrapped in a cache, so its
 			// concrete type is an implementation detail, whereas querying *arr
@@ -241,4 +240,101 @@ func TestBuildArrFilterPicksModeFromConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRemoteArrFilterLearnsRoutedCategories covers how the source discovers
+// routing when the instances live with the destination: it asks, over the
+// connection already carrying pieces, rather than being configured.
+func TestRemoteArrFilterLearnsRoutedCategories(t *testing.T) {
+	t.Parallel()
+
+	t.Run("an item-less request fetches just the routing", func(t *testing.T) {
+		t.Parallel()
+		var gotItems int
+		filter := newRemoteArrFilter(
+			func(_ context.Context, req *pb.CheckArrRejectionsRequest) (*pb.CheckArrRejectionsResponse, error) {
+				gotItems = len(req.GetItems())
+				return &pb.CheckArrRejectionsResponse{
+					FilterEnabled: true,
+					Categories:    []string{"radarr", "tv-sonarr"},
+				}, nil
+			},
+			testStoreLogger(),
+		)
+
+		if err := filter.RefreshCategories(context.Background()); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if gotItems != 0 {
+			t.Errorf("sent %d items, want 0: fetching the routing should not compute verdicts", gotItems)
+		}
+		if got := filter.RoutedCategories(); !slices.Equal(got, []string{"radarr", "tv-sonarr"}) {
+			t.Errorf("routed = %v, want both categories", got)
+		}
+	})
+
+	t.Run("an ordinary verdict response also refreshes it", func(t *testing.T) {
+		t.Parallel()
+		filter := newRemoteArrFilter(
+			func(context.Context, *pb.CheckArrRejectionsRequest) (*pb.CheckArrRejectionsResponse, error) {
+				return &pb.CheckArrRejectionsResponse{
+					FilterEnabled: true,
+					Categories:    []string{"radarr"},
+					Verdicts:      []*pb.ArrVerdict{{TorrentHash: "aaa", Sync: true}},
+				}, nil
+			},
+			testStoreLogger(),
+		)
+
+		filter.ShouldSyncAll(context.Background(), []arr.CheckItem{{Hash: "aaa", Category: "radarr"}})
+
+		if got := filter.RoutedCategories(); !slices.Equal(got, []string{"radarr"}) {
+			t.Errorf("routed = %v, want it learned from the verdict response", got)
+		}
+	})
+
+	t.Run("a rename on the destination propagates", func(t *testing.T) {
+		t.Parallel()
+		categories := []string{"radarr"}
+		filter := newRemoteArrFilter(
+			func(context.Context, *pb.CheckArrRejectionsRequest) (*pb.CheckArrRejectionsResponse, error) {
+				return &pb.CheckArrRejectionsResponse{FilterEnabled: true, Categories: categories}, nil
+			},
+			testStoreLogger(),
+		)
+
+		_ = filter.RefreshCategories(context.Background())
+		categories = []string{"radarr-4k"}
+		_ = filter.RefreshCategories(context.Background())
+
+		if got := filter.RoutedCategories(); !slices.Equal(got, []string{"radarr-4k"}) {
+			t.Errorf("routed = %v, want the renamed category", got)
+		}
+	})
+
+	t.Run("an unreachable destination keeps the last known routing", func(t *testing.T) {
+		t.Parallel()
+		fail := false
+		filter := newRemoteArrFilter(
+			func(context.Context, *pb.CheckArrRejectionsRequest) (*pb.CheckArrRejectionsResponse, error) {
+				if fail {
+					return nil, status.Error(codes.Unavailable, "connection refused")
+				}
+				return &pb.CheckArrRejectionsResponse{FilterEnabled: true, Categories: []string{"radarr"}}, nil
+			},
+			testStoreLogger(),
+		)
+
+		_ = filter.RefreshCategories(context.Background())
+		fail = true
+		if err := filter.RefreshCategories(context.Background()); err == nil {
+			t.Error("a failed refresh must be reported, not swallowed")
+		}
+
+		// Clearing it would stop filtering everything, because the source skips
+		// any category it does not believe is routed.
+		if got := filter.RoutedCategories(); !slices.Equal(got, []string{"radarr"}) {
+			t.Errorf("routed = %v, want the previous set retained", got)
+		}
+	})
 }

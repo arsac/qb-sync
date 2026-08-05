@@ -27,19 +27,21 @@ func historyHandler(t *testing.T, records string) http.Handler {
 	})
 }
 
-func newTestService(t *testing.T, instances ...*instanceState) *Service {
+// routes are passed explicitly because they are discovered from *arr at
+// runtime rather than derived from the instance, so a fixture has to state
+// them rather than imply them.
+func newTestService(t *testing.T, routes map[string]string, instances ...*instanceState) *Service {
 	t.Helper()
 	im := make(map[string]*instanceState, len(instances))
-	rt := make(map[string]string)
 	for _, ins := range instances {
 		im[ins.name] = ins
-		for _, cat := range ins.categories {
-			rt[cat] = ins.name
-		}
+	}
+	if routes == nil {
+		routes = map[string]string{}
 	}
 	return &Service{
 		instances: im,
-		routes:    rt,
+		routes:    routes,
 		cache:     newVerdictCache(),
 		cacheTTL:  50 * time.Millisecond,
 		logger:    slog.New(slog.NewTextHandler(testWriter{t: t}, nil)),
@@ -53,7 +55,7 @@ type testWriter struct{ t *testing.T }
 func (w testWriter) Write(p []byte) (int, error) { w.t.Log(string(p)); return len(p), nil }
 
 func TestServiceShouldSyncNoCategoryRoute(t *testing.T) {
-	svc := newTestService(t)
+	svc := newTestService(t, nil)
 	d := svc.ShouldSync(context.Background(), "abc", "unmapped-category")
 	if !d.Sync || d.Reason != ReasonNoCategory {
 		t.Fatalf("expected SYNC/NoCategory, got %+v", d)
@@ -65,10 +67,9 @@ func TestServiceShouldSyncIgnoredEvent(t *testing.T) {
 		`[{"eventType":"downloadIgnored","downloadId":"abc","date":"2026-04-29T10:00:00Z"}]`))
 	t.Cleanup(srv.Close)
 
-	svc := newTestService(t, &instanceState{
-		name:       "radarr",
-		client:     NewClient(srv.URL, "k", time.Second),
-		categories: []string{"radarr"},
+	svc := newTestService(t, map[string]string{"radarr": "radarr"}, &instanceState{
+		name:   "radarr",
+		client: NewClient(srv.URL, "k", time.Second),
 	})
 
 	d := svc.ShouldSync(context.Background(), "abc", "radarr")
@@ -84,10 +85,9 @@ func TestServiceShouldSyncEmptyHistory(t *testing.T) {
 	srv := httptest.NewServer(historyHandler(t, `[]`))
 	t.Cleanup(srv.Close)
 
-	svc := newTestService(t, &instanceState{
-		name:       "sonarr",
-		client:     NewClient(srv.URL, "k", time.Second),
-		categories: []string{"tv-sonarr"},
+	svc := newTestService(t, map[string]string{"tv-sonarr": "sonarr"}, &instanceState{
+		name:   "sonarr",
+		client: NewClient(srv.URL, "k", time.Second),
 	})
 
 	d := svc.ShouldSync(context.Background(), "abc", "tv-sonarr")
@@ -105,10 +105,9 @@ func TestServiceShouldSyncCacheHit(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	svc := newTestService(t, &instanceState{
-		name:       "radarr",
-		client:     NewClient(srv.URL, "k", time.Second),
-		categories: []string{"radarr"},
+	svc := newTestService(t, map[string]string{"radarr": "radarr"}, &instanceState{
+		name:   "radarr",
+		client: NewClient(srv.URL, "k", time.Second),
 	})
 
 	for range 5 {
@@ -126,13 +125,12 @@ func TestServiceCircuitBreakerOpensAfterFailures(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	inst := &instanceState{
-		name:       "radarr",
-		client:     NewClient(srv.URL, "k", 100*time.Millisecond),
-		categories: []string{"radarr"},
+		name:   "radarr",
+		client: NewClient(srv.URL, "k", 100*time.Millisecond),
 	}
 	attachBreaker(inst, utils.CircuitBreakerConfig{MaxFailures: 3, ResetTimeout: time.Hour})
 
-	svc := newTestService(t, inst)
+	svc := newTestService(t, map[string]string{"radarr": "radarr"}, inst)
 	// Drive 3 distinct hashes through the failing endpoint to trip the breaker.
 	for i := range 3 {
 		hash := []string{"a", "b", "c"}[i]
@@ -156,10 +154,9 @@ func TestServiceEmitsDecisionMetric(t *testing.T) {
 		`[{"eventType":"downloadIgnored","downloadId":"abc"}]`))
 	t.Cleanup(srv.Close)
 
-	svc := newTestService(t, &instanceState{
-		name:       "radarr",
-		client:     NewClient(srv.URL, "k", time.Second),
-		categories: []string{"radarr"},
+	svc := newTestService(t, map[string]string{"radarr": "radarr"}, &instanceState{
+		name:   "radarr",
+		client: NewClient(srv.URL, "k", time.Second),
 	})
 
 	before := testutil.ToFloat64(metrics.ArrDecisionsTotal.WithLabelValues("radarr", "skipped"))
@@ -189,16 +186,6 @@ func TestNewRejectsURLWithoutAPIKey(t *testing.T) {
 	}
 }
 
-func TestNewRejectsCategoryConflict(t *testing.T) {
-	_, err := New(Config{
-		Radarr: InstanceConfig{URL: "http://r", APIKey: "k", Categories: []string{"shared"}},
-		Sonarr: InstanceConfig{URL: "http://s", APIKey: "k", Categories: []string{"shared"}},
-	}, slog.Default())
-	if err == nil {
-		t.Fatalf("expected error for category appearing in both instances")
-	}
-}
-
 func TestServiceCachesIgnoredVerdictForLongTTL(t *testing.T) {
 	calls := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -208,10 +195,9 @@ func TestServiceCachesIgnoredVerdictForLongTTL(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	svc := newTestService(t, &instanceState{
-		name:       "radarr",
-		client:     NewClient(srv.URL, "k", time.Second),
-		categories: []string{"radarr"},
+	svc := newTestService(t, map[string]string{"radarr": "radarr"}, &instanceState{
+		name:   "radarr",
+		client: NewClient(srv.URL, "k", time.Second),
 	})
 
 	d := svc.ShouldSync(context.Background(), "abc", "radarr")
@@ -239,10 +225,9 @@ func TestServiceDoesNotCacheLookupFailures(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	svc := newTestService(t, &instanceState{
-		name:       "radarr",
-		client:     NewClient(srv.URL, "k", time.Second),
-		categories: []string{"radarr"},
+	svc := newTestService(t, map[string]string{"radarr": "radarr"}, &instanceState{
+		name:   "radarr",
+		client: NewClient(srv.URL, "k", time.Second),
 	})
 
 	for range 3 {

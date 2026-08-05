@@ -3,6 +3,8 @@ package source
 import (
 	"context"
 	"log/slog"
+	"slices"
+	"sync"
 	"sync/atomic"
 
 	"google.golang.org/grpc/codes"
@@ -29,6 +31,13 @@ type remoteArrFilter struct {
 
 	// check is injected so tests can drive the RPC boundary without a server.
 	check func(context.Context, *pb.CheckArrRejectionsRequest) (*pb.CheckArrRejectionsResponse, error)
+
+	// routed is what the destination last told us it routes. Held here so the
+	// source can decide locally whether a torrent is worth asking about: on a
+	// typical library most categories belong to no *arr, and each of those would
+	// otherwise cost a round trip to be told so.
+	routedMu sync.RWMutex
+	routed   []string
 
 	// disabled latches once the destination proves it cannot answer, either
 	// because it predates the RPC or because it has no *arr configured. Latched
@@ -62,6 +71,36 @@ func newRemoteArrFilter(
 }
 
 // ShouldSync resolves a single torrent as a batch of one.
+// RefreshCategories asks the destination what it routes. An empty batch is a
+// verdict-free request, so this costs one small round trip.
+func (r *remoteArrFilter) RefreshCategories(ctx context.Context) error {
+	if r.disabled.Load() {
+		return nil
+	}
+	resp, err := r.check(ctx, &pb.CheckArrRejectionsRequest{})
+	if err != nil {
+		metrics.ArrRelayErrorsTotal.WithLabelValues(status.Code(err).String()).Inc()
+		return err
+	}
+	r.storeRouted(resp)
+	return nil
+}
+
+// RoutedCategories returns the destination's routed set as last reported.
+func (r *remoteArrFilter) RoutedCategories() []string {
+	r.routedMu.RLock()
+	defer r.routedMu.RUnlock()
+	return slices.Clone(r.routed)
+}
+
+// storeRouted keeps the routed set current from any response, so an ordinary
+// verdict request doubles as a refresh.
+func (r *remoteArrFilter) storeRouted(resp *pb.CheckArrRejectionsResponse) {
+	r.routedMu.Lock()
+	r.routed = resp.GetCategories()
+	r.routedMu.Unlock()
+}
+
 func (r *remoteArrFilter) ShouldSync(ctx context.Context, hash, category string) arr.Decision {
 	decisions := r.ShouldSyncAll(ctx, []arr.CheckItem{{Hash: hash, Category: category}})
 	if len(decisions) != 1 {
@@ -97,6 +136,8 @@ func (r *remoteArrFilter) ShouldSyncAll(ctx context.Context, items []arr.CheckIt
 		}
 		return failOpen(items, arr.ReasonNoCategory)
 	}
+
+	r.storeRouted(resp)
 
 	verdicts := resp.GetVerdicts()
 	if len(verdicts) != len(items) {

@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
-	"slices"
-	"strings"
 	"time"
 
 	"github.com/arsac/qb-sync/internal/utils"
@@ -41,32 +39,25 @@ type Config struct {
 // field would otherwise need adding in two places and copying in two more, and
 // a forgotten copy compiles cleanly while silently doing nothing.
 type InstanceConfig struct {
-	URL        string
-	APIKey     string
-	Categories []string
+	URL    string
+	APIKey string
 }
 
 // String returns a redacted representation suitable for logging. Config is
 // logged at startup and dumped by the health endpoint, so a plain struct would
 // put the API key in both.
 func (i InstanceConfig) String() string {
-	return fmt.Sprintf("InstanceConfig{URL:%q, APIKey:%s, Categories:%v}",
-		i.URL, redactAPIKey(i.APIKey), i.Categories)
+	return fmt.Sprintf("InstanceConfig{URL:%q, APIKey:%s}", i.URL, redactAPIKey(i.APIKey))
 }
 
 // MarshalJSON masks the API key in JSON output.
 func (i InstanceConfig) MarshalJSON() ([]byte, error) {
 	type alias struct {
-		URL        string   `json:"url"`
-		APIKey     string   `json:"api_key"`
-		Categories []string `json:"categories"`
+		URL    string `json:"url"`
+		APIKey string `json:"api_key"`
 	}
 
-	return json.Marshal(alias{
-		URL:        i.URL,
-		APIKey:     redactAPIKey(i.APIKey),
-		Categories: i.Categories,
-	})
+	return json.Marshal(alias{URL: i.URL, APIKey: redactAPIKey(i.APIKey)})
 }
 
 // redactAPIKey returns a fixed mask rather than a prefix: a few characters of a
@@ -78,34 +69,29 @@ func redactAPIKey(key string) string {
 	return "***"
 }
 
-// Validate rejects a partially configured instance. All three fields or none:
-// a URL with no key, or categories with no URL, is a deployment mistake that
-// would otherwise present as the filter silently never running.
+// Validate rejects a partially configured instance. Both fields or neither: a
+// URL with no key, or a key with no URL, is a deployment mistake that would
+// otherwise present as the filter silently never running.
+//
+// Categories are not configured. They are discovered from the instance, which
+// is the authority on which ones it assigns.
 func (i InstanceConfig) Validate(name string) error {
 	if i.IsZero() {
 		return nil
 	}
 	if i.URL == "" {
-		return fmt.Errorf("%s: URL is required when %s is configured", name, name)
+		return fmt.Errorf("%s: URL is required when an API key is set", name)
 	}
 	if i.APIKey == "" {
-		return fmt.Errorf("%s: API key is required when %s is configured", name, name)
-	}
-	if len(i.Categories) == 0 {
-		return fmt.Errorf("%s: at least one category is required when %s is configured", name, name)
+		return fmt.Errorf("%s: API key is required when a URL is set", name)
 	}
 	if _, err := url.Parse(i.URL); err != nil {
 		return fmt.Errorf("%s: invalid URL: %w", name, err)
 	}
-	for _, category := range i.Categories {
-		if strings.TrimSpace(category) == "" {
-			return fmt.Errorf("%s: categories must not contain an empty value", name)
-		}
-	}
 	return nil
 }
 
-// Validate checks both instances and their routing.
+// Validate checks both instances.
 //
 // The single rule set: process config delegates here rather than keeping its
 // own copy, so a rule tightened in one place cannot fail to apply on the other
@@ -115,17 +101,14 @@ func (c Config) Validate() error {
 	if err := c.Radarr.Validate(instanceRadarr); err != nil {
 		return err
 	}
-	if err := c.Sonarr.Validate(instanceSonarr); err != nil {
-		return err
-	}
-	for _, category := range c.Radarr.Categories {
-		if slices.Contains(c.Sonarr.Categories, category) {
-			return fmt.Errorf("category %q is configured for both %s and %s",
-				category, instanceRadarr, instanceSonarr)
-		}
-	}
-	return nil
+	return c.Sonarr.Validate(instanceSonarr)
 }
+
+// CategoryRefreshInterval is how often routing is rediscovered. It lives here
+// because both sides refresh on their own schedule - the source against its own
+// instances or the destination's relay, the destination against its instances -
+// and a knob tuned on one side but not the other would drift silently.
+const CategoryRefreshInterval = 5 * time.Minute
 
 const (
 	defaultCacheTTL            = 15 * time.Second
@@ -138,7 +121,7 @@ const (
 
 // IsZero reports whether the instance is unconfigured.
 func (i InstanceConfig) IsZero() bool {
-	return i.URL == "" && i.APIKey == "" && len(i.Categories) == 0
+	return i.URL == "" && i.APIKey == ""
 }
 
 // New builds a Filter from cfg. Always returns a usable Filter (never nil).
@@ -166,11 +149,9 @@ func New(cfg Config, logger *slog.Logger) (Filter, error) {
 	}
 
 	instances := make(map[string]*instanceState)
-	routes := make(map[string]string)
 
 	addInstance(
 		instances,
-		routes,
 		instanceRadarr,
 		cfg.Radarr,
 		cfg.PerCallTimeout,
@@ -179,7 +160,6 @@ func New(cfg Config, logger *slog.Logger) (Filter, error) {
 	)
 	addInstance(
 		instances,
-		routes,
 		instanceSonarr,
 		cfg.Sonarr,
 		cfg.PerCallTimeout,
@@ -189,7 +169,7 @@ func New(cfg Config, logger *slog.Logger) (Filter, error) {
 
 	return &Service{
 		instances: instances,
-		routes:    routes,
+		routes:    make(map[string]string),
 		cache:     newVerdictCache(),
 		cacheTTL:  cfg.CacheTTL,
 		logger:    logger,
@@ -198,10 +178,10 @@ func New(cfg Config, logger *slog.Logger) (Filter, error) {
 }
 
 // addInstance registers an instance and its category routes. Shape and routing
-// conflicts are already rejected by Config.Validate, which New runs first.
+// rejected by Config.Validate, which New runs first. Routing is not set here:
+// it is discovered from the instance by RefreshCategories.
 func addInstance(
 	instances map[string]*instanceState,
-	routes map[string]string,
 	name string,
 	cfg InstanceConfig,
 	perCall time.Duration,
@@ -211,14 +191,10 @@ func addInstance(
 	if cfg.IsZero() {
 		return
 	}
-	for _, cat := range cfg.Categories {
-		routes[cat] = name
-	}
 
 	inst := &instanceState{
-		name:       name,
-		client:     NewClient(cfg.URL, cfg.APIKey, perCall),
-		categories: cfg.Categories,
+		name:   name,
+		client: NewClient(cfg.URL, cfg.APIKey, perCall),
 	}
 	// attachBreaker already returns early on a non-positive threshold.
 	attachBreaker(inst, utils.CircuitBreakerConfig{MaxFailures: breakerMax, ResetTimeout: breakerReset})

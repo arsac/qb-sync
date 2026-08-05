@@ -19,6 +19,12 @@ type stubFilter struct {
 	calls    atomic.Int32
 }
 
+func (s *stubFilter) RefreshCategories(context.Context) error { return nil }
+
+// The categories the fixtures use. Callers pre-filter on this before asking, so
+// a stub reporting nothing would never be consulted at all.
+func (s *stubFilter) RoutedCategories() []string { return []string{"radarr", "tv-sonarr"} }
+
 func (s *stubFilter) ShouldSync(_ context.Context, _, _ string) arr.Decision {
 	s.calls.Add(1)
 	return s.decision
@@ -222,4 +228,73 @@ func TestIsExcludedFromTrackingConsultsArrLast(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestArrRejectsSkipsUnroutedCategories is the point of discovering categories
+// at all. On a typical library most torrents belong to no *arr, and asking
+// about each of them costs a lookup - a full round trip when the verdict is
+// relayed - only to be told the category routes nowhere.
+func TestArrRejectsSkipsUnroutedCategories(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		category  string
+		wantAsked bool
+	}{
+		{name: "a routed category is asked about", category: "radarr", wantAsked: true},
+		{name: "an unrouted category is not", category: "manual-adds"},
+		{name: "no category at all is not", category: ""},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			filter := &stubFilter{decision: arr.Decision{Sync: true, Reason: arr.ReasonNotRejected}}
+			task, _ := arrTask(t, &config.SourceConfig{ArrSkippedTag: "arr-skipped"}, filter)
+
+			task.arrRejects(context.Background(), qbittorrent.Torrent{Hash: "abc", Category: tc.category})
+
+			if asked := filter.calls.Load() > 0; asked != tc.wantAsked {
+				t.Errorf("consulted the filter = %v, want %v", asked, tc.wantAsked)
+			}
+		})
+	}
+}
+
+// An empty routed set means nothing routes anywhere - discovery has not landed,
+// or no instance claims anything. Either way no verdict is reachable, so asking
+// would spend a lookup to learn nothing.
+func TestArrRejectsSkipsEverythingWhenNothingIsRouted(t *testing.T) {
+	t.Parallel()
+
+	filter := &unroutedFilter{}
+	task, _ := arrTask(t, &config.SourceConfig{ArrSkippedTag: "arr-skipped"}, filter)
+
+	if task.arrRejects(context.Background(), qbittorrent.Torrent{Hash: "abc", Category: "radarr"}) {
+		t.Error("nothing can be rejected when nothing is routed")
+	}
+	if filter.calls > 0 {
+		t.Errorf("asked %d times with no routing known, want 0", filter.calls)
+	}
+}
+
+// unroutedFilter routes nothing and records whether it was asked anyway.
+type unroutedFilter struct{ calls int }
+
+func (u *unroutedFilter) RefreshCategories(context.Context) error { return nil }
+func (u *unroutedFilter) RoutedCategories() []string              { return nil }
+
+func (u *unroutedFilter) ShouldSync(context.Context, string, string) arr.Decision {
+	u.calls++
+	return arr.Decision{Sync: true}
+}
+
+func (u *unroutedFilter) ShouldSyncAll(_ context.Context, items []arr.CheckItem) []arr.Decision {
+	u.calls += len(items)
+	out := make([]arr.Decision, len(items))
+	for i := range out {
+		out[i] = arr.Decision{Sync: true}
+	}
+	return out
 }

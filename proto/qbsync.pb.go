@@ -1352,7 +1352,12 @@ type CheckArrRejectionsResponse struct {
 	// asking without needing a second flag of its own.
 	FilterEnabled bool `protobuf:"varint,1,opt,name=filter_enabled,json=filterEnabled,proto3" json:"filter_enabled,omitempty"`
 	// Verdicts are index-aligned with the request items.
-	Verdicts      []*ArrVerdict `protobuf:"bytes,2,rep,name=verdicts,proto3" json:"verdicts,omitempty"`
+	Verdicts []*ArrVerdict `protobuf:"bytes,2,rep,name=verdicts,proto3" json:"verdicts,omitempty"`
+	// Categories currently routed to an *arr instance, discovered from the
+	// instances themselves rather than configured. The source uses this to skip
+	// asking about torrents no *arr owns, which is most of them on a typical
+	// library. A request with no items is a cheap way to fetch just this.
+	Categories    []string `protobuf:"bytes,3,rep,name=categories,proto3" json:"categories,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1397,6 +1402,13 @@ func (x *CheckArrRejectionsResponse) GetFilterEnabled() bool {
 func (x *CheckArrRejectionsResponse) GetVerdicts() []*ArrVerdict {
 	if x != nil {
 		return x.Verdicts
+	}
+	return nil
+}
+
+func (x *CheckArrRejectionsResponse) GetCategories() []string {
+	if x != nil {
+		return x.Categories
 	}
 	return nil
 }
@@ -1505,10 +1517,13 @@ const file_qbsync_proto_rawDesc = "" +
 	"\ftorrent_hash\x18\x01 \x01(\tR\vtorrentHash\x12\x12\n" +
 	"\x04sync\x18\x02 \x01(\bR\x04sync\x12\x16\n" +
 	"\x06reason\x18\x03 \x01(\tR\x06reason\x12\x1a\n" +
-	"\binstance\x18\x04 \x01(\tR\binstance\"s\n" +
+	"\binstance\x18\x04 \x01(\tR\binstance\"\x93\x01\n" +
 	"\x1aCheckArrRejectionsResponse\x12%\n" +
 	"\x0efilter_enabled\x18\x01 \x01(\bR\rfilterEnabled\x12.\n" +
-	"\bverdicts\x18\x02 \x03(\v2\x12.qbsync.ArrVerdictR\bverdicts*\x96\x01\n" +
+	"\bverdicts\x18\x02 \x03(\v2\x12.qbsync.ArrVerdictR\bverdicts\x12\x1e\n" +
+	"\n" +
+	"categories\x18\x03 \x03(\tR\n" +
+	"categories*\x96\x01\n" +
 	"\x0ePieceErrorCode\x12\x14\n" +
 	"\x10PIECE_ERROR_NONE\x10\x00\x12\x12\n" +
 	"\x0ePIECE_ERROR_IO\x10\x01\x12\x1d\n" +

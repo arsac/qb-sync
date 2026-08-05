@@ -348,16 +348,14 @@ func SetupSourceFlags(cmd *cobra.Command) {
 // whichever process sits with the instances configures them, and the source
 // relays to the destination when it has none.
 func addArrFlags(flags *pflag.FlagSet) {
-	flags.String("radarr-url", "", "Radarr URL (e.g. http://radarr:7878). Empty disables the Radarr filter.")
+	flags.String("radarr-url", "",
+		"Radarr URL (e.g. http://radarr:7878). Empty disables the Radarr filter. "+
+			"Categories are discovered from Radarr's own download client settings.")
 	flags.String("radarr-api-key", "", "Radarr API key (sent via X-Api-Key header)")
-	flags.StringSlice("radarr-categories", nil,
-		"qBittorrent categories routed to Radarr. Filtering only applies to torrents Radarr grabbed "+
-			"itself; cross-seed and manually added torrents have no history and are synced.")
-
-	flags.String("sonarr-url", "", "Sonarr URL (e.g. http://sonarr:8989). Empty disables the Sonarr filter.")
+	flags.String("sonarr-url", "",
+		"Sonarr URL (e.g. http://sonarr:8989). Empty disables the Sonarr filter. "+
+			"Categories are discovered from Sonarr's own download client settings.")
 	flags.String("sonarr-api-key", "", "Sonarr API key (sent via X-Api-Key header)")
-	flags.StringSlice("sonarr-categories", nil,
-		"qBittorrent categories routed to Sonarr. Same scope and limitations as --radarr-categories.")
 }
 
 // SetupDestinationFlags sets up flags for the destination command.
@@ -419,8 +417,8 @@ func BindSourceFlags(cmd *cobra.Command, v *viper.Viper) error {
 		"source-removed-tag", "exclude-cleanup-tag", "sync-failed-tag", "exclude-sync-tag",
 		"sync-failed-guard",
 		"arr-skipped-tag",
-		"radarr-url", "radarr-api-key", "radarr-categories",
-		"sonarr-url", "sonarr-api-key", "sonarr-categories",
+		"radarr-url", "radarr-api-key",
+		"sonarr-url", "sonarr-api-key",
 		flagHealthAddr, flagSyncedTag,
 		flagDryRun, flagLogLevel, "drain-annotation", "drain-timeout",
 	})
@@ -432,8 +430,8 @@ func BindDestinationFlags(cmd *cobra.Command, v *viper.Viper) error {
 		"listen", flagData, "save-path", flagQBURL, flagQBUsername, flagQBPassword,
 		"poll-interval", "poll-timeout", "stream-workers", "max-stream-buffer",
 		"qb-finalize-concurrency", "verify-concurrency",
-		"radarr-url", "radarr-api-key", "radarr-categories",
-		"sonarr-url", "sonarr-api-key", "sonarr-categories",
+		"radarr-url", "radarr-api-key",
+		"sonarr-url", "sonarr-api-key",
 		flagHealthAddr, flagSyncedTag, flagDryRun, flagLogLevel,
 	})
 }
@@ -455,14 +453,12 @@ func loadBase(v *viper.Viper) BaseConfig {
 		LogLevel:   v.GetString(flagLogLevel),
 		DryRun:     v.GetBool(flagDryRun),
 		Radarr: arr.InstanceConfig{
-			URL:        v.GetString("radarr-url"),
-			APIKey:     v.GetString("radarr-api-key"),
-			Categories: v.GetStringSlice("radarr-categories"),
+			URL:    v.GetString("radarr-url"),
+			APIKey: v.GetString("radarr-api-key"),
 		},
 		Sonarr: arr.InstanceConfig{
-			URL:        v.GetString("sonarr-url"),
-			APIKey:     v.GetString("sonarr-api-key"),
-			Categories: v.GetStringSlice("sonarr-categories"),
+			URL:    v.GetString("sonarr-url"),
+			APIKey: v.GetString("sonarr-api-key"),
 		},
 	}
 }

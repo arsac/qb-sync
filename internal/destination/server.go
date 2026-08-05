@@ -216,6 +216,7 @@ func (s *Server) Run(ctx context.Context) error {
 
 	// Start background orphan cleanup
 	go s.runOrphanCleaner(ctx)
+	go s.runArrCategoryRefresher(ctx)
 
 	// Start background inode cleanup
 	go s.runInodeCleaner(ctx)

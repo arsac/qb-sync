@@ -87,6 +87,11 @@ type QBTask struct {
 	// each have to remember to set it.
 	arrFilter arr.Filter
 
+	// arrCategoriesAt is when the *arr routing was last refreshed. Tracked by
+	// time rather than cycle count because the routing gates every lookup, so it
+	// needs a tighter cadence than the periodic prune pass.
+	arrCategoriesAt time.Time
+
 	// Cycle counter for periodic pruning of completedOnDest
 	pruneCycleCount int
 
@@ -249,6 +254,11 @@ func (t *QBTask) Run(ctx context.Context) error {
 func (t *QBTask) runOnce(ctx context.Context) {
 	t.cycleTorrents = nil
 	t.resetCycleFiles()
+
+	// Before tracking, not after: tracking is where the *arr routing is applied,
+	// and a torrent admitted while the routing is still unknown is never
+	// re-examined by the pre-sync check - it is already tracked by then.
+	t.maybeRefreshArrCategories(ctx)
 
 	if err := t.trackNewTorrents(ctx); err != nil {
 		t.logger.ErrorContext(ctx, "failed to track torrents", "error", err)

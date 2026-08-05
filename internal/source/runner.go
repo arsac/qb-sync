@@ -142,7 +142,7 @@ func (r *Runner) shutdownDrain(task *QBTask) {
 	}
 }
 
-// buildArrFilter picks how this process obtains *arr verdicts.
+// newArrFilter picks how this process obtains *arr verdicts.
 //
 // Where the instances are configured is the mode, so there is no separate
 // switch to set or to disagree with reality. Configured here means they are
@@ -153,9 +153,10 @@ func (r *Runner) shutdownDrain(task *QBTask) {
 // Configuring both sides is not an error, but the local instances win, because
 // a round trip to ask someone else about a service this process can already
 // reach is pure cost.
-func (r *Runner) buildArrFilter(ctx context.Context, dest *streaming.GRPCDestination) arr.Filter {
-	logger := r.logger.With("component", "arr")
-
+//
+// Pure selection, with no I/O: startup work belongs to buildArrFilter, so the
+// choice can be tested without a live destination.
+func (r *Runner) newArrFilter(dest *streaming.GRPCDestination, logger *slog.Logger) arr.Filter {
 	if r.cfg.Radarr.IsZero() && r.cfg.Sonarr.IsZero() {
 		// Cache in front of the relay. The destination caches its own *arr
 		// lookups, but that is on the far side of the link, so without this a
@@ -176,20 +177,37 @@ func (r *Runner) buildArrFilter(ctx context.Context, dest *streaming.GRPCDestina
 		// Validation already rejected the shapes worth rejecting, so this is
 		// unexpected. Degrade to relaying rather than failing startup: the
 		// filter only ever saves work.
-		r.logger.ErrorContext(ctx, "arr filter falling back to the destination: local construction failed",
+		logger.ErrorContext(context.Background(),
+			"arr filter falling back to the destination: local construction failed", "error", err)
+		return arr.Cached(newRemoteArrFilter(dest.CheckArrRejections, logger), relayVerdictTTL)
+	}
+	return filter
+}
+
+// buildArrFilter selects the filter and gets it ready to use.
+func (r *Runner) buildArrFilter(ctx context.Context, dest *streaming.GRPCDestination) arr.Filter {
+	logger := r.logger.With("component", "arr")
+	filter := r.newArrFilter(dest, logger)
+
+	// Learn the routing before the first cycle. The source pre-filters on it, so
+	// an empty set skips every torrent - which means no verdict requests, and
+	// therefore no responses to learn the routing from. Left to the periodic
+	// refresh alone, that syncs everything unfiltered until it lands.
+	if err := filter.RefreshCategories(ctx); err != nil {
+		r.logger.WarnContext(ctx, "arr category discovery failed at startup, nothing filters until it succeeds",
 			"error", err)
-		return newRemoteArrFilter(dest.CheckArrRejections, logger)
+	} else {
+		r.logger.InfoContext(ctx, "arr categories discovered", "categories", filter.RoutedCategories())
 	}
 
-	r.logger.InfoContext(ctx, "arr filter querying locally configured instances")
 	for name, pingErr := range arr.PingAll(ctx, filter) {
 		if pingErr != nil {
-			r.logger.WarnContext(ctx, "arr instance ping failed at startup",
-				"instance", name, "error", pingErr)
+			r.logger.WarnContext(ctx, "arr instance ping failed at startup", "instance", name, "error", pingErr)
 			continue
 		}
 		r.logger.InfoContext(ctx, "arr instance reachable at startup", "instance", name)
 	}
+
 	return filter
 }
 

@@ -36,6 +36,12 @@ func Cached(f Filter, ttl time.Duration) Filter {
 	return &cachedFilter{inner: f, cache: newVerdictCache(), ttl: ttl}
 }
 
+func (c *cachedFilter) RefreshCategories(ctx context.Context) error {
+	return c.inner.RefreshCategories(ctx)
+}
+
+func (c *cachedFilter) RoutedCategories() []string { return c.inner.RoutedCategories() }
+
 func (c *cachedFilter) ShouldSync(ctx context.Context, hash, category string) Decision {
 	return c.ShouldSyncAll(ctx, []CheckItem{{Hash: hash, Category: category}})[0]
 }
