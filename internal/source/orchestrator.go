@@ -35,7 +35,7 @@ const (
 
 	// minQuarantineAttempts is the minimum number of consecutive failures before
 	// the guard is even consulted. It is a floor, not a cap: on its own it never
-	// quarantines anything. The wall-clock guard decides that — a torrent can
+	// quarantines anything. The wall-clock guard decides that - a torrent can
 	// fail far more than this many times and still not be quarantined, which is
 	// the whole point. See docs/adr/0001-quarantine-requires-a-wall-clock-guard.md.
 	minQuarantineAttempts = 3
@@ -45,7 +45,7 @@ const (
 	// streak. Must exceed the destination's worst-case budget:
 	// finalizeQueueTimeout (2h) + qB-stage budget (up to ~2x the 6h poll cap).
 	// Persisted alongside the quarantine clocks, so a source restarting more
-	// often than the guard cannot hide a permanently wedged destination.
+	// often than the guard cannot hide a destination that never recovers.
 	busyGuardDuration = 8 * time.Hour
 
 	// Timeout for unary RPCs to destination server during removal/handoff.
@@ -157,11 +157,7 @@ func NewQBTask(
 		source:    source,
 		tracker:   tracker,
 		queue:     queue,
-		store:     newTorrentStore(cachePath, logger),
-	}
-
-	if cfg.SyncFailedGuard > 0 {
-		t.store.guard = cfg.SyncFailedGuard
+		store:     newTorrentStore(cachePath, cfg.SyncFailedGuard, logger),
 	}
 
 	t.store.Load()
@@ -245,10 +241,12 @@ func (t *QBTask) runOnce(ctx context.Context) {
 	}
 	t.recordEligibilityMetrics()
 	t.checkExcludedTorrents(ctx)
-	if err := t.finalizeCompletedStreams(ctx); err != nil {
+	tracked := t.store.TrackedSnapshot()
+	progressByHash := t.collectProgress(ctx, tracked)
+	if err := t.finalizeCompletedStreams(ctx, tracked, progressByHash); err != nil {
 		t.logger.ErrorContext(ctx, "failed to finalize streams", "error", err)
 	}
-	t.checkStalledStreams(ctx)
+	t.checkStalledStreams(ctx, progressByHash)
 	if !t.Draining() {
 		if err := t.maybeMoveToDest(ctx); err != nil {
 			t.logger.ErrorContext(ctx, "failed to move torrents", "error", err)

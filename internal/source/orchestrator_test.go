@@ -163,7 +163,7 @@ func TestFinalizeBackoff(t *testing.T) {
 		task := &QBTask{
 			cfg:    &config.SourceConfig{},
 			logger: logger,
-			store:  newTorrentStore("", logger),
+			store:  newTorrentStore("", 0, logger),
 		}
 
 		if !task.store.ShouldAttempt("hash123") {
@@ -175,7 +175,7 @@ func TestFinalizeBackoff(t *testing.T) {
 		task := &QBTask{
 			cfg:    &config.SourceConfig{},
 			logger: logger,
-			store:  newTorrentStore("", logger),
+			store:  newTorrentStore("", 0, logger),
 		}
 
 		hash := "hash123"
@@ -187,7 +187,7 @@ func TestFinalizeBackoff(t *testing.T) {
 	})
 
 	t.Run("shouldAttemptFinalize returns true after backoff period", func(t *testing.T) {
-		tracker := newTorrentStore("", logger)
+		tracker := newTorrentStore("", 0, logger)
 
 		hash := "hash123"
 
@@ -206,7 +206,7 @@ func TestFinalizeBackoff(t *testing.T) {
 		task := &QBTask{
 			cfg:    &config.SourceConfig{},
 			logger: logger,
-			store:  newTorrentStore("", logger),
+			store:  newTorrentStore("", 0, logger),
 		}
 
 		hash := "hash123"
@@ -224,7 +224,7 @@ func TestFinalizeBackoff(t *testing.T) {
 		task := &QBTask{
 			cfg:    &config.SourceConfig{},
 			logger: logger,
-			store:  newTorrentStore("", logger),
+			store:  newTorrentStore("", 0, logger),
 		}
 
 		hash := "hash123"
@@ -241,7 +241,7 @@ func TestFinalizeBackoff(t *testing.T) {
 	})
 
 	t.Run("backoff is capped at maxFinalizeBackoff", func(t *testing.T) {
-		tracker := newTorrentStore("", logger)
+		tracker := newTorrentStore("", 0, logger)
 
 		hash := "hash123"
 
@@ -265,7 +265,7 @@ func TestFinalizeBackoff(t *testing.T) {
 // Tests for tracking maps operations.
 func TestTrackedTorrentsMap(t *testing.T) {
 	t.Run("concurrent map access is safe", func(_ *testing.T) {
-		tracked := newTorrentStore("", testLogger(t))
+		tracked := newTorrentStore("", 0, testLogger(t))
 
 		var wg sync.WaitGroup
 		const numOps = 100
@@ -299,7 +299,7 @@ func TestTrackedTorrentsMap(t *testing.T) {
 
 func TestConcurrentBackoffAccess(t *testing.T) {
 	t.Run("concurrent backoff operations are safe", func(_ *testing.T) {
-		tracker := newTorrentStore("", testLogger(t))
+		tracker := newTorrentStore("", 0, testLogger(t))
 
 		var wg sync.WaitGroup
 		const numOps = 100
@@ -349,7 +349,7 @@ func TestConstants(t *testing.T) {
 		// The cap scales with the guard so a shrunken guard shrinks the whole
 		// mechanism, which is what lets end-to-end tests exercise the failure
 		// path without a second knob.
-		s := newTorrentStore("", testLogger(t))
+		s := newTorrentStore("", 0, testLogger(t))
 		s.guard = 4 * time.Hour
 		if got, want := s.backoffCap(), 30*time.Minute; got != want {
 			t.Errorf("backoffCap at the 4h default = %v, want %v", got, want)
@@ -447,7 +447,7 @@ func TestHandleTorrentRemoval(t *testing.T) {
 
 	t.Run("calls StartTorrent when completedOnDest", func(t *testing.T) {
 		dest := &mockDest{}
-		store := newTorrentStore("", logger)
+		store := newTorrentStore("", 0, logger)
 		store.Track("abc123", TrackedTorrent{CompletionTime: time.Now()})
 		store.MarkComplete("abc123", "")
 		task := &QBTask{
@@ -489,7 +489,7 @@ func TestHandleTorrentRemoval(t *testing.T) {
 
 	t.Run("handles AbortTorrent error gracefully", func(t *testing.T) {
 		dest := &mockDest{abortErr: errors.New("destination server down")}
-		store := newTorrentStore("", logger)
+		store := newTorrentStore("", 0, logger)
 		store.Track("abc123", TrackedTorrent{CompletionTime: time.Now()})
 		task := &QBTask{
 			cfg:      &config.SourceConfig{},
@@ -517,7 +517,7 @@ func TestHandleTorrentRemoval(t *testing.T) {
 
 	t.Run("respects dry run mode", func(t *testing.T) {
 		dest := &mockDest{}
-		store := newTorrentStore("", logger)
+		store := newTorrentStore("", 0, logger)
 		store.Track("abc123", TrackedTorrent{CompletionTime: time.Now()})
 		store.MarkComplete("abc123", "")
 		task := &QBTask{
@@ -554,7 +554,7 @@ func TestHandleTorrentRemoval(t *testing.T) {
 
 	t.Run("calls AbortTorrent when not completedOnDest", func(t *testing.T) {
 		dest := &mockDest{abortResult: 3}
-		store := newTorrentStore("", logger)
+		store := newTorrentStore("", 0, logger)
 		store.Track("abc123", TrackedTorrent{CompletionTime: time.Now()})
 		task := &QBTask{
 			cfg:      &config.SourceConfig{},
@@ -582,7 +582,7 @@ func TestHandleTorrentRemoval(t *testing.T) {
 
 	t.Run("passes empty tag when SourceRemovedTag is empty", func(t *testing.T) {
 		dest := &mockDest{}
-		store := newTorrentStore("", logger)
+		store := newTorrentStore("", 0, logger)
 		store.Track("abc123", TrackedTorrent{CompletionTime: time.Now()})
 		store.MarkComplete("abc123", "")
 		task := &QBTask{
@@ -610,7 +610,7 @@ func TestHandleTorrentRemoval(t *testing.T) {
 
 	t.Run("keeps completedOnDest when StartTorrent fails", func(t *testing.T) {
 		dest := &mockDest{startErr: errors.New("destination unreachable")}
-		store := newTorrentStore("", logger)
+		store := newTorrentStore("", 0, logger)
 		store.Track("abc123", TrackedTorrent{CompletionTime: time.Now()})
 		store.MarkComplete("abc123", "")
 		task := &QBTask{
@@ -653,7 +653,7 @@ func TestHandleTorrentRemoval(t *testing.T) {
 			tracker: streaming.NewPieceMonitor(
 				nil, &mockPieceSource{numPieces: 1}, logger, streaming.DefaultPieceMonitorConfig(),
 			),
-			store: newTorrentStore("", logger),
+			store: newTorrentStore("", 0, logger),
 		}
 
 		task.handleTorrentRemoval(context.Background(), "unknown_hash")
@@ -684,7 +684,7 @@ func TestTryFinalizeFullyStreamed(t *testing.T) {
 			srcClient: src,
 			grpcDest:  dest,
 			source:    qbclient.NewSource(nil, ""),
-			store:     newTorrentStore("", logger),
+			store:     newTorrentStore("", 0, logger),
 		}
 	}
 
@@ -1240,7 +1240,7 @@ func TestFinalizeTorrent_ErrFinalizeVerifyingPropagates(t *testing.T) {
 			srcClient: mockClient,
 			grpcDest:  dest,
 			source:    qbclient.NewSource(nil, ""),
-			store:     newTorrentStore("", logger),
+			store:     newTorrentStore("", 0, logger),
 		}
 
 		// Call finalizeTorrent — returns ErrFinalizeVerifying
@@ -1299,7 +1299,7 @@ func TestFinalizeTorrent_ErrFinalizeIncompletePropagates(t *testing.T) {
 			srcClient: mockClient,
 			grpcDest:  dest,
 			source:    qbclient.NewSource(nil, ""),
-			store:     newTorrentStore("", logger),
+			store:     newTorrentStore("", 0, logger),
 		}
 
 		_ = task.finalizeTorrent(context.Background(), "abc123")
@@ -1446,7 +1446,7 @@ func TestFinalizeTorrent_ErrFinalizeNotFoundPropagates(t *testing.T) {
 			srcClient: mockClient,
 			grpcDest:  dest,
 			source:    qbclient.NewSource(nil, ""),
-			store:     newTorrentStore("", logger),
+			store:     newTorrentStore("", 0, logger),
 		}
 
 		_ = task.finalizeTorrent(context.Background(), "abc123")
@@ -1464,7 +1464,7 @@ func TestHandleNotFoundFinalization_Untracks(t *testing.T) {
 		PollInterval: time.Second,
 	})
 	dest := &mockDest{}
-	tracked := newTorrentStore("", logger)
+	tracked := newTorrentStore("", 0, logger)
 	tracked.TrackIfAbsent("abc123", TrackedTorrent{Name: "test"})
 
 	task := &QBTask{
@@ -1498,7 +1498,7 @@ func TestSyncedTagApplication(t *testing.T) {
 			},
 			logger:    logger,
 			srcClient: mockClient,
-			store:     newTorrentStore("", logger),
+			store:     newTorrentStore("", 0, logger),
 		}
 
 		// Simulate the tag application logic from markTorrentComplete
@@ -1524,7 +1524,7 @@ func TestSyncedTagApplication(t *testing.T) {
 			cfg:       &config.SourceConfig{},
 			logger:    logger,
 			srcClient: mockClient,
-			store:     newTorrentStore("", logger),
+			store:     newTorrentStore("", 0, logger),
 		}
 
 		// Simulate the tag application logic
@@ -1546,7 +1546,7 @@ func TestSyncedTagApplication(t *testing.T) {
 			},
 			logger:    logger,
 			srcClient: mockClient,
-			store:     newTorrentStore("", logger),
+			store:     newTorrentStore("", 0, logger),
 		}
 
 		// Simulate the tag application logic
@@ -1574,7 +1574,7 @@ func TestQueryDestStatus(t *testing.T) {
 			cfg:      &config.SourceConfig{},
 			logger:   logger,
 			grpcDest: dest,
-			store:    newTorrentStore("", logger),
+			store:    newTorrentStore("", 0, logger),
 			tracker:  makeTracker(),
 		}
 
@@ -1595,7 +1595,7 @@ func TestQueryDestStatus(t *testing.T) {
 			cfg:      &config.SourceConfig{},
 			logger:   logger,
 			grpcDest: dest,
-			store:    newTorrentStore("", logger),
+			store:    newTorrentStore("", 0, logger),
 			tracker:  makeTracker(),
 		}
 
@@ -1620,7 +1620,7 @@ func TestQueryDestStatus(t *testing.T) {
 			cfg:      &config.SourceConfig{},
 			logger:   logger,
 			grpcDest: dest,
-			store:    newTorrentStore(filepath.Join(tmpDir, "cache.json"), logger),
+			store:    newTorrentStore(filepath.Join(tmpDir, "cache.json"), 0, logger),
 			tracker:  makeTracker(),
 		}
 
@@ -1645,7 +1645,7 @@ func TestPruneCompletedOnDest(t *testing.T) {
 	newTask := func(t *testing.T, dest *mockDest, srcTorrents []qbittorrent.Torrent, dryRun bool) (*QBTask, *torrentStore) {
 		t.Helper()
 		mockClient := &mockQBClient{getTorrentsResult: srcTorrents}
-		completed := newTorrentStore("", logger)
+		completed := newTorrentStore("", 0, logger)
 		return &QBTask{
 			cfg: &config.SourceConfig{
 				BaseConfig:       config.BaseConfig{DryRun: dryRun},
@@ -1739,7 +1739,7 @@ func TestCompletedCachePersistence(t *testing.T) {
 		tmpDir := t.TempDir()
 		cachePath := filepath.Join(tmpDir, ".qb-sync", "completed_on_dest.json")
 
-		cache := newTorrentStore(cachePath, logger)
+		cache := newTorrentStore(cachePath, 0, logger)
 
 		// Mark some torrents as complete
 		cache.MarkComplete("hash1", "")
@@ -1762,7 +1762,7 @@ func TestCompletedCachePersistence(t *testing.T) {
 		}
 
 		// Load into a new cache
-		cache2 := newTorrentStore(cachePath, logger)
+		cache2 := newTorrentStore(cachePath, 0, logger)
 		cache2.Load()
 
 		if cache2.CompletedCount() != 3 {
@@ -1779,7 +1779,7 @@ func TestCompletedCachePersistence(t *testing.T) {
 		tmpDir := t.TempDir()
 		cachePath := filepath.Join(tmpDir, "nonexistent", "cache.json")
 
-		cache := newTorrentStore(cachePath, logger)
+		cache := newTorrentStore(cachePath, 0, logger)
 		cache.Load()
 
 		if cache.CompletedCount() != 0 {
@@ -1795,7 +1795,7 @@ func TestCompletedCachePersistence(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		cache := newTorrentStore(cachePath, logger)
+		cache := newTorrentStore(cachePath, 0, logger)
 		cache.Load()
 
 		if cache.CompletedCount() != 0 {
@@ -1807,7 +1807,7 @@ func TestCompletedCachePersistence(t *testing.T) {
 		tmpDir := t.TempDir()
 		cachePath := filepath.Join(tmpDir, ".qb-sync", "completed_on_dest.json")
 
-		cache := newTorrentStore(cachePath, logger)
+		cache := newTorrentStore(cachePath, 0, logger)
 
 		cache.MarkComplete("hash_abc", "0,1")
 		cache.Save()
@@ -1946,7 +1946,7 @@ func TestTrackNewTorrents_StateAndProgressFiltering(t *testing.T) {
 			srcClient: mockClient,
 			grpcDest:  dest,
 			tracker:   tracker,
-			store:     newTorrentStore(filepath.Join(t.TempDir(), "cache.json"), logger),
+			store:     newTorrentStore(filepath.Join(t.TempDir(), "cache.json"), 0, logger),
 		}
 
 		var trackOrder []string
@@ -1993,7 +1993,7 @@ func TestTrackNewTorrents_StateAndProgressFiltering(t *testing.T) {
 			srcClient: mockClient,
 			grpcDest:  dest,
 			tracker:   tracker,
-			store:     newTorrentStore(filepath.Join(t.TempDir(), "cache.json"), logger),
+			store:     newTorrentStore(filepath.Join(t.TempDir(), "cache.json"), 0, logger),
 		}
 
 		var trackOrder []string
@@ -2043,7 +2043,7 @@ func TestTrackNewTorrents_StateAndProgressFiltering(t *testing.T) {
 			srcClient: mockClient,
 			grpcDest:  dest,
 			tracker:   tracker,
-			store:     newTorrentStore(filepath.Join(t.TempDir(), "cache.json"), logger),
+			store:     newTorrentStore(filepath.Join(t.TempDir(), "cache.json"), 0, logger),
 		}
 
 		var trackOrder []string
@@ -2138,7 +2138,7 @@ func TestTrackNewTorrents_PrioritizesByProgress(t *testing.T) {
 			srcClient: mockClient,
 			grpcDest:  dest,
 			tracker:   tracker,
-			store:     newTorrentStore(filepath.Join(t.TempDir(), "cache.json"), logger),
+			store:     newTorrentStore(filepath.Join(t.TempDir(), "cache.json"), 0, logger),
 		}
 
 		var trackOrder []string
@@ -2186,7 +2186,7 @@ func TestTrackNewTorrents_PrioritizesByProgress(t *testing.T) {
 			srcClient: mockClient,
 			grpcDest:  dest,
 			tracker:   tracker,
-			store:     newTorrentStore(filepath.Join(t.TempDir(), "cache.json"), logger),
+			store:     newTorrentStore(filepath.Join(t.TempDir(), "cache.json"), 0, logger),
 		}
 
 		var trackOrder []string
@@ -2370,7 +2370,7 @@ func TestFetchTorrentsCompletedOnDest_ExcludeCleanupTag(t *testing.T) {
 				{Hash: "hash3", Tags: "foo, keep-on-source, bar", Size: 300},
 			},
 		}
-		completed := newTorrentStore("", logger)
+		completed := newTorrentStore("", 0, logger)
 		completed.MarkComplete("hash1", "")
 		completed.MarkComplete("hash2", "")
 		completed.MarkComplete("hash3", "")
@@ -2401,7 +2401,7 @@ func TestFetchTorrentsCompletedOnDest_ExcludeCleanupTag(t *testing.T) {
 				{Hash: "hash2", Tags: "other", Size: 200},
 			},
 		}
-		completed := newTorrentStore("", logger)
+		completed := newTorrentStore("", 0, logger)
 		completed.MarkComplete("hash1", "")
 		completed.MarkComplete("hash2", "")
 		task := &QBTask{
@@ -2428,7 +2428,7 @@ func TestFetchTorrentsCompletedOnDest_ExcludeCleanupTag(t *testing.T) {
 				{Hash: "hash2", Tags: "other", Size: 200},
 			},
 		}
-		completed := newTorrentStore("", logger)
+		completed := newTorrentStore("", 0, logger)
 		completed.MarkComplete("hash1", "")
 		completed.MarkComplete("hash2", "")
 		task := &QBTask{
@@ -2450,7 +2450,7 @@ func TestFetchTorrentsCompletedOnDest_ExcludeCleanupTag(t *testing.T) {
 	})
 
 	t.Run("uses cycle cache when available", func(t *testing.T) {
-		completed := newTorrentStore("", logger)
+		completed := newTorrentStore("", 0, logger)
 		completed.MarkComplete("hash1", "")
 		completed.MarkComplete("hash2", "")
 		task := &QBTask{
@@ -2488,7 +2488,7 @@ func TestDrain(t *testing.T) {
 			cfg:       &config.SourceConfig{MinSpaceGB: 10},
 			logger:    logger,
 			srcClient: mockClient,
-			store:     newTorrentStore("", logger),
+			store:     newTorrentStore("", 0, logger),
 		}
 
 		if task.Draining() {
@@ -2514,7 +2514,7 @@ func TestDrain(t *testing.T) {
 			},
 		}
 		dest := &mockDest{}
-		completed := newTorrentStore("", logger)
+		completed := newTorrentStore("", 0, logger)
 		completed.MarkComplete("abc123", "")
 		task := &QBTask{
 			cfg:       &config.SourceConfig{MinSpaceGB: 10},
@@ -2542,7 +2542,7 @@ func TestDrain(t *testing.T) {
 		task := &QBTask{
 			cfg:    &config.SourceConfig{MinSpaceGB: 10},
 			logger: logger,
-			store:  newTorrentStore("", logger),
+			store:  newTorrentStore("", 0, logger),
 		}
 
 		// Manually set draining to simulate an in-progress drain
@@ -2640,7 +2640,7 @@ func TestLoadCompletedCache(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		cache := newTorrentStore(cachePath, logger)
+		cache := newTorrentStore(cachePath, 0, logger)
 		cache.Load()
 
 		if cache.CompletedCount() != 3 {
@@ -2672,7 +2672,7 @@ func TestLoadCompletedCache(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		cache := newTorrentStore(cachePath, logger)
+		cache := newTorrentStore(cachePath, 0, logger)
 		cache.Load()
 
 		if cache.CompletedCount() != 0 {
@@ -2700,7 +2700,7 @@ func TestSyncFailedTag(t *testing.T) {
 			grpcDest:  dest,
 			source:    qbclient.NewSource(nil, ""),
 			tracker:   tracker,
-			store:     newTorrentStore("", logger),
+			store:     newTorrentStore("", 0, logger),
 		}
 
 		hash := "fail-hash"
@@ -2750,7 +2750,7 @@ func TestSyncFailedTag(t *testing.T) {
 				logger,
 				streaming.DefaultPieceMonitorConfig(),
 			),
-			store: newTorrentStore("", logger),
+			store: newTorrentStore("", 0, logger),
 		}
 
 		task.markSyncFailed(context.Background(), "hash")
@@ -2807,7 +2807,7 @@ func TestSyncFailedTag(t *testing.T) {
 			srcClient: mockClient,
 			grpcDest:  dest,
 			tracker:   tracker,
-			store:     newTorrentStore(filepath.Join(t.TempDir(), "cache.json"), logger),
+			store:     newTorrentStore(filepath.Join(t.TempDir(), "cache.json"), 0, logger),
 		}
 
 		var trackOrder []string
@@ -2856,7 +2856,7 @@ func TestSyncFailedTag(t *testing.T) {
 			srcClient: mockClient,
 			grpcDest:  dest,
 			tracker:   tracker,
-			store:     newTorrentStore(filepath.Join(t.TempDir(), "cache.json"), logger),
+			store:     newTorrentStore(filepath.Join(t.TempDir(), "cache.json"), 0, logger),
 		}
 
 		var trackOrder []string
@@ -2884,7 +2884,7 @@ func TestSyncFailedTag(t *testing.T) {
 		task := &QBTask{
 			cfg:    &config.SourceConfig{},
 			logger: logger,
-			store:  newTorrentStore("", logger),
+			store:  newTorrentStore("", 0, logger),
 		}
 
 		hash := "count-hash"
@@ -2921,7 +2921,7 @@ func TestHandleFinalizeError_DefaultBranchCapsAtMaxRetries(t *testing.T) {
 			tracker: streaming.NewPieceMonitor(
 				nil, &mockPieceSource{numPieces: 1}, logger, streaming.DefaultPieceMonitorConfig(),
 			),
-			store: newTorrentStore("", logger),
+			store: newTorrentStore("", 0, logger),
 		}
 		task.store.Track(hash, TrackedTorrent{Name: name})
 		return task, mockClient
@@ -3080,7 +3080,7 @@ func TestExcludeSyncTag(t *testing.T) {
 			srcClient: mockClient,
 			grpcDest:  dest,
 			tracker:   tracker,
-			store:     newTorrentStore(filepath.Join(t.TempDir(), "cache.json"), logger),
+			store:     newTorrentStore(filepath.Join(t.TempDir(), "cache.json"), 0, logger),
 		}
 
 		var trackOrder []string
@@ -3126,7 +3126,7 @@ func TestExcludeSyncTag(t *testing.T) {
 			srcClient: mockClient,
 			grpcDest:  dest,
 			tracker:   tracker,
-			store:     newTorrentStore(filepath.Join(t.TempDir(), "cache.json"), logger),
+			store:     newTorrentStore(filepath.Join(t.TempDir(), "cache.json"), 0, logger),
 		}
 
 		var trackOrder []string
@@ -3178,7 +3178,7 @@ func TestExcludeSyncTag(t *testing.T) {
 			srcClient: mockClient,
 			grpcDest:  dest,
 			tracker:   tracker,
-			store:     newTorrentStore(filepath.Join(t.TempDir(), "cache.json"), logger),
+			store:     newTorrentStore(filepath.Join(t.TempDir(), "cache.json"), 0, logger),
 		}
 
 		var trackOrder []string
@@ -3233,7 +3233,7 @@ func TestExcludeSyncTagReactive(t *testing.T) {
 			grpcDest:  dest,
 			source:    qbclient.NewSource(nil, ""),
 			tracker:   tracker,
-			store:     newTorrentStore(filepath.Join(t.TempDir(), "cache.json"), logger),
+			store:     newTorrentStore(filepath.Join(t.TempDir(), "cache.json"), 0, logger),
 		}
 
 		// Track without the tag.
@@ -3307,7 +3307,7 @@ func TestExcludeSyncTagReactive(t *testing.T) {
 			},
 		}
 
-		completed := newTorrentStore(filepath.Join(t.TempDir(), "cache.json"), logger)
+		completed := newTorrentStore(filepath.Join(t.TempDir(), "cache.json"), 0, logger)
 		completed.MarkComplete("completed-hash", "")
 		task := &QBTask{
 			cfg:       &config.SourceConfig{ExcludeSyncTag: "no-sync"},
@@ -3376,7 +3376,7 @@ func TestExcludeSyncTagReactive(t *testing.T) {
 			grpcDest:  dest,
 			source:    qbclient.NewSource(nil, ""),
 			tracker:   tracker,
-			store:     newTorrentStore(filepath.Join(t.TempDir(), "cache.json"), logger),
+			store:     newTorrentStore(filepath.Join(t.TempDir(), "cache.json"), 0, logger),
 		}
 
 		err := task.trackNewTorrents(context.Background())
@@ -3455,7 +3455,7 @@ func TestExcludeSyncTagReactive(t *testing.T) {
 // TestHandleFinalizeError_BusyDoesNotBurnRetryBudget covers the BUSY
 // (destination congested) contract: queue timeouts and qB-still-checking
 // timeouts are destination-wide congestion, not per-torrent faults, so they
-// must not count toward minQuarantineAttempts — until the wall-clock guard
+// must not count toward minQuarantineAttempts - until the wall-clock guard
 // (busyGuardDuration) expires, after which a permanently wedged destination
 // must still surface as sync-failed.
 func TestHandleFinalizeError_BusyDoesNotBurnRetryBudget(t *testing.T) {
@@ -3472,7 +3472,7 @@ func TestHandleFinalizeError_BusyDoesNotBurnRetryBudget(t *testing.T) {
 			tracker: streaming.NewPieceMonitor(
 				nil, &mockPieceSource{numPieces: 1}, logger, streaming.DefaultPieceMonitorConfig(),
 			),
-			store: newTorrentStore("", logger),
+			store: newTorrentStore("", 0, logger),
 		}
 		task.store.Track(hash, TrackedTorrent{Name: name})
 		return task, mockClient

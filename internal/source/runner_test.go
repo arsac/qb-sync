@@ -45,7 +45,7 @@ func setupShutdownDrain(
 	}
 	dest := &mockDest{}
 
-	completed := newTorrentStore("", logger)
+	completed := newTorrentStore("", 0, logger)
 	completed.MarkComplete("abc123", "")
 	task := &QBTask{
 		cfg:       cfg,

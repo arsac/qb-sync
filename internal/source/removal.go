@@ -28,7 +28,7 @@ func (t *QBTask) handleTorrentRemoval(ctx context.Context, hash string) {
 		"hash", hash,
 	)
 
-	_, wasTracked := t.store.UntrackAndGet(hash)
+	wasTracked := t.store.IsTracked(hash)
 
 	// Read completedOnDest but don't delete yet -- only remove after
 	// StartTorrent succeeds so pruneCompletedOnDest can retry on failure.
@@ -36,9 +36,6 @@ func (t *QBTask) handleTorrentRemoval(ctx context.Context, hash string) {
 
 	// Full release: the torrent is gone from the source, so every piece of
 	// streaming state for it is stale. Completion is handled separately below.
-	// The untrack here is redundant with UntrackAndGet above — that call is for
-	// its return value — but releasing through one path is what keeps the six
-	// releases from drifting apart again.
 	t.releaseTorrent(hash)
 
 	if !wasTracked {

@@ -62,7 +62,7 @@ type torrentState struct {
 
 	// lastAdvance is when the streamed count last increased. The orchestrator
 	// uses it, together with the count of downloaded-but-unstreamed pieces, to
-	// tell a wedged torrent from one that is simply waiting on its source.
+	// tell a stalled torrent from one that is simply waiting on its source.
 	lastAdvance time.Time
 
 	mu sync.RWMutex
@@ -540,7 +540,7 @@ func (t *PieceMonitor) startTracking(ctx context.Context, hash string, alreadyWr
 		failed:     make([]bool, numPieces),
 		// Start the clock now rather than at the zero time, so a torrent that
 		// never streams a single piece still measures how long it has failed to
-		// advance. That is precisely the wedged case, and leaving this zero
+		// advance. That is precisely the stalled case, and leaving this zero
 		// would exclude it from stall detection entirely.
 		lastAdvance: time.Now(),
 	}

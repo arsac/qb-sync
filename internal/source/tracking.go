@@ -113,12 +113,16 @@ func (t *QBTask) trackNewTorrents(ctx context.Context) error {
 	return nil
 }
 
+// isQuarantined reports whether a torrent carries the quarantine marker.
+func (t *QBTask) isQuarantined(torrent qbittorrent.Torrent) bool {
+	return t.cfg.SyncFailedTag != "" && hasTag(torrent.Tags, t.cfg.SyncFailedTag)
+}
+
 // exclusionReason returns the metrics reason a torrent is skipped during
 // tracking, or "" when it is eligible.
 //
-// Reported as a gauge because these torrents were otherwise invisible: a
-// torrent sitting in error or missingFiles on the source is silently never
-// synced, with no log and no metric to say so.
+// Reported as a gauge because a torrent sitting in error or missingFiles on the
+// source is otherwise silently never synced, with no log and no metric to say so.
 func (t *QBTask) exclusionReason(torrent qbittorrent.Torrent) string {
 	switch {
 	case !isSyncableState(torrent.State):
@@ -127,7 +131,7 @@ func (t *QBTask) exclusionReason(torrent qbittorrent.Torrent) string {
 		return metrics.ReasonSkipZeroProgress
 	case t.cfg.ExcludeSyncTag != "" && hasTag(torrent.Tags, t.cfg.ExcludeSyncTag):
 		return metrics.ReasonSkipExcludeTag
-	case t.cfg.SyncFailedTag != "" && hasTag(torrent.Tags, t.cfg.SyncFailedTag):
+	case t.isQuarantined(torrent):
 		return metrics.ReasonSkipQuarantined
 	case t.store.IsComplete(torrent.Hash):
 		return metrics.ReasonSkipAlreadySynced
@@ -158,15 +162,27 @@ func (t *QBTask) recordEligibilityMetrics() {
 		metrics.ReasonSkipQuarantined:   0,
 		metrics.ReasonSkipAlreadySynced: 0,
 	}
+	// The quarantine population is counted on its own rather than read off the
+	// exclusion switch. That switch reports one reason per torrent and ranks
+	// source state ahead of the marker, so a quarantined torrent that is also in
+	// error or missingFiles reports as not_syncable_state and never reaches this
+	// gauge. Those two conditions travel together: a torrent is quarantined
+	// because it kept failing, and unreadable source data is a leading cause of
+	// that. Deriving the gauge from the switch blinds it to the very population
+	// the alert exists to catch.
+	var quarantined int
 	for i := range t.cycleTorrents {
 		if reason := t.exclusionReason(t.cycleTorrents[i]); reason != "" {
 			counts[reason]++
+		}
+		if t.isQuarantined(t.cycleTorrents[i]) {
+			quarantined++
 		}
 	}
 	for reason, n := range counts {
 		metrics.SkippedTorrents.WithLabelValues(reason).Set(float64(n))
 	}
-	metrics.QuarantinedTorrents.Set(float64(counts[metrics.ReasonSkipQuarantined]))
+	metrics.QuarantinedTorrents.Set(float64(quarantined))
 }
 
 // queryDestStatus checks a torrent's status on destination without starting tracking.

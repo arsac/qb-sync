@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/autobrr/go-qbittorrent"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/arsac/qb-sync/internal/config"
 	"github.com/arsac/qb-sync/internal/metrics"
@@ -19,7 +20,7 @@ func testStoreLogger() *slog.Logger {
 
 func newTestStore(t *testing.T) *torrentStore {
 	t.Helper()
-	return newTorrentStore("", testStoreLogger())
+	return newTorrentStore("", 0, testStoreLogger())
 }
 
 // --- Finalization retry accounting ------------------------------------------
@@ -84,7 +85,6 @@ func TestStoreRecordIsDroppedWhenEmpty(t *testing.T) {
 
 	release := map[string]func(s *torrentStore, hash string){
 		"untrack":         func(s *torrentStore, h string) { s.Untrack(h) },
-		"untrackAndGet":   func(s *torrentStore, h string) { s.UntrackAndGet(h) },
 		"forgetComplete":  func(s *torrentStore, h string) { s.ForgetComplete(h) },
 		"forgetAll":       func(s *torrentStore, h string) { s.ForgetCompleteAll([]string{h}) },
 		"clearBackoff":    func(s *torrentStore, h string) { s.ClearBackoff(h) },
@@ -98,7 +98,7 @@ func TestStoreRecordIsDroppedWhenEmpty(t *testing.T) {
 
 			// Give the record exactly the state this releaser clears.
 			switch name {
-			case "untrack", "untrackAndGet", "trackIfAbsentNo":
+			case "untrack", "trackIfAbsentNo":
 				s.Track("h1", TrackedTorrent{Name: "x"})
 			case "forgetComplete", "forgetAll":
 				s.MarkComplete("h1", "0,1")
@@ -213,25 +213,24 @@ func TestStoreTrackIfAbsent(t *testing.T) {
 		t.Fatal("second TrackIfAbsent should report already tracked")
 	}
 
-	info, ok := s.UntrackAndGet("h1")
-	if !ok || info.Name != "first" {
-		t.Fatalf("TrackIfAbsent must not overwrite: got %q, ok=%v", info.Name, ok)
+	if info := s.TrackedSnapshot()["h1"]; info.Name != "first" {
+		t.Fatalf("TrackIfAbsent must not overwrite: got %q", info.Name)
 	}
 }
 
-func TestStoreUntrackAndGetOnUntrackedTorrent(t *testing.T) {
+func TestStoreUntrackOnUntrackedTorrentLeavesCompletion(t *testing.T) {
 	t.Parallel()
 	s := newTestStore(t)
 
-	// Complete but never tracked: UntrackAndGet must report false and must not
-	// disturb the completion state.
+	// Complete but never tracked: untracking must not disturb completion.
 	s.MarkComplete("h1", "0")
+	s.Untrack("h1")
 
-	if _, ok := s.UntrackAndGet("h1"); ok {
-		t.Error("UntrackAndGet should report false for an untracked torrent")
+	if s.IsTracked("h1") {
+		t.Error("a torrent that was never tracked must not report as tracked")
 	}
 	if !s.IsComplete("h1") {
-		t.Error("UntrackAndGet must not clear completion")
+		t.Error("Untrack must not clear completion")
 	}
 }
 
@@ -308,7 +307,7 @@ func TestObserveStallQuarantinesOnDuration(t *testing.T) {
 	}
 }
 
-// TestObserveStallForgivesProgress covers the difference between a wedged
+// TestObserveStallForgivesProgress covers the difference between a stalled
 // torrent and a slow one: any genuine advance resets the clock entirely.
 func TestObserveStallForgivesProgress(t *testing.T) {
 	t.Parallel()
@@ -343,7 +342,7 @@ func TestObserveStallSurvivesRestart(t *testing.T) {
 	logger := testStoreLogger()
 	path := dir + "/completed_on_dest.json"
 
-	s := newTorrentStore(path, logger)
+	s := newTorrentStore(path, 0, logger)
 	s.guard = time.Hour
 	now := time.Now()
 	s.now = func() time.Time { return now }
@@ -353,7 +352,7 @@ func TestObserveStallSurvivesRestart(t *testing.T) {
 	s.SaveStreaks()
 
 	// New process: clocks reloaded, the torrent resumes at the same 40 pieces.
-	s2 := newTorrentStore(path, logger)
+	s2 := newTorrentStore(path, 0, logger)
 	s2.guard = time.Hour
 	s2.now = func() time.Time { return now.Add(2 * time.Hour) }
 	s2.LoadStreaks()
@@ -383,10 +382,10 @@ func TestPruneStreaksDropsDepartedTorrents(t *testing.T) {
 
 // --- Eligibility reporting ----------------------------------------------------
 
-// TestExclusionReason pins the reason a torrent is reported as skipped. These
-// torrents were previously invisible: one sitting in error or missingFiles on
-// the source is silently never synced, with no log and no metric. A wrong label
-// here is a silent observability bug, so the mapping is worth pinning.
+// TestExclusionReason pins the reason a torrent is reported as skipped. A
+// torrent sitting in error or missingFiles on the source is otherwise silently
+// never synced, with no log and no metric to say so, which makes a wrong label
+// here a silent observability bug.
 func TestExclusionReason(t *testing.T) {
 	t.Parallel()
 
@@ -397,7 +396,7 @@ func TestExclusionReason(t *testing.T) {
 				ExcludeSyncTag: "no-sync",
 			},
 			logger: testStoreLogger(),
-			store:  newTorrentStore("", testStoreLogger()),
+			store:  newTorrentStore("", 0, testStoreLogger()),
 		}
 	}
 
@@ -475,6 +474,47 @@ func TestExclusionReason(t *testing.T) {
 	}
 }
 
+// TestQuarantineGaugeCountsTorrentsAlsoExcludedForAnotherReason pins the gauge
+// against the exclusion switch. A torrent is quarantined because it kept
+// failing, and unreadable source data is a leading cause of that, so the two
+// conditions travel together. Deriving the gauge from exclusionReason, which
+// returns one reason per torrent and ranks source state ahead of the marker,
+// reported those torrents as not_syncable_state and left the alert blind to
+// exactly the population it exists to catch.
+//
+// Not parallel: it asserts on process-global gauges.
+func TestQuarantineGaugeCountsTorrentsAlsoExcludedForAnotherReason(t *testing.T) {
+	task := &QBTask{
+		cfg:    &config.SourceConfig{SyncFailedTag: "sync-failed"},
+		logger: testStoreLogger(),
+		store:  newTorrentStore("", 0, testStoreLogger()),
+		cycleTorrents: []qbittorrent.Torrent{
+			{Hash: "a", State: qbittorrent.TorrentStateUploading, Progress: 1, Tags: "sync-failed"},
+			{Hash: "b", State: qbittorrent.TorrentStateMissingFiles, Progress: 1, Tags: "sync-failed"},
+			{Hash: "c", State: qbittorrent.TorrentStateError, Progress: 1, Tags: "sync-failed"},
+			{Hash: "d", State: qbittorrent.TorrentStateUploading, Progress: 1},
+		},
+	}
+
+	task.recordEligibilityMetrics()
+
+	if got := testutil.ToFloat64(metrics.QuarantinedTorrents); got != 3 {
+		t.Errorf("quarantined gauge = %v, want 3: one clean plus two also broken on the source", got)
+	}
+
+	// The label keeps its one-reason-per-torrent meaning; only the gauge counts
+	// the tag itself. Pinned so the two are not quietly reconverged.
+	skipped := func(reason string) float64 {
+		return testutil.ToFloat64(metrics.SkippedTorrents.WithLabelValues(reason))
+	}
+	if got := skipped(metrics.ReasonSkipNotSyncable); got != 2 {
+		t.Errorf("not_syncable_state = %v, want 2", got)
+	}
+	if got := skipped(metrics.ReasonSkipQuarantined); got != 1 {
+		t.Errorf("quarantined label = %v, want 1", got)
+	}
+}
+
 // --- Teardown -----------------------------------------------------------------
 
 // TestReleaseTorrentLeavesNoRecord covers the hazard that made the teardown
@@ -498,7 +538,7 @@ func TestReleaseTorrentLeavesNoRecord(t *testing.T) {
 			tracker: streaming.NewPieceMonitor(
 				nil, &mockPieceSource{numPieces: 1}, testStoreLogger(), streaming.DefaultPieceMonitorConfig(),
 			),
-			store: newTorrentStore("", testStoreLogger()),
+			store: newTorrentStore("", 0, testStoreLogger()),
 		}
 	}
 
@@ -544,7 +584,7 @@ func TestReleaseTorrentLeavesNoRecord(t *testing.T) {
 // TestBusyStreakSurvivesRestart pins the reason firstBusy is persisted. The
 // busy guard bounds how long destination congestion is tolerated before it
 // counts as a failure. With the clock in memory only, a source restarting more
-// often than that guard could never surface a permanently wedged destination —
+// often than that guard could never surface a destination that never recovers -
 // the same weakness the failure and stall clocks are persisted to avoid.
 func TestBusyStreakSurvivesRestart(t *testing.T) {
 	t.Parallel()
@@ -553,13 +593,13 @@ func TestBusyStreakSurvivesRestart(t *testing.T) {
 	path := dir + "/completed_on_dest.json"
 
 	now := time.Now()
-	s := newTorrentStore(path, logger)
+	s := newTorrentStore(path, 0, logger)
 	s.now = func() time.Time { return now }
 	s.RecordBusy("h1")
 	s.SaveStreaks()
 
 	// New process, three hours later.
-	s2 := newTorrentStore(path, logger)
+	s2 := newTorrentStore(path, 0, logger)
 	s2.now = func() time.Time { return now.Add(3 * time.Hour) }
 	s2.LoadStreaks()
 

@@ -379,11 +379,11 @@ func TestTorrentStore_BeginReclaim(t *testing.T) {
 	}
 
 	// An entry pred accepts is dropped and registered in one step.
-	commitTestTorrent(t, ts, "abandoned", "abandoned/file.txt")
-	if !ts.BeginReclaim("abandoned", make(chan struct{}), stale) {
+	commitTestTorrent(t, ts, "orphan", "orphan/file.txt")
+	if !ts.BeginReclaim("orphan", make(chan struct{}), stale) {
 		t.Fatal("BeginReclaim: expected true for a stale entry")
 	}
-	if _, present := ts.peek("abandoned"); present {
+	if _, present := ts.peek("orphan"); present {
 		t.Fatal("an accepted reclaim must drop the entry")
 	}
 }

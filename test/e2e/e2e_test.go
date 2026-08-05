@@ -2489,7 +2489,7 @@ func TestE2E_FinalizedTorrentSkippedOnRecovery(t *testing.T) {
 //
 // Quarantine is duration-based, so the guard is shrunk here. That works through
 // the single knob because the retry backoff is derived from the guard rather
-// than being an independent constant — see docs/adr/0001.
+// than being an independent constant - see docs/adr/0001.
 func TestE2E_StuckAtFullStreamedQBIntegrationQuarantinesPastTheGuard(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")

@@ -356,10 +356,9 @@ func TestCleanupOrphan_HealsQBOwnedCompleteTorrent(t *testing.T) {
 //
 // On an unfinalized torrent, everything we wrote lives at a .partial path.
 // A file at its final path is pre-existing operator data, a hardlink, or a
-// deselected file, and deleting any of those is data loss. Before the fix,
-// deleteOrphanFiles removed both paths unconditionally. That was close to
-// harmless only because the orphan cleaner almost never ran; the reclamation
-// work makes it run, which is what turns this from dormant into live.
+// deselected file, and deleting any of those is data loss. Removing both paths
+// unconditionally is harmless only while the orphan cleaner never runs, and
+// reclamation exists to make it run.
 func TestDeleteOrphanFiles_OnlyRemovesPartials(t *testing.T) {
 	t.Parallel()
 

@@ -12,17 +12,38 @@ import (
 	"github.com/arsac/qb-sync/internal/streaming"
 )
 
-// finalizeCompletedStreams checks for streams where all pieces are streamed
-// and calls FinalizeTorrent on the destination server.
-//
-//nolint:unparam // error return kept for interface consistency
-func (t *QBTask) finalizeCompletedStreams(ctx context.Context) error {
-	tracked := t.store.TrackedSnapshot()
-
+// collectProgress takes one progress snapshot per tracked torrent for the
+// cycle. Both the finalization pass and the stall pass need it, and GetProgress
+// scans the whole piece bitmap under the monitor's read lock, so sampling twice
+// per cycle doubles that scan and the time piece writers wait behind it.
+func (t *QBTask) collectProgress(
+	ctx context.Context,
+	tracked map[string]TrackedTorrent,
+) map[string]streaming.StreamProgress {
+	progressByHash := make(map[string]streaming.StreamProgress, len(tracked))
 	for hash := range tracked {
 		progress, err := t.tracker.GetProgress(hash)
 		if err != nil {
 			t.logger.DebugContext(ctx, "GetProgress failed", "hash", hash, "error", err)
+			continue
+		}
+		progressByHash[hash] = progress
+	}
+	return progressByHash
+}
+
+// finalizeCompletedStreams checks for streams where all pieces are streamed
+// and calls FinalizeTorrent on the destination server.
+//
+//nolint:unparam // error return kept for interface consistency
+func (t *QBTask) finalizeCompletedStreams(
+	ctx context.Context,
+	tracked map[string]TrackedTorrent,
+	progressByHash map[string]streaming.StreamProgress,
+) error {
+	for hash := range tracked {
+		progress, ok := progressByHash[hash]
+		if !ok {
 			continue
 		}
 
@@ -118,19 +139,19 @@ func (t *QBTask) handleFinalizeError(ctx context.Context, hash string, finalizeE
 	return false
 }
 
-// stallGracePeriod is how long a tracked torrent may sit without advancing
+// stallThreshold is how long a tracked torrent may sit without advancing
 // before the stall clock starts. It only has to outlast normal jitter - the
 // queue draining, a congested destination, a slow disk read - because the
 // guard, not this, decides quarantine.
-func (t *QBTask) stallGracePeriod() time.Duration {
+func (t *QBTask) stallThreshold() time.Duration {
 	const (
-		minGrace     = time.Minute
+		minThreshold = time.Minute
 		cyclesOfSlop = 2 // tolerate a couple of quiet cycles before starting the clock
 	)
 	if t.cfg != nil && t.cfg.SleepInterval > 0 {
-		return max(minGrace, cyclesOfSlop*t.cfg.SleepInterval)
+		return max(minThreshold, cyclesOfSlop*t.cfg.SleepInterval)
 	}
-	return minGrace
+	return minThreshold
 }
 
 // checkStalledStreams quarantines torrents that have pieces waiting on the
@@ -142,25 +163,31 @@ func (t *QBTask) stallGracePeriod() time.Duration {
 // therefore never reaches the failure streak that would quarantine it. It stays
 // tracked forever, retrying the same unreadable piece.
 //
-// The available-pieces condition is what separates a wedged torrent from one
+// The available-pieces condition is what separates a stalled torrent from one
 // whose source is merely slow to download: a source waiting on peers has
 // nothing available, so it can never be judged stalled.
-func (t *QBTask) checkStalledStreams(ctx context.Context) {
-	grace := t.stallGracePeriod()
+func (t *QBTask) checkStalledStreams(
+	ctx context.Context,
+	progressByHash map[string]streaming.StreamProgress,
+) {
+	threshold := t.stallThreshold()
 
+	// Re-snapshot rather than walking progressByHash: finalization releases
+	// synced torrents mid-cycle, and ObserveStall creates a record on access,
+	// so observing one that has just been released would resurrect it and leak.
 	for hash := range t.store.TrackedSnapshot() {
-		progress, err := t.tracker.GetProgress(hash)
-		if err != nil {
+		progress, ok := progressByHash[hash]
+		if !ok {
 			continue
 		}
 
 		// No IsZero guard: the monitor stamps lastAdvance when tracking starts,
-		// so a torrent that has never streamed a piece is the wedged case, not
+		// so a torrent that has never streamed a piece is the stalled case, not
 		// an unknown one. Excluding it here would skip the very torrents this
 		// check exists to catch.
 		stalling := !progress.Complete &&
 			progress.Available > 0 &&
-			time.Since(progress.LastAdvance) >= grace
+			time.Since(progress.LastAdvance) >= threshold
 
 		stalledFor, quarantine := t.store.ObserveStall(hash, progress.Streamed, stalling)
 		if !quarantine {
@@ -176,7 +203,7 @@ func (t *QBTask) checkStalledStreams(ctx context.Context) {
 			"available", progress.Available,
 			// Failed is the count of pieces whose send or read failed. It is
 			// the first thing to look at when diagnosing a stall: a high count
-			// points at unreadable source data rather than a wedged pipeline.
+			// points at unreadable source data rather than a stalled pipeline.
 			"failed", progress.Failed,
 		)
 		t.markSyncFailed(ctx, hash)
@@ -276,7 +303,8 @@ func (t *QBTask) handleIncompleteFinalization(ctx context.Context, hash string) 
 	t.logger.WarnContext(ctx, "destination reports incomplete, re-syncing streamed state",
 		"hash", hash,
 		"attempt", failures,
-		"maxRetries", minQuarantineAttempts,
+		"minAttempts", minQuarantineAttempts,
+		"guard", t.store.Guard(),
 	)
 	t.resyncWithDest(ctx, hash)
 }
@@ -356,16 +384,15 @@ func (t *QBTask) releaseDestination(ctx context.Context, hash string) {
 // releaseTorrent tears down every piece of per-torrent streaming state in one
 // operation.
 //
-// These six releases used to be spelled out at each lifecycle transition in
-// five different combinations, so every new path had to remember which subset
-// applied. That is not a hypothetical hazard: markTorrentSynced omitted the
-// stall release, which left lastStreamed set on every successfully synced
-// torrent and kept its record alive for the lifetime of the process.
+// Every lifecycle transition goes through here rather than spelling out the
+// subset it needs. The hazard is concrete, not hypothetical: omitting the stall
+// release leaves lastStreamed set on a synced torrent, which keeps its record
+// alive for the lifetime of the process.
 //
 // Completion state is deliberately NOT released here. Whether a torrent stays
-// known-complete genuinely differs by caller — quiesceExcludedCompleted must
+// known-complete genuinely differs by caller - quiesceExcludedCompleted must
 // preserve it so a later removal takes the safe handoff path, while
-// resyncFileSelection must drop it — so it stays explicit at each site.
+// resyncFileSelection must drop it - so it stays explicit at each site.
 func (t *QBTask) releaseTorrent(hash string) {
 	t.tracker.Untrack(hash)
 	t.store.Untrack(hash)

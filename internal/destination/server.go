@@ -97,7 +97,7 @@ type Server struct {
 	// processStart anchors contact age for torrents rebuilt by startup
 	// recovery, which carry no contact stamp until a source asks about them.
 	// Measuring their age from the epoch instead would make every recovered
-	// torrent look abandoned the instant the server came up.
+	// torrent look like an orphan the instant the server came up.
 	processStart time.Time
 
 	// Health server for K8s probes

@@ -42,7 +42,7 @@ func newTorrentStore(basePath string, logger *slog.Logger) *torrentStore {
 //
 // The contact stamp lives here rather than at each RPC entry point on purpose:
 // every request path resolves state through these accessors, so a new RPC gets
-// it for free. Forgetting to stamp would make a live transfer look abandoned
+// it for free. Forgetting to stamp would make a live transfer look like an orphan
 // and have its data reclaimed, so a safe default matters more than the
 // accessor being free of side effects. Scanning callers that must NOT refresh
 // the stamp use peek.
@@ -139,6 +139,12 @@ func (ts *torrentStore) Commit(hash string, state *serverTorrentState) error {
 		ts.abortInodesForFiles(hash, state.files)
 		return err
 	}
+	// Stamp at creation, not just on later access. Both creating paths reach
+	// here, and an unstamped entry measures its age from process start: on a
+	// server whose uptime already exceeds the orphan timeout, a torrent that
+	// InitTorrent has only just committed would read as abandoned and have its
+	// .partial files reclaimed before the first WritePiece stamped it.
+	state.touch()
 	ts.entries[hash] = state
 	registerFilePaths(ts.filePaths, hash, state.files)
 	ts.mu.Unlock()
@@ -154,15 +160,27 @@ func (ts *torrentStore) Unreserve(hash string) {
 	}
 }
 
+// dropEntryLocked removes a torrent's entry and unregisters its file paths.
+// Caller must hold ts.mu. Returns the removed state so the caller can abort its
+// in-progress inodes AFTER unlocking, which the documented lock ordering
+// (store.mu -> InodeRegistry locks) requires. Spelled once because all three
+// removal paths must agree: a miss leaks filePaths entries or strands
+// in-progress inode registrations on a doneCh nobody will close.
+func (ts *torrentStore) dropEntryLocked(hash string) (*serverTorrentState, bool) {
+	state, exists := ts.entries[hash]
+	if !exists {
+		return nil, false
+	}
+	unregisterFilePaths(ts.filePaths, hash, state.files)
+	delete(ts.entries, hash)
+	return state, true
+}
+
 // Remove deletes a torrent, unregisters file paths, and aborts any in-progress
 // inodes for the hash. Returns the old state for caller cleanup. No-op if not found.
 func (ts *torrentStore) Remove(hash string) *serverTorrentState {
 	ts.mu.Lock()
-	state, exists := ts.entries[hash]
-	if exists {
-		unregisterFilePaths(ts.filePaths, hash, state.files)
-		delete(ts.entries, hash)
-	}
+	state, exists := ts.dropEntryLocked(hash)
 	ts.mu.Unlock()
 	if exists {
 		ts.abortInodesForFiles(hash, state.files)
@@ -196,11 +214,7 @@ func (ts *torrentStore) BeginAbort(hash string, ch chan struct{}) (*serverTorren
 		return nil, existing
 	}
 	ts.aborting[hash] = ch
-	state, exists := ts.entries[hash]
-	if exists {
-		unregisterFilePaths(ts.filePaths, hash, state.files)
-		delete(ts.entries, hash)
-	}
+	state, exists := ts.dropEntryLocked(hash)
 	ts.mu.Unlock()
 
 	// Abort in-progress inodes outside the lock (matching Remove behavior).
@@ -243,8 +257,7 @@ func (ts *torrentStore) BeginReclaim(
 			ts.mu.Unlock()
 			return false
 		}
-		unregisterFilePaths(ts.filePaths, hash, state.files)
-		delete(ts.entries, hash)
+		ts.dropEntryLocked(hash)
 	}
 	ts.aborting[hash] = ch
 	ts.mu.Unlock()

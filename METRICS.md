@@ -90,7 +90,7 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_torrents_with_dirty_state` | | Torrents with state not yet flushed to disk (destination) |
 | `qbsync_active_finalization_backoffs` | | Torrents in finalization backoff (source). BUSY-deferred torrents may not appear here — watch `qbsync_finalize_busy_total` for congestion |
 | `qbsync_stalled_torrents` | | Torrents with pieces available on source but not advancing (source). Reaching `--sync-failed-guard` quarantines them, so this is the early warning |
-| `qbsync_quarantined_torrents` | | Standing population carrying the `sync-failed` tag (source). `qbsync_sync_outcomes_total` gives the rate of new failures; this gives how many are sitting quarantined now |
+| `qbsync_quarantined_torrents` | | Standing population carrying the `sync-failed` tag (source). `qbsync_sync_outcomes_total` gives the rate of new failures; this gives how many are sitting quarantined now. Counts the tag itself, so it includes torrents that `qbsync_skipped_torrents` reports under a different reason |
 | `qbsync_skipped_torrents` | `reason` | Source torrents not eligible for sync: `not_syncable_state`, `zero_progress`, `exclude_tag`, `quarantined`, `already_synced` |
 | `qbsync_finalization_queue_depth` | `stage` | Torrents currently waiting for a finalization stage slot (destination) |
 | `qbsync_oldest_pending_sync_seconds` | `hash`, `name` | Age of each torrent waiting to sync |

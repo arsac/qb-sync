@@ -691,7 +691,7 @@ func TestPieceMonitor_RemovalNotification_Integration(t *testing.T) {
 }
 
 // stallProbeSource is a minimal PieceSource whose pieces are all downloaded on
-// the source but which never yields any data - the wedged shape.
+// the source but which never yields any data - the stall shape.
 type stallProbeSource struct{ numPieces int }
 
 func (s *stallProbeSource) GetPieceStates(context.Context, string) ([]PieceState, error) {
@@ -719,7 +719,7 @@ func (s *stallProbeSource) ReadPiece(context.Context, *pb.Piece) ([]byte, error)
 	return nil, errors.New("unreadable")
 }
 
-// TestGetProgress_ReportsTheStallSignal guards the wedged case.
+// TestGetProgress_ReportsTheStallSignal guards the stalled case.
 //
 // lastAdvance only moves when a piece transitions to streamed, so a torrent
 // whose source data cannot be read never sets it. Left at the zero time, the

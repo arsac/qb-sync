@@ -150,7 +150,7 @@ type serverTorrentState struct {
 	// lastContact is the UnixNano time a source last asked about this torrent.
 	// Reclamation is judged on this rather than on store membership: startup
 	// recovery repopulates the store from every unfinalized metadata directory,
-	// so membership can never distinguish a live transfer from an abandoned one.
+	// so membership can never distinguish a live transfer from an orphan.
 	// Stamped by the store's Get accessors, which every request path goes
 	// through. Atomic so scanning does not contend with the request path.
 	lastContact atomic.Int64
@@ -174,7 +174,7 @@ func (s *serverTorrentState) touch() {
 // contactAge reports how long it has been since a source last asked about this
 // torrent. A zero stamp means the state was rebuilt by startup recovery and no
 // source has been in touch since, so age is measured from process start rather
-// than from the epoch - otherwise every recovered torrent would look abandoned
+// than from the epoch - otherwise every recovered torrent would look like an orphan
 // the moment the server came up.
 func (s *serverTorrentState) contactAge(processStart time.Time) time.Duration {
 	nanos := s.lastContact.Load()

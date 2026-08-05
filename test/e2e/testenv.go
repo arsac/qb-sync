@@ -584,18 +584,82 @@ func (env *TestEnv) isTorrentComplete(state qbittorrent.TorrentState) bool {
 	}
 }
 
+// SourceTorrentHasTag reports whether the torrent carries the tag on source
+// qBittorrent. A torrent that cannot be listed reports false, so callers can
+// poll this while the stack is still settling.
+func (env *TestEnv) SourceTorrentHasTag(ctx context.Context, hash, tag string) bool {
+	torrents, err := env.sourceClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+		Hashes: []string{hash},
+	})
+	if err != nil || len(torrents) != 1 {
+		return false
+	}
+	// Compare whole tags: a substring match would let "sync-failed-later"
+	// satisfy a check for "sync-failed".
+	for t := range strings.SplitSeq(torrents[0].Tags, ",") {
+		if strings.TrimSpace(t) == tag {
+			return true
+		}
+	}
+	return false
+}
+
+// PartialFiles returns every .partial path under the destination data path.
+// These are the files qb-sync itself wrote; anything at a final path was
+// pre-existing, hardlinked, or deselected.
+//
+// A walk error fails the test rather than being ignored: an empty result is the
+// success signal for reclamation and leftover-partial assertions, so a failed
+// walk would forge one.
+func (env *TestEnv) PartialFiles() []string {
+	env.t.Helper()
+
+	var partials []string
+	walkErr := filepath.WalkDir(env.DestinationPath(), func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			// A vanishing entry is expected: the cleaner deletes while we walk.
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if !d.IsDir() && strings.HasSuffix(path, ".partial") {
+			partials = append(partials, path)
+		}
+		return nil
+	})
+	require.NoError(env.t, walkErr)
+	return partials
+}
+
+// TorrentCompleteOnDestination reports whether a torrent is complete on
+// destination qBittorrent, surfacing query failures instead of folding them
+// into the answer.
+//
+// Absence is a definitive "not complete": qb-sync adds the torrent to
+// destination qB only at finalization. An unreachable API is not, and callers
+// that would draw a conclusion from "not complete" must be able to tell the
+// two apart.
+func (env *TestEnv) TorrentCompleteOnDestination(ctx context.Context, hash string) (bool, error) {
+	torrents, err := env.destinationClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+		Hashes: []string{hash},
+	})
+	if err != nil {
+		return false, err
+	}
+	if len(torrents) == 0 {
+		return false, nil
+	}
+	torrent := torrents[0]
+	return torrent.Progress >= 1.0 || env.isTorrentComplete(torrent.State), nil
+}
+
 // IsTorrentCompleteOnDestination checks if a torrent is complete on destination qBittorrent.
 // This is the new way to verify sync completion - checking destination qB status
 // instead of the old "synced" tag approach.
 func (env *TestEnv) IsTorrentCompleteOnDestination(ctx context.Context, hash string) bool {
-	torrents, err := env.destinationClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
-		Hashes: []string{hash},
-	})
-	if err != nil || len(torrents) == 0 {
-		return false
-	}
-	torrent := torrents[0]
-	return torrent.Progress >= 1.0 || env.isTorrentComplete(torrent.State)
+	complete, err := env.TorrentCompleteOnDestination(ctx, hash)
+	return err == nil && complete
 }
 
 // WaitForTorrentCompleteOnDestination waits for a torrent to be complete on destination qBittorrent.

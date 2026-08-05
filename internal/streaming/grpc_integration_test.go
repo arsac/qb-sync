@@ -402,8 +402,8 @@ func TestIntegration_PoolErrorPropagation(t *testing.T) {
 	// Stream's Done channel should be closed.
 	//
 	// This must wait rather than poll once. Done() is closed by receiveAcks
-	// while the error is published by forwardAcks — different goroutines with
-	// no ordering between them — so a non-blocking check asserts a sequence the
+	// while the error is published by forwardAcks - different goroutines with
+	// no ordering between them - so a non-blocking check asserts a sequence the
 	// code never promises and fails under scheduler pressure.
 	select {
 	case <-ps.Done():

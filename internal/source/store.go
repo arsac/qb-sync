@@ -42,9 +42,8 @@ const (
 // torrentRecord is everything the source knows about one torrent. A torrent
 // participates in three concerns at once - it is being streamed, it is known
 // complete on the destination, and it may be in a finalization retry streak -
-// and those used to live in three separate maps behind three separate locks.
-// Nothing kept them consistent with each other, and every lifecycle transition
-// had to remember which subset to update.
+// and one record under one lock is what keeps them consistent, so a lifecycle
+// transition cannot update one concern and forget another.
 //
 // A record exists while any concern applies to it and is dropped by gc once
 // none do.
@@ -65,7 +64,7 @@ type torrentRecord struct {
 	//
 	// firstBusy is persisted alongside the quarantine clocks for the same
 	// reason: with it in memory only, a source restarting more often than the
-	// busy guard could never surface a permanently wedged destination.
+	// busy guard could never surface a destination that never recovers.
 	failures    int
 	lastAttempt time.Time
 	firstBusy   time.Time
@@ -97,8 +96,10 @@ type torrentRecord struct {
 // what the old BackoffTracker expressed by the presence or absence of a map
 // entry, and it is what the active-backoffs gauge counts. A stall is
 // deliberately excluded: a stalled torrent is not retrying a finalization.
+// RecordFailure is the only writer of failures and always starts firstFailure
+// in the same call, so the clocks alone answer this.
 func (r *torrentRecord) hasBackoff() bool {
-	return r.failures > 0 || !r.firstBusy.IsZero() || !r.firstFailure.IsZero()
+	return !r.firstBusy.IsZero() || !r.firstFailure.IsZero()
 }
 
 // isStalled reports whether a stall clock is running.
@@ -130,9 +131,11 @@ func (r *torrentRecord) clearStreaks() {
 }
 
 // isEmpty reports whether the record carries no remaining state and can be
-// dropped.
+// dropped. It leans on hasStreakState for the same reason that predicate
+// exists: gc must not disagree with the load, save and prune sites about what
+// counts as state worth keeping.
 func (r *torrentRecord) isEmpty() bool {
-	return !r.tracked && !r.complete && !r.hasBackoff() && !r.hasStallState()
+	return !r.tracked && !r.complete && !r.hasStreakState()
 }
 
 // torrentStore holds per-torrent source state behind a single lock, and
@@ -152,18 +155,21 @@ type torrentStore struct {
 	// quarantines the torrent. It also derives the finalization backoff cap.
 	guard time.Duration
 
-	// streaksDirty records that a clock or streaming position changed since the
-	// last save. It suppresses the write only on a genuinely idle cycle: any
-	// torrent that advances marks the store dirty, so an active sync still
-	// writes the sidecar every cycle. That is cheap and correct — it is not the
-	// per-transition optimisation the name might suggest.
+	// streaksDirty records that a clock changed since the last save. A bare
+	// streaming advance does not set it: doing so would fsync the sidecar every
+	// cycle for the whole of any active sync, to persist a piece counter whose
+	// loss costs one baseline cycle against a guard measured in hours.
 	streaksDirty bool
 
 	now func() time.Time // injectable for tests
 }
 
-// newTorrentStore creates a store. Pass an empty path to disable persistence.
-func newTorrentStore(path string, logger *slog.Logger) *torrentStore {
+// newTorrentStore creates a store. Pass an empty path to disable persistence,
+// and a non-positive guard to accept the default.
+func newTorrentStore(path string, guard time.Duration, logger *slog.Logger) *torrentStore {
+	if guard <= 0 {
+		guard = config.DefaultSyncFailedGuard
+	}
 	streakPath := ""
 	if path != "" {
 		streakPath = filepath.Join(filepath.Dir(path), streakFileName)
@@ -173,7 +179,7 @@ func newTorrentStore(path string, logger *slog.Logger) *torrentStore {
 		path:       path,
 		streakPath: streakPath,
 		logger:     logger,
-		guard:      config.DefaultSyncFailedGuard,
+		guard:      guard,
 		now:        time.Now,
 	}
 }
@@ -272,21 +278,6 @@ func (s *torrentStore) Untrack(hash string) {
 	r.tracked = false
 	r.info = TrackedTorrent{}
 	s.gc(hash, r)
-}
-
-// UntrackAndGet stops tracking a torrent and returns what was tracked.
-func (s *torrentStore) UntrackAndGet(hash string) (TrackedTorrent, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	r, ok := s.records[hash]
-	if !ok || !r.tracked {
-		return TrackedTorrent{}, false
-	}
-	info := r.info
-	r.tracked = false
-	r.info = TrackedTorrent{}
-	s.gc(hash, r)
-	return info, true
 }
 
 // TrackedSnapshot returns a copy of the currently tracked torrents.
@@ -484,8 +475,16 @@ func (s *torrentStore) ObserveStall(
 
 	if streamed > r.lastStreamed {
 		r.lastStreamed = streamed
-		s.streaksDirty = true
-		r.firstStalled = time.Time{}
+		// A bare advance does not need to reach disk: on restart the first
+		// observation re-establishes the baseline, costing one cycle against a
+		// guard measured in hours. Marking dirty here instead would fsync the
+		// sidecar every cycle for the whole of any active sync, which is the
+		// only time it costs anything. Clearing a running clock must persist,
+		// or a restart would resume a stall that has already been forgiven.
+		if !r.firstStalled.IsZero() {
+			r.firstStalled = time.Time{}
+			s.streaksDirty = true
+		}
 		s.gc(hash, r)
 		return 0, false
 	}
@@ -563,6 +562,45 @@ func (s *torrentStore) BackoffCount() int { return s.count((*torrentRecord).hasB
 
 // --- Persistence ------------------------------------------------------------
 
+// readJSONMap loads a JSON object from path. Reports false when there is
+// nothing usable; a missing file is normal and is not logged. Spelled once for
+// both persisted files so their four warn-and-continue paths cannot drift.
+func readJSONMap[T any](path, what string, logger *slog.Logger) (map[string]T, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			logger.Warn("failed to read "+what+", starting fresh", "path", path, "error", err)
+		}
+		return nil, false
+	}
+
+	var out map[string]T
+	if jsonErr := json.Unmarshal(data, &out); jsonErr != nil {
+		logger.Warn("failed to parse "+what+", starting fresh", "path", path, "error", jsonErr)
+		return nil, false
+	}
+	return out, true
+}
+
+// writeJSONMap atomically persists v to path, creating the directory if needed.
+func writeJSONMap(path, what string, v any, logger *slog.Logger) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		logger.Warn("failed to marshal "+what, "error", err)
+		return
+	}
+
+	dir := filepath.Dir(path)
+	if mkErr := os.MkdirAll(dir, 0o750); mkErr != nil {
+		logger.Warn("failed to create cache directory", "path", dir, "error", mkErr)
+		return
+	}
+
+	if writeErr := utils.AtomicWriteFile(path, data, cacheFilePermissions); writeErr != nil {
+		logger.Warn("failed to write "+what, "path", path, "error", writeErr)
+	}
+}
+
 // Load reads the persisted completion cache from disk. A missing or corrupt
 // file is non-fatal; the cache repopulates as torrents are re-checked.
 func (s *torrentStore) Load() {
@@ -570,23 +608,8 @@ func (s *torrentStore) Load() {
 		return
 	}
 
-	data, err := os.ReadFile(s.path)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			s.logger.Warn("failed to read completed cache, starting fresh",
-				"path", s.path,
-				"error", err,
-			)
-		}
-		return
-	}
-
-	var fingerprints map[string]string
-	if jsonErr := json.Unmarshal(data, &fingerprints); jsonErr != nil {
-		s.logger.Warn("failed to parse completed cache, starting fresh",
-			"path", s.path,
-			"error", jsonErr,
-		)
+	fingerprints, ok := readJSONMap[string](s.path, "completed cache", s.logger)
+	if !ok {
 		return
 	}
 
@@ -614,21 +637,7 @@ func (s *torrentStore) Save() {
 	snapshot := s.completedLocked()
 	s.mu.RUnlock()
 
-	data, err := json.Marshal(snapshot)
-	if err != nil {
-		s.logger.Warn("failed to marshal completed cache", "error", err)
-		return
-	}
-
-	dir := filepath.Dir(s.path)
-	if mkErr := os.MkdirAll(dir, 0o750); mkErr != nil {
-		s.logger.Warn("failed to create cache directory", "path", dir, "error", mkErr)
-		return
-	}
-
-	if writeErr := utils.AtomicWriteFile(s.path, data, cacheFilePermissions); writeErr != nil {
-		s.logger.Warn("failed to write completed cache", "error", writeErr)
-	}
+	writeJSONMap(s.path, "completed cache", snapshot, s.logger)
 }
 
 // persistedStreak is the on-disk form of a torrent's quarantine clocks.
@@ -647,19 +656,8 @@ func (s *torrentStore) LoadStreaks() {
 		return
 	}
 
-	data, err := os.ReadFile(s.streakPath)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			s.logger.Warn("failed to read streak file, starting fresh",
-				"path", s.streakPath, "error", err)
-		}
-		return
-	}
-
-	var streaks map[string]persistedStreak
-	if jsonErr := json.Unmarshal(data, &streaks); jsonErr != nil {
-		s.logger.Warn("failed to parse streak file, starting fresh",
-			"path", s.streakPath, "error", jsonErr)
+	streaks, ok := readJSONMap[persistedStreak](s.streakPath, "streak file", s.logger)
+	if !ok {
 		return
 	}
 
@@ -707,20 +705,7 @@ func (s *torrentStore) SaveStreaks() {
 	s.streaksDirty = false
 	s.mu.Unlock()
 
-	data, err := json.Marshal(streaks)
-	if err != nil {
-		s.logger.Warn("failed to marshal streak file", "error", err)
-		return
-	}
-
-	if mkErr := os.MkdirAll(filepath.Dir(s.streakPath), 0o750); mkErr != nil {
-		s.logger.Warn("failed to create cache directory", "error", mkErr)
-		return
-	}
-
-	if writeErr := utils.AtomicWriteFile(s.streakPath, data, cacheFilePermissions); writeErr != nil {
-		s.logger.Warn("failed to write streak file", "error", writeErr)
-	}
+	writeJSONMap(s.streakPath, "streak file", streaks, s.logger)
 }
 
 // PruneStreaks drops streak clocks for torrents no longer present on the

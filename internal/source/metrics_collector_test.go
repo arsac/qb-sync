@@ -26,7 +26,7 @@ func TestMetricsCollector_GatherSurface(t *testing.T) {
 	task := &QBTask{
 		logger:  logger,
 		tracker: tracker,
-		store:   newTorrentStore("", logger),
+		store:   newTorrentStore("", 0, logger),
 	}
 
 	registry := prometheus.NewRegistry()

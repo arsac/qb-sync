@@ -64,9 +64,8 @@ const (
 	ReasonQBChecking = "qb_checking"
 
 	// ReasonSkipNotSyncable and its siblings label SkippedTorrents: why a source
-	// torrent is not eligible for sync. Torrents dropped for these reasons were
-	// previously invisible - one broken on the source would simply never sync,
-	// with no log and no metric to say so.
+	// torrent is not eligible for sync. Without these, a torrent broken on the
+	// source simply never syncs, with no log and no metric to say so.
 	ReasonSkipNotSyncable   = "not_syncable_state" // error, missingFiles, download-side paused
 	ReasonSkipZeroProgress  = "zero_progress"      // nothing downloaded yet
 	ReasonSkipExcludeTag    = "exclude_tag"        // operator opted the torrent out
@@ -754,9 +753,14 @@ var (
 	// tag. sync_outcomes_total gives the rate of new failures but never how
 	// many are sitting quarantined right now, which is what needs an alert.
 	//
-	// This deliberately mirrors SkippedTorrents{reason="quarantined"}. It is
-	// kept as a separate, label-free series so the alert rule in METRICS.md does
-	// not depend on a label value that a future refactor could rename.
+	// It is kept as a separate, label-free series so the alert rule in METRICS.md
+	// does not depend on a label value that a future refactor could rename.
+	//
+	// It is not the same population as SkippedTorrents{reason="quarantined"}:
+	// that label reports one reason per torrent and ranks source state ahead of
+	// the marker, so a quarantined torrent also sitting in error or missingFiles
+	// counts under not_syncable_state there. This gauge counts the tag itself and
+	// so includes those, which is what the alert needs.
 	QuarantinedTorrents = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: namespace,

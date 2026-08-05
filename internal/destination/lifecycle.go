@@ -181,9 +181,9 @@ func (s *Server) isStaleState(state *serverTorrentState, timeout time.Duration) 
 // Orphan-ness is judged on how long it has been since a source asked about the
 // torrent, not on whether it is present in the store. Membership cannot answer
 // the question: startup recovery repopulates the store from every unfinalized
-// metadata directory, so an abandoned transfer is put straight back and
-// shielded again. That made this check unable to fire for the very case it was
-// written for - a source that crashed or was decommissioned.
+// metadata directory, so an orphan is put straight back and shielded again.
+// Judging on membership would leave this check unable to fire for the very case
+// it exists for - a source that crashed or was decommissioned.
 //
 // Metadata mtime is only a fallback for torrents with no in-memory state. It
 // cannot be the primary signal because it records flushes, not activity: a
@@ -341,7 +341,7 @@ func (s *Server) cleanupOrphan(ctx context.Context, hash string, timeout time.Du
 //
 // Only .partial paths are removed, never a file at its final path. Everything
 // this server writes lives at a .partial path until finalizeFiles renames it,
-// so on an unfinalized torrent — and an orphan is by definition unfinalized —
+// so on an unfinalized torrent - and an orphan is by definition unfinalized -
 // a file sitting at its final path is one of:
 //
 //   - pre-existing operator data that setupFile adopted at the right size,

@@ -6,7 +6,6 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -26,7 +25,7 @@ import (
 const (
 	// reproObservationWindow bounds how long we wait for the stall to be
 	// noticed and quarantined. It must comfortably exceed reproGuard plus the
-	// stall grace period, which is two orchestrator cycles.
+	// stall threshold, which is two orchestrator cycles.
 	reproObservationWindow = 3 * time.Minute
 
 	// reproGuard shrinks the quarantine guard from its 4h default. The retry
@@ -44,16 +43,9 @@ const (
 	reproOrphanInterval = 2 * time.Second
 )
 
-// truncateTorrentContent truncates every file of the torrent on the source
-// data path to zero bytes, leaving the directory entries in place.
-//
-// This makes every piece permanently unreadable without deleting anything:
-// ReadPiece's ENOENT retry does not fire (the files still exist), so the read
-// fails with a short read on every attempt. qBittorrent is not told, and does
-// not recheck on its own, so the source continues to report every piece as
-// downloaded. That is exactly the state the source orchestrator cannot
-// currently escape.
-func truncateTorrentContent(t *testing.T, env *TestEnv, hash string) int {
+// torrentContentPaths resolves the on-disk source path of every file in the
+// torrent, mirroring the layout qBittorrent reports.
+func torrentContentPaths(t *testing.T, env *TestEnv, hash string) []string {
 	t.Helper()
 
 	ctx := context.Background()
@@ -67,9 +59,7 @@ func truncateTorrentContent(t *testing.T, env *TestEnv, hash string) int {
 	require.NoError(t, err)
 	require.Len(t, torrents, 1)
 
-	// The torrent's content lives under the source data path, mirroring the
-	// layout qBittorrent reports. Derive the root from the first file's path.
-	var truncated int
+	paths := make([]string, 0, len(*files))
 	for _, f := range *files {
 		rel := filepath.FromSlash(f.Name)
 		// Try the save-path-relative location first, then the layout that
@@ -79,38 +69,36 @@ func truncateTorrentContent(t *testing.T, env *TestEnv, hash string) int {
 			filepath.Join(env.SourcePath(), torrents[0].Name, rel),
 		}
 		for _, path := range candidates {
-			if _, statErr := os.Stat(path); statErr != nil {
-				continue
+			if _, statErr := os.Stat(path); statErr == nil {
+				paths = append(paths, path)
+				break
 			}
-			require.NoError(t, os.Truncate(path, 0), "truncating %s", path)
-			truncated++
-			break
 		}
 	}
 
-	require.NotZero(t, truncated, "expected to truncate at least one content file")
-	t.Logf("Truncated %d of %d content files to zero bytes", truncated, len(*files))
-	return truncated
+	require.NotEmpty(t, paths, "expected to resolve at least one content file")
+	return paths
 }
 
-// countPartialFiles returns the number of .partial files under the destination
-// data path. These are the files qb-sync itself wrote; anything at a final
-// path was pre-existing, hardlinked, or deselected.
-func countPartialFiles(t *testing.T, env *TestEnv) int {
+// truncateTorrentContent truncates every file of the torrent on the source
+// data path to zero bytes, leaving the directory entries in place.
+//
+// This makes every piece permanently unreadable without deleting anything:
+// ReadPiece's ENOENT retry does not fire (the files still exist), so the read
+// fails with a short read on every attempt. qBittorrent is not told, and does
+// not recheck on its own, so the source continues to report every piece as
+// downloaded. That is exactly the state the source orchestrator cannot
+// currently escape.
+func truncateTorrentContent(t *testing.T, env *TestEnv, hash string) int {
 	t.Helper()
 
-	var n int
-	walkErr := filepath.Walk(env.DestinationPath(), func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil // unreadable entries are not our concern here
-		}
-		if !info.IsDir() && strings.HasSuffix(path, ".partial") {
-			n++
-		}
-		return nil
-	})
-	require.NoError(t, walkErr)
-	return n
+	paths := torrentContentPaths(t, env, hash)
+	for _, path := range paths {
+		require.NoError(t, os.Truncate(path, 0), "truncating %s", path)
+	}
+
+	t.Logf("Truncated %d content files to zero bytes", len(paths))
+	return len(paths)
 }
 
 // TestE2E_Repro_UnreadableSourcePieceWedgesTorrent verifies that a torrent
@@ -169,13 +157,7 @@ func TestE2E_Repro_UnreadableSourcePieceWedgesTorrent(t *testing.T) {
 		reproObservationWindow, reproGuard)
 
 	require.Eventually(t, func() bool {
-		torrents, listErr := env.SourceClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
-			Hashes: []string{wiredCDHash},
-		})
-		if listErr != nil || len(torrents) != 1 {
-			return false
-		}
-		return strings.Contains(torrents[0].Tags, "sync-failed")
+		return env.SourceTorrentHasTag(ctx, wiredCDHash, defaultSyncFailedTag)
 	}, reproObservationWindow, 2*time.Second,
 		"an unreadable torrent must be quarantined once the stall outlasts the guard, not wedge forever")
 
@@ -185,16 +167,14 @@ func TestE2E_Repro_UnreadableSourcePieceWedgesTorrent(t *testing.T) {
 	assert.Error(t, progressErr, "a quarantined torrent must be untracked")
 }
 
-// TestE2E_Repro_AbandonedTransferIsNotReclaimed demonstrates that the
-// destination cannot reclaim disk from a transfer whose source went away.
+// TestE2E_Repro_OrphanIsNotReclaimed is the regression test for ADR-0002: the
+// destination must reclaim disk from a transfer whose source went away.
 //
-// The orphan cleaner skips any torrent present in the store, and recovery
-// repopulates the store from every unfinalized metadata directory at startup.
-// So a transfer abandoned without an explicit abort is shielded permanently.
-//
-// This test asserts the DESIRED behaviour and is expected to FAIL against the
-// current code. It becomes the regression test for ADR-0002.
-func TestE2E_Repro_AbandonedTransferIsNotReclaimed(t *testing.T) {
+// Judging orphan-ness on store membership cannot work, which is what this
+// guards. The cleaner would skip any torrent present in the store, and recovery
+// repopulates the store from every unfinalized metadata directory at startup,
+// so a transfer left without an explicit abort would be shielded permanently.
+func TestE2E_Repro_OrphanIsNotReclaimed(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")
 	}
@@ -229,7 +209,7 @@ func TestE2E_Repro_AbandonedTransferIsNotReclaimed(t *testing.T) {
 
 	destMetaDir := filepath.Join(env.DestinationPath(), ".qbsync", wiredCDHash)
 	require.DirExists(t, destMetaDir, "destination metadata directory should exist mid-transfer")
-	require.NotZero(t, countPartialFiles(t, env), "destination should hold .partial files mid-transfer")
+	require.NotZero(t, len(env.PartialFiles()), "destination should hold .partial files mid-transfer")
 
 	// Abandon the transfer the way a crashed or decommissioned source does:
 	// stop talking to the destination, without deleting the torrent from
@@ -240,14 +220,14 @@ func TestE2E_Repro_AbandonedTransferIsNotReclaimed(t *testing.T) {
 
 	// Give the cleaner several scan intervals past the timeout.
 	wait := reproOrphanTimeout + 6*reproOrphanInterval
-	t.Logf("Waiting %s for the destination to reclaim the abandoned transfer...", wait)
+	t.Logf("Waiting %s for the destination to reclaim the orphan...", wait)
 
 	require.Eventually(t, func() bool {
 		_, statErr := os.Stat(destMetaDir)
 		return os.IsNotExist(statErr)
 	}, wait, time.Second,
-		"BUG: abandoned transfer is never reclaimed, its metadata directory persists forever")
+		"BUG: orphan is never reclaimed, its metadata directory persists forever")
 
-	assert.Zero(t, countPartialFiles(t, env),
+	assert.Zero(t, len(env.PartialFiles()),
 		"reclamation should remove the .partial files it wrote")
 }
