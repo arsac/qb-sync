@@ -113,26 +113,76 @@ func (t *QBTask) trackNewTorrents(ctx context.Context) error {
 	return nil
 }
 
+// isQuarantined reports whether a torrent carries the quarantine marker.
+func (t *QBTask) isQuarantined(torrent qbittorrent.Torrent) bool {
+	return t.cfg.SyncFailedTag != "" && hasTag(torrent.Tags, t.cfg.SyncFailedTag)
+}
+
+// exclusionReason returns the metrics reason a torrent is skipped during
+// tracking, or "" when it is eligible.
+//
+// Reported as a gauge because a torrent sitting in error or missingFiles on the
+// source is otherwise silently never synced, with no log and no metric to say so.
+func (t *QBTask) exclusionReason(torrent qbittorrent.Torrent) string {
+	switch {
+	case !isSyncableState(torrent.State):
+		return metrics.ReasonSkipNotSyncable
+	case torrent.Progress <= 0:
+		return metrics.ReasonSkipZeroProgress
+	case t.cfg.ExcludeSyncTag != "" && hasTag(torrent.Tags, t.cfg.ExcludeSyncTag):
+		return metrics.ReasonSkipExcludeTag
+	case t.isQuarantined(torrent):
+		return metrics.ReasonSkipQuarantined
+	case t.store.IsComplete(torrent.Hash):
+		return metrics.ReasonSkipAlreadySynced
+	}
+	return ""
+}
+
 // isExcludedFromTracking returns true if the torrent should be skipped during tracking:
 // non-syncable state, zero progress, excluded/sync-failed tag, already complete, or already tracked.
 func (t *QBTask) isExcludedFromTracking(torrent qbittorrent.Torrent) bool {
-	if !isSyncableState(torrent.State) || torrent.Progress <= 0 {
+	if t.exclusionReason(torrent) != "" {
 		return true
 	}
 
-	if t.cfg.ExcludeSyncTag != "" && hasTag(torrent.Tags, t.cfg.ExcludeSyncTag) {
-		return true
-	}
+	// Already tracked is not an exclusion worth reporting: it is the steady
+	// state of a healthy sync, not a torrent being left behind.
+	return t.store.IsTracked(torrent.Hash)
+}
 
-	if t.cfg.SyncFailedTag != "" && hasTag(torrent.Tags, t.cfg.SyncFailedTag) {
-		return true
+// recordEligibilityMetrics publishes the standing population of skipped and
+// quarantined torrents. Every reason is set every cycle, including zero, so a
+// series that stops applying reads as 0 rather than going stale.
+func (t *QBTask) recordEligibilityMetrics() {
+	counts := map[string]int{
+		metrics.ReasonSkipNotSyncable:   0,
+		metrics.ReasonSkipZeroProgress:  0,
+		metrics.ReasonSkipExcludeTag:    0,
+		metrics.ReasonSkipQuarantined:   0,
+		metrics.ReasonSkipAlreadySynced: 0,
 	}
-
-	if t.completed.IsComplete(torrent.Hash) {
-		return true
+	// The quarantine population is counted on its own rather than read off the
+	// exclusion switch. That switch reports one reason per torrent and ranks
+	// source state ahead of the marker, so a quarantined torrent that is also in
+	// error or missingFiles reports as not_syncable_state and never reaches this
+	// gauge. Those two conditions travel together: a torrent is quarantined
+	// because it kept failing, and unreadable source data is a leading cause of
+	// that. Deriving the gauge from the switch blinds it to the very population
+	// the alert exists to catch.
+	var quarantined int
+	for i := range t.cycleTorrents {
+		if reason := t.exclusionReason(t.cycleTorrents[i]); reason != "" {
+			counts[reason]++
+		}
+		if t.isQuarantined(t.cycleTorrents[i]) {
+			quarantined++
+		}
 	}
-
-	return t.tracked.Has(torrent.Hash)
+	for reason, n := range counts {
+		metrics.SkippedTorrents.WithLabelValues(reason).Set(float64(n))
+	}
+	metrics.QuarantinedTorrents.Set(float64(quarantined))
 }
 
 // queryDestStatus checks a torrent's status on destination without starting tracking.
@@ -145,7 +195,7 @@ func (t *QBTask) queryDestStatus(
 	torrent qbittorrent.Torrent,
 ) (*streaming.InitTorrentResult, error) {
 	if t.tracker.IsTracking(torrent.Hash) {
-		t.tracked.Add(torrent.Hash, trackedTorrentFromQB(torrent))
+		t.store.Track(torrent.Hash, trackedTorrentFromQB(torrent))
 		t.logger.DebugContext(ctx, "synced tracker state to orchestrator",
 			"name", torrent.Name,
 			"hash", torrent.Hash,
@@ -168,8 +218,8 @@ func (t *QBTask) queryDestStatus(
 
 	switch initResp.Status {
 	case pb.TorrentSyncStatus_SYNC_STATUS_COMPLETE:
-		t.completed.MarkWithFingerprint(torrent.Hash, "")
-		t.completed.Save()
+		t.store.MarkComplete(torrent.Hash, "")
+		t.store.Save()
 		t.applySyncedTag(ctx, torrent.Hash)
 		t.logger.InfoContext(ctx, "torrent already complete on destination",
 			"name", torrent.Name,
@@ -232,7 +282,7 @@ func (t *QBTask) startTrackingReady(
 		return false
 	}
 
-	return t.tracked.AddIfAbsent(torrent.Hash, trackedTorrentFromQB(torrent))
+	return t.store.TrackIfAbsent(torrent.Hash, trackedTorrentFromQB(torrent))
 }
 
 // selectedFingerprint computes a fingerprint from the selected (priority > 0) file indices.
@@ -363,7 +413,7 @@ func (t *QBTask) checkExcludedTorrents(ctx context.Context) {
 
 // abortExcludedTracked aborts in-progress torrents that now have the exclude-sync tag.
 func (t *QBTask) abortExcludedTracked(ctx context.Context, excludedHashes map[string]struct{}) {
-	allTracked := t.tracked.Snapshot()
+	allTracked := t.store.TrackedSnapshot()
 
 	for hash, tt := range allTracked {
 		if _, excluded := excludedHashes[hash]; !excluded {
@@ -391,7 +441,7 @@ func (t *QBTask) abortExcludedTracked(ctx context.Context, excludedHashes map[st
 			}
 		}
 
-		t.stopTracking(hash)
+		t.releaseTorrent(hash)
 
 		metrics.ExcludeSyncAbortTotal.Inc()
 	}
@@ -407,7 +457,7 @@ func (t *QBTask) abortExcludedTracked(ctx context.Context, excludedHashes map[st
 // entry is pruned naturally by pruneCompletedOnDest once the source torrent
 // is actually gone.
 func (t *QBTask) quiesceExcludedCompleted(ctx context.Context, excludedHashes map[string]struct{}) {
-	completedSnapshot := t.completed.Snapshot()
+	completedSnapshot := t.store.CompletedSnapshot()
 	for hash := range completedSnapshot {
 		if _, excluded := excludedHashes[hash]; !excluded {
 			continue
@@ -420,8 +470,7 @@ func (t *QBTask) quiesceExcludedCompleted(ctx context.Context, excludedHashes ma
 			"name", name,
 			"hash", hash,
 		)
-		t.source.EvictCache(hash)
-		t.grpcDest.ClearInitResult(hash)
+		t.releaseCaches(hash)
 	}
 }
 
@@ -432,7 +481,7 @@ func (t *QBTask) quiesceExcludedCompleted(ctx context.Context, excludedHashes ma
 // for these, and quiesceExcludedCompleted preserves their completion-cache
 // entry for safe-handoff purposes only.
 func (t *QBTask) recheckFileSelections(ctx context.Context) {
-	completed := t.completed.Snapshot()
+	completed := t.store.CompletedSnapshot()
 
 	var changed bool
 	for hash, storedFingerprint := range completed {
@@ -465,7 +514,7 @@ func (t *QBTask) recheckFileSelections(ctx context.Context) {
 	}
 
 	if changed {
-		t.completed.Save()
+		t.store.Save()
 	}
 }
 
@@ -473,9 +522,8 @@ func (t *QBTask) recheckFileSelections(ctx context.Context) {
 // resync=true, and starts tracking any newly-needed pieces for streaming.
 func (t *QBTask) resyncFileSelection(ctx context.Context, hash, fingerprint string) {
 	// Evict caches so next InitTorrent gets fresh metadata
-	t.completed.Remove(hash)
-	t.source.EvictCache(hash)
-	t.grpcDest.ClearInitResult(hash)
+	t.store.ForgetComplete(hash)
+	t.releaseCaches(hash)
 
 	// Get fresh metadata with updated file selection
 	meta, metaErr := t.source.GetTorrentMetadata(ctx, hash)
@@ -495,8 +543,8 @@ func (t *QBTask) resyncFileSelection(ctx context.Context, hash, fingerprint stri
 	switch result.Status {
 	case pb.TorrentSyncStatus_SYNC_STATUS_COMPLETE:
 		// Torrent is verified in destination qBittorrent — no streaming needed.
-		t.completed.MarkWithFingerprint(hash, fingerprint)
-		t.completed.Save()
+		t.store.MarkComplete(hash, fingerprint)
+		t.store.Save()
 		t.applySyncedTag(ctx, hash)
 		return
 	case pb.TorrentSyncStatus_SYNC_STATUS_VERIFYING:
@@ -524,5 +572,5 @@ func (t *QBTask) resyncFileSelection(ctx context.Context, hash, fingerprint stri
 	if torrent := t.findTorrentByHash(hash); torrent != nil {
 		tt = trackedTorrentFromQB(*torrent)
 	}
-	t.tracked.Add(hash, tt)
+	t.store.Track(hash, tt)
 }

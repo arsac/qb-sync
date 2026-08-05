@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -222,12 +223,7 @@ func TestE2E_FileSelectionChangeTriggersResync(t *testing.T) {
 
 	t.Log("Waiting for first sync to complete (all files selected)...")
 	require.Eventually(t, func() bool {
-		for _, hash := range task.FetchCompletedOnDestination() {
-			if hash == wiredCDHash {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(task.FetchCompletedOnDestination(), wiredCDHash)
 	}, syncCompleteTimeout, pollInterval, "torrent should be in completedOnDest cache")
 	env.AssertTorrentCompleteOnDestination(ctx, wiredCDHash)
 

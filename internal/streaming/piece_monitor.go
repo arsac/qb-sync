@@ -59,7 +59,19 @@ type torrentState struct {
 	// monotonically once written, so the cursor only ever moves forward.
 	// Updated under mu (write) by queueCompletedPieces; read by the same.
 	firstUnstreamedScanIdx int
-	mu                     sync.RWMutex
+
+	// lastAdvance is when the streamed count last increased. The orchestrator
+	// uses it, together with the count of downloaded-but-unstreamed pieces, to
+	// tell a stalled torrent from one that is simply waiting on its source.
+	lastAdvance time.Time
+
+	mu sync.RWMutex
+}
+
+// noteAdvance records that a piece became streamed. Caller must hold the write
+// lock.
+func (s *torrentState) noteAdvance() {
+	s.lastAdvance = time.Now()
 }
 
 // PieceMonitor monitors piece completion and queues pieces for streaming.
@@ -154,6 +166,9 @@ func (t *PieceMonitor) MarkStreamed(hash string, pieceIndex int) {
 	}
 
 	state.mu.Lock()
+	if !state.streamed[pieceIndex] {
+		state.noteAdvance()
+	}
 	state.streamed[pieceIndex] = true
 	state.failed[pieceIndex] = false
 	state.mu.Unlock()
@@ -174,12 +189,23 @@ func (t *PieceMonitor) MarkStreamedBatch(hash string, written []bool) int {
 	defer state.mu.Unlock()
 
 	count := 0
+	advanced := false
 	for i, isWritten := range written {
 		if isWritten && i < len(state.streamed) {
+			if !state.streamed[i] {
+				advanced = true
+			}
 			state.streamed[i] = true
 			state.failed[i] = false
 			count++
 		}
+	}
+
+	// Once for the batch, not once per piece: a resync of a large torrent would
+	// otherwise take tens of thousands of clock readings under the write lock,
+	// and only the last one survives anyway.
+	if advanced {
+		state.noteAdvance()
 	}
 
 	return count
@@ -245,13 +271,19 @@ func (t *PieceMonitor) GetProgress(hash string) (StreamProgress, error) {
 	state.mu.RLock()
 	defer state.mu.RUnlock()
 
-	var streamed, failed int
+	var streamed, failed, available int
 	for i := range state.streamed {
 		if state.streamed[i] {
 			streamed++
+			continue
 		}
 		if state.failed[i] {
 			failed++
+		}
+		// Un-streamed but the source says it has the data: this piece could be
+		// moving and is not.
+		if i < len(state.lastStates) && state.lastStates[i] == PieceStateDownloaded {
+			available++
 		}
 	}
 
@@ -262,6 +294,8 @@ func (t *PieceMonitor) GetProgress(hash string) (StreamProgress, error) {
 		TotalPieces: numPieces,
 		Streamed:    streamed,
 		Failed:      failed,
+		Available:   available,
+		LastAdvance: state.lastAdvance,
 		Complete:    streamed == numPieces,
 	}, nil
 }
@@ -504,6 +538,11 @@ func (t *PieceMonitor) startTracking(ctx context.Context, hash string, alreadyWr
 		lastStates: states,
 		streamed:   make([]bool, numPieces),
 		failed:     make([]bool, numPieces),
+		// Start the clock now rather than at the zero time, so a torrent that
+		// never streams a single piece still measures how long it has failed to
+		// advance. That is precisely the stalled case, and leaving this zero
+		// would exclude it from stall detection entirely.
+		lastAdvance: time.Now(),
 	}
 
 	// Apply already-written pieces BEFORE adding to map and queuing.
@@ -721,43 +760,6 @@ func (t *PieceMonitor) buildPiece(state *torrentState, index int) *pb.Piece {
 		Size:        size,
 		Hash:        hash,
 	}
-}
-
-// RetryFailed re-queues failed pieces for retry.
-func (t *PieceMonitor) RetryFailed(ctx context.Context, hash string) error {
-	if t.closed.Load() {
-		return ctx.Err()
-	}
-
-	t.mu.RLock()
-	state, ok := t.torrents[hash]
-	t.mu.RUnlock()
-
-	if !ok {
-		return ErrTorrentNotTracked
-	}
-
-	state.mu.Lock()
-	defer state.mu.Unlock()
-
-	for i, failed := range state.failed {
-		if !failed {
-			continue
-		}
-
-		piece := t.buildPiece(state, i)
-
-		switch {
-		case t.trySendCompletedNonBlocking(ctx, piece):
-			state.failed[i] = false
-		case ctx.Err() != nil:
-			return ctx.Err()
-		case !t.closed.Load():
-			// Channel full — piece stays failed, will retry next cycle
-		}
-	}
-
-	return nil
 }
 
 // TrackedCount returns the number of torrents being tracked.

@@ -35,22 +35,40 @@ func newTorrentStore(basePath string, logger *slog.Logger) *torrentStore {
 	}
 }
 
-// Get returns a torrent's state, safe to use outside the lock.
+// Get returns a torrent's state, safe to use outside the lock, and stamps it
+// as contacted.
 // Sentinel entries (initializing=true) are filtered out — callers see (nil, false).
 // Use GetWithSentinel when the distinction between "not found" and "initializing" matters.
+//
+// The contact stamp lives here rather than at each RPC entry point on purpose:
+// every request path resolves state through these accessors, so a new RPC gets
+// it for free. Forgetting to stamp would make a live transfer look like an orphan
+// and have its data reclaimed, so a safe default matters more than the
+// accessor being free of side effects. Scanning callers that must NOT refresh
+// the stamp use peek.
 func (ts *torrentStore) Get(hash string) (*serverTorrentState, bool) {
-	ts.mu.RLock()
-	state, ok := ts.entries[hash]
-	ts.mu.RUnlock()
-	if ok && state.initializing.Load() {
+	state, ok := ts.peek(hash)
+	if !ok || state.initializing.Load() {
 		return nil, false
+	}
+	state.touch()
+	return state, true
+}
+
+// GetWithSentinel returns a torrent's state including sentinel entries, and
+// stamps it as contacted.
+// Only use when distinguishing "not found" from "initializing" is required (e.g., InitTorrent).
+func (ts *torrentStore) GetWithSentinel(hash string) (*serverTorrentState, bool) {
+	state, ok := ts.peek(hash)
+	if ok {
+		state.touch()
 	}
 	return state, ok
 }
 
-// GetWithSentinel returns a torrent's state including sentinel entries.
-// Only use when distinguishing "not found" from "initializing" is required (e.g., InitTorrent).
-func (ts *torrentStore) GetWithSentinel(hash string) (*serverTorrentState, bool) {
+// peek returns a torrent's state without stamping contact. Used by orphan
+// scanning, which would otherwise refresh the very timestamp it is testing.
+func (ts *torrentStore) peek(hash string) (*serverTorrentState, bool) {
 	ts.mu.RLock()
 	state, ok := ts.entries[hash]
 	ts.mu.RUnlock()
@@ -121,6 +139,12 @@ func (ts *torrentStore) Commit(hash string, state *serverTorrentState) error {
 		ts.abortInodesForFiles(hash, state.files)
 		return err
 	}
+	// Stamp at creation, not just on later access. Both creating paths reach
+	// here, and an unstamped entry measures its age from process start: on a
+	// server whose uptime already exceeds the orphan timeout, a torrent that
+	// InitTorrent has only just committed would read as abandoned and have its
+	// .partial files reclaimed before the first WritePiece stamped it.
+	state.touch()
 	ts.entries[hash] = state
 	registerFilePaths(ts.filePaths, hash, state.files)
 	ts.mu.Unlock()
@@ -136,15 +160,27 @@ func (ts *torrentStore) Unreserve(hash string) {
 	}
 }
 
+// dropEntryLocked removes a torrent's entry and unregisters its file paths.
+// Caller must hold ts.mu. Returns the removed state so the caller can abort its
+// in-progress inodes AFTER unlocking, which the documented lock ordering
+// (store.mu -> InodeRegistry locks) requires. Spelled once because all three
+// removal paths must agree: a miss leaks filePaths entries or strands
+// in-progress inode registrations on a doneCh nobody will close.
+func (ts *torrentStore) dropEntryLocked(hash string) (*serverTorrentState, bool) {
+	state, exists := ts.entries[hash]
+	if !exists {
+		return nil, false
+	}
+	unregisterFilePaths(ts.filePaths, hash, state.files)
+	delete(ts.entries, hash)
+	return state, true
+}
+
 // Remove deletes a torrent, unregisters file paths, and aborts any in-progress
 // inodes for the hash. Returns the old state for caller cleanup. No-op if not found.
 func (ts *torrentStore) Remove(hash string) *serverTorrentState {
 	ts.mu.Lock()
-	state, exists := ts.entries[hash]
-	if exists {
-		unregisterFilePaths(ts.filePaths, hash, state.files)
-		delete(ts.entries, hash)
-	}
+	state, exists := ts.dropEntryLocked(hash)
 	ts.mu.Unlock()
 	if exists {
 		ts.abortInodesForFiles(hash, state.files)
@@ -178,11 +214,7 @@ func (ts *torrentStore) BeginAbort(hash string, ch chan struct{}) (*serverTorren
 		return nil, existing
 	}
 	ts.aborting[hash] = ch
-	state, exists := ts.entries[hash]
-	if exists {
-		unregisterFilePaths(ts.filePaths, hash, state.files)
-		delete(ts.entries, hash)
-	}
+	state, exists := ts.dropEntryLocked(hash)
 	ts.mu.Unlock()
 
 	// Abort in-progress inodes outside the lock (matching Remove behavior).
@@ -193,18 +225,46 @@ func (ts *torrentStore) BeginAbort(hash string, ch chan struct{}) (*serverTorren
 	return state, nil
 }
 
-// BeginCleanup registers a cleanup channel for an untracked hash (orphan cleanup).
-// Returns false if the hash is tracked or already being cleaned.
-func (ts *torrentStore) BeginCleanup(hash string, ch chan struct{}) bool {
+// BeginReclaim registers a cleanup channel for orphan reclamation, dropping the
+// torrent's in-memory entry when it has one.
+//
+// Orphan-ness no longer depends on store membership, so a reclaimable torrent
+// may or may not hold state. Both cases register the same channel, which is
+// what blocks a concurrent InitTorrent from recreating files about to be
+// deleted.
+//
+// pred runs while the store lock is held. That is the point: a source can
+// resume a torrent between the scan judging it stale and this call, and testing
+// staleness outside the lock would delete files from under an active transfer.
+// A torrent with no entry has nothing to re-test, so pred is not consulted.
+//
+// Returns false when another cleanup or abort is already registered, or when
+// pred rejects the entry.
+func (ts *torrentStore) BeginReclaim(
+	hash string,
+	ch chan struct{},
+	pred func(*serverTorrentState) bool,
+) bool {
 	ts.mu.Lock()
-	defer ts.mu.Unlock()
-	if _, tracked := ts.entries[hash]; tracked {
+	if _, busy := ts.aborting[hash]; busy {
+		ts.mu.Unlock()
 		return false
 	}
-	if _, cleaning := ts.aborting[hash]; cleaning {
-		return false
+
+	state, exists := ts.entries[hash]
+	if exists {
+		if !pred(state) {
+			ts.mu.Unlock()
+			return false
+		}
+		ts.dropEntryLocked(hash)
 	}
 	ts.aborting[hash] = ch
+	ts.mu.Unlock()
+
+	if exists {
+		ts.abortInodesForFiles(hash, state.files)
+	}
 	return true
 }
 

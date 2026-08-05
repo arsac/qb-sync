@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"testing"
+	"time"
 
 	"golang.org/x/sync/semaphore"
 )
@@ -26,14 +27,15 @@ func newTestDestServer(t *testing.T) (*Server, string) {
 	logger := testLogger(t)
 	bgCtx, bgCancel := context.WithCancel(context.Background())
 	s := &Server{
-		config:      ServerConfig{BasePath: tmpDir},
-		logger:      logger,
-		store:       newTorrentStore(tmpDir, logger),
-		memBudget:   semaphore.NewWeighted(512 * 1024 * 1024),
-		finalizeSem: semaphore.NewWeighted(1),
-		qbStageSem:  semaphore.NewWeighted(1),
-		bgCtx:       bgCtx,
-		bgCancel:    bgCancel,
+		config:       ServerConfig{BasePath: tmpDir},
+		logger:       logger,
+		store:        newTorrentStore(tmpDir, logger),
+		memBudget:    semaphore.NewWeighted(512 * 1024 * 1024),
+		finalizeSem:  semaphore.NewWeighted(1),
+		qbStageSem:   semaphore.NewWeighted(1),
+		bgCtx:        bgCtx,
+		bgCancel:     bgCancel,
+		processStart: time.Now(),
 	}
 	t.Cleanup(func() {
 		bgCancel()

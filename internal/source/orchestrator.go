@@ -33,16 +33,19 @@ const (
 	// Streaming queue configuration defaults.
 	defaultRetryDelay = 5 * time.Second
 
-	// maxVerificationRetries is the number of consecutive verification failures
-	// before the torrent is tagged as sync-failed and excluded from future syncs.
-	maxVerificationRetries = 3
+	// minQuarantineAttempts is the minimum number of consecutive failures before
+	// the guard is even consulted. It is a floor, not a cap: on its own it never
+	// quarantines anything. The wall-clock guard decides that - a torrent can
+	// fail far more than this many times and still not be quarantined, which is
+	// the whole point. See docs/adr/0001-quarantine-requires-a-wall-clock-guard.md.
+	minQuarantineAttempts = 3
 
 	// busyGuardDuration bounds how long BUSY (destination congested) responses
-	// are tolerated per torrent before they start counting toward
-	// maxVerificationRetries. Must exceed the destination's worst-case budget:
+	// are tolerated per torrent before they start counting toward the failure
+	// streak. Must exceed the destination's worst-case budget:
 	// finalizeQueueTimeout (2h) + qB-stage budget (up to ~2x the 6h poll cap).
-	// In-memory only — a source restart resets the streak (acceptable: the
-	// guard catches permanently wedged destinations, not crash recovery).
+	// Persisted alongside the quarantine clocks, so a source restarting more
+	// often than the guard cannot hide a destination that never recovers.
 	busyGuardDuration = 8 * time.Hour
 
 	// Timeout for unary RPCs to destination server during removal/handoff.
@@ -74,10 +77,9 @@ type QBTask struct {
 	tracker *streaming.PieceMonitor
 	queue   *streaming.BidiQueue
 
-	// Extracted sub-components with internal locking
-	tracked   *TrackedSet      // torrents currently being streamed
-	completed *CompletionCache // torrents known to be complete on destination
-	backoffs  *BackoffTracker  // finalization retry backoff per torrent
+	// All per-torrent source state behind one lock: what is being streamed,
+	// what the destination has finalized, and finalization retry accounting.
+	store *torrentStore
 
 	// Cycle counter for periodic pruning of completedOnDest
 	pruneCycleCount int
@@ -155,12 +157,11 @@ func NewQBTask(
 		source:    source,
 		tracker:   tracker,
 		queue:     queue,
-		tracked:   NewTrackedSet(),
-		completed: NewCompletionCache(cachePath, logger),
-		backoffs:  NewBackoffTracker(),
+		store:     newTorrentStore(cachePath, cfg.SyncFailedGuard, logger),
 	}
 
-	t.completed.Load()
+	t.store.Load()
+	t.store.LoadStreaks()
 
 	return t, nil
 }
@@ -238,19 +239,26 @@ func (t *QBTask) runOnce(ctx context.Context) {
 	if err := t.trackNewTorrents(ctx); err != nil {
 		t.logger.ErrorContext(ctx, "failed to track torrents", "error", err)
 	}
+	t.recordEligibilityMetrics()
 	t.checkExcludedTorrents(ctx)
-	if err := t.finalizeCompletedStreams(ctx); err != nil {
+	tracked := t.store.TrackedSnapshot()
+	progressByHash := t.collectProgress(ctx, tracked)
+	if err := t.finalizeCompletedStreams(ctx, tracked, progressByHash); err != nil {
 		t.logger.ErrorContext(ctx, "failed to finalize streams", "error", err)
 	}
+	t.checkStalledStreams(ctx, progressByHash)
 	if !t.Draining() {
 		if err := t.maybeMoveToDest(ctx); err != nil {
 			t.logger.ErrorContext(ctx, "failed to move torrents", "error", err)
 		}
 	}
 
+	t.store.SaveStreaks()
+
 	t.pruneCycleCount++
 	if t.pruneCycleCount >= pruneCycleInterval {
 		t.pruneCycleCount = 0
+		t.pruneStreaks()
 		t.pruneCompletedOnDest(ctx)
 		t.recheckFileSelections(ctx)
 		t.pruneStaleMonitorEntries(ctx)
@@ -266,13 +274,13 @@ func (t *QBTask) Progress(_ context.Context, hash string) (streaming.StreamProgr
 // FetchCompletedOnDestination returns torrents known to be complete on destination.
 // Exported for testing (used by E2E tests).
 func (t *QBTask) FetchCompletedOnDestination() []string {
-	return t.completed.Keys()
+	return t.store.CompletedKeys()
 }
 
 // MarkCompletedOnDestination marks a torrent as complete on destination.
 // Exported for testing only - allows tests to simulate synced state.
 func (t *QBTask) MarkCompletedOnDestination(hash string) {
-	t.completed.Mark(hash)
+	t.store.MarkComplete(hash, "")
 }
 
 // withDestRPCTimeout derives a context with destRPCTimeout from the parent
@@ -317,7 +325,7 @@ func (t *QBTask) pruneCompletedOnDest(ctx context.Context) {
 	}
 
 	var prunable []string
-	for hash := range t.completed.Snapshot() {
+	for hash := range t.store.CompletedSnapshot() {
 		if _, stillInSource := sourceHashes[hash]; stillInSource {
 			continue
 		}
@@ -336,11 +344,11 @@ func (t *QBTask) pruneCompletedOnDest(ctx context.Context) {
 		return
 	}
 
-	t.completed.RemoveAll(prunable)
-	t.completed.Save()
+	t.store.ForgetCompleteAll(prunable)
+	t.store.Save()
 	t.logger.InfoContext(ctx, "pruned completed-on-destination cache",
 		"pruned", len(prunable),
-		"remaining", t.completed.Count(),
+		"remaining", t.store.CompletedCount(),
 	)
 }
 
@@ -363,11 +371,24 @@ func (t *QBTask) handoffRemovedCompleted(ctx context.Context, hash string) bool 
 	return true
 }
 
+// pruneStreaks drops quarantine clocks for torrents that have left the source,
+// so the sidecar cannot grow without bound.
+func (t *QBTask) pruneStreaks() {
+	if t.cycleTorrents == nil {
+		return
+	}
+	present := make(map[string]struct{}, len(t.cycleTorrents))
+	for i := range t.cycleTorrents {
+		present[t.cycleTorrents[i].Hash] = struct{}{}
+	}
+	t.store.PruneStreaks(present)
+}
+
 // pruneStaleMonitorEntries removes PieceMonitor entries for torrents that the
 // orchestrator no longer tracks. This is a safety net for cases where Untrack
 // was missed due to an error path.
 func (t *QBTask) pruneStaleMonitorEntries(ctx context.Context) {
-	pruned := t.tracker.PruneStale(t.tracked.Hashes())
+	pruned := t.tracker.PruneStale(t.store.TrackedHashes())
 	if pruned > 0 {
 		t.logger.WarnContext(ctx, "pruned stale PieceMonitor entries",
 			"pruned", pruned,

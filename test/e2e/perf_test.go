@@ -15,16 +15,16 @@ import (
 
 // PerfMetrics holds performance measurements during a sync test.
 type PerfMetrics struct {
-	Timestamp       time.Time
-	Elapsed         time.Duration
+	Timestamp         time.Time
+	Elapsed           time.Duration
 	SourcePieces      int     // Completed pieces on source (download progress)
 	DestinationPieces int     // Streamed pieces to destination
 	SyncLag           int     // SourcePieces - DestinationPieces
 	SyncLagPercent    float64 // Lag as percentage of source progress
-	InFlight        int     // Pieces currently in flight
-	BytesSent       int64   // Total bytes sent
-	ThroughputMBps  float64 // MB/s throughput (instantaneous)
-	DownloadPercent float64 // Download progress on source (0-1)
+	InFlight          int     // Pieces currently in flight
+	BytesSent         int64   // Total bytes sent
+	ThroughputMBps    float64 // MB/s throughput (instantaneous)
+	DownloadPercent   float64 // Download progress on source (0-1)
 }
 
 // PerfReport summarizes the performance test results.

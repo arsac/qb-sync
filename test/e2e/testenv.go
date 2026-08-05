@@ -43,17 +43,22 @@ const (
 
 	// Shared test constants used by both testenv.go and test files.
 	torrentAppearTimeout = 30 * time.Second
-	progressTolerance    = 0.001 // For float comparisons
+
+	// Mirror production defaults so the harness does not silently disable
+	// behaviour under test. Individual tests shrink the guard.
+	defaultSyncFailedTag   = "sync-failed"
+	defaultSyncFailedGuard = 4 * time.Hour
+	progressTolerance      = 0.001 // For float comparisons
 )
 
 // TestEnv holds the complete test environment for source/destination e2e tests.
 type TestEnv struct {
-	compose          compose.ComposeStack
-	sourceURL        string
-	destinationURL   string
-	sourcePath       string
-	destinationPath  string
-	sourceClient     *qbittorrent.Client
+	compose           compose.ComposeStack
+	sourceURL         string
+	destinationURL    string
+	sourcePath        string
+	destinationPath   string
+	sourceClient      *qbittorrent.Client
 	destinationClient *qbittorrent.Client
 	destinationServer *destination.Server
 	grpcAddr          string
@@ -138,7 +143,7 @@ func SetupTestEnv(t *testing.T, opts ...SetupOption) *TestEnv {
 	composeContent := fmt.Sprintf(`
 services:
   qb-source:
-    image: ghcr.io/home-operations/qbittorrent:5.2.0@sha256:08eb7ed4c7fe70425064d58154c35fccc89fafffd64ce9d1affed399e173ff20
+    image: ghcr.io/home-operations/qbittorrent:5.2.3@sha256:4fcf15b7f265c2c8d7bc2a7e13240a07e0593c326f3cf3b5b9bb69eec5b79299
     volumes:
       - %s:/downloads
       - %s:/config%s
@@ -152,7 +157,7 @@ services:
       start_period: 10s
 
   qb-destination:
-    image: ghcr.io/home-operations/qbittorrent:5.2.0@sha256:08eb7ed4c7fe70425064d58154c35fccc89fafffd64ce9d1affed399e173ff20
+    image: ghcr.io/home-operations/qbittorrent:5.2.3@sha256:4fcf15b7f265c2c8d7bc2a7e13240a07e0593c326f3cf3b5b9bb69eec5b79299
     volumes:
       - %s:/destination-data
       - %s:/config
@@ -166,12 +171,22 @@ services:
       start_period: 10s
 `, sourcePath, sourceConfig, sourceExtraVolumes, destinationPath, destinationConfig)
 
+	// Write the compose file ourselves rather than passing a reader.
+	// WithStackReaders materialises each reader at
+	// os.TempDir()/<UnixNano>/docker-compose-0.yml, and MkdirAll tolerates an
+	// existing directory, so two stacks created on the same nanosecond tick
+	// write that one path concurrently. The interleaved result fails schema
+	// validation on whichever key gets torn. t.TempDir() is unique per test,
+	// which removes the shared path entirely.
+	composePath := filepath.Join(tmpDir, "docker-compose.yml")
+	require.NoError(t, os.WriteFile(composePath, []byte(composeContent), 0o600))
+
 	// Create compose stack — use test name for a deterministic, unique identifier
 	// that won't collide when tests run in parallel.
 	identifier := sanitizeComposeIdentifier(t.Name())
 	stack, err := compose.NewDockerComposeWith(
 		compose.StackIdentifier(identifier),
-		compose.WithStackReaders(strings.NewReader(composeContent)),
+		compose.WithStackFiles(composePath),
 	)
 	require.NoError(t, err)
 
@@ -579,18 +594,82 @@ func (env *TestEnv) isTorrentComplete(state qbittorrent.TorrentState) bool {
 	}
 }
 
+// SourceTorrentHasTag reports whether the torrent carries the tag on source
+// qBittorrent. A torrent that cannot be listed reports false, so callers can
+// poll this while the stack is still settling.
+func (env *TestEnv) SourceTorrentHasTag(ctx context.Context, hash, tag string) bool {
+	torrents, err := env.sourceClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+		Hashes: []string{hash},
+	})
+	if err != nil || len(torrents) != 1 {
+		return false
+	}
+	// Compare whole tags: a substring match would let "sync-failed-later"
+	// satisfy a check for "sync-failed".
+	for t := range strings.SplitSeq(torrents[0].Tags, ",") {
+		if strings.TrimSpace(t) == tag {
+			return true
+		}
+	}
+	return false
+}
+
+// PartialFiles returns every .partial path under the destination data path.
+// These are the files qb-sync itself wrote; anything at a final path was
+// pre-existing, hardlinked, or deselected.
+//
+// A walk error fails the test rather than being ignored: an empty result is the
+// success signal for reclamation and leftover-partial assertions, so a failed
+// walk would forge one.
+func (env *TestEnv) PartialFiles() []string {
+	env.t.Helper()
+
+	var partials []string
+	walkErr := filepath.WalkDir(env.DestinationPath(), func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			// A vanishing entry is expected: the cleaner deletes while we walk.
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if !d.IsDir() && strings.HasSuffix(path, ".partial") {
+			partials = append(partials, path)
+		}
+		return nil
+	})
+	require.NoError(env.t, walkErr)
+	return partials
+}
+
+// TorrentCompleteOnDestination reports whether a torrent is complete on
+// destination qBittorrent, surfacing query failures instead of folding them
+// into the answer.
+//
+// Absence is a definitive "not complete": qb-sync adds the torrent to
+// destination qB only at finalization. An unreachable API is not, and callers
+// that would draw a conclusion from "not complete" must be able to tell the
+// two apart.
+func (env *TestEnv) TorrentCompleteOnDestination(ctx context.Context, hash string) (bool, error) {
+	torrents, err := env.destinationClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+		Hashes: []string{hash},
+	})
+	if err != nil {
+		return false, err
+	}
+	if len(torrents) == 0 {
+		return false, nil
+	}
+	torrent := torrents[0]
+	return torrent.Progress >= 1.0 || env.isTorrentComplete(torrent.State), nil
+}
+
 // IsTorrentCompleteOnDestination checks if a torrent is complete on destination qBittorrent.
 // This is the new way to verify sync completion - checking destination qB status
 // instead of the old "synced" tag approach.
 func (env *TestEnv) IsTorrentCompleteOnDestination(ctx context.Context, hash string) bool {
-	torrents, err := env.destinationClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
-		Hashes: []string{hash},
-	})
-	if err != nil || len(torrents) == 0 {
-		return false
-	}
-	torrent := torrents[0]
-	return torrent.Progress >= 1.0 || env.isTorrentComplete(torrent.State)
+	complete, err := env.TorrentCompleteOnDestination(ctx, hash)
+	return err == nil && complete
 }
 
 // WaitForTorrentCompleteOnDestination waits for a torrent to be complete on destination qBittorrent.
@@ -674,6 +753,12 @@ func (env *TestEnv) CreateSourceConfig(opts ...SourceConfigOption) *config.Sourc
 			DataPath:   env.sourcePath,
 			SyncedTag:  "synced",
 		},
+		// Production defaults these; leaving them unset meant no E2E test ever
+		// exercised quarantine, because markSyncFailed skips tagging when the
+		// tag is empty and nothing then excludes the torrent from re-tracking.
+		SyncFailedTag:   defaultSyncFailedTag,
+		SyncFailedGuard: defaultSyncFailedGuard,
+
 		MinSpaceGB:         1,
 		MinSeedingTime:     0,
 		SleepInterval:      time.Second,

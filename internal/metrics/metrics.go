@@ -36,6 +36,15 @@ const (
 	ResultSynced         = "synced" // sync_outcomes_total
 	ResultFailed         = "failed" // sync_outcomes_total
 
+	// ResultDrainStarted and its siblings label shutdown_drain_outcomes_total.
+	// The two skip reasons are kept apart because they need different
+	// responses: not_allowed is the gate working as configured, whereas
+	// check_failed means the gate could not be evaluated and the drain was
+	// dropped on the fail-closed path.
+	ResultDrainStarted         = "started"
+	ResultDrainSkippedNotAllow = "skipped_not_allowed"
+	ResultDrainSkippedFailed   = "skipped_check_failed"
+
 	SelectionPartial = "partial"
 	SelectionFull    = "full"
 
@@ -62,6 +71,15 @@ const (
 	ReasonQueueTimeout = "queue_timeout"
 	// ReasonQBChecking marks BUSY caused by qB still checking at budget expiry.
 	ReasonQBChecking = "qb_checking"
+
+	// ReasonSkipNotSyncable and its siblings label SkippedTorrents: why a source
+	// torrent is not eligible for sync. Without these, a torrent broken on the
+	// source simply never syncs, with no log and no metric to say so.
+	ReasonSkipNotSyncable   = "not_syncable_state" // error, missingFiles, download-side paused
+	ReasonSkipZeroProgress  = "zero_progress"      // nothing downloaded yet
+	ReasonSkipExcludeTag    = "exclude_tag"        // operator opted the torrent out
+	ReasonSkipQuarantined   = "quarantined"        // carries the sync-failed tag
+	ReasonSkipAlreadySynced = "already_synced"     // destination already has it
 
 	ReasonOrphanInQB          = "in_qb"          // OrphanCleanupSkippedTotal: torrent in destination qB but not healable (non-seeding state, <100%, or savepath is not qb-sync's copy)
 	ReasonOrphanQBUnreachable = "qb_unreachable" // OrphanCleanupSkippedTotal: destination qB unreachable during safety check
@@ -662,6 +680,15 @@ var (
 		nil, nil,
 	)
 
+	// StalledTorrentsDesc counts torrents whose stall clock is running: pieces
+	// are available on the source but nothing is moving. Reaching the guard
+	// quarantines them, so a rising value is the early warning.
+	StalledTorrentsDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "", "stalled_torrents"),
+		"Torrents with pieces available on source but not advancing",
+		nil, nil,
+	)
+
 	ActiveFinalizationBackoffsDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "", "active_finalization_backoffs"),
 		"Torrents currently in finalization backoff on source server",
@@ -731,6 +758,36 @@ var (
 		[]string{LabelMode, LabelComponent},
 	)
 
+	// QuarantinedTorrents is the standing population carrying the sync-failed
+	// tag. sync_outcomes_total gives the rate of new failures but never how
+	// many are sitting quarantined right now, which is what needs an alert.
+	//
+	// It is kept as a separate, label-free series so the alert rule in METRICS.md
+	// does not depend on a label value that a future refactor could rename.
+	//
+	// It is not the same population as SkippedTorrents{reason="quarantined"}:
+	// that label reports one reason per torrent and ranks source state ahead of
+	// the marker, so a quarantined torrent also sitting in error or missingFiles
+	// counts under not_syncable_state there. This gauge counts the tag itself and
+	// so includes those, which is what the alert needs.
+	QuarantinedTorrents = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "quarantined_torrents",
+			Help:      "Source torrents currently carrying the sync-failed tag",
+		},
+	)
+
+	// SkippedTorrents counts source torrents excluded from sync, by reason.
+	SkippedTorrents = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "skipped_torrents",
+			Help:      "Source torrents not eligible for sync, by reason",
+		},
+		[]string{LabelReason},
+	)
+
 	// StreamPoolScalingPaused tracks whether pool scaling is paused (1=paused, 0=active).
 	StreamPoolScalingPaused = promauto.NewGauge(
 		prometheus.GaugeOpts{
@@ -784,6 +841,25 @@ var (
 			Name:      "draining",
 			Help:      "Whether the source server is draining synced torrents on shutdown (1=draining, 0=normal)",
 		},
+	)
+
+	// ShutdownDrainOutcomesTotal records how the shutdown drain resolved.
+	//
+	// Draining only reports a drain that started, so a drain skipped at the
+	// annotation gate is indistinguishable from one that never ran at all, and
+	// from a pod that simply died before the last scrape. This counter makes
+	// the skip explicit, which matters because a skip is silent by nature: it
+	// happens at SIGTERM, in a pod that is about to disappear.
+	//
+	// Scrape timing at shutdown is unreliable, so treat the logs as the
+	// authoritative record and this as the aggregate signal.
+	ShutdownDrainOutcomesTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "shutdown_drain_outcomes_total",
+			Help:      "Shutdown drain outcomes by result (source)",
+		},
+		[]string{LabelResult},
 	)
 
 	// GRPCConnectionsConfigured tracks the maximum configured TCP connections to the destination server.

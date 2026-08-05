@@ -235,7 +235,7 @@ func TestCleanupOrphan_HealsQBOwnedCompleteTorrent(t *testing.T) {
 		mock := &mockQBClient{torrents: qbTorrent(qbittorrent.TorrentStateStoppedUp, 1.0, ownPath)}
 		s, metaDir := newOrphanEnv(t, mock)
 
-		s.cleanupOrphan(context.Background(), hash)
+		s.cleanupOrphan(context.Background(), hash, defaultOrphanTimeout)
 
 		assertHealed(t, s, metaDir)
 	})
@@ -245,7 +245,7 @@ func TestCleanupOrphan_HealsQBOwnedCompleteTorrent(t *testing.T) {
 		mock := &mockQBClient{torrents: qbTorrent(qbittorrent.TorrentStateUploading, 1.0, ownPath)}
 		s, metaDir := newOrphanEnv(t, mock)
 
-		s.cleanupOrphan(context.Background(), hash)
+		s.cleanupOrphan(context.Background(), hash, defaultOrphanTimeout)
 
 		assertHealed(t, s, metaDir)
 	})
@@ -258,7 +258,7 @@ func TestCleanupOrphan_HealsQBOwnedCompleteTorrent(t *testing.T) {
 		mock := &mockQBClient{torrents: qbTorrent(qbittorrent.TorrentStateStoppedUp, 1.0, "/somewhere-else")}
 		s, metaDir := newOrphanEnv(t, mock)
 
-		s.cleanupOrphan(context.Background(), hash)
+		s.cleanupOrphan(context.Background(), hash, defaultOrphanTimeout)
 
 		assertHealed(t, s, metaDir)
 	})
@@ -268,7 +268,7 @@ func TestCleanupOrphan_HealsQBOwnedCompleteTorrent(t *testing.T) {
 		mock := &mockQBClient{torrents: qbTorrent(qbittorrent.TorrentStateStoppedUp, 0.99, ownPath)}
 		s, metaDir := newOrphanEnv(t, mock)
 
-		s.cleanupOrphan(context.Background(), hash)
+		s.cleanupOrphan(context.Background(), hash, defaultOrphanTimeout)
 
 		assertSkipped(t, s, metaDir)
 	})
@@ -278,7 +278,7 @@ func TestCleanupOrphan_HealsQBOwnedCompleteTorrent(t *testing.T) {
 		mock := &mockQBClient{torrents: qbTorrent(qbittorrent.TorrentStateMissingFiles, 1.0, ownPath)}
 		s, metaDir := newOrphanEnv(t, mock)
 
-		s.cleanupOrphan(context.Background(), hash)
+		s.cleanupOrphan(context.Background(), hash, defaultOrphanTimeout)
 
 		assertSkipped(t, s, metaDir)
 	})
@@ -288,7 +288,7 @@ func TestCleanupOrphan_HealsQBOwnedCompleteTorrent(t *testing.T) {
 		mock := &mockQBClient{torrents: qbTorrent(qbittorrent.TorrentStateStoppedDl, 0.5, ownPath)}
 		s, metaDir := newOrphanEnv(t, mock)
 
-		s.cleanupOrphan(context.Background(), hash)
+		s.cleanupOrphan(context.Background(), hash, defaultOrphanTimeout)
 
 		assertSkipped(t, s, metaDir)
 	})
@@ -298,7 +298,7 @@ func TestCleanupOrphan_HealsQBOwnedCompleteTorrent(t *testing.T) {
 		mock := &mockQBClient{loginErr: errors.New("connection refused")}
 		s, metaDir := newOrphanEnv(t, mock)
 
-		s.cleanupOrphan(context.Background(), hash)
+		s.cleanupOrphan(context.Background(), hash, defaultOrphanTimeout)
 
 		assertSkipped(t, s, metaDir)
 	})
@@ -312,7 +312,7 @@ func TestCleanupOrphan_HealsQBOwnedCompleteTorrent(t *testing.T) {
 		s, metaDir := newOrphanEnv(t, mock)
 		require.NoError(t, os.Remove(filepath.Join(metaDir, metaFileName)))
 
-		s.cleanupOrphan(context.Background(), hash)
+		s.cleanupOrphan(context.Background(), hash, defaultOrphanTimeout)
 
 		require.True(t, s.isFinalized(hash), "old-format dir with qB-complete torrent must heal")
 	})
@@ -333,20 +333,81 @@ func TestCleanupOrphan_HealsQBOwnedCompleteTorrent(t *testing.T) {
 			"finalized torrent must never be an orphan candidate again")
 	})
 
-	t.Run("concurrent cleanup is single-flight via BeginCleanup", func(t *testing.T) {
+	t.Run("concurrent cleanup is single-flight via BeginReclaim", func(t *testing.T) {
 		t.Parallel()
 		mock := &mockQBClient{torrents: qbTorrent(qbittorrent.TorrentStateStoppedUp, 1.0, ownPath)}
 		s, _ := newOrphanEnv(t, mock)
 
 		// Hold the cleanup registration, as a concurrent cleanupOrphan would.
 		ch := make(chan struct{})
-		require.True(t, s.store.BeginCleanup(hash, ch))
+		require.True(t, s.store.BeginReclaim(hash, ch, func(*serverTorrentState) bool { return true }))
 
-		s.cleanupOrphan(context.Background(), hash)
+		s.cleanupOrphan(context.Background(), hash, defaultOrphanTimeout)
 
 		require.False(t, s.isFinalized(hash),
-			"second cleanup must bail at BeginCleanup, not heal concurrently")
+			"second cleanup must bail at BeginReclaim, not heal concurrently")
 		close(ch)
 		s.store.EndCleanup(hash)
 	})
+}
+
+// TestDeleteOrphanFiles_OnlyRemovesPartials is the safety property behind
+// ADR-0002: reclamation may delete only the files this server wrote.
+//
+// On an unfinalized torrent, everything we wrote lives at a .partial path.
+// A file at its final path is pre-existing operator data, a hardlink, or a
+// deselected file, and deleting any of those is data loss. Removing both paths
+// unconditionally is harmless only while the orphan cleaner never runs, and
+// reclamation exists to make it run.
+func TestDeleteOrphanFiles_OnlyRemovesPartials(t *testing.T) {
+	t.Parallel()
+
+	const (
+		hash    = "b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0"
+		subPath = "movies"
+	)
+
+	s, tmpDir := newTestDestServer(t)
+
+	// Two files: one we streamed (.partial), one the operator already had on
+	// disk at the right size, which setupFile would have adopted as
+	// PreExisting and never written to.
+	const (
+		streamedName    = "streamed.mkv"
+		preExistingName = "operator-had-this.mkv"
+	)
+
+	contentDir := filepath.Join(tmpDir, subPath)
+	require.NoError(t, os.MkdirAll(contentDir, 0o755))
+
+	partialPath := filepath.Join(contentDir, streamedName) + partialSuffix
+	preExistingPath := filepath.Join(contentDir, preExistingName)
+	require.NoError(t, os.WriteFile(partialPath, []byte("partially streamed"), 0o644))
+	require.NoError(t, os.WriteFile(preExistingPath, []byte("operator data"), 0o644))
+
+	metaDir := filepath.Join(tmpDir, metaDirName, hash)
+	require.NoError(t, os.MkdirAll(metaDir, 0o755))
+	require.NoError(t, savePersistedMeta(filepath.Join(metaDir, metaFileName), &pb.PersistedTorrentMeta{
+		SchemaVersion: currentSchemaVersion,
+		TorrentHash:   hash,
+		SaveSubPath:   subPath,
+		Files: []*pb.PersistedFileInfo{
+			{Path: streamedName, Selected: true},
+			{Path: preExistingName, Selected: true},
+		},
+	}))
+
+	deleted := s.deleteOrphanFiles(context.Background(), hash, metaDir)
+
+	require.Equal(t, 1, deleted, "only the .partial file is ours to delete")
+
+	_, statErr := os.Stat(partialPath)
+	require.True(t, os.IsNotExist(statErr), "the .partial file we wrote must be reclaimed")
+
+	require.FileExists(t, preExistingPath,
+		"a file at its final path is operator data or a hardlink and must survive reclamation")
+
+	data, readErr := os.ReadFile(preExistingPath)
+	require.NoError(t, readErr)
+	require.Equal(t, "operator data", string(data), "operator data must be untouched, not just present")
 }

@@ -4,6 +4,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/bits-and-blooms/bitset"
 
@@ -145,7 +146,16 @@ type serverTorrentState struct {
 	piecesSinceFlush int            // Pieces written since last flush (for count-based trigger)
 	flushGen         uint64         // Monotonic counter incremented on every successful state flush
 	initializing     atomic.Bool    // True while disk I/O is in progress; set once before publication, never written again.
-	mu               sync.Mutex
+
+	// lastContact is the UnixNano time a source last asked about this torrent.
+	// Reclamation is judged on this rather than on store membership: startup
+	// recovery repopulates the store from every unfinalized metadata directory,
+	// so membership can never distinguish a live transfer from an orphan.
+	// Stamped by the store's Get accessors, which every request path goes
+	// through. Atomic so scanning does not contend with the request path.
+	lastContact atomic.Int64
+
+	mu sync.Mutex
 
 	// Finalization lifecycle (state machine: inactive -> active -> result stored).
 	// All fields are mutable and require state.mu.
@@ -154,6 +164,24 @@ type serverTorrentState struct {
 
 	// Cached for re-initialization (hardlink info for logging)
 	hardlinkResults []*pb.HardlinkResult
+}
+
+// touch records that a source has just asked about this torrent.
+func (s *serverTorrentState) touch() {
+	s.lastContact.Store(time.Now().UnixNano())
+}
+
+// contactAge reports how long it has been since a source last asked about this
+// torrent. A zero stamp means the state was rebuilt by startup recovery and no
+// source has been in touch since, so age is measured from process start rather
+// than from the epoch - otherwise every recovered torrent would look like an orphan
+// the moment the server came up.
+func (s *serverTorrentState) contactAge(processStart time.Time) time.Duration {
+	nanos := s.lastContact.Load()
+	if nanos == 0 {
+		return time.Since(processStart)
+	}
+	return time.Since(time.Unix(0, nanos))
 }
 
 // finalizationState tracks the background finalization lifecycle.

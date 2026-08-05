@@ -6,7 +6,6 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,6 +13,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// completeCheckBudget bounds a single destination-completeness query so one
+// stalled qBittorrent API call cannot consume the whole early-finalization
+// window. Four parallel docker stacks share a filesystem, and the window is
+// only a few seconds wide.
+const completeCheckBudget = time.Second
 
 // TestE2E_PerFileEarlyFinalization verifies that individual files in a multi-file
 // torrent are renamed from .partial to their final path as soon as all their pieces
@@ -99,15 +104,36 @@ func TestE2E_PerFileEarlyFinalization(t *testing.T) {
 				continue
 			}
 
-			earlyFinalizedCount.Store(count)
-
 			// Check if torrent is NOT yet complete on destination qBittorrent.
 			// If we see finalized files before torrent completion, that's
-			// proof of per-file early finalization.
-			if !env.IsTorrentCompleteOnDestination(ctx, wiredCDHash) {
-				if observedBeforeComplete.CompareAndSwap(false, true) {
-					t.Logf("Early finalization observed: %d files at final path before torrent completion", count)
-				}
+			// proof of per-file early finalization. Sampling the filesystem
+			// first is what makes this sound: completion never reverses, so a
+			// "not complete" answer here also held when the files were counted.
+			//
+			// Cap the query. Unbounded, a call issued while files are landing
+			// can be answered after finalization: the tick is then spent on a
+			// verdict that no longer describes the moment it sampled, and the
+			// window under test does not come back. Bounded, it is simply
+			// retried on the next tick.
+			checkCtx, checkCancel := context.WithTimeout(ctx, completeCheckBudget)
+			complete, checkErr := env.TorrentCompleteOnDestination(checkCtx, wiredCDHash)
+			checkCancel()
+
+			if checkErr != nil {
+				t.Logf("destination completeness check did not answer within %v, retrying: %v",
+					completeCheckBudget, checkErr)
+				continue
+			}
+			if complete {
+				continue
+			}
+
+			// Only count files seen while the torrent was still incomplete.
+			// Counting every tick reports the state after finalization, which
+			// reads as proof of early finalization even when none was observed.
+			earlyFinalizedCount.Store(count)
+			if observedBeforeComplete.CompareAndSwap(false, true) {
+				t.Logf("Early finalization observed: %d files at final path before torrent completion", count)
 			}
 		}
 	}()
@@ -141,18 +167,7 @@ func TestE2E_PerFileEarlyFinalization(t *testing.T) {
 			".partial file should not exist after sync: %s", partialPath)
 	}
 
-	// Verify no .partial files remain anywhere under the destination path for this torrent.
-	var leftoverPartials []string
-	_ = filepath.WalkDir(env.DestinationPath(), func(path string, _ os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if strings.HasSuffix(path, ".partial") {
-			leftoverPartials = append(leftoverPartials, path)
-		}
-		return nil
-	})
-	assert.Empty(t, leftoverPartials, "no .partial files should remain after sync")
+	assert.Empty(t, env.PartialFiles(), "no .partial files should remain after sync")
 
 	env.AssertTorrentCompleteOnDestination(ctx, wiredCDHash)
 

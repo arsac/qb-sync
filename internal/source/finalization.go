@@ -12,17 +12,38 @@ import (
 	"github.com/arsac/qb-sync/internal/streaming"
 )
 
-// finalizeCompletedStreams checks for streams where all pieces are streamed
-// and calls FinalizeTorrent on the destination server.
-//
-//nolint:unparam // error return kept for interface consistency
-func (t *QBTask) finalizeCompletedStreams(ctx context.Context) error {
-	tracked := t.tracked.Snapshot()
-
+// collectProgress takes one progress snapshot per tracked torrent for the
+// cycle. Both the finalization pass and the stall pass need it, and GetProgress
+// scans the whole piece bitmap under the monitor's read lock, so sampling twice
+// per cycle doubles that scan and the time piece writers wait behind it.
+func (t *QBTask) collectProgress(
+	ctx context.Context,
+	tracked map[string]TrackedTorrent,
+) map[string]streaming.StreamProgress {
+	progressByHash := make(map[string]streaming.StreamProgress, len(tracked))
 	for hash := range tracked {
 		progress, err := t.tracker.GetProgress(hash)
 		if err != nil {
 			t.logger.DebugContext(ctx, "GetProgress failed", "hash", hash, "error", err)
+			continue
+		}
+		progressByHash[hash] = progress
+	}
+	return progressByHash
+}
+
+// finalizeCompletedStreams checks for streams where all pieces are streamed
+// and calls FinalizeTorrent on the destination server.
+//
+//nolint:unparam // error return kept for interface consistency
+func (t *QBTask) finalizeCompletedStreams(
+	ctx context.Context,
+	tracked map[string]TrackedTorrent,
+	progressByHash map[string]streaming.StreamProgress,
+) error {
+	for hash := range tracked {
+		progress, ok := progressByHash[hash]
+		if !ok {
 			continue
 		}
 
@@ -33,7 +54,7 @@ func (t *QBTask) finalizeCompletedStreams(ctx context.Context) error {
 			"complete", progress.Complete,
 		)
 
-		if !progress.Complete || !t.backoffs.ShouldAttempt(hash) {
+		if !progress.Complete || !t.store.ShouldAttempt(hash) {
 			continue
 		}
 
@@ -59,7 +80,7 @@ func (t *QBTask) handleFinalizeError(ctx context.Context, hash string, finalizeE
 	// again without burning the retry budget, but bound it with a wall-clock
 	// guard so a permanently wedged destination still surfaces as sync-failed.
 	if errors.Is(finalizeErr, streaming.ErrFinalizeBusy) {
-		if busyFor := t.backoffs.RecordBusy(hash); busyFor < busyGuardDuration {
+		if busyFor := t.store.RecordBusy(hash); busyFor < busyGuardDuration {
 			t.logger.WarnContext(ctx, "destination finalization busy, will retry",
 				"hash", hash,
 				"busyFor", busyFor.Round(time.Second),
@@ -103,19 +124,90 @@ func (t *QBTask) handleFinalizeError(ctx context.Context, hash string, finalizeE
 	}
 
 	// Persistent per-torrent failure (e.g. destination qB stuck in missingFiles).
-	// Share the maxVerificationRetries budget with handleIncompleteFinalization so
-	// the torrent surfaces as sync-failed instead of looping in tracked forever.
-	failures := t.backoffs.RecordFailure(hash)
-	if failures >= maxVerificationRetries {
-		t.logger.ErrorContext(ctx, "finalize failed repeatedly, marking torrent as sync-failed",
+	// Shares the failure streak with handleIncompleteFinalization so the torrent
+	// surfaces as sync-failed instead of looping in tracked forever.
+	failures, quarantine := t.store.RecordFailure(hash)
+	if quarantine {
+		t.logger.ErrorContext(ctx, "finalize failing past the guard, marking torrent as sync-failed",
 			"hash", hash,
 			"failures", failures,
-			"maxRetries", maxVerificationRetries,
+			"guard", t.store.Guard(),
 			"error", finalizeErr,
 		)
 		t.markSyncFailed(ctx, hash)
 	}
 	return false
+}
+
+// stallThreshold is how long a tracked torrent may sit without advancing
+// before the stall clock starts. It only has to outlast normal jitter - the
+// queue draining, a congested destination, a slow disk read - because the
+// guard, not this, decides quarantine.
+func (t *QBTask) stallThreshold() time.Duration {
+	const (
+		minThreshold = time.Minute
+		cyclesOfSlop = 2 // tolerate a couple of quiet cycles before starting the clock
+	)
+	if t.cfg != nil && t.cfg.SleepInterval > 0 {
+		return max(minThreshold, cyclesOfSlop*t.cfg.SleepInterval)
+	}
+	return minThreshold
+}
+
+// checkStalledStreams quarantines torrents that have pieces waiting on the
+// source but are not moving them.
+//
+// This closes the hole that made an unreadable piece unrecoverable. A failed
+// send only sets a bit in a bitmap nothing reads, and the next poll re-queues
+// the piece, so the torrent never completes, never reaches finalization, and
+// therefore never reaches the failure streak that would quarantine it. It stays
+// tracked forever, retrying the same unreadable piece.
+//
+// The available-pieces condition is what separates a stalled torrent from one
+// whose source is merely slow to download: a source waiting on peers has
+// nothing available, so it can never be judged stalled.
+func (t *QBTask) checkStalledStreams(
+	ctx context.Context,
+	progressByHash map[string]streaming.StreamProgress,
+) {
+	threshold := t.stallThreshold()
+
+	// Re-snapshot rather than walking progressByHash: finalization releases
+	// synced torrents mid-cycle, and ObserveStall creates a record on access,
+	// so observing one that has just been released would resurrect it and leak.
+	for hash := range t.store.TrackedSnapshot() {
+		progress, ok := progressByHash[hash]
+		if !ok {
+			continue
+		}
+
+		// No IsZero guard: the monitor stamps lastAdvance when tracking starts,
+		// so a torrent that has never streamed a piece is the stalled case, not
+		// an unknown one. Excluding it here would skip the very torrents this
+		// check exists to catch.
+		stalling := !progress.Complete &&
+			progress.Available > 0 &&
+			time.Since(progress.LastAdvance) >= threshold
+
+		stalledFor, quarantine := t.store.ObserveStall(hash, progress.Streamed, stalling)
+		if !quarantine {
+			continue
+		}
+
+		t.logger.ErrorContext(ctx, "torrent stalled past the guard, marking as sync-failed",
+			"hash", hash,
+			"stalledFor", stalledFor.Round(time.Second),
+			"guard", t.store.Guard(),
+			"streamed", progress.Streamed,
+			"total", progress.TotalPieces,
+			"available", progress.Available,
+			// Failed is the count of pieces whose send or read failed. It is
+			// the first thing to look at when diagnosing a stall: a high count
+			// points at unreadable source data rather than a stalled pipeline.
+			"failed", progress.Failed,
+		)
+		t.markSyncFailed(ctx, hash)
+	}
 }
 
 // markTorrentSynced handles post-finalization bookkeeping: clears backoff, updates
@@ -124,15 +216,11 @@ func (t *QBTask) markTorrentSynced(ctx context.Context, hash string, tt TrackedT
 	// Compute fingerprint before evicting source cache
 	fingerprint := t.computeSelectionFingerprint(ctx, hash)
 
-	t.backoffs.Clear(hash)
-
 	metrics.TorrentSyncLatencySeconds.Observe(time.Since(tt.CompletionTime).Seconds())
-	t.completed.MarkWithFingerprint(hash, fingerprint)
-	t.completed.Save()
+	t.store.MarkComplete(hash, fingerprint)
+	t.store.Save()
 
-	t.tracker.Untrack(hash)
-	t.source.EvictCache(hash)
-	t.tracked.Delete(hash)
+	t.releaseTorrent(hash)
 
 	selection := t.computeSelectionLabel(ctx, hash)
 	metrics.SyncOutcomesTotal.WithLabelValues(metrics.ModeSource, metrics.ResultSynced, selection).Inc()
@@ -198,16 +286,16 @@ func (t *QBTask) finalizeTorrent(ctx context.Context, hash string) error {
 }
 
 // handleIncompleteFinalization handles a FINALIZE_ERROR_INCOMPLETE response from
-// the destination. Tracks consecutive failures to prevent infinite verify→re-stream
-// loops. After maxVerificationRetries, tags the torrent as sync-failed so the user
-// can investigate. Removing the tag re-enables sync.
+// the destination. Tracks the failure streak to prevent infinite verify→re-stream
+// loops. Once the streak outlasts the guard, tags the torrent as sync-failed so
+// the user can investigate. Removing the tag re-enables sync.
 func (t *QBTask) handleIncompleteFinalization(ctx context.Context, hash string) {
-	failures := t.backoffs.RecordFailure(hash)
-	if failures >= maxVerificationRetries {
-		t.logger.ErrorContext(ctx, "verification failed repeatedly, marking torrent as sync-failed",
+	failures, quarantine := t.store.RecordFailure(hash)
+	if quarantine {
+		t.logger.ErrorContext(ctx, "verification failing past the guard, marking torrent as sync-failed",
 			"hash", hash,
 			"failures", failures,
-			"maxRetries", maxVerificationRetries,
+			"guard", t.store.Guard(),
 		)
 		t.markSyncFailed(ctx, hash)
 		return
@@ -215,7 +303,8 @@ func (t *QBTask) handleIncompleteFinalization(ctx context.Context, hash string) 
 	t.logger.WarnContext(ctx, "destination reports incomplete, re-syncing streamed state",
 		"hash", hash,
 		"attempt", failures,
-		"maxRetries", maxVerificationRetries,
+		"minAttempts", minQuarantineAttempts,
+		"guard", t.store.Guard(),
 	)
 	t.resyncWithDest(ctx, hash)
 }
@@ -229,7 +318,7 @@ func (t *QBTask) handleNotFoundFinalization(ctx context.Context, hash string) {
 	t.logger.WarnContext(ctx, "destination has no state for torrent, untracking for re-init",
 		"hash", hash,
 	)
-	t.stopTracking(hash)
+	t.releaseTorrent(hash)
 }
 
 // markSyncFailed tags the torrent as sync-failed on source qBittorrent and stops
@@ -251,22 +340,72 @@ func (t *QBTask) markSyncFailed(ctx context.Context, hash string) {
 	// behavior where sync_failed_total had no label distinction.
 	selection := t.computeSelectionLabel(ctx, hash)
 
+	t.releaseDestination(ctx, hash)
+
 	// Stop tracking so the torrent is not re-streamed.
 	// It will be picked up again if the user removes the tag.
-	t.stopTracking(hash)
+	t.releaseTorrent(hash)
 
 	metrics.SyncOutcomesTotal.WithLabelValues(metrics.ModeSource, metrics.ResultFailed, selection).Inc()
 }
 
-// stopTracking tears down all tracking state for a torrent: unregisters from the
-// piece monitor, evicts file-handle and init caches, removes from TrackedTorrents,
-// and clears finalization backoff. Callers handle their own metrics and RPC cleanup.
-func (t *QBTask) stopTracking(hash string) {
+// releaseDestination tells the destination to drop its in-memory hold on a
+// quarantined torrent while keeping the bytes it has already received.
+//
+// Quarantine previously told the destination nothing at all, so its partial
+// data sat there with no path to reclamation. Deleting it here would be worse:
+// the common cause of quarantine is a long transient fault, where the partial
+// data is perfectly good, and a release would then re-copy the whole torrent.
+// Keeping the bytes means a release within the reclamation window resumes from
+// the persisted piece bitmap instead.
+//
+// Best-effort. If the call fails the tag is still applied, and the
+// destination's own reclamation is the backstop.
+func (t *QBTask) releaseDestination(ctx context.Context, hash string) {
+	if t.cfg.DryRun {
+		return
+	}
+
+	abortCtx, cancel := withDestRPCTimeout(ctx)
+	defer cancel()
+
+	if _, abortErr := t.grpcDest.AbortTorrent(abortCtx, hash, false); abortErr != nil {
+		t.logger.WarnContext(ctx, "failed to release quarantined torrent on destination, reclamation will handle it",
+			"hash", hash,
+			"error", abortErr,
+		)
+		return
+	}
+	t.logger.InfoContext(ctx, "released quarantined torrent on destination, data preserved for retry",
+		"hash", hash,
+	)
+}
+
+// releaseTorrent tears down every piece of per-torrent streaming state in one
+// operation.
+//
+// Every lifecycle transition goes through here rather than spelling out the
+// subset it needs. The hazard is concrete, not hypothetical: omitting the stall
+// release leaves lastStreamed set on a synced torrent, which keeps its record
+// alive for the lifetime of the process.
+//
+// Completion state is deliberately NOT released here. Whether a torrent stays
+// known-complete genuinely differs by caller - quiesceExcludedCompleted must
+// preserve it so a later removal takes the safe handoff path, while
+// resyncFileSelection must drop it - so it stays explicit at each site.
+func (t *QBTask) releaseTorrent(hash string) {
 	t.tracker.Untrack(hash)
+	t.store.Untrack(hash)
+	t.store.ClearBackoff(hash)
+	t.store.ClearStall(hash)
+	t.releaseCaches(hash)
+}
+
+// releaseCaches drops the source-side memos for a torrent without untracking
+// it, so the next cycle re-derives them from scratch.
+func (t *QBTask) releaseCaches(hash string) {
 	t.source.EvictCache(hash)
 	t.grpcDest.ClearInitResult(hash)
-	t.tracked.Delete(hash)
-	t.backoffs.Clear(hash)
 }
 
 // invertPiecesNeeded converts PiecesNeeded (true=missing) to written (true=have).

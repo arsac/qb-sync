@@ -1,6 +1,6 @@
 # TorrentStore Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Historical record.** This plan describes work that has already shipped. It is kept for context on why the code looks the way it does; the checkboxes reflect the original build order and are not outstanding work.
 
 **Goal:** Centralize destination server state management behind a single `TorrentStore` type, eliminating 17 scattered map-access sites across 6 files, and add startup recovery from persisted metadata.
 
@@ -8,7 +8,7 @@
 
 **Tech Stack:** Go 1.25, bitset, protobuf, gRPC
 
-**Spec:** `docs/superpowers/specs/2026-04-27-torrent-store-design.md`
+**Spec:** `docs/specs/2026-04-27-torrent-store-design.md`
 
 ---
 
@@ -117,7 +117,7 @@ func TestTorrentStore_ForEach(t *testing.T) {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `GOROOT=/Users/mailoarsac/.local/share/mise/installs/go/1.25.7 go test ./internal/destination/... -run "TestTorrentStore_Get|TestTorrentStore_Len|TestTorrentStore_ForEach" -count=1`
+Run: `go test ./internal/destination/... -run "TestTorrentStore_Get|TestTorrentStore_Len|TestTorrentStore_ForEach" -count=1`
 
 Expected: compilation error — `TorrentStore` not defined.
 
@@ -203,7 +203,7 @@ func (ts *TorrentStore) Len() int {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `GOROOT=/Users/mailoarsac/.local/share/mise/installs/go/1.25.7 go test ./internal/destination/... -run "TestTorrentStore_Get|TestTorrentStore_Len|TestTorrentStore_ForEach" -count=1 -v`
+Run: `go test ./internal/destination/... -run "TestTorrentStore_Get|TestTorrentStore_Len|TestTorrentStore_ForEach" -count=1 -v`
 
 Expected: PASS
 
@@ -329,7 +329,7 @@ func TestTorrentStore_CommitCollision(t *testing.T) {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `GOROOT=/Users/mailoarsac/.local/share/mise/installs/go/1.25.7 go test ./internal/destination/... -run "TestTorrentStore_Reserve|TestTorrentStore_Unreserve|TestTorrentStore_CommitCollision" -count=1`
+Run: `go test ./internal/destination/... -run "TestTorrentStore_Reserve|TestTorrentStore_Unreserve|TestTorrentStore_CommitCollision" -count=1`
 
 Expected: compilation error — `Reserve`, `Commit`, `Unreserve` not defined.
 
@@ -431,7 +431,7 @@ Remove the `nil` guards (the store always initializes the map). Remove the `(s *
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `GOROOT=/Users/mailoarsac/.local/share/mise/installs/go/1.25.7 go test ./internal/destination/... -run "TestTorrentStore" -count=1 -v`
+Run: `go test ./internal/destination/... -run "TestTorrentStore" -count=1 -v`
 
 Expected: PASS
 
@@ -582,7 +582,7 @@ func TestTorrentStore_BeginCleanup(t *testing.T) {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `GOROOT=/Users/mailoarsac/.local/share/mise/installs/go/1.25.7 go test ./internal/destination/... -run "TestTorrentStore_Remove|TestTorrentStore_Drain|TestTorrentStore_BeginAbort|TestTorrentStore_BeginCleanup" -count=1`
+Run: `go test ./internal/destination/... -run "TestTorrentStore_Remove|TestTorrentStore_Drain|TestTorrentStore_BeginAbort|TestTorrentStore_BeginCleanup" -count=1`
 
 Expected: compilation error — `Remove`, `Drain`, `BeginAbort`, `BeginCleanup`, `EndCleanup`, `AbortCh` not defined.
 
@@ -682,7 +682,7 @@ Add `"context"` to imports.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `GOROOT=/Users/mailoarsac/.local/share/mise/installs/go/1.25.7 go test ./internal/destination/... -run "TestTorrentStore" -count=1 -v`
+Run: `go test ./internal/destination/... -run "TestTorrentStore" -count=1 -v`
 
 Expected: PASS
 
@@ -753,7 +753,7 @@ func TestTorrentStore_InodeDelegation(t *testing.T) {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `GOROOT=/Users/mailoarsac/.local/share/mise/installs/go/1.25.7 go test ./internal/destination/... -run TestTorrentStore_InodeDelegation -count=1`
+Run: `go test ./internal/destination/... -run TestTorrentStore_InodeDelegation -count=1`
 
 Expected: compilation error — `RegisterInodes`, `Inodes`, `SaveInodes` not defined.
 
@@ -805,7 +805,7 @@ func (ts *TorrentStore) SaveInodes() error {
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `GOROOT=/Users/mailoarsac/.local/share/mise/installs/go/1.25.7 go test ./internal/destination/... -run TestTorrentStore_InodeDelegation -count=1 -v`
+Run: `go test ./internal/destination/... -run TestTorrentStore_InodeDelegation -count=1 -v`
 
 Expected: PASS
 
@@ -1021,7 +1021,7 @@ func newTestDestServer(t *testing.T) (*Server, string) {
 
 - [ ] **Step 9: Run full unit test suite**
 
-Run: `GOROOT=/Users/mailoarsac/.local/share/mise/installs/go/1.25.7 go test ./internal/destination/... -short -count=1`
+Run: `go test ./internal/destination/... -short -count=1`
 
 Expected: PASS (some test files may need further updates — see Task 6)
 
@@ -1060,7 +1060,7 @@ Replace:
 
 - [ ] **Step 3: Run full test suite**
 
-Run: `GOROOT=/Users/mailoarsac/.local/share/mise/installs/go/1.25.7 go test ./internal/destination/... -short -count=1 -v`
+Run: `go test ./internal/destination/... -short -count=1 -v`
 
 Expected: PASS
 
@@ -1121,7 +1121,7 @@ func TestSetupMetadataDir_Idempotent(t *testing.T) {
 
 - [ ] **Step 2: Run test**
 
-Run: `GOROOT=/Users/mailoarsac/.local/share/mise/installs/go/1.25.7 go test ./internal/destination/... -run TestSetupMetadataDir_Idempotent -count=1 -v`
+Run: `go test ./internal/destination/... -run TestSetupMetadataDir_Idempotent -count=1 -v`
 
 Expected: PASS (current code already handles most of this — `MkdirAll` is idempotent, `len(torrentFile) > 0` guard exists). If it fails, fix in step 3.
 
@@ -1142,7 +1142,7 @@ if len(torrentFile) > 0 {
 
 - [ ] **Step 4: Run test to verify**
 
-Run: `GOROOT=/Users/mailoarsac/.local/share/mise/installs/go/1.25.7 go test ./internal/destination/... -run TestSetupMetadataDir_Idempotent -count=1 -v`
+Run: `go test ./internal/destination/... -run TestSetupMetadataDir_Idempotent -count=1 -v`
 
 Expected: PASS
 
@@ -1287,7 +1287,7 @@ Note: `createTestTorrentFile` needs `"fmt"` imported in the test file.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `GOROOT=/Users/mailoarsac/.local/share/mise/installs/go/1.25.7 go test ./internal/destination/... -run "TestRecoverInFlightTorrents" -count=1`
+Run: `go test ./internal/destination/... -run "TestRecoverInFlightTorrents" -count=1`
 
 Expected: compilation error — `recoverInFlightTorrents` not defined.
 
@@ -1434,13 +1434,13 @@ func (s *Server) Start(ctx context.Context) {
 
 - [ ] **Step 5: Run recovery tests**
 
-Run: `GOROOT=/Users/mailoarsac/.local/share/mise/installs/go/1.25.7 go test ./internal/destination/... -run "TestRecoverInFlightTorrents" -count=1 -v`
+Run: `go test ./internal/destination/... -run "TestRecoverInFlightTorrents" -count=1 -v`
 
 Expected: PASS
 
 - [ ] **Step 6: Run full unit test suite**
 
-Run: `GOROOT=/Users/mailoarsac/.local/share/mise/installs/go/1.25.7 go test ./internal/destination/... -short -count=1`
+Run: `go test ./internal/destination/... -short -count=1`
 
 Expected: PASS
 
@@ -1459,19 +1459,19 @@ git commit -m "feat(destination): add startup recovery from persisted metadata"
 
 - [ ] **Step 1: Run all unit tests**
 
-Run: `GOROOT=/Users/mailoarsac/.local/share/mise/installs/go/1.25.7 go test ./internal/... -short -count=1`
+Run: `go test ./internal/... -short -count=1`
 
 Expected: PASS across all packages
 
 - [ ] **Step 2: Run linter**
 
-Run: `GOROOT=/Users/mailoarsac/.local/share/mise/installs/go/1.25.7 golangci-lint run --fix`
+Run: `golangci-lint run --fix`
 
 Expected: 0 issues (fix any that appear)
 
 - [ ] **Step 3: Run E2E vet**
 
-Run: `GOROOT=/Users/mailoarsac/.local/share/mise/installs/go/1.25.7 go vet -tags=e2e ./test/e2e/...`
+Run: `go vet -tags=e2e ./test/e2e/...`
 
 Expected: No errors
 

@@ -24,11 +24,9 @@ func TestMetricsCollector_GatherSurface(t *testing.T) {
 		nil, &mockPieceSource{numPieces: 1}, logger, streaming.DefaultPieceMonitorConfig(),
 	)
 	task := &QBTask{
-		logger:    logger,
-		tracker:   tracker,
-		tracked:   NewTrackedSet(),
-		completed: NewCompletionCache("", logger),
-		backoffs:  NewBackoffTracker(),
+		logger:  logger,
+		tracker: tracker,
+		store:   newTorrentStore("", 0, logger),
 	}
 
 	registry := prometheus.NewRegistry()

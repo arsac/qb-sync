@@ -7,6 +7,7 @@ package streaming
 import (
 	"context"
 	"errors"
+	"time"
 
 	pb "github.com/arsac/qb-sync/proto"
 )
@@ -60,10 +61,21 @@ type PieceDestination interface {
 
 // StreamProgress tracks streaming progress for a torrent.
 type StreamProgress struct {
-	TorrentHash  string
-	TotalPieces  int
-	Streamed     int
-	Failed       int
+	TorrentHash string
+	TotalPieces int
+	Streamed    int
+	Failed      int
+
+	// Available counts pieces the source reports as downloaded but which have
+	// not been streamed yet. Together with LastAdvance this distinguishes a
+	// stall from a source that is merely slow to download: a source waiting on
+	// peers has nothing available, so it can never look stalled.
+	Available int
+
+	// LastAdvance is when the streamed count last increased. Zero means the
+	// torrent has not advanced since tracking began.
+	LastAdvance time.Time
+
 	InFlight     int
 	BytesSent    int64
 	BytesPerSec  float64

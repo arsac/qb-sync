@@ -218,7 +218,7 @@ func (t *QBTask) fetchTorrentsCompletedOnDest(ctx context.Context) ([]qbittorren
 		}
 	}
 
-	completedSnapshot := t.completed.Snapshot()
+	completedSnapshot := t.store.CompletedSnapshot()
 
 	var result []qbittorrent.Torrent
 	for _, torrent := range allTorrents {
