@@ -30,6 +30,15 @@ const (
 	// behavior on unary RPCs when the destination server was recently restarted.
 	finalizeConnTimeout = 20 * time.Second
 
+	// arrCheckTimeout bounds a CheckArrRejections call. The re-check path
+	// already passes a tighter batch budget and keeps it, since the earlier
+	// deadline wins; this is the backstop for the callers that pass the bare
+	// cycle context - the pre-sync check and the category refresh - so a
+	// destination that is reachable but slow cannot stall a sync cycle
+	// indefinitely. Set above the destination's own worst case, because the
+	// verdict is fail-open: cutting it short syncs a torrent *arr rejected.
+	arrCheckTimeout = 20 * time.Second
+
 	// maxReconnectBackoff caps gRPC's exponential reconnection backoff.
 	// The default (120s) causes long gaps between reconnect attempts, which
 	// can exceed finalizeConnTimeout and prevent recovery after a server restart.
@@ -581,7 +590,10 @@ func (d *GRPCDestination) CheckArrRejections(
 	ctx context.Context,
 	req *pb.CheckArrRejectionsRequest,
 ) (*pb.CheckArrRejectionsResponse, error) {
-	resp, err := d.client().CheckArrRejections(ctx, req)
+	callCtx, cancel := context.WithTimeout(ctx, arrCheckTimeout)
+	defer cancel()
+
+	resp, err := d.client().CheckArrRejections(callCtx, req)
 	if err != nil {
 		return nil, fmt.Errorf("check arr rejections RPC failed: %w", err)
 	}

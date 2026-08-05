@@ -130,6 +130,7 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_finalize_queue_wait_seconds` | `stage` | 1s .. 2h | Time a finalization waited for a stage slot (destination) |
 | `qbsync_finalize_stage_duration_seconds` | `stage`, `result` | 1s .. 6h | Per-stage finalization work time, excluding queue wait (destination) |
 | `qbsync_qb_api_call_duration_seconds` | `mode`, `operation` | 10ms .. 10s | qBittorrent API call latency (including retries) |
+| `qbsync_arr_lookup_seconds` | `instance` | 50ms .. 5s | Latency of a single *arr history lookup (destination). Only cache misses are observed, so the rate is also how often the verdict cache is missed. Sustained time in the top bucket precedes `arr_lookup_errors_total{kind="timeout"}`, since the per-call timeout is 3s |
 | `qbsync_state_flush_duration_seconds` | | 1ms .. 2.5s | Time to flush dirty torrent state to disk (destination) |
 | `qbsync_torrent_sync_latency_seconds` | | 10s .. 7200s | End-to-end sync duration from download completion to destination finalization |
 
