@@ -38,6 +38,7 @@ const (
 	defaultHealthAddr           = ":8080"
 	defaultSyncedTag            = "synced"
 	defaultSyncFailedTag        = "sync-failed"
+	defaultArrSkippedTag        = "arr-skipped"
 	DefaultSyncFailedGuard      = 4 * time.Hour
 	defaultSourceRemovedTag     = "source-removed"
 	defaultReconnectMaxDelaySec = 30
@@ -68,6 +69,14 @@ type BaseConfig struct {
 	LogLevel string // Log level: debug, info, warn, error (default: info)
 
 	DryRun bool
+
+	// Radarr and Sonarr gate syncing on whether *arr rejected the download.
+	// They live on the shared config because either side may own them: whichever
+	// process is colocated with the *arr instances configures them, and the
+	// source relays to the destination when it has none of its own. A zero
+	// instance disables filtering for its categories.
+	Radarr ArrInstanceConfig
+	Sonarr ArrInstanceConfig
 }
 
 // SourceConfig contains configuration for the source server.
@@ -104,6 +113,11 @@ type SourceConfig struct {
 	// happened to be finalizing. See docs/adr/0001.
 	SyncFailedGuard time.Duration
 	ExcludeSyncTag  string // Tag that prevents torrents from being synced (empty to disable)
+
+	// ArrSkippedTag marks source torrents the *arr filter skipped (empty
+	// disables). The instances themselves are configured on the destination,
+	// which is where the lookup runs; the source only applies the marker.
+	ArrSkippedTag string
 }
 
 // Validate validates the base configuration shared by source and destination.
@@ -113,6 +127,17 @@ func (c *BaseConfig) Validate() error {
 	if c.DataPath == "" {
 		return errors.New("data path is required")
 	}
+
+	if err := validateArrInstance("radarr", c.Radarr); err != nil {
+		return err
+	}
+	if err := validateArrInstance("sonarr", c.Sonarr); err != nil {
+		return err
+	}
+	if conflict := overlappingCategory(c.Radarr.Categories, c.Sonarr.Categories); conflict != "" {
+		return fmt.Errorf("category %q is configured for both radarr and sonarr", conflict)
+	}
+
 	return nil
 }
 
@@ -157,6 +182,7 @@ func (c *SourceConfig) Validate() error {
 	if c.DrainTimeout < 0 {
 		return errors.New("drain timeout cannot be negative")
 	}
+
 	return nil
 }
 
@@ -217,6 +243,7 @@ func (c *DestinationConfig) Validate() error {
 	if c.QBFinalizeConcurrency < 0 || c.QBFinalizeConcurrency > 8 {
 		return errors.New("qb finalize concurrency must be between 0 and 8 (0 = default 1)")
 	}
+
 	return nil
 }
 
@@ -304,6 +331,26 @@ func SetupSourceFlags(cmd *cobra.Command) {
 		int(DefaultSyncFailedGuard.Seconds()),
 		"How long a torrent must fail continuously (seconds) before it is tagged sync-failed",
 	)
+
+	flags.String("arr-skipped-tag", defaultArrSkippedTag,
+		"Tag applied to source torrents skipped by the arr filter (empty to disable)")
+	addArrFlags(flags)
+}
+
+// addArrFlags registers the Sonarr/Radarr flags. Both commands accept them:
+// whichever process sits with the instances configures them, and the source
+// relays to the destination when it has none.
+func addArrFlags(flags *pflag.FlagSet) {
+	flags.String("radarr-url", "", "Radarr URL (e.g. http://radarr:7878). Empty disables the Radarr filter.")
+	flags.String("radarr-api-key", "", "Radarr API key (sent via X-Api-Key header)")
+	flags.StringSlice("radarr-categories", nil,
+		"qBittorrent categories routed to Radarr. Filtering only applies to torrents Radarr grabbed "+
+			"itself; cross-seed and manually added torrents have no history and are synced.")
+
+	flags.String("sonarr-url", "", "Sonarr URL (e.g. http://sonarr:8989). Empty disables the Sonarr filter.")
+	flags.String("sonarr-api-key", "", "Sonarr API key (sent via X-Api-Key header)")
+	flags.StringSlice("sonarr-categories", nil,
+		"qBittorrent categories routed to Sonarr. Same scope and limitations as --radarr-categories.")
 }
 
 // SetupDestinationFlags sets up flags for the destination command.
@@ -337,6 +384,7 @@ func SetupDestinationFlags(cmd *cobra.Command) {
 		0,
 		"Concurrent piece-read goroutines during finalize verification (0 = default 4, max 16). Raise on healthy storage to speed finalize; lower if your NFS server can't handle the burst.",
 	)
+	addArrFlags(flags)
 }
 
 // bindFlags configures viper with an env prefix and binds the given flag names.
@@ -363,6 +411,9 @@ func BindSourceFlags(cmd *cobra.Command, v *viper.Viper) error {
 		"num-senders", "min-connections", "max-connections",
 		"source-removed-tag", "exclude-cleanup-tag", "sync-failed-tag", "exclude-sync-tag",
 		"sync-failed-guard",
+		"arr-skipped-tag",
+		"radarr-url", "radarr-api-key", "radarr-categories",
+		"sonarr-url", "sonarr-api-key", "sonarr-categories",
 		flagHealthAddr, flagSyncedTag,
 		flagDryRun, flagLogLevel, "drain-annotation", "drain-timeout",
 	})
@@ -374,6 +425,8 @@ func BindDestinationFlags(cmd *cobra.Command, v *viper.Viper) error {
 		"listen", flagData, "save-path", flagQBURL, flagQBUsername, flagQBPassword,
 		"poll-interval", "poll-timeout", "stream-workers", "max-stream-buffer",
 		"qb-finalize-concurrency", "verify-concurrency",
+		"radarr-url", "radarr-api-key", "radarr-categories",
+		"sonarr-url", "sonarr-api-key", "sonarr-categories",
 		flagHealthAddr, flagSyncedTag, flagDryRun, flagLogLevel,
 	})
 }
@@ -394,6 +447,16 @@ func loadBase(v *viper.Viper) BaseConfig {
 		SyncedTag:  v.GetString(flagSyncedTag),
 		LogLevel:   v.GetString(flagLogLevel),
 		DryRun:     v.GetBool(flagDryRun),
+		Radarr: ArrInstanceConfig{
+			URL:        v.GetString("radarr-url"),
+			APIKey:     v.GetString("radarr-api-key"),
+			Categories: v.GetStringSlice("radarr-categories"),
+		},
+		Sonarr: ArrInstanceConfig{
+			URL:        v.GetString("sonarr-url"),
+			APIKey:     v.GetString("sonarr-api-key"),
+			Categories: v.GetStringSlice("sonarr-categories"),
+		},
 	}
 }
 
@@ -427,6 +490,7 @@ func LoadSource(v *viper.Viper) (*SourceConfig, error) {
 		SyncFailedTag:      v.GetString("sync-failed-tag"),
 		SyncFailedGuard:    seconds(v, "sync-failed-guard"),
 		ExcludeSyncTag:     v.GetString("exclude-sync-tag"),
+		ArrSkippedTag:      v.GetString("arr-skipped-tag"),
 	}
 
 	cfg.HealthAddr = applyEnvFallback(cfg.HealthAddr, defaultHealthAddr, "HTTP_PORT", "HEALTH_PORT")
