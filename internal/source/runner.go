@@ -116,14 +116,25 @@ func (r *Runner) shutdownDrain(task *QBTask) {
 	if r.cfg.DrainAnnotation != "" {
 		allowed, err := r.checkAnnotation(drainCtx, r.cfg.DrainAnnotation)
 		if err != nil {
-			r.logger.Warn("drain skipped: annotation check failed", "error", err)
+			// Error, not warning: the gate could not be evaluated, so a drain
+			// the operator asked for silently did not happen. Common causes are
+			// a deployment missing POD_NAME/POD_NAMESPACE and an unreachable
+			// API server, and both leave synced torrents stranded on the source.
+			metrics.ShutdownDrainOutcomesTotal.WithLabelValues(metrics.ResultDrainSkippedFailed).Inc()
+			r.logger.Error("drain skipped: annotation check failed",
+				"annotation", r.cfg.DrainAnnotation,
+				"error", err,
+			)
 			return
 		}
 		if !allowed {
-			r.logger.Info("drain skipped: annotation not set")
+			metrics.ShutdownDrainOutcomesTotal.WithLabelValues(metrics.ResultDrainSkippedNotAllow).Inc()
+			r.logger.Info("drain skipped: annotation not set", "annotation", r.cfg.DrainAnnotation)
 			return
 		}
 	}
+
+	metrics.ShutdownDrainOutcomesTotal.WithLabelValues(metrics.ResultDrainStarted).Inc()
 
 	if err := task.Drain(drainCtx); err != nil {
 		r.logger.Error("shutdown drain failed", "error", err)

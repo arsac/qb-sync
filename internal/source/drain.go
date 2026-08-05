@@ -15,6 +15,10 @@ import (
 
 // checkDrainAnnotation queries the K8s API for the current pod's annotation.
 // Returns true if the annotation value is "true".
+//
+// Every error path here means the drain is skipped, so the reasons are kept
+// distinguishable: an operator reading "POD_NAME or POD_NAMESPACE not set" in
+// the shutdown log knows it is a deployment problem, not an API outage.
 func checkDrainAnnotation(ctx context.Context, annotationKey string) (bool, error) {
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
@@ -25,6 +29,19 @@ func checkDrainAnnotation(ctx context.Context, annotationKey string) (bool, erro
 		return false, fmt.Errorf("creating clientset: %w", err)
 	}
 
+	return podAnnotationIsTrue(ctx, clientset, annotationKey)
+}
+
+// podAnnotationIsTrue reads the running pod's annotation through an existing
+// client. Split from checkDrainAnnotation so tests can drive the real
+// client-go request and decode path against a stub API server: a fake
+// clientset would skip exactly the serialization this needs to cover, which is
+// where the Kubernetes and OpenAPI libraries actually get exercised.
+func podAnnotationIsTrue(
+	ctx context.Context,
+	clientset kubernetes.Interface,
+	annotationKey string,
+) (bool, error) {
 	podName := os.Getenv("POD_NAME")
 	namespace := os.Getenv("POD_NAMESPACE")
 	if podName == "" || namespace == "" {

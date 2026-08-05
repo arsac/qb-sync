@@ -36,6 +36,15 @@ const (
 	ResultSynced         = "synced" // sync_outcomes_total
 	ResultFailed         = "failed" // sync_outcomes_total
 
+	// ResultDrainStarted and its siblings label shutdown_drain_outcomes_total.
+	// The two skip reasons are kept apart because they need different
+	// responses: not_allowed is the gate working as configured, whereas
+	// check_failed means the gate could not be evaluated and the drain was
+	// dropped on the fail-closed path.
+	ResultDrainStarted         = "started"
+	ResultDrainSkippedNotAllow = "skipped_not_allowed"
+	ResultDrainSkippedFailed   = "skipped_check_failed"
+
 	SelectionPartial = "partial"
 	SelectionFull    = "full"
 
@@ -832,6 +841,25 @@ var (
 			Name:      "draining",
 			Help:      "Whether the source server is draining synced torrents on shutdown (1=draining, 0=normal)",
 		},
+	)
+
+	// ShutdownDrainOutcomesTotal records how the shutdown drain resolved.
+	//
+	// Draining only reports a drain that started, so a drain skipped at the
+	// annotation gate is indistinguishable from one that never ran at all, and
+	// from a pod that simply died before the last scrape. This counter makes
+	// the skip explicit, which matters because a skip is silent by nature: it
+	// happens at SIGTERM, in a pod that is about to disappear.
+	//
+	// Scrape timing at shutdown is unreliable, so treat the logs as the
+	// authoritative record and this as the aggregate signal.
+	ShutdownDrainOutcomesTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "shutdown_drain_outcomes_total",
+			Help:      "Shutdown drain outcomes by result (source)",
+		},
+		[]string{LabelResult},
 	)
 
 	// GRPCConnectionsConfigured tracks the maximum configured TCP connections to the destination server.
