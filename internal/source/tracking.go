@@ -79,7 +79,7 @@ func (t *QBTask) trackNewTorrents(ctx context.Context) error {
 
 	var candidates []candidateTorrent
 	for _, torrent := range torrents {
-		if t.isExcludedFromTracking(torrent) {
+		if t.isExcludedFromTracking(ctx, torrent) {
 			continue
 		}
 
@@ -140,15 +140,43 @@ func (t *QBTask) exclusionReason(torrent qbittorrent.Torrent) string {
 }
 
 // isExcludedFromTracking returns true if the torrent should be skipped during tracking:
-// non-syncable state, zero progress, excluded/sync-failed tag, already complete, or already tracked.
-func (t *QBTask) isExcludedFromTracking(torrent qbittorrent.Torrent) bool {
+// non-syncable state, zero progress, excluded/sync-failed tag, already complete,
+// already tracked, or rejected by the arr filter.
+func (t *QBTask) isExcludedFromTracking(ctx context.Context, torrent qbittorrent.Torrent) bool {
 	if t.exclusionReason(torrent) != "" {
 		return true
 	}
 
 	// Already tracked is not an exclusion worth reporting: it is the steady
 	// state of a healthy sync, not a torrent being left behind.
-	return t.store.IsTracked(torrent.Hash)
+	if t.store.IsTracked(torrent.Hash) {
+		return true
+	}
+
+	return t.arrRejects(ctx, torrent)
+}
+
+// arrRejects asks the filter whether *arr has rejected this torrent.
+//
+// Deliberately not part of exclusionReason: that runs for every torrent on
+// every cycle to publish the skipped-torrent gauges, and a lookup there would
+// put *arr on the metrics path. Ordering it last also means the cheap local
+// checks short-circuit first, so a torrent already tracked, complete or
+// quarantined never costs a request.
+func (t *QBTask) arrRejects(ctx context.Context, torrent qbittorrent.Torrent) bool {
+	decision := t.filter().ShouldSync(ctx, torrent.Hash, torrent.Category)
+	if !decision.Sync {
+		t.applyArrSkippedTag(ctx, torrent.Hash, decision.Reason)
+		t.logger.InfoContext(ctx, "arr filter: skipping torrent",
+			"hash", torrent.Hash,
+			"category", torrent.Category,
+			"reason", decision.Reason,
+		)
+		return true
+	}
+
+	t.removeArrSkippedTagIfPresent(ctx, torrent.Hash, torrent.Tags)
+	return false
 }
 
 // recordEligibilityMetrics publishes the standing population of skipped and
