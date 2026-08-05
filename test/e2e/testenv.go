@@ -171,12 +171,22 @@ services:
       start_period: 10s
 `, sourcePath, sourceConfig, sourceExtraVolumes, destinationPath, destinationConfig)
 
+	// Write the compose file ourselves rather than passing a reader.
+	// WithStackReaders materialises each reader at
+	// os.TempDir()/<UnixNano>/docker-compose-0.yml, and MkdirAll tolerates an
+	// existing directory, so two stacks created on the same nanosecond tick
+	// write that one path concurrently. The interleaved result fails schema
+	// validation on whichever key gets torn. t.TempDir() is unique per test,
+	// which removes the shared path entirely.
+	composePath := filepath.Join(tmpDir, "docker-compose.yml")
+	require.NoError(t, os.WriteFile(composePath, []byte(composeContent), 0o600))
+
 	// Create compose stack — use test name for a deterministic, unique identifier
 	// that won't collide when tests run in parallel.
 	identifier := sanitizeComposeIdentifier(t.Name())
 	stack, err := compose.NewDockerComposeWith(
 		compose.StackIdentifier(identifier),
-		compose.WithStackReaders(strings.NewReader(composeContent)),
+		compose.WithStackFiles(composePath),
 	)
 	require.NoError(t, err)
 
