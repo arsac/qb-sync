@@ -19,11 +19,12 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	QBSyncService_StreamPiecesBidi_FullMethodName = "/qbsync.QBSyncService/StreamPiecesBidi"
-	QBSyncService_InitTorrent_FullMethodName      = "/qbsync.QBSyncService/InitTorrent"
-	QBSyncService_FinalizeTorrent_FullMethodName  = "/qbsync.QBSyncService/FinalizeTorrent"
-	QBSyncService_AbortTorrent_FullMethodName     = "/qbsync.QBSyncService/AbortTorrent"
-	QBSyncService_StartTorrent_FullMethodName     = "/qbsync.QBSyncService/StartTorrent"
+	QBSyncService_StreamPiecesBidi_FullMethodName   = "/qbsync.QBSyncService/StreamPiecesBidi"
+	QBSyncService_InitTorrent_FullMethodName        = "/qbsync.QBSyncService/InitTorrent"
+	QBSyncService_FinalizeTorrent_FullMethodName    = "/qbsync.QBSyncService/FinalizeTorrent"
+	QBSyncService_AbortTorrent_FullMethodName       = "/qbsync.QBSyncService/AbortTorrent"
+	QBSyncService_StartTorrent_FullMethodName       = "/qbsync.QBSyncService/StartTorrent"
+	QBSyncService_CheckArrRejections_FullMethodName = "/qbsync.QBSyncService/CheckArrRejections"
 )
 
 // QBSyncServiceClient is the client API for QBSyncService service.
@@ -56,6 +57,18 @@ type QBSyncServiceClient interface {
 	// Called by source during disk pressure cleanup after stopping the torrent on source,
 	// ensuring destination takes over seeding before source deletes the torrent.
 	StartTorrent(ctx context.Context, in *StartTorrentRequest, opts ...grpc.CallOption) (*StartTorrentResponse, error)
+	// CheckArrRejections asks the destination whether Sonarr/Radarr rejected each
+	// torrent, so the source can skip syncing it.
+	//
+	// The lookup runs on the destination because that is where the *arr instances
+	// live. A history response can carry a hundred records; relaying returns one
+	// verdict per torrent instead, and reuses the connection already streaming
+	// pieces rather than opening an HTTP call across the link.
+	//
+	// Fail-open by contract: every error path, on either side, yields sync=true.
+	// The filter is an optimisation, and refusing to sync because *arr is
+	// unreachable would be worse than syncing something unwanted.
+	CheckArrRejections(ctx context.Context, in *CheckArrRejectionsRequest, opts ...grpc.CallOption) (*CheckArrRejectionsResponse, error)
 }
 
 type qBSyncServiceClient struct {
@@ -119,6 +132,16 @@ func (c *qBSyncServiceClient) StartTorrent(ctx context.Context, in *StartTorrent
 	return out, nil
 }
 
+func (c *qBSyncServiceClient) CheckArrRejections(ctx context.Context, in *CheckArrRejectionsRequest, opts ...grpc.CallOption) (*CheckArrRejectionsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CheckArrRejectionsResponse)
+	err := c.cc.Invoke(ctx, QBSyncService_CheckArrRejections_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // QBSyncServiceServer is the server API for QBSyncService service.
 // All implementations must embed UnimplementedQBSyncServiceServer
 // for forward compatibility.
@@ -149,6 +172,18 @@ type QBSyncServiceServer interface {
 	// Called by source during disk pressure cleanup after stopping the torrent on source,
 	// ensuring destination takes over seeding before source deletes the torrent.
 	StartTorrent(context.Context, *StartTorrentRequest) (*StartTorrentResponse, error)
+	// CheckArrRejections asks the destination whether Sonarr/Radarr rejected each
+	// torrent, so the source can skip syncing it.
+	//
+	// The lookup runs on the destination because that is where the *arr instances
+	// live. A history response can carry a hundred records; relaying returns one
+	// verdict per torrent instead, and reuses the connection already streaming
+	// pieces rather than opening an HTTP call across the link.
+	//
+	// Fail-open by contract: every error path, on either side, yields sync=true.
+	// The filter is an optimisation, and refusing to sync because *arr is
+	// unreachable would be worse than syncing something unwanted.
+	CheckArrRejections(context.Context, *CheckArrRejectionsRequest) (*CheckArrRejectionsResponse, error)
 	mustEmbedUnimplementedQBSyncServiceServer()
 }
 
@@ -173,6 +208,9 @@ func (UnimplementedQBSyncServiceServer) AbortTorrent(context.Context, *AbortTorr
 }
 func (UnimplementedQBSyncServiceServer) StartTorrent(context.Context, *StartTorrentRequest) (*StartTorrentResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method StartTorrent not implemented")
+}
+func (UnimplementedQBSyncServiceServer) CheckArrRejections(context.Context, *CheckArrRejectionsRequest) (*CheckArrRejectionsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CheckArrRejections not implemented")
 }
 func (UnimplementedQBSyncServiceServer) mustEmbedUnimplementedQBSyncServiceServer() {}
 func (UnimplementedQBSyncServiceServer) testEmbeddedByValue()                       {}
@@ -274,6 +312,24 @@ func _QBSyncService_StartTorrent_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
+func _QBSyncService_CheckArrRejections_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CheckArrRejectionsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(QBSyncServiceServer).CheckArrRejections(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: QBSyncService_CheckArrRejections_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(QBSyncServiceServer).CheckArrRejections(ctx, req.(*CheckArrRejectionsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // QBSyncService_ServiceDesc is the grpc.ServiceDesc for QBSyncService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -296,6 +352,10 @@ var QBSyncService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "StartTorrent",
 			Handler:    _QBSyncService_StartTorrent_Handler,
+		},
+		{
+			MethodName: "CheckArrRejections",
+			Handler:    _QBSyncService_CheckArrRejections_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

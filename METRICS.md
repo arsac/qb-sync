@@ -73,6 +73,12 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_abort_file_deletions_skipped_total` | `reason` | AbortTorrent file deletions suppressed by safety guards — `in_qb` (per call: torrent already in destination qB), `pre_existing` (per file: setupFile reused operator data), `unselected` (per file: deselected file we never wrote) (destination) |
 | `qbsync_finalize_busy_total` | `reason` | BUSY (congestion) responses returned to source — `queue_timeout` (stage queue saturated) or `qb_checking` (qB still rechecking at budget expiry). BUSY torrents are waiting, NOT failed: they don't get the sync-failed tag and don't count toward the retry cap (destination) |
 | `qbsync_orphan_cleanup_skipped_total` | `reason` | Orphan-cleanup attempts suppressed by safety checks — `in_qb` (torrent registered in destination qB but **not** seeding-side complete: download-side/checking/error state or <100% — never deleted, never marked; a genuinely stuck torrent worth investigating), `qb_unreachable` (destination qB returned an error during the safety check; sustained increments mean orphans accumulating because qB is offline / misconfigured) (destination) |
+| `qbsync_arr_decisions_total` | `instance`, `outcome` | *arr filter decisions (destination): `synced`, `skipped`, `failed_open`. Rising `failed_open` means torrents are syncing unfiltered because *arr could not be reached - the filter is deliberately fail-open, so this is not a sync failure |
+| `qbsync_arr_skip_total` | `instance`, `reason` | Torrents skipped on an *arr verdict (destination): `download_ignored`, `download_failed` |
+| `qbsync_arr_aborted_total` | `instance`, `reason` | In-progress syncs abandoned because the verdict flipped after transfer began (source). Distinct from `arr_skip_total`: work was thrown away, not merely never started |
+| `qbsync_arr_lookup_errors_total` | `instance`, `kind` | *arr lookup failures (destination): `timeout`, `http_5xx`, `unauthorized`, `network`, `rate_limited` |
+| `qbsync_arr_lookup_skipped_budget_total` | | Torrents that synced without a verdict because the per-cycle budget was spent (source) |
+| `qbsync_arr_relay_errors_total` | `code` | Source-side failures to obtain a verdict from the destination, by gRPC code. Separate from `failed_open`, which the destination emits: these are failures the destination never sees, so without this a source that cannot reach the destination would look like one that is simply syncing everything |
 | `qbsync_orphan_cleanup_healed_total` | | Orphans self-healed to finalized: stale unfinalized metadata whose torrent destination qB reports complete on the seeding side (path-independent — same rule the source's `checkQBCompletion` uses). The sync objective is met, so the `.finalized` marker is written to end the hourly skip. Typically the crash window between AddTorrent and the marker write; also covers legacy dirs with no `.meta` and cross-seed copies at other paths (destination) |
 
 ## Gauges
@@ -106,6 +112,7 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_grpc_connections_configured` | | Maximum TCP connections configured for gRPC streaming (source) |
 | `qbsync_grpc_connections_active` | | Current active TCP connections to destination server (source) |
 | `qbsync_sender_workers_configured` | | Concurrent sender workers configured (source) |
+| `qbsync_arr_circuit_breaker_state` | `instance` | *arr circuit breaker state (destination): 0=closed, 1=open, 2=half-open |
 | `qbsync_draining` | | Shutdown drain in progress: 1=draining, 0=normal (source) |
 | `qbsync_shutdown_drain_outcomes_total` | `result` | How the shutdown drain resolved (source): `started`, `skipped_not_allowed`, `skipped_check_failed`. `qbsync_draining` only ever reports a drain that started, so without this a skipped drain looks identical to a pod that died before its last scrape |
 
@@ -163,5 +170,7 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 - `qbsync_stalled_torrents > 0` sustained -- pieces are available on the source but not moving; these quarantine once the stall outlasts `--sync-failed-guard`
 - `qbsync_quarantined_torrents > 0` -- torrents need a human. Removing the `sync-failed` tag releases them
 - `qbsync_skipped_torrents{reason="not_syncable_state"} > 0` sustained -- torrents broken on the source (error, missingFiles) that will never sync and produce no other signal
+- `rate(qbsync_arr_relay_errors_total[15m]) > 0` sustained -- the source cannot reach the destination for verdicts, so torrents are syncing unfiltered. Note the source cannot sync at all while the destination is unreachable, so this usually accompanies a broader outage
+- `qbsync_arr_circuit_breaker_state > 0` -- an *arr instance is failing; the filter is failing open until it recovers
 - `qbsync_draining == 1` for > 5m -- shutdown drain taking too long
 - `increase(qbsync_shutdown_drain_outcomes_total{result="skipped_check_failed"}[1h]) > 0` -- the drain gate could not be evaluated, so synced torrents were left on the source. Usually a deployment missing `POD_NAME`/`POD_NAMESPACE`, or an unreachable Kubernetes API. Scrapes at shutdown are unreliable, so treat the `drain skipped: annotation check failed` log line as the authoritative signal and this as the aggregate one

@@ -21,6 +21,17 @@ const (
 	LabelDirection  = "direction"  // scaling direction (up, down)
 	LabelSelection  = "selection"  // partial, full
 	LabelStage      = "stage"      // finalization stage (disk, qb)
+	LabelInstance   = "instance"   // arr instance name (radarr, sonarr)
+	LabelKind       = "kind"       // arr lookup error kind
+	LabelOutcome    = "outcome"    // arr decision outcome (synced, skipped, failed_open)
+	LabelCode       = "code"       // gRPC status code
+)
+
+// Arr decision outcomes labelling ArrDecisionsTotal.
+const (
+	OutcomeArrSynced     = "synced"
+	OutcomeArrSkipped    = "skipped"
+	OutcomeArrFailedOpen = "failed_open"
 )
 
 // Label value constants for consistent usage across the codebase.
@@ -860,6 +871,100 @@ var (
 			Help:      "Shutdown drain outcomes by result (source)",
 		},
 		[]string{LabelResult},
+	)
+
+	// ArrDecisionsTotal counts arr filter decisions by outcome. failed_open is
+	// the one to watch: the filter deliberately syncs when it cannot reach
+	// *arr, so a rising failed_open means torrents are syncing unfiltered
+	// rather than that anything is broken in the sync path itself.
+	ArrDecisionsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "arr_decisions_total",
+			Help:      "Total arr filter decisions (outcome: synced, skipped, failed_open)",
+		},
+		[]string{LabelInstance, LabelOutcome},
+	)
+
+	// ArrSkipTotal counts pre-sync skips by the verdict that caused them.
+	ArrSkipTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "arr_skip_total",
+			Help:      "Total pre-sync skips driven by arr verdict (reason: download_ignored, download_failed)",
+		},
+		[]string{LabelInstance, LabelReason},
+	)
+
+	// ArrAbortedTotal counts in-flight syncs abandoned because the verdict
+	// flipped after the transfer had already started. Distinct from ArrSkipTotal
+	// because this one means work was thrown away, not merely never begun.
+	ArrAbortedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "arr_aborted_total",
+			Help:      "Total in-progress syncs aborted because arr's verdict flipped to skip",
+		},
+		[]string{LabelInstance, LabelReason},
+	)
+
+	// ArrLookupErrorsTotal counts arr lookup errors by kind.
+	ArrLookupErrorsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "arr_lookup_errors_total",
+			Help:      "Total arr lookup errors (kind: timeout, http_5xx, unauthorized, network, rate_limited)",
+		},
+		[]string{LabelInstance, LabelKind},
+	)
+
+	// ArrLookupSkippedBudgetTotal counts torrents that bypassed the lookup
+	// because the per-cycle time budget was already spent, and therefore synced
+	// without a verdict.
+	ArrLookupSkippedBudgetTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "arr_lookup_skipped_budget_total",
+			Help:      "Total torrents that bypassed arr lookup because the per-cycle budget was exhausted",
+		},
+	)
+
+	// ArrRelayErrorsTotal counts source-side failures to reach the destination
+	// for an *arr verdict, labelled by gRPC code.
+	//
+	// Separate from ArrDecisionsTotal{outcome="failed_open"}: that one is emitted
+	// by the destination and covers *arr being unreachable from there. These are
+	// failures the destination never sees, so without this counter a source that
+	// cannot reach the destination at all would look like a destination that is
+	// simply deciding to sync everything.
+	ArrRelayErrorsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "arr_relay_errors_total",
+			Help:      "Source-side failures to obtain an arr verdict from the destination, by gRPC code",
+		},
+		[]string{LabelCode},
+	)
+
+	// ArrCircuitBreakerState tracks the arr circuit breaker state per instance.
+	ArrCircuitBreakerState = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "arr_circuit_breaker_state",
+			Help:      "Arr circuit breaker state (0=closed, 1=open, 2=half-open)",
+		},
+		[]string{LabelInstance},
+	)
+
+	// ArrLookupSeconds is the per-call HTTP latency for arr lookups.
+	ArrLookupSeconds = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: namespace,
+			Name:      "arr_lookup_seconds",
+			Help:      "Per-call latency of arr history lookups",
+			Buckets:   []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 3, 5},
+		},
+		[]string{LabelInstance},
 	)
 
 	// GRPCConnectionsConfigured tracks the maximum configured TCP connections to the destination server.

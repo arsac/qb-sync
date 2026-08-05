@@ -161,6 +161,7 @@ func runDestination(cmd *cobra.Command, _ []string) error {
 		VerifyConcurrency:     cfg.VerifyConcurrency,
 		SyncedTag:             cfg.SyncedTag,
 		DryRun:                cfg.DryRun,
+		Arr:                   cfg.ArrConfig(),
 	}
 
 	if cfg.QBURL != "" {

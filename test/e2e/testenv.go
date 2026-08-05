@@ -48,6 +48,7 @@ const (
 	// behaviour under test. Individual tests shrink the guard.
 	defaultSyncFailedTag   = "sync-failed"
 	defaultSyncFailedGuard = 4 * time.Hour
+	defaultArrSkippedTag   = "arr-skipped"
 	progressTolerance      = 0.001 // For float comparisons
 )
 
@@ -614,6 +615,23 @@ func (env *TestEnv) SourceTorrentHasTag(ctx context.Context, hash, tag string) b
 	return false
 }
 
+// WaitForSourceTag waits for a tag to appear on a source torrent.
+func (env *TestEnv) WaitForSourceTag(ctx context.Context, hash, tag string, timeout time.Duration, msg string) {
+	env.t.Helper()
+	require.Eventually(env.t, func() bool {
+		return env.SourceTorrentHasTag(ctx, hash, tag)
+	}, timeout, time.Second, msg)
+}
+
+// DestinationHasTorrent reports whether destination qBittorrent knows the
+// torrent at all, regardless of its state or progress.
+func (env *TestEnv) DestinationHasTorrent(ctx context.Context, hash string) bool {
+	torrents, err := env.destinationClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+		Hashes: []string{hash},
+	})
+	return err == nil && len(torrents) > 0
+}
+
 // PartialFiles returns every .partial path under the destination data path.
 // These are the files qb-sync itself wrote; anything at a final path was
 // pre-existing, hardlinked, or deselected.
@@ -799,6 +817,13 @@ func WithMinSeedingTime(d time.Duration) SourceConfigOption {
 	}
 }
 
+// WithArrSkippedTag sets the tag applied to torrents the arr filter rejects.
+func WithArrSkippedTag(tag string) SourceConfigOption {
+	return func(cfg *config.SourceConfig) {
+		cfg.ArrSkippedTag = tag
+	}
+}
+
 // WithGRPCConnections sets the min and max gRPC connections.
 func WithGRPCConnections(min, max int) SourceConfigOption {
 	return func(cfg *config.SourceConfig) {
@@ -835,7 +860,9 @@ func (env *TestEnv) CreateSourceTask(cfg *config.SourceConfig) (*source.QBTask, 
 		return nil, nil, fmt.Errorf("creating gRPC destination: %w", err)
 	}
 
-	task, err := source.NewQBTask(cfg, dest, env.logger)
+	// Relay verdicts to the destination exactly as production does, so a test
+	// that configures *arr on the destination exercises the real RPC path.
+	task, err := source.NewQBTask(cfg, dest, source.NewRemoteArrFilter(dest.CheckArrRejections, env.logger), env.logger)
 	if err != nil {
 		dest.Close()
 		return nil, nil, fmt.Errorf("creating source task: %w", err)

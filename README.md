@@ -54,6 +54,8 @@ All flags can be set via environment variables with the prefix `QBSYNC_SOURCE_` 
 | `QBSYNC_SOURCE_MIN_SPACE` | `--min-space` | Min free space (GB) before syncing | `50` |
 | `QBSYNC_SOURCE_MIN_SEEDING_TIME` | `--min-seeding-time` | Min seeding time (seconds) | `3600` |
 | `QBSYNC_SOURCE_SLEEP` | `--sleep` | Sleep interval between checks (seconds) | `30` |
+| `QBSYNC_SOURCE_ARR_SKIPPED_TAG` | `--arr-skipped-tag` | Tag applied to torrents the *arr filter skipped (empty to disable) | `arr-skipped` |
+| `QBSYNC_SOURCE_RADARR_URL` etc. | `--radarr-url` etc. | Same *arr flags as the destination. Set them on whichever side can reach *arr; the source relays to the destination when it has none | |
 | `QBSYNC_SOURCE_RATE_LIMIT` | `--rate-limit` | Max bytes/sec (0 = unlimited) | `0` |
 | `QBSYNC_SOURCE_PIECE_TIMEOUT` | `--piece-timeout` | Timeout for stale in-flight pieces (seconds) | `60` |
 | `QBSYNC_SOURCE_RECONNECT_MAX_DELAY` | `--reconnect-max-delay` | Max reconnect backoff delay (seconds) | `30` |
@@ -89,6 +91,12 @@ All flags can be set via environment variables with the prefix `QBSYNC_SOURCE_` 
 | `QBSYNC_DESTINATION_QB_FINALIZE_CONCURRENCY` | `--qb-finalize-concurrency` | Max torrents concurrently in the qB add/recheck stage (0 = default 1, max 8). Raise only on SSD-backed storage | `0` |
 | `QBSYNC_DESTINATION_VERIFY_CONCURRENCY` | `--verify-concurrency` | Concurrent piece-read goroutines during finalize verification (0 = default 4). Raise on healthy storage; lower if your NFS server can't handle the burst | `0` |
 | `QBSYNC_DESTINATION_SYNCED_TAG` | `--synced-tag` | Tag for synced torrents (empty to disable) | `synced` |
+| `QBSYNC_DESTINATION_RADARR_URL` | `--radarr-url` | Radarr URL (empty disables the Radarr filter) | |
+| `QBSYNC_DESTINATION_RADARR_API_KEY` | `--radarr-api-key` | Radarr API key, sent via `X-Api-Key` | |
+| `QBSYNC_DESTINATION_RADARR_CATEGORIES` | `--radarr-categories` | qBittorrent categories routed to Radarr | |
+| `QBSYNC_DESTINATION_SONARR_URL` | `--sonarr-url` | Sonarr URL (empty disables the Sonarr filter) | |
+| `QBSYNC_DESTINATION_SONARR_API_KEY` | `--sonarr-api-key` | Sonarr API key, sent via `X-Api-Key` | |
+| `QBSYNC_DESTINATION_SONARR_CATEGORIES` | `--sonarr-categories` | qBittorrent categories routed to Sonarr | |
 | `QBSYNC_DESTINATION_HEALTH_ADDR` | `--health-addr` | Health/metrics endpoint | `:8080` |
 | `QBSYNC_DESTINATION_LOG_LEVEL` | `--log-level` | Log level: debug, info, warn, error | `info` |
 | `QBSYNC_DESTINATION_DRY_RUN` | `--dry-run` | Run without making changes | `false` |
@@ -148,6 +156,80 @@ reclaims the disk on its own.
 
 Watch `qbsync_quarantined_torrents` for the standing population and
 `qbsync_stalled_torrents` as the early warning. See [METRICS.md](METRICS.md).
+
+## Sonarr/Radarr filter (optional)
+
+qb-sync can ask Sonarr and Radarr whether they rejected a download, and skip
+syncing it if so. Torrents they have not rejected, and torrents in categories
+routed to neither, sync exactly as before.
+
+### Configure it on whichever side can reach *arr
+
+Both commands accept the same instance flags. Configure them on the process that
+sits with your *arr instances; the other side needs nothing.
+
+If the source has no instances of its own, it asks the destination over the gRPC
+connection already carrying pieces. That matters when the two are far apart: a
+history response can carry a hundred records while the answer is one bit, so
+relaying keeps the bulk local to *arr and sends only the verdict.
+
+Configuring both sides is allowed and not an error, but the local instances win
+- asking someone else about a service this process can already reach is pure
+cost.
+
+```
+# *arr alongside the destination (relayed):
+QBSYNC_DESTINATION_RADARR_URL=http://radarr:7878
+QBSYNC_DESTINATION_RADARR_API_KEY=<api-key>
+QBSYNC_DESTINATION_RADARR_CATEGORIES=radarr,radarr-1080p
+
+QBSYNC_DESTINATION_SONARR_URL=http://sonarr:8989
+QBSYNC_DESTINATION_SONARR_API_KEY=<api-key>
+QBSYNC_DESTINATION_SONARR_CATEGORIES=tv-sonarr,sonarr-anime
+
+# ...or alongside the source (queried directly):
+QBSYNC_SOURCE_RADARR_URL=http://radarr:7878
+QBSYNC_SOURCE_RADARR_API_KEY=<api-key>
+QBSYNC_SOURCE_RADARR_CATEGORIES=radarr,radarr-1080p
+```
+
+The tag is always applied by the source, since that is where the torrent lives:
+
+```
+QBSYNC_SOURCE_ARR_SKIPPED_TAG=arr-skipped   # default; "" disables the tag
+```
+
+Every instance is optional. An unconfigured instance disables filtering for its
+categories, and if neither side has any, nothing changes: the destination says
+so once and the source stops asking.
+
+### Behaviour
+
+- **Before syncing:** a new torrent's category routes it to an instance, and
+  qb-sync asks for its history. A terminal `downloadIgnored` or `downloadFailed`
+  skips it; anything else, including no history at all, syncs.
+- **While syncing:** tracked torrents are re-checked periodically. *arr often
+  rejects an import after the grab, which is precisely when the transfer is
+  already running. A flipped verdict aborts the sync and removes the partial
+  data from the destination.
+- **Tag:** skipped torrents are tagged `arr-skipped` for visibility, and the tag
+  is removed if the verdict flips back. The tag is a marker only, never the
+  reason for a skip: deciding on it would freeze the verdict, since a tagged
+  torrent could never be re-checked and un-tagged.
+- **Fail-open:** an unreachable *arr, an open circuit breaker, an exhausted
+  budget, or an unreachable destination all sync. The filter only saves work, so
+  refusing to sync because it cannot get an answer would be worse than syncing
+  something unwanted. Watch `qbsync_arr_circuit_breaker_state`,
+  `qbsync_arr_lookup_errors_total` and `qbsync_arr_relay_errors_total`.
+
+### Limitations
+
+- Only catches what *arr explicitly rejected. Cross-seeds and manual adds have
+  no *arr history and sync normally.
+- `importBlocked` and `importPending` are not treated as rejections. *arr writes
+  no history for them, and they usually mean "waiting on a human" rather than
+  "unwanted".
+- One instance per type. Separate 1080p and 4K stacks are not supported.
 
 ## Health & Metrics
 

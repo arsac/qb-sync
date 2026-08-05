@@ -27,6 +27,7 @@ type Client interface {
 	ExportTorrentCtx(ctx context.Context, hash string) ([]byte, error)
 	DeleteTorrentsCtx(ctx context.Context, hashes []string, deleteFiles bool) error
 	AddTagsCtx(ctx context.Context, hashes []string, tags string) error
+	RemoveTagsCtx(ctx context.Context, hashes []string, tags string) error
 	StopCtx(ctx context.Context, hashes []string) error
 	ResumeCtx(ctx context.Context, hashes []string) error
 	AddTorrentFromMemoryCtx(ctx context.Context, buf []byte, options map[string]string) error
@@ -240,6 +241,17 @@ func (r *ResilientClient) AddTagsCtx(
 ) error {
 	return r.runVoid(ctx, "AddTags", func(ctx context.Context) error {
 		return r.client.AddTagsCtx(ctx, hashes, tags)
+	})
+}
+
+// RemoveTagsCtx removes tags from torrents with retry.
+func (r *ResilientClient) RemoveTagsCtx(
+	ctx context.Context,
+	hashes []string,
+	tags string,
+) error {
+	return r.runVoid(ctx, "RemoveTags", func(ctx context.Context) error {
+		return r.client.RemoveTagsCtx(ctx, hashes, tags)
 	})
 }
 

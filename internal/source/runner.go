@@ -13,6 +13,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/arsac/qb-sync/internal/arr"
 	"github.com/arsac/qb-sync/internal/config"
 	"github.com/arsac/qb-sync/internal/health"
 	"github.com/arsac/qb-sync/internal/metrics"
@@ -71,7 +72,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	)
 
 	// Create QBTask with streaming destination
-	qbTask, taskErr := NewQBTask(r.cfg, dest, r.logger.With("task", "qb"))
+	qbTask, taskErr := NewQBTask(r.cfg, dest, r.buildArrFilter(ctx, dest), r.logger.With("task", "qb"))
 	if taskErr != nil {
 		return fmt.Errorf("creating qb task: %w", taskErr)
 	}
@@ -140,3 +141,74 @@ func (r *Runner) shutdownDrain(task *QBTask) {
 		r.logger.Error("shutdown drain failed", "error", err)
 	}
 }
+
+// buildArrFilter picks how this process obtains *arr verdicts.
+//
+// Where the instances are configured is the mode, so there is no separate
+// switch to set or to disagree with reality. Configured here means they are
+// reachable from the source, so query them directly. Not configured means they
+// sit with the destination, so relay: the verdict is one bit where the history
+// behind it can be a hundred records, and the gRPC connection is already open.
+//
+// Configuring both sides is not an error, but the local instances win, because
+// a round trip to ask someone else about a service this process can already
+// reach is pure cost.
+func (r *Runner) buildArrFilter(ctx context.Context, dest *streaming.GRPCDestination) arr.Filter {
+	logger := r.logger.With("component", "arr")
+
+	if r.cfg.Radarr.IsZero() && r.cfg.Sonarr.IsZero() {
+		// Cache in front of the relay. The destination caches its own *arr
+		// lookups, but that is on the far side of the link, so without this a
+		// rejected torrent costs a round trip every cycle for as long as it
+		// exists: it is never tracked, and its tag deliberately does not exclude
+		// it from being re-checked.
+		return arr.Cached(newRemoteArrFilter(dest.CheckArrRejections, logger), relayVerdictTTL)
+	}
+
+	arrCfg := r.cfg.ArrConfig()
+	arrCfg.PerCallTimeout = arrPerCallTimeout
+	arrCfg.CacheTTL = r.cfg.SleepInterval / arrCacheDivisor
+	arrCfg.BreakerMaxFailures = arrBreakerMaxFailures
+	arrCfg.BreakerResetTimeout = arrBreakerResetTimeout
+
+	filter, err := arr.New(arrCfg, logger)
+	if err != nil {
+		// Validation already rejected the shapes worth rejecting, so this is
+		// unexpected. Degrade to relaying rather than failing startup: the
+		// filter only ever saves work.
+		r.logger.ErrorContext(ctx, "arr filter falling back to the destination: local construction failed",
+			"error", err)
+		return newRemoteArrFilter(dest.CheckArrRejections, logger)
+	}
+
+	r.logger.InfoContext(ctx, "arr filter querying locally configured instances")
+	for name, pingErr := range arr.PingAll(ctx, filter) {
+		if pingErr != nil {
+			r.logger.WarnContext(ctx, "arr instance ping failed at startup",
+				"instance", name, "error", pingErr)
+			continue
+		}
+		r.logger.InfoContext(ctx, "arr instance reachable at startup", "instance", name)
+	}
+	return filter
+}
+
+// arr tuning for locally configured instances.
+const (
+	// arrPerCallTimeout bounds a single *arr HTTP request. The filter runs
+	// inside the tracking loop, so a hung *arr must not hold up the cycle.
+	arrPerCallTimeout = 3 * time.Second
+
+	// arrCacheDivisor derives the SYNC verdict TTL from the cycle interval, so
+	// a torrent is re-checked every couple of cycles rather than every one.
+	arrCacheDivisor = 2
+
+	arrBreakerMaxFailures  = 5
+	arrBreakerResetTimeout = 60 * time.Second
+
+	// relayVerdictTTL bounds how long a relayed verdict is reused. Short on
+	// purpose: this cache sits in series with the destination's, so the two
+	// staleness windows add, and the cost of being wrong is a torrent that
+	// stays skipped a few minutes after *arr changed its mind.
+	relayVerdictTTL = 5 * time.Minute
+)

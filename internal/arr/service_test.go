@@ -1,0 +1,258 @@
+package arr
+
+import (
+	"context"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/arsac/qb-sync/internal/metrics"
+	"github.com/arsac/qb-sync/internal/utils"
+)
+
+// historyHandler returns a handler that responds with the given records list as JSON.
+func historyHandler(t *testing.T, records string) http.Handler {
+	t.Helper()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/v3/history") {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"records":` + records + `}`))
+	})
+}
+
+func newTestService(t *testing.T, instances ...*instanceState) *Service {
+	t.Helper()
+	im := make(map[string]*instanceState, len(instances))
+	rt := make(map[string]string)
+	for _, ins := range instances {
+		im[ins.name] = ins
+		for _, cat := range ins.categories {
+			rt[cat] = ins.name
+		}
+	}
+	return &Service{
+		instances: im,
+		routes:    rt,
+		cache:     newVerdictCache(),
+		cacheTTL:  50 * time.Millisecond,
+		logger:    slog.New(slog.NewTextHandler(testWriter{t: t}, nil)),
+		now:       time.Now,
+	}
+}
+
+// testWriter forwards writes to t.Log so test logs appear with the test.
+type testWriter struct{ t *testing.T }
+
+func (w testWriter) Write(p []byte) (int, error) { w.t.Log(string(p)); return len(p), nil }
+
+func TestServiceShouldSyncNoCategoryRoute(t *testing.T) {
+	svc := newTestService(t)
+	d := svc.ShouldSync(context.Background(), "abc", "unmapped-category")
+	if !d.Sync || d.Reason != ReasonNoCategory {
+		t.Fatalf("expected SYNC/NoCategory, got %+v", d)
+	}
+}
+
+func TestServiceShouldSyncIgnoredEvent(t *testing.T) {
+	srv := httptest.NewServer(historyHandler(t,
+		`[{"eventType":"downloadIgnored","downloadId":"abc","date":"2026-04-29T10:00:00Z"}]`))
+	t.Cleanup(srv.Close)
+
+	svc := newTestService(t, &instanceState{
+		name:       "radarr",
+		client:     NewClient(srv.URL, "k", time.Second),
+		categories: []string{"radarr"},
+	})
+
+	d := svc.ShouldSync(context.Background(), "abc", "radarr")
+	if d.Sync {
+		t.Fatalf("expected SKIP, got %+v", d)
+	}
+	if d.Reason != ReasonIgnored {
+		t.Fatalf("expected ReasonIgnored, got %q", d.Reason)
+	}
+}
+
+func TestServiceShouldSyncEmptyHistory(t *testing.T) {
+	srv := httptest.NewServer(historyHandler(t, `[]`))
+	t.Cleanup(srv.Close)
+
+	svc := newTestService(t, &instanceState{
+		name:       "sonarr",
+		client:     NewClient(srv.URL, "k", time.Second),
+		categories: []string{"tv-sonarr"},
+	})
+
+	d := svc.ShouldSync(context.Background(), "abc", "tv-sonarr")
+	if !d.Sync || d.Reason != ReasonEmptyHistory {
+		t.Fatalf("expected SYNC/EmptyHistory, got %+v", d)
+	}
+}
+
+func TestServiceShouldSyncCacheHit(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"records":[{"eventType":"downloadIgnored","downloadId":"abc"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	svc := newTestService(t, &instanceState{
+		name:       "radarr",
+		client:     NewClient(srv.URL, "k", time.Second),
+		categories: []string{"radarr"},
+	})
+
+	for range 5 {
+		_ = svc.ShouldSync(context.Background(), "abc", "radarr")
+	}
+	if calls != 1 {
+		t.Fatalf("expected 1 HTTP call (rest cached), got %d", calls)
+	}
+}
+
+func TestServiceCircuitBreakerOpensAfterFailures(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	inst := &instanceState{
+		name:       "radarr",
+		client:     NewClient(srv.URL, "k", 100*time.Millisecond),
+		categories: []string{"radarr"},
+	}
+	attachBreaker(inst, utils.CircuitBreakerConfig{MaxFailures: 3, ResetTimeout: time.Hour})
+
+	svc := newTestService(t, inst)
+	// Drive 3 distinct hashes through the failing endpoint to trip the breaker.
+	for i := range 3 {
+		hash := []string{"a", "b", "c"}[i]
+		_ = svc.ShouldSync(context.Background(), hash, "radarr")
+	}
+	// Next call should short-circuit with ReasonCircuitOpen.
+	d := svc.ShouldSync(context.Background(), "d", "radarr")
+	if !d.Sync || d.Reason != ReasonCircuitOpen {
+		t.Fatalf("expected SYNC/CircuitOpen, got %+v", d)
+	}
+
+	// Gauge must report 1 (open) after the breaker trips.
+	val := testutil.ToFloat64(metrics.ArrCircuitBreakerState.WithLabelValues("radarr"))
+	if val != 1 {
+		t.Fatalf("expected ArrCircuitBreakerState=1 (open), got %v", val)
+	}
+}
+
+func TestServiceEmitsDecisionMetric(t *testing.T) {
+	srv := httptest.NewServer(historyHandler(t,
+		`[{"eventType":"downloadIgnored","downloadId":"abc"}]`))
+	t.Cleanup(srv.Close)
+
+	svc := newTestService(t, &instanceState{
+		name:       "radarr",
+		client:     NewClient(srv.URL, "k", time.Second),
+		categories: []string{"radarr"},
+	})
+
+	before := testutil.ToFloat64(metrics.ArrDecisionsTotal.WithLabelValues("radarr", "skipped"))
+	_ = svc.ShouldSync(context.Background(), "abc", "radarr")
+	after := testutil.ToFloat64(metrics.ArrDecisionsTotal.WithLabelValues("radarr", "skipped"))
+	if after-before != 1 {
+		t.Fatalf("expected counter to increment by 1, got delta=%v", after-before)
+	}
+}
+
+func TestNewWithEmptyConfigReturnsNoop(t *testing.T) {
+	f, err := New(Config{}, slog.Default())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := f.(noopFilter); !ok {
+		t.Fatalf("expected noopFilter, got %T", f)
+	}
+}
+
+func TestNewRejectsURLWithoutAPIKey(t *testing.T) {
+	_, err := New(Config{
+		Radarr: InstanceConfig{URL: "http://radarr:7878"},
+	}, slog.Default())
+	if err == nil {
+		t.Fatalf("expected error when URL is set but APIKey is empty")
+	}
+}
+
+func TestNewRejectsCategoryConflict(t *testing.T) {
+	_, err := New(Config{
+		Radarr: InstanceConfig{URL: "http://r", APIKey: "k", Categories: []string{"shared"}},
+		Sonarr: InstanceConfig{URL: "http://s", APIKey: "k", Categories: []string{"shared"}},
+	}, slog.Default())
+	if err == nil {
+		t.Fatalf("expected error for category appearing in both instances")
+	}
+}
+
+func TestServiceCachesIgnoredVerdictForLongTTL(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"records":[{"eventType":"downloadIgnored","downloadId":"abc"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	svc := newTestService(t, &instanceState{
+		name:       "radarr",
+		client:     NewClient(srv.URL, "k", time.Second),
+		categories: []string{"radarr"},
+	})
+
+	d := svc.ShouldSync(context.Background(), "abc", "radarr")
+	if d.Sync || d.Reason != ReasonIgnored {
+		t.Fatalf("expected SKIP/Ignored, got %+v", d)
+	}
+
+	// Sleep past the short sync TTL (50ms) but well inside the terminal TTL (1h).
+	time.Sleep(100 * time.Millisecond)
+
+	d2 := svc.ShouldSync(context.Background(), "abc", "radarr")
+	if d2.Sync || d2.Reason != ReasonIgnored {
+		t.Fatalf("expected cached SKIP/Ignored, got %+v", d2)
+	}
+	if calls != 1 {
+		t.Fatalf("expected 1 HTTP call (terminal verdict cached), got %d", calls)
+	}
+}
+
+func TestServiceDoesNotCacheLookupFailures(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	svc := newTestService(t, &instanceState{
+		name:       "radarr",
+		client:     NewClient(srv.URL, "k", time.Second),
+		categories: []string{"radarr"},
+	})
+
+	for range 3 {
+		d := svc.ShouldSync(context.Background(), "abc", "radarr")
+		if !d.Sync || d.Reason != ReasonLookupFailed {
+			t.Fatalf("expected SYNC/LookupFailed, got %+v", d)
+		}
+	}
+	// Each call should hit the server (not cached).
+	if calls != 3 {
+		t.Fatalf("expected 3 HTTP calls (errors not cached), got %d", calls)
+	}
+}

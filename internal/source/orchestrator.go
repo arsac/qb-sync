@@ -13,6 +13,7 @@ import (
 	"github.com/autobrr/go-qbittorrent"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/arsac/qb-sync/internal/arr"
 	"github.com/arsac/qb-sync/internal/config"
 	"github.com/arsac/qb-sync/internal/congestion"
 	"github.com/arsac/qb-sync/internal/metrics"
@@ -81,6 +82,11 @@ type QBTask struct {
 	// what the destination has finalized, and finalization retry accounting.
 	store *torrentStore
 
+	// arrFilter decides whether *arr has rejected a torrent. Read it through
+	// filter(), never directly: tests build QBTask literals and would otherwise
+	// each have to remember to set it.
+	arrFilter arr.Filter
+
 	// Cycle counter for periodic pruning of completedOnDest
 	pruneCycleCount int
 
@@ -110,6 +116,7 @@ type QBTask struct {
 func NewQBTask(
 	cfg *config.SourceConfig,
 	dest *streaming.GRPCDestination,
+	arrFilter arr.Filter,
 	logger *slog.Logger,
 ) (*QBTask, error) {
 	rawClient := qbittorrent.NewClient(qbittorrent.Config{
@@ -149,6 +156,12 @@ func NewQBTask(
 
 	cachePath := filepath.Join(cfg.DataPath, ".qb-sync", "completed_on_dest.json")
 
+	// Normalise here rather than trusting every caller, so the "never nil"
+	// invariant is enforced by the constructor instead of by convention.
+	if arrFilter == nil {
+		arrFilter = arr.NoopFilter()
+	}
+
 	t := &QBTask{
 		cfg:       cfg,
 		logger:    logger,
@@ -158,6 +171,7 @@ func NewQBTask(
 		tracker:   tracker,
 		queue:     queue,
 		store:     newTorrentStore(cachePath, cfg.SyncFailedGuard, logger),
+		arrFilter: arrFilter,
 	}
 
 	t.store.Load()
@@ -262,6 +276,7 @@ func (t *QBTask) runOnce(ctx context.Context) {
 		t.pruneCompletedOnDest(ctx)
 		t.recheckFileSelections(ctx)
 		t.pruneStaleMonitorEntries(ctx)
+		t.recheckArrRejectedTorrents(ctx)
 	}
 }
 
