@@ -209,7 +209,7 @@ func TestE2E_Repro_OrphanIsNotReclaimed(t *testing.T) {
 
 	destMetaDir := filepath.Join(env.DestinationPath(), ".qbsync", wiredCDHash)
 	require.DirExists(t, destMetaDir, "destination metadata directory should exist mid-transfer")
-	require.NotZero(t, len(env.PartialFiles()), "destination should hold .partial files mid-transfer")
+	require.NotEmpty(t, env.PartialFiles(), "destination should hold .partial files mid-transfer")
 
 	// Abandon the transfer the way a crashed or decommissioned source does:
 	// stop talking to the destination, without deleting the torrent from
@@ -228,6 +228,6 @@ func TestE2E_Repro_OrphanIsNotReclaimed(t *testing.T) {
 	}, wait, time.Second,
 		"BUG: orphan is never reclaimed, its metadata directory persists forever")
 
-	assert.Zero(t, len(env.PartialFiles()),
+	assert.Empty(t, env.PartialFiles(),
 		"reclamation should remove the .partial files it wrote")
 }

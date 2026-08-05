@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -269,7 +270,12 @@ func TestE2E_FullSyncFlow(t *testing.T) {
 	}()
 
 	t.Log("Waiting for torrent to be synced to destination...")
-	env.WaitForTorrentCompleteOnDestination(ctx, bigBuckBunnyHash, 3*time.Minute, "torrent should be complete on destination")
+	env.WaitForTorrentCompleteOnDestination(
+		ctx,
+		bigBuckBunnyHash,
+		3*time.Minute,
+		"torrent should be complete on destination",
+	)
 
 	// Wait for the orchestrator to finish post-finalization work (tag application)
 	// before canceling. WaitForTorrentCompleteOnDestination returns as soon as the torrent
@@ -443,7 +449,12 @@ func TestE2E_TorrentSeedsOnSourceAfterSync(t *testing.T) {
 	}()
 
 	t.Log("Waiting for torrent to be synced to destination...")
-	env.WaitForTorrentCompleteOnDestination(ctx, wiredCDHash, syncCompleteTimeout, "torrent should be complete on destination")
+	env.WaitForTorrentCompleteOnDestination(
+		ctx,
+		wiredCDHash,
+		syncCompleteTimeout,
+		"torrent should be complete on destination",
+	)
 
 	cancelOrchestrator()
 	<-orchestratorDone
@@ -505,7 +516,12 @@ func TestE2E_StopBeforeDeleteOnDiskPressure(t *testing.T) {
 	}()
 
 	t.Log("Waiting for torrent to be synced to destination...")
-	env.WaitForTorrentCompleteOnDestination(ctx, wiredCDHash, syncCompleteTimeout, "torrent should be complete on destination")
+	env.WaitForTorrentCompleteOnDestination(
+		ctx,
+		wiredCDHash,
+		syncCompleteTimeout,
+		"torrent should be complete on destination",
+	)
 
 	// Wait for background finalization to fully complete (including the explicit stop
 	// after addAndVerifyTorrent). The synced tag is applied after the stop, so this
@@ -602,7 +618,12 @@ func TestE2E_SourceRemovedTagOnDiskPressure(t *testing.T) {
 	}()
 
 	t.Log("Waiting for torrent to be synced to destination...")
-	env.WaitForTorrentCompleteOnDestination(ctx, wiredCDHash, syncCompleteTimeout, "torrent should be complete on destination")
+	env.WaitForTorrentCompleteOnDestination(
+		ctx,
+		wiredCDHash,
+		syncCompleteTimeout,
+		"torrent should be complete on destination",
+	)
 
 	// Wait for background finalization to apply the synced tag on destination before canceling the orchestrator.
 	// The synced tag is applied after addAndVerifyTorrent completes.
@@ -1110,8 +1131,18 @@ func TestE2E_HardlinkGroupDeletion(t *testing.T) {
 	}()
 
 	t.Log("Waiting for both torrents to sync to destination...")
-	env.WaitForTorrentCompleteOnDestination(ctx, bigBuckBunnyHash, syncCompleteTimeout, "BBB should be complete on destination")
-	env.WaitForTorrentCompleteOnDestination(ctx, wiredCDHash, syncCompleteTimeout, "Wired CD should be complete on destination")
+	env.WaitForTorrentCompleteOnDestination(
+		ctx,
+		bigBuckBunnyHash,
+		syncCompleteTimeout,
+		"BBB should be complete on destination",
+	)
+	env.WaitForTorrentCompleteOnDestination(
+		ctx,
+		wiredCDHash,
+		syncCompleteTimeout,
+		"Wired CD should be complete on destination",
+	)
 	// Wait for source synced tags before stopping the orchestrator so drain can
 	// find both torrents (fetchTorrentsCompletedOnDest requires the source synced tag).
 	env.WaitForSyncedTagOnSource(ctx, bigBuckBunnyHash, 30*time.Second,
@@ -1272,7 +1303,12 @@ func TestE2E_DestinationHardlinkDeduplication(t *testing.T) {
 
 	// Wait for sync to complete (torrent complete on destination qBittorrent)
 	t.Log("Waiting for Wired CD to sync to destination...")
-	env.WaitForTorrentCompleteOnDestination(ctx, wiredCDHash, syncCompleteTimeout, "torrent should be complete on destination")
+	env.WaitForTorrentCompleteOnDestination(
+		ctx,
+		wiredCDHash,
+		syncCompleteTimeout,
+		"torrent should be complete on destination",
+	)
 
 	// Stop orchestrator
 	cancelOrchestrator()
@@ -1430,8 +1466,18 @@ func TestE2E_NonHardlinkedDeletedIndependently(t *testing.T) {
 	}()
 
 	t.Log("Waiting for both torrents to sync to destination...")
-	env.WaitForTorrentCompleteOnDestination(ctx, bigBuckBunnyHash, syncCompleteTimeout, "BBB should be complete on destination")
-	env.WaitForTorrentCompleteOnDestination(ctx, wiredCDHash, syncCompleteTimeout, "Wired CD should be complete on destination")
+	env.WaitForTorrentCompleteOnDestination(
+		ctx,
+		bigBuckBunnyHash,
+		syncCompleteTimeout,
+		"BBB should be complete on destination",
+	)
+	env.WaitForTorrentCompleteOnDestination(
+		ctx,
+		wiredCDHash,
+		syncCompleteTimeout,
+		"Wired CD should be complete on destination",
+	)
 	// Wait for source synced tags before stopping the orchestrator so drain can
 	// find both torrents (fetchTorrentsCompletedOnDest requires the source synced tag).
 	env.WaitForSyncedTagOnSource(ctx, bigBuckBunnyHash, 30*time.Second,
@@ -1532,7 +1578,12 @@ func TestE2E_FullSyncFlowWiredCD(t *testing.T) {
 
 	// Wait for torrent to be synced (complete on destination qBittorrent)
 	t.Log("Waiting for torrent to be synced to destination...")
-	env.WaitForTorrentCompleteOnDestination(ctx, wiredCDHash, syncCompleteTimeout, "torrent should be complete on destination")
+	env.WaitForTorrentCompleteOnDestination(
+		ctx,
+		wiredCDHash,
+		syncCompleteTimeout,
+		"torrent should be complete on destination",
+	)
 
 	t.Log("Torrent is complete on destination qBittorrent")
 
@@ -1898,12 +1949,7 @@ func TestE2E_ExcludeSyncTagReactive(t *testing.T) {
 	// Step 3: Wait for the torrent to appear in the source's completedOnDest cache.
 	t.Log("Waiting for torrent to complete sync...")
 	require.Eventually(t, func() bool {
-		for _, hash := range task.FetchCompletedOnDestination() {
-			if hash == bigBuckBunnyHash {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(task.FetchCompletedOnDestination(), bigBuckBunnyHash)
 	}, syncCompleteTimeout, pollInterval,
 		"torrent should appear in completedOnDest cache after sync")
 	t.Log("Confirmed: torrent is in completedOnDest cache")
@@ -1920,13 +1966,7 @@ func TestE2E_ExcludeSyncTagReactive(t *testing.T) {
 	// survives.
 	t.Log("Verifying completion-cache entry survives a check-excluded cycle...")
 	time.Sleep(15 * time.Second)
-	stillCached := false
-	for _, hash := range task.FetchCompletedOnDestination() {
-		if hash == bigBuckBunnyHash {
-			stillCached = true
-			break
-		}
-	}
+	stillCached := slices.Contains(task.FetchCompletedOnDestination(), bigBuckBunnyHash)
 	require.True(t, stillCached,
 		"torrent should remain in completedOnDest after exclude tag is applied "+
 			"(preserved as authoritative record for safe-handoff)")
@@ -1950,12 +1990,7 @@ func TestE2E_ExcludeSyncTagReactive(t *testing.T) {
 	// Step 8: Confirm the torrent is still in the cache after tag removal.
 	t.Log("Confirming torrent remains complete on destination after tag removal...")
 	require.Eventually(t, func() bool {
-		for _, hash := range task.FetchCompletedOnDestination() {
-			if hash == bigBuckBunnyHash {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(task.FetchCompletedOnDestination(), bigBuckBunnyHash)
 	}, syncCompleteTimeout, pollInterval,
 		"torrent should remain in completedOnDest after tag removal")
 
@@ -2010,12 +2045,7 @@ func TestE2E_RemovedCompletedAutoHandoff(t *testing.T) {
 	}()
 
 	require.Eventually(t, func() bool {
-		for _, hash := range task.FetchCompletedOnDestination() {
-			if hash == bigBuckBunnyHash {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(task.FetchCompletedOnDestination(), bigBuckBunnyHash)
 	}, syncCompleteTimeout, pollInterval, "torrent should be in completedOnDest cache")
 	env.AssertTorrentCompleteOnDestination(ctx, bigBuckBunnyHash)
 
@@ -2446,12 +2476,7 @@ func TestE2E_FinalizedTorrentSkippedOnRecovery(t *testing.T) {
 	// re-streaming.
 	t.Log("Waiting for orchestrator to recognize torrent as already complete...")
 	require.Eventually(t, func() bool {
-		for _, hash := range task2.FetchCompletedOnDestination() {
-			if hash == bigBuckBunnyHash {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(task2.FetchCompletedOnDestination(), bigBuckBunnyHash)
 	}, syncCompleteTimeout, pollInterval,
 		"orchestrator should recognize finalized torrent as complete without re-streaming")
 
