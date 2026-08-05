@@ -78,6 +78,7 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_arr_aborted_total` | `instance`, `reason` | In-progress syncs abandoned because the verdict flipped after transfer began (source). Distinct from `arr_skip_total`: work was thrown away, not merely never started |
 | `qbsync_arr_lookup_errors_total` | `instance`, `kind` | *arr lookup failures (destination): `timeout`, `http_5xx`, `unauthorized`, `network`, `rate_limited` |
 | `qbsync_arr_lookup_skipped_budget_total` | | Torrents that synced without a verdict because the per-cycle budget was spent (source) |
+| `qbsync_arr_category_refresh_errors_total` | `instance` | Failures discovering which categories an *arr instance claims. Routing is discovered rather than configured, so sustained failures mean filtering is running against a stale map - it keeps the last good one rather than clearing it, which is safe but silent |
 | `qbsync_arr_relay_errors_total` | `code` | Source-side failures to obtain a verdict from the destination, by gRPC code. Separate from `failed_open`, which the destination emits: these are failures the destination never sees, so without this a source that cannot reach the destination would look like one that is simply syncing everything |
 | `qbsync_orphan_cleanup_healed_total` | | Orphans self-healed to finalized: stale unfinalized metadata whose torrent destination qB reports complete on the seeding side (path-independent — same rule the source's `checkQBCompletion` uses). The sync objective is met, so the `.finalized` marker is written to end the hourly skip. Typically the crash window between AddTorrent and the marker write; also covers legacy dirs with no `.meta` and cross-seed copies at other paths (destination) |
 
@@ -112,6 +113,7 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_grpc_connections_configured` | | Maximum TCP connections configured for gRPC streaming (source) |
 | `qbsync_grpc_connections_active` | | Current active TCP connections to destination server (source) |
 | `qbsync_sender_workers_configured` | | Concurrent sender workers configured (source) |
+| `qbsync_arr_routed_categories` | `instance` | Categories currently routed to each *arr instance. Zero means the filter is inert for it: nothing routes there, so nothing is ever checked against it |
 | `qbsync_arr_circuit_breaker_state` | `instance` | *arr circuit breaker state (destination): 0=closed, 1=open, 2=half-open |
 | `qbsync_draining` | | Shutdown drain in progress: 1=draining, 0=normal (source) |
 | `qbsync_shutdown_drain_outcomes_total` | `result` | How the shutdown drain resolved (source): `started`, `skipped_not_allowed`, `skipped_check_failed`. `qbsync_draining` only ever reports a drain that started, so without this a skipped drain looks identical to a pod that died before its last scrape |

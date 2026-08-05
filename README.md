@@ -55,7 +55,7 @@ All flags can be set via environment variables with the prefix `QBSYNC_SOURCE_` 
 | `QBSYNC_SOURCE_MIN_SEEDING_TIME` | `--min-seeding-time` | Min seeding time (seconds) | `3600` |
 | `QBSYNC_SOURCE_SLEEP` | `--sleep` | Sleep interval between checks (seconds) | `30` |
 | `QBSYNC_SOURCE_ARR_SKIPPED_TAG` | `--arr-skipped-tag` | Tag applied to torrents the *arr filter skipped (empty to disable) | `arr-skipped` |
-| `QBSYNC_SOURCE_RADARR_URL` etc. | `--radarr-url` etc. | Same *arr flags as the destination. Set them on whichever side can reach *arr; the source relays to the destination when it has none | |
+| `QBSYNC_SOURCE_RADARR_URL` / `_API_KEY` | `--radarr-url`, `--radarr-api-key` | Same *arr flags as the destination. Set them on whichever side can reach *arr; the source relays to the destination when it has none. Categories are discovered, not configured | |
 | `QBSYNC_SOURCE_RATE_LIMIT` | `--rate-limit` | Max bytes/sec (0 = unlimited) | `0` |
 | `QBSYNC_SOURCE_PIECE_TIMEOUT` | `--piece-timeout` | Timeout for stale in-flight pieces (seconds) | `60` |
 | `QBSYNC_SOURCE_RECONNECT_MAX_DELAY` | `--reconnect-max-delay` | Max reconnect backoff delay (seconds) | `30` |
@@ -93,10 +93,8 @@ All flags can be set via environment variables with the prefix `QBSYNC_SOURCE_` 
 | `QBSYNC_DESTINATION_SYNCED_TAG` | `--synced-tag` | Tag for synced torrents (empty to disable) | `synced` |
 | `QBSYNC_DESTINATION_RADARR_URL` | `--radarr-url` | Radarr URL (empty disables the Radarr filter) | |
 | `QBSYNC_DESTINATION_RADARR_API_KEY` | `--radarr-api-key` | Radarr API key, sent via `X-Api-Key` | |
-| `QBSYNC_DESTINATION_RADARR_CATEGORIES` | `--radarr-categories` | qBittorrent categories routed to Radarr | |
 | `QBSYNC_DESTINATION_SONARR_URL` | `--sonarr-url` | Sonarr URL (empty disables the Sonarr filter) | |
 | `QBSYNC_DESTINATION_SONARR_API_KEY` | `--sonarr-api-key` | Sonarr API key, sent via `X-Api-Key` | |
-| `QBSYNC_DESTINATION_SONARR_CATEGORIES` | `--sonarr-categories` | qBittorrent categories routed to Sonarr | |
 | `QBSYNC_DESTINATION_HEALTH_ADDR` | `--health-addr` | Health/metrics endpoint | `:8080` |
 | `QBSYNC_DESTINATION_LOG_LEVEL` | `--log-level` | Log level: debug, info, warn, error | `info` |
 | `QBSYNC_DESTINATION_DRY_RUN` | `--dry-run` | Run without making changes | `false` |
@@ -181,17 +179,20 @@ cost.
 # *arr alongside the destination (relayed):
 QBSYNC_DESTINATION_RADARR_URL=http://radarr:7878
 QBSYNC_DESTINATION_RADARR_API_KEY=<api-key>
-QBSYNC_DESTINATION_RADARR_CATEGORIES=radarr,radarr-1080p
 
 QBSYNC_DESTINATION_SONARR_URL=http://sonarr:8989
 QBSYNC_DESTINATION_SONARR_API_KEY=<api-key>
-QBSYNC_DESTINATION_SONARR_CATEGORIES=tv-sonarr,sonarr-anime
 
 # ...or alongside the source (queried directly):
 QBSYNC_SOURCE_RADARR_URL=http://radarr:7878
 QBSYNC_SOURCE_RADARR_API_KEY=<api-key>
-QBSYNC_SOURCE_RADARR_CATEGORIES=radarr,radarr-1080p
 ```
+
+There is no category setting. qb-sync reads the categories straight from each
+*arr's download client configuration and refreshes them periodically, so
+renaming a category in Sonarr does not leave a stale list here silently
+matching nothing. Both the download category and the imported one are picked
+up, since *arr moves a torrent to the latter after a successful import.
 
 The tag is always applied by the source, since that is where the torrent lives:
 
@@ -205,13 +206,15 @@ so once and the source stops asking.
 
 ### Behaviour
 
-- **Before syncing:** a new torrent's category routes it to an instance, and
-  qb-sync asks for its history. A terminal `downloadIgnored` or `downloadFailed`
+- **Before syncing:** a torrent whose category no *arr claims is skipped
+  locally, without a lookup - on a typical library that is most of them. For
+  the rest, qb-sync asks the owning instance for its history. A terminal `downloadIgnored` or `downloadFailed`
   skips it; anything else, including no history at all, syncs.
 - **While syncing:** tracked torrents are re-checked periodically. *arr often
   rejects an import after the grab, which is precisely when the transfer is
-  already running. A flipped verdict aborts the sync and removes the partial
-  data from the destination.
+  already running. A flipped verdict aborts the sync and discards the partial
+  copy from the destination, freeing the disk it was holding. The torrent on the
+  source is untouched.
 - **Tag:** skipped torrents are tagged `arr-skipped` for visibility, and the tag
   is removed if the verdict flips back. The tag is a marker only, never the
   reason for a skip: deciding on it would freeze the verdict, since a tagged

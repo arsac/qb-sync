@@ -3,6 +3,7 @@ package destination
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/arsac/qb-sync/internal/arr"
 	pb "github.com/arsac/qb-sync/proto"
@@ -41,6 +42,7 @@ func (s *Server) CheckArrRejections(
 ) (*pb.CheckArrRejectionsResponse, error) {
 	resp := &pb.CheckArrRejectionsResponse{
 		FilterEnabled: s.arrEnabled,
+		Categories:    s.arrFilter.RoutedCategories(),
 		Verdicts:      make([]*pb.ArrVerdict, 0, len(req.GetItems())),
 	}
 	if len(req.GetItems()) == 0 {
@@ -61,4 +63,43 @@ func (s *Server) CheckArrRejections(
 		})
 	}
 	return resp, nil
+}
+
+// runArrCategoryRefresher keeps the routed categories current.
+//
+// Discovery runs here rather than inside the filter because the Service owns no
+// goroutine: whichever process holds the instances schedules it, which keeps
+// the lifetime with the thing that already has a shutdown context.
+func (s *Server) runArrCategoryRefresher(ctx context.Context) {
+	if !s.arrEnabled {
+		return
+	}
+
+	// Once up front so the filter is useful from the first sync rather than
+	// after the first tick, during which nothing would route and everything
+	// would sync unfiltered.
+	s.refreshArrCategories(ctx)
+
+	ticker := time.NewTicker(arr.CategoryRefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.refreshArrCategories(ctx)
+		}
+	}
+}
+
+func (s *Server) refreshArrCategories(ctx context.Context) {
+	if err := s.arrFilter.RefreshCategories(ctx); err != nil {
+		// Not fatal: the previous map is kept, so filtering carries on against
+		// what was last known rather than silently switching off.
+		s.logger.WarnContext(ctx, "arr category discovery failed, keeping the previous routing",
+			"error", err)
+		return
+	}
+	s.logger.InfoContext(ctx, "arr categories discovered",
+		"categories", s.arrFilter.RoutedCategories())
 }

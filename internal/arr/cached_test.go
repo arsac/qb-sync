@@ -13,6 +13,11 @@ type countingFilter struct {
 	decision Decision
 }
 
+func (c *countingFilter) RefreshCategories(context.Context) error { return nil }
+
+// routed is everything: these stubs answer for whatever they are asked.
+func (c *countingFilter) RoutedCategories() []string { return nil }
+
 func (c *countingFilter) ShouldSync(ctx context.Context, hash, category string) Decision {
 	return c.ShouldSyncAll(ctx, []CheckItem{{Hash: hash, Category: category}})[0]
 }

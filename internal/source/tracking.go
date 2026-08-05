@@ -164,6 +164,18 @@ func (t *QBTask) isExcludedFromTracking(ctx context.Context, torrent qbittorrent
 // checks short-circuit first, so a torrent already tracked, complete or
 // quarantined never costs a request.
 func (t *QBTask) arrRejects(ctx context.Context, torrent qbittorrent.Torrent) bool {
+	// Decide locally whether this is even an *arr torrent. The routed set is
+	// discovered from the instances, so on a typical library most categories
+	// belong to no *arr and would otherwise cost a lookup - a full round trip
+	// each, when the verdict is relayed - only to be told so.
+	//
+	// An empty set means nothing routes anywhere, either because discovery has
+	// not landed yet or because no instance claims anything. Both mean the
+	// filter cannot reach a verdict, so asking would be pointless.
+	if !slices.Contains(t.filter().RoutedCategories(), torrent.Category) {
+		return false
+	}
+
 	decision := t.filter().ShouldSync(ctx, torrent.Hash, torrent.Category)
 	if !decision.Sync {
 		t.applyArrSkippedTag(ctx, torrent.Hash, decision.Reason)

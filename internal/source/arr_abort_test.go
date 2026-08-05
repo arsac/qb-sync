@@ -13,16 +13,21 @@ import (
 	"github.com/arsac/qb-sync/internal/streaming"
 )
 
-// The mid-flight abort is the only place qb-sync deletes a user's data on the
-// strength of a third party's opinion. Quarantine, by deliberate contrast,
-// keeps the bytes. So these tests care less about the happy path than about
-// every way the filter could delete something it should not have.
+// The mid-flight abort discards partial data on the strength of a third
+// party's opinion, so these tests care less about the happy path than about
+// every way it could fire when it should not have.
 
 // batchFilter returns a fixed decision per hash and records what it was asked.
 type batchFilter struct {
 	byHash map[string]arr.Decision
 	asked  []arr.CheckItem
 }
+
+func (b *batchFilter) RefreshCategories(context.Context) error { return nil }
+
+// The categories the fixtures use. The re-check pre-filters on this, so a stub
+// reporting nothing would never be asked about anything.
+func (b *batchFilter) RoutedCategories() []string { return []string{"radarr", "tv-sonarr"} }
 
 func (b *batchFilter) ShouldSync(ctx context.Context, hash, category string) arr.Decision {
 	return b.ShouldSyncAll(ctx, []arr.CheckItem{{Hash: hash, Category: category}})[0]
@@ -66,7 +71,7 @@ func TestRecheckArrRejectedTorrents(t *testing.T) {
 
 	const hash = "abc"
 
-	t.Run("a flipped verdict aborts the sync and deletes the partial data", func(t *testing.T) {
+	t.Run("a flipped verdict aborts the sync and discards the partial data", func(t *testing.T) {
 		t.Parallel()
 		filter := &batchFilter{byHash: map[string]arr.Decision{
 			hash: {Sync: false, Reason: arr.ReasonIgnored, Instance: "radarr"},
@@ -84,8 +89,8 @@ func TestRecheckArrRejectedTorrents(t *testing.T) {
 			t.Errorf("aborted %q, want %q", dest.abortHash, hash)
 		}
 		if !dest.abortDeleteFiles {
-			t.Error("the partial data must be deleted: the torrent was never wanted, " +
-				"unlike quarantine where the bytes are kept for a retry")
+			t.Error("the partial copy must be discarded, or a rejected torrent holds " +
+				"destination disk until the orphan cleaner runs")
 		}
 		if !client.addTagsCalled {
 			t.Error("the torrent must be tagged so the operator can see why it stopped")
@@ -118,9 +123,9 @@ func TestRecheckArrRejectedTorrents(t *testing.T) {
 	})
 
 	// Every fail-open reason has to reach here as sync. If any of them were
-	// treated as a rejection, an unreachable *arr would delete data instead of
-	// merely failing to filter.
-	t.Run("fail-open verdicts never delete anything", func(t *testing.T) {
+	// treated as a rejection, an unreachable *arr would tear down running
+	// transfers and discard their data instead of merely failing to filter.
+	t.Run("fail-open verdicts never abort anything", func(t *testing.T) {
 		t.Parallel()
 
 		for _, reason := range []arr.Reason{
@@ -142,7 +147,7 @@ func TestRecheckArrRejectedTorrents(t *testing.T) {
 				task.recheckArrRejectedTorrents(context.Background())
 
 				if dest.abortCalled {
-					t.Errorf("reason %q is fail-open and must never delete data", reason)
+					t.Errorf("reason %q is fail-open and must never abort a transfer", reason)
 				}
 			})
 		}
@@ -198,7 +203,7 @@ func TestRecheckArrRejectedTorrents(t *testing.T) {
 		task.recheckArrRejectedTorrents(context.Background())
 
 		if dest.abortCalled {
-			t.Error("dry run must not delete destination data")
+			t.Error("dry run must not abort the destination transfer")
 		}
 		if client.addTagsCalled {
 			t.Error("dry run must not tag the source torrent")
@@ -233,6 +238,10 @@ func TestRecheckArrRejectedTorrentsIgnoresMismatchedVerdicts(t *testing.T) {
 
 // shortFilter returns fewer decisions than it was asked about.
 type shortFilter struct{}
+
+func (shortFilter) RefreshCategories(context.Context) error { return nil }
+
+func (shortFilter) RoutedCategories() []string { return []string{"radarr"} }
 
 func (shortFilter) ShouldSync(context.Context, string, string) arr.Decision {
 	return arr.Decision{Sync: true}

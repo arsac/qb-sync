@@ -4,8 +4,11 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/failsafe-go/failsafe-go"
@@ -18,9 +21,8 @@ import (
 
 // instanceState holds per-instance config and runtime state.
 type instanceState struct {
-	name       string
-	client     *Client
-	categories []string
+	name   string
+	client *Client
 	// executor is nil when no breaker is attached, and selects the lookup path.
 	executor failsafe.Executor[any]
 }
@@ -35,12 +37,119 @@ const verdictTerminalTTL = time.Hour
 // callers don't depend on concrete type.
 type Service struct {
 	instances map[string]*instanceState
-	routes    map[string]string // category -> instance name
 	cache     *verdictCache
 	cacheTTL  time.Duration // "sync" TTL for non-terminal decisions
 	logger    *slog.Logger
 
+	// routes maps a qBittorrent category to the instance that claims it, and is
+	// discovered from *arr rather than configured. *arr is the authority on
+	// which category it assigns, so asking it removes a list that would
+	// otherwise silently stop matching the day someone renames one.
+	//
+	// Empty until the first refresh succeeds, which leaves the filter inert and
+	// everything syncing. That is the only behaviour available without a
+	// mapping - there is no instance to ask - and it is the fail-open direction.
+	// A failed refresh keeps the previous map rather than clearing it, so a
+	// transient *arr outage does not silently switch filtering off.
+	routesMu sync.RWMutex
+	routes   map[string]string
+
 	now func() time.Time // injectable for tests
+}
+
+// RefreshCategories rediscovers which categories each instance claims.
+//
+// Callers schedule this; the Service does not own a goroutine. Returns the
+// first error encountered, having still applied whatever it did learn: one
+// unreachable instance should not discard the other's routing.
+func (s *Service) RefreshCategories(ctx context.Context) error {
+	discovered := make(map[string]string)
+	var firstErr error
+
+	s.routesMu.RLock()
+	previous := maps.Clone(s.routes)
+	s.routesMu.RUnlock()
+
+	// Deterministic order. Two instances can legitimately claim the same
+	// category - someone points Radarr and Sonarr at one qBittorrent category -
+	// and map iteration would otherwise hand it to a different owner on each
+	// refresh, so a torrent would be checked against whichever won that round.
+	for _, name := range slices.Sorted(maps.Keys(s.instances)) {
+		inst := s.instances[name]
+		categories, err := inst.client.DownloadClientCategories(ctx)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("%s: %w", name, err)
+			}
+			metrics.ArrCategoryRefreshErrorsTotal.WithLabelValues(name).Inc()
+			// Carry this instance's previous routes forward, so one instance
+			// failing does not unroute torrents the other never owned.
+			for category, owner := range previous {
+				if owner == name {
+					discovered[category] = owner
+				}
+			}
+			continue
+		}
+		for _, category := range categories {
+			if owner, taken := discovered[category]; taken && owner != name {
+				// First owner wins, deterministically. Logged because the
+				// verdict a torrent gets now depends on which instance is
+				// asked, and only the operator can resolve that.
+				s.logger.WarnContext(ctx, "category claimed by more than one arr instance",
+					"category", category, "using", owner, "ignoring", name)
+				continue
+			}
+			discovered[category] = name
+		}
+	}
+
+	s.publishRoutedCounts(discovered)
+
+	s.routesMu.Lock()
+	s.routes = discovered
+	s.routesMu.Unlock()
+	return firstErr
+}
+
+// publishRoutedCounts reports how many categories each instance actually owns.
+//
+// Counted from the routing rather than from what each instance reported: a
+// category lost to a conflict stays in the loser's reply but routes nowhere,
+// and counting it would overstate a filter that is inert for that instance.
+// Every instance is published, including ones whose refresh failed, so a zero
+// shows up as a zero rather than as a gap in the series.
+func (s *Service) publishRoutedCounts(routes map[string]string) {
+	counts := make(map[string]int, len(s.instances))
+	for name := range s.instances {
+		counts[name] = 0
+	}
+	for _, owner := range routes {
+		counts[owner]++
+	}
+	for name, count := range counts {
+		metrics.ArrRoutedCategories.WithLabelValues(name).Set(float64(count))
+	}
+}
+
+// RoutedCategories returns every category currently routed to an instance.
+func (s *Service) RoutedCategories() []string {
+	s.routesMu.RLock()
+	defer s.routesMu.RUnlock()
+	out := make([]string, 0, len(s.routes))
+	for category := range s.routes {
+		out = append(out, category)
+	}
+	slices.Sort(out) // stable output for logs and the relayed response
+	return out
+}
+
+// instanceFor returns the instance claiming a category, if any.
+func (s *Service) instanceFor(category string) (string, bool) {
+	s.routesMu.RLock()
+	defer s.routesMu.RUnlock()
+	name, ok := s.routes[category]
+	return name, ok
 }
 
 // Compile-time interface assertion.
@@ -52,14 +161,14 @@ func (s *Service) ShouldSync(ctx context.Context, hash, category string) Decisio
 	d := s.decide(ctx, hash, category)
 	// Stamped here rather than inside decide so it is set on every path,
 	// including a cache hit, where the cached Decision predates this call.
-	d.Instance = s.routes[category]
+	d.Instance, _ = s.instanceFor(category)
 	s.recordDecision(d)
 	return d
 }
 
 // decide is the pure decision logic without metric side-effects.
 func (s *Service) decide(ctx context.Context, hash, category string) Decision {
-	instanceName, ok := s.routes[category]
+	instanceName, ok := s.instanceFor(category)
 	if !ok {
 		return Decision{Sync: true, Reason: ReasonNoCategory}
 	}

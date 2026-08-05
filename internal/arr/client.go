@@ -20,6 +20,12 @@ const (
 	transportTimeoutMult  = 2
 	maxResponseBodySize   = 1 << 20
 
+	// protocolTorrent and categoryFieldSuffix drive download-client discovery.
+	// The suffix is matched rather than the full name because Sonarr calls it
+	// tvCategory and Radarr movieCategory.
+	protocolTorrent     = "torrent"
+	categoryFieldSuffix = "Category"
+
 	// historyPageSize overrides the endpoint's default of 10. Sonarr records one
 	// history row per episode, so a season pack alone can exceed that.
 	historyPageSize = 100
@@ -195,4 +201,77 @@ func recordsForHash(records []HistoryRecord, hash string) []HistoryRecord {
 		}
 	}
 	return kept
+}
+
+// downloadClient is the subset of GET /api/v3/downloadclient we decode.
+type downloadClient struct {
+	Enable   bool   `json:"enable"`
+	Protocol string `json:"protocol"`
+	Fields   []struct {
+		Name  string `json:"name"`
+		Value any    `json:"value"`
+	} `json:"fields"`
+}
+
+// DownloadClientCategories returns the qBittorrent categories this *arr assigns
+// to its download clients.
+//
+// Asking *arr beats configuring the same list by hand: it is the authority, and
+// a hand-copied list silently stops matching the moment someone renames a
+// category in *arr - which presents as the filter never firing rather than as
+// an error.
+//
+// Field names are matched by suffix rather than spelled out, because Sonarr
+// calls it tvCategory and Radarr movieCategory, and this client is otherwise
+// unaware of which app it is talking to. It also picks up the *ImportedCategory
+// pair, which matters: *arr moves a torrent there after a successful import, so
+// a filter that only knew the download category would stop recognising exactly
+// the torrents that completed.
+func (c *Client) DownloadClientCategories(ctx context.Context) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.perCallTimeout)
+	defer cancel()
+
+	req, err := c.newRequest(ctx, http.MethodGet, apiV3Prefix+"/downloadclient", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, doErr := c.httpc.Do(req)
+	if doErr != nil {
+		return nil, classifyDoError(doErr)
+	}
+	defer func() { drainAndClose(resp.Body) }()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, classifyStatusError(resp)
+	}
+
+	var clients []downloadClient
+	if decodeErr := json.NewDecoder(resp.Body).Decode(&clients); decodeErr != nil {
+		return nil, &Error{Kind: KindNetwork, Cause: decodeErr}
+	}
+
+	seen := make(map[string]struct{})
+	categories := make([]string, 0, len(clients))
+	for _, client := range clients {
+		// A disabled client assigns nothing, and usenet has no torrents for
+		// qb-sync to sync.
+		if !client.Enable || client.Protocol != protocolTorrent {
+			continue
+		}
+		for _, field := range client.Fields {
+			if !strings.HasSuffix(field.Name, categoryFieldSuffix) {
+				continue
+			}
+			value, ok := field.Value.(string)
+			if !ok || strings.TrimSpace(value) == "" {
+				continue
+			}
+			if _, dup := seen[value]; dup {
+				continue
+			}
+			seen[value] = struct{}{}
+			categories = append(categories, value)
+		}
+	}
+	return categories, nil
 }

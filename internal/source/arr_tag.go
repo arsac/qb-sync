@@ -2,6 +2,7 @@ package source
 
 import (
 	"context"
+	"slices"
 	"time"
 
 	"github.com/arsac/qb-sync/internal/arr"
@@ -58,6 +59,34 @@ func (t *QBTask) removeArrSkippedTagIfPresent(ctx context.Context, hash, current
 	}
 }
 
+// maybeRefreshArrCategories refreshes the routing when it has gone stale.
+func (t *QBTask) maybeRefreshArrCategories(ctx context.Context) {
+	if time.Since(t.arrCategoriesAt) < arr.CategoryRefreshInterval {
+		return
+	}
+	t.arrCategoriesAt = time.Now()
+	t.refreshArrCategories(ctx)
+}
+
+// refreshArrCategories rediscovers which categories route to an *arr.
+//
+// In direct mode this queries the instances; in relay mode it asks the
+// destination, which discovered them itself. Either way the source ends up
+// able to decide locally whether a torrent is worth a lookup, which on a
+// typical library spares most of them.
+//
+// A failure keeps the previous routing rather than clearing it, so a transient
+// outage does not silently switch filtering off for everything.
+func (t *QBTask) refreshArrCategories(ctx context.Context) {
+	if err := t.filter().RefreshCategories(ctx); err != nil {
+		t.logger.WarnContext(ctx, "arr category discovery failed, keeping the previous routing",
+			"error", err)
+		return
+	}
+	t.logger.DebugContext(ctx, "arr categories refreshed",
+		"categories", t.filter().RoutedCategories())
+}
+
 // recheckArrRejectedTorrents aborts tracked torrents whose verdict has flipped
 // to SKIP since tracking began.
 //
@@ -82,11 +111,15 @@ func (t *QBTask) recheckArrRejectedTorrents(ctx context.Context) {
 		categoryFor[t.cycleTorrents[i].Hash] = t.cycleTorrents[i].Category
 	}
 
+	routed := t.filter().RoutedCategories()
 	items := make([]arr.CheckItem, 0, len(tracked))
 	for hash := range tracked {
 		category, ok := categoryFor[hash]
 		if !ok {
 			// Gone from qBittorrent this cycle; removal handling owns it.
+			continue
+		}
+		if !slices.Contains(routed, category) {
 			continue
 		}
 		items = append(items, arr.CheckItem{Hash: hash, Category: category})
@@ -123,10 +156,17 @@ func (t *QBTask) recheckArrRejectedTorrents(ctx context.Context) {
 
 // abortArrFlipped abandons an in-progress sync whose verdict flipped to SKIP.
 //
-// Deletes the destination's partial data, unlike quarantine which preserves it.
-// The distinction is intent: quarantine is a fault we expect to clear, whereas
-// an *arr rejection means the torrent was never wanted, so keeping the bytes
-// would defeat the purpose of the filter.
+// Discards the destination's partial data, which is the point: the filter
+// exists to stop a torrent *arr does not want from consuming destination disk,
+// and leaving the partial behind for the orphan cleaner would hold that space
+// for at least OrphanTimeout.
+//
+// This is not the user's copy. The torrent itself lives on the source and is
+// never touched; what gets deleted is the incomplete copy this service was in
+// the middle of writing. A torrent only enters destination qBittorrent at
+// finalization, so an in-flight abort is always scratch data. In the narrow
+// case where the destination does have it in qB, the destination refuses the
+// deletion itself and keeps the files - the source cannot override that.
 func (t *QBTask) abortArrFlipped(
 	ctx context.Context,
 	tracked map[string]TrackedTorrent,

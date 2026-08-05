@@ -236,4 +236,9 @@ message CheckArrRejectionsResponse {
   bool filter_enabled = 1;
   // Verdicts are index-aligned with the request items.
   repeated ArrVerdict verdicts = 2;
+  // Categories currently routed to an *arr instance, discovered from the
+  // instances themselves rather than configured. The source uses this to skip
+  // asking about torrents no *arr owns, which is most of them on a typical
+  // library. A request with no items is a cheap way to fetch just this.
+  repeated string categories = 3;
 }

@@ -946,12 +946,40 @@ var (
 		[]string{LabelCode},
 	)
 
+	// ArrCategoryRefreshErrorsTotal counts failures to rediscover which
+	// categories an *arr instance claims.
+	//
+	// Worth alerting on: the routing is discovered rather than configured, so
+	// sustained failures mean qb-sync is filtering against a stale map. It keeps
+	// the last good one rather than clearing it, which is the safe choice but
+	// also the silent one.
+	ArrCategoryRefreshErrorsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "arr_category_refresh_errors_total",
+			Help:      "Failures discovering the categories an arr instance claims",
+		},
+		[]string{LabelInstance},
+	)
+
 	// ArrCircuitBreakerState tracks the arr circuit breaker state per instance.
 	ArrCircuitBreakerState = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "arr_circuit_breaker_state",
 			Help:      "Arr circuit breaker state (0=closed, 1=open, 2=half-open)",
+		},
+		[]string{LabelInstance},
+	)
+
+	// ArrRoutedCategories is how many categories each instance currently claims.
+	// Zero means the filter is inert for that instance: nothing routes to it, so
+	// nothing is ever checked against it.
+	ArrRoutedCategories = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "arr_routed_categories",
+			Help:      "Categories currently routed to each arr instance (0 = filter inert for it)",
 		},
 		[]string{LabelInstance},
 	)
