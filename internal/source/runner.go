@@ -165,22 +165,13 @@ func (r *Runner) buildArrFilter(ctx context.Context, dest *streaming.GRPCDestina
 		return arr.Cached(newRemoteArrFilter(dest.CheckArrRejections, logger), relayVerdictTTL)
 	}
 
-	filter, err := arr.New(arr.Config{
-		Radarr: arr.InstanceConfig{
-			URL:        r.cfg.Radarr.URL,
-			APIKey:     r.cfg.Radarr.APIKey,
-			Categories: r.cfg.Radarr.Categories,
-		},
-		Sonarr: arr.InstanceConfig{
-			URL:        r.cfg.Sonarr.URL,
-			APIKey:     r.cfg.Sonarr.APIKey,
-			Categories: r.cfg.Sonarr.Categories,
-		},
-		PerCallTimeout:      arrPerCallTimeout,
-		CacheTTL:            r.cfg.SleepInterval / arrCacheDivisor,
-		BreakerMaxFailures:  arrBreakerMaxFailures,
-		BreakerResetTimeout: arrBreakerResetTimeout,
-	}, logger)
+	arrCfg := r.cfg.ArrConfig()
+	arrCfg.PerCallTimeout = arrPerCallTimeout
+	arrCfg.CacheTTL = r.cfg.SleepInterval / arrCacheDivisor
+	arrCfg.BreakerMaxFailures = arrBreakerMaxFailures
+	arrCfg.BreakerResetTimeout = arrBreakerResetTimeout
+
+	filter, err := arr.New(arrCfg, logger)
 	if err != nil {
 		// Validation already rejected the shapes worth rejecting, so this is
 		// unexpected. Degrade to relaying rather than failing startup: the

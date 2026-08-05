@@ -2,9 +2,12 @@ package arr
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/url"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/arsac/qb-sync/internal/utils"
@@ -32,15 +35,105 @@ type Config struct {
 }
 
 // InstanceConfig is one *arr instance's connection + routing.
+//
+// This is also the shape held by the process config, so there is one
+// declaration rather than a parallel struct copied across the boundary: a new
+// field would otherwise need adding in two places and copying in two more, and
+// a forgotten copy compiles cleanly while silently doing nothing.
 type InstanceConfig struct {
 	URL        string
 	APIKey     string
 	Categories []string
 }
 
+// String returns a redacted representation suitable for logging. Config is
+// logged at startup and dumped by the health endpoint, so a plain struct would
+// put the API key in both.
+func (i InstanceConfig) String() string {
+	return fmt.Sprintf("InstanceConfig{URL:%q, APIKey:%s, Categories:%v}",
+		i.URL, redactAPIKey(i.APIKey), i.Categories)
+}
+
+// MarshalJSON masks the API key in JSON output.
+func (i InstanceConfig) MarshalJSON() ([]byte, error) {
+	type alias struct {
+		URL        string   `json:"url"`
+		APIKey     string   `json:"api_key"`
+		Categories []string `json:"categories"`
+	}
+
+	return json.Marshal(alias{
+		URL:        i.URL,
+		APIKey:     redactAPIKey(i.APIKey),
+		Categories: i.Categories,
+	})
+}
+
+// redactAPIKey returns a fixed mask rather than a prefix: a few characters of a
+// key are still worth withholding, and a fixed mask cannot leak length either.
+func redactAPIKey(key string) string {
+	if key == "" {
+		return "<unset>"
+	}
+	return "***"
+}
+
+// Validate rejects a partially configured instance. All three fields or none:
+// a URL with no key, or categories with no URL, is a deployment mistake that
+// would otherwise present as the filter silently never running.
+func (i InstanceConfig) Validate(name string) error {
+	if i.IsZero() {
+		return nil
+	}
+	if i.URL == "" {
+		return fmt.Errorf("%s: URL is required when %s is configured", name, name)
+	}
+	if i.APIKey == "" {
+		return fmt.Errorf("%s: API key is required when %s is configured", name, name)
+	}
+	if len(i.Categories) == 0 {
+		return fmt.Errorf("%s: at least one category is required when %s is configured", name, name)
+	}
+	if _, err := url.Parse(i.URL); err != nil {
+		return fmt.Errorf("%s: invalid URL: %w", name, err)
+	}
+	for _, category := range i.Categories {
+		if strings.TrimSpace(category) == "" {
+			return fmt.Errorf("%s: categories must not contain an empty value", name)
+		}
+	}
+	return nil
+}
+
+// Validate checks both instances and their routing.
+//
+// The single rule set: process config delegates here rather than keeping its
+// own copy, so a rule tightened in one place cannot fail to apply on the other
+// path. New must validate regardless, since the destination builds a Config
+// directly rather than through process config.
+func (c Config) Validate() error {
+	if err := c.Radarr.Validate(instanceRadarr); err != nil {
+		return err
+	}
+	if err := c.Sonarr.Validate(instanceSonarr); err != nil {
+		return err
+	}
+	for _, category := range c.Radarr.Categories {
+		if slices.Contains(c.Sonarr.Categories, category) {
+			return fmt.Errorf("category %q is configured for both %s and %s",
+				category, instanceRadarr, instanceSonarr)
+		}
+	}
+	return nil
+}
+
 const (
 	defaultCacheTTL            = 15 * time.Second
 	defaultBreakerResetTimeout = 60 * time.Second
+
+	// Instance names, used for routing, error text and metric labels.
+	instanceRadarr = "radarr"
+	instanceSonarr = "sonarr"
 )
 
 // IsZero reports whether the instance is unconfigured.
@@ -64,6 +157,10 @@ func New(cfg Config, logger *slog.Logger) (Filter, error) {
 		cfg.BreakerResetTimeout = defaultBreakerResetTimeout
 	}
 
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+
 	if cfg.Radarr.IsZero() && cfg.Sonarr.IsZero() {
 		return noopFilter{}, nil
 	}
@@ -71,28 +168,24 @@ func New(cfg Config, logger *slog.Logger) (Filter, error) {
 	instances := make(map[string]*instanceState)
 	routes := make(map[string]string)
 
-	if err := addInstance(
+	addInstance(
 		instances,
 		routes,
-		"radarr",
+		instanceRadarr,
 		cfg.Radarr,
 		cfg.PerCallTimeout,
 		cfg.BreakerMaxFailures,
 		cfg.BreakerResetTimeout,
-	); err != nil {
-		return nil, err
-	}
-	if err := addInstance(
+	)
+	addInstance(
 		instances,
 		routes,
-		"sonarr",
+		instanceSonarr,
 		cfg.Sonarr,
 		cfg.PerCallTimeout,
 		cfg.BreakerMaxFailures,
 		cfg.BreakerResetTimeout,
-	); err != nil {
-		return nil, err
-	}
+	)
 
 	return &Service{
 		instances: instances,
@@ -104,7 +197,8 @@ func New(cfg Config, logger *slog.Logger) (Filter, error) {
 	}, nil
 }
 
-// addInstance validates and inserts an instance into the maps.
+// addInstance registers an instance and its category routes. Shape and routing
+// conflicts are already rejected by Config.Validate, which New runs first.
 func addInstance(
 	instances map[string]*instanceState,
 	routes map[string]string,
@@ -113,26 +207,11 @@ func addInstance(
 	perCall time.Duration,
 	breakerMax int,
 	breakerReset time.Duration,
-) error {
+) {
 	if cfg.IsZero() {
-		return nil
-	}
-	if cfg.URL == "" {
-		return fmt.Errorf("arr.%s: URL is required when instance is configured", name)
-	}
-	if cfg.APIKey == "" {
-		return fmt.Errorf("arr.%s: API key is required when URL is set", name)
-	}
-	if len(cfg.Categories) == 0 {
-		return fmt.Errorf("arr.%s: at least one category must be configured", name)
-	}
-	if _, err := url.Parse(cfg.URL); err != nil {
-		return fmt.Errorf("arr.%s: invalid URL: %w", name, err)
+		return
 	}
 	for _, cat := range cfg.Categories {
-		if existing, dup := routes[cat]; dup {
-			return fmt.Errorf("arr.%s: category %q is also assigned to %q", name, cat, existing)
-		}
 		routes[cat] = name
 	}
 
@@ -141,11 +220,9 @@ func addInstance(
 		client:     NewClient(cfg.URL, cfg.APIKey, perCall),
 		categories: cfg.Categories,
 	}
-	if breakerMax > 0 {
-		attachBreaker(inst, utils.CircuitBreakerConfig{MaxFailures: breakerMax, ResetTimeout: breakerReset})
-	}
+	// attachBreaker already returns early on a non-positive threshold.
+	attachBreaker(inst, utils.CircuitBreakerConfig{MaxFailures: breakerMax, ResetTimeout: breakerReset})
 	instances[name] = inst
-	return nil
 }
 
 // PingAll calls Ping on every configured instance and returns a map

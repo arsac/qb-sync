@@ -194,7 +194,7 @@ func TestRemoteArrFilterKeepsAskingOnTransientErrors(t *testing.T) {
 func TestBuildArrFilterPicksModeFromConfig(t *testing.T) {
 	t.Parallel()
 
-	radarrCfg := config.ArrInstanceConfig{
+	radarrCfg := arr.InstanceConfig{
 		URL:        "http://127.0.0.1:1",
 		APIKey:     "k",
 		Categories: []string{"radarr"},
@@ -202,7 +202,7 @@ func TestBuildArrFilterPicksModeFromConfig(t *testing.T) {
 	// A distinct category: routing the same one to both instances is a conflict
 	// that arr.New rejects, which would fall back to relaying and make the
 	// "both configured" case pass for the wrong reason.
-	sonarrCfg := config.ArrInstanceConfig{
+	sonarrCfg := arr.InstanceConfig{
 		URL:        "http://127.0.0.1:2",
 		APIKey:     "k",
 		Categories: []string{"tv-sonarr"},
@@ -210,8 +210,8 @@ func TestBuildArrFilterPicksModeFromConfig(t *testing.T) {
 
 	tests := []struct {
 		name       string
-		radarr     config.ArrInstanceConfig
-		sonarr     config.ArrInstanceConfig
+		radarr     arr.InstanceConfig
+		sonarr     arr.InstanceConfig
 		wantRemote bool
 	}{
 		{name: "nothing configured locally relays", wantRemote: true},

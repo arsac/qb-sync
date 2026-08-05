@@ -10,6 +10,8 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
+
+	"github.com/arsac/qb-sync/internal/arr"
 )
 
 // Flag names used in both registration (flags.String/Bool) and viper lookups
@@ -75,8 +77,19 @@ type BaseConfig struct {
 	// process is colocated with the *arr instances configures them, and the
 	// source relays to the destination when it has none of its own. A zero
 	// instance disables filtering for its categories.
-	Radarr ArrInstanceConfig
-	Sonarr ArrInstanceConfig
+	//
+	// Held as arr's own type rather than a parallel struct: a copy would need a
+	// new field added in two places and copied in two more, and a missed copy
+	// compiles cleanly while silently dropping the setting.
+	Radarr arr.InstanceConfig
+	Sonarr arr.InstanceConfig
+}
+
+// ArrConfig assembles the *arr filter config from the instances configured on
+// this process. Tuning (timeouts, cache TTL, breaker) is the caller's, since it
+// differs between querying *arr directly and relaying.
+func (c *BaseConfig) ArrConfig() arr.Config {
+	return arr.Config{Radarr: c.Radarr, Sonarr: c.Sonarr}
 }
 
 // SourceConfig contains configuration for the source server.
@@ -128,14 +141,8 @@ func (c *BaseConfig) Validate() error {
 		return errors.New("data path is required")
 	}
 
-	if err := validateArrInstance("radarr", c.Radarr); err != nil {
+	if err := c.ArrConfig().Validate(); err != nil {
 		return err
-	}
-	if err := validateArrInstance("sonarr", c.Sonarr); err != nil {
-		return err
-	}
-	if conflict := overlappingCategory(c.Radarr.Categories, c.Sonarr.Categories); conflict != "" {
-		return fmt.Errorf("category %q is configured for both radarr and sonarr", conflict)
 	}
 
 	return nil
@@ -447,12 +454,12 @@ func loadBase(v *viper.Viper) BaseConfig {
 		SyncedTag:  v.GetString(flagSyncedTag),
 		LogLevel:   v.GetString(flagLogLevel),
 		DryRun:     v.GetBool(flagDryRun),
-		Radarr: ArrInstanceConfig{
+		Radarr: arr.InstanceConfig{
 			URL:        v.GetString("radarr-url"),
 			APIKey:     v.GetString("radarr-api-key"),
 			Categories: v.GetStringSlice("radarr-categories"),
 		},
-		Sonarr: ArrInstanceConfig{
+		Sonarr: arr.InstanceConfig{
 			URL:        v.GetString("sonarr-url"),
 			APIKey:     v.GetString("sonarr-api-key"),
 			Categories: v.GetStringSlice("sonarr-categories"),

@@ -12,7 +12,6 @@ import (
 	"github.com/spf13/viper"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/arsac/qb-sync/internal/arr"
 	"github.com/arsac/qb-sync/internal/config"
 	"github.com/arsac/qb-sync/internal/destination"
 	"github.com/arsac/qb-sync/internal/grpcutil"
@@ -162,18 +161,7 @@ func runDestination(cmd *cobra.Command, _ []string) error {
 		VerifyConcurrency:     cfg.VerifyConcurrency,
 		SyncedTag:             cfg.SyncedTag,
 		DryRun:                cfg.DryRun,
-		Arr: arr.Config{
-			Radarr: arr.InstanceConfig{
-				URL:        cfg.Radarr.URL,
-				APIKey:     cfg.Radarr.APIKey,
-				Categories: cfg.Radarr.Categories,
-			},
-			Sonarr: arr.InstanceConfig{
-				URL:        cfg.Sonarr.URL,
-				APIKey:     cfg.Sonarr.APIKey,
-				Categories: cfg.Sonarr.Categories,
-			},
-		},
+		Arr:                   cfg.ArrConfig(),
 	}
 
 	if cfg.QBURL != "" {
