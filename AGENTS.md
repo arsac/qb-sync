@@ -50,7 +50,7 @@ Use **Go modules**: `go mod tidy`, `go build ./...`
 
 ## Linting
 
-- `golangci-lint run --fix` (v2.7.1, config in `.golangci.yml`)
+- `golangci-lint run --fix` (v2.12.2, config in `.golangci.yml`)
 - ~70+ linters enabled, strict settings
 - `goimports` with local prefix `github.com/arsac/qb-sync`
 - `golines` max-len 120

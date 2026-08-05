@@ -143,7 +143,7 @@ func SetupTestEnv(t *testing.T, opts ...SetupOption) *TestEnv {
 	composeContent := fmt.Sprintf(`
 services:
   qb-source:
-    image: ghcr.io/home-operations/qbittorrent:5.2.0@sha256:08eb7ed4c7fe70425064d58154c35fccc89fafffd64ce9d1affed399e173ff20
+    image: ghcr.io/home-operations/qbittorrent:5.2.3@sha256:4fcf15b7f265c2c8d7bc2a7e13240a07e0593c326f3cf3b5b9bb69eec5b79299
     volumes:
       - %s:/downloads
       - %s:/config%s
@@ -157,7 +157,7 @@ services:
       start_period: 10s
 
   qb-destination:
-    image: ghcr.io/home-operations/qbittorrent:5.2.0@sha256:08eb7ed4c7fe70425064d58154c35fccc89fafffd64ce9d1affed399e173ff20
+    image: ghcr.io/home-operations/qbittorrent:5.2.3@sha256:4fcf15b7f265c2c8d7bc2a7e13240a07e0593c326f3cf3b5b9bb69eec5b79299
     volumes:
       - %s:/destination-data
       - %s:/config

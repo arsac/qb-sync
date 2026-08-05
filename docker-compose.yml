@@ -26,7 +26,7 @@ services:
       - qb-dest
 
   qb-src:
-    image: lscr.io/linuxserver/qbittorrent:latest
+    image: lscr.io/linuxserver/qbittorrent:5.2.3
     volumes:
       - ./tmp/src:/downloads
       - ./tmp/qb-src:/config
@@ -37,7 +37,7 @@ services:
       - clean
 
   qb-dest:
-    image: lscr.io/linuxserver/qbittorrent:latest
+    image: lscr.io/linuxserver/qbittorrent:5.2.3
     volumes:
       - ./tmp/dest:/downloads
       - ./tmp/qb-dest:/config
@@ -46,14 +46,14 @@ services:
       - TORRENTING_PORT=9092
 
   clean:
-    image: busybox
+    image: busybox:1.38.0
     command: sh -c "ls -la /src && rm -rf /src/* && rm -rf /dest/*"
     volumes:
       - ./tmp/src:/src
       - ./tmp/dest:/dest
 
   setup-qbittorrent:
-    image: alpine:latest
+    image: alpine:3.24.1
     entrypoint: sh -c
     command:
       - |-
