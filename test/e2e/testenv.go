@@ -862,13 +862,12 @@ func (env *TestEnv) CreateSourceTask(cfg *config.SourceConfig) (*source.QBTask, 
 
 	// Relay verdicts to the destination exactly as production does, so a test
 	// that configures *arr on the destination exercises the real RPC path.
-	// Learn the routing before the first cycle, as the runner does in
-	// production. Without it the first cycle tracks torrents whose category is
-	// not yet known to route anywhere.
+	//
+	// Deliberately not pre-refreshed here. runOnce discovers the routing before
+	// it tracks, so the first cycle already has it, and doing it here would put
+	// a blocking round trip in the setup of every test in the suite - including
+	// the great majority that never configure *arr.
 	arrFilter := source.NewRemoteArrFilter(dest.CheckArrRejections, env.logger)
-	if refreshErr := arrFilter.RefreshCategories(context.Background()); refreshErr != nil {
-		env.logger.Warn("arr category discovery failed in test setup", "error", refreshErr)
-	}
 
 	task, err := source.NewQBTask(cfg, dest, arrFilter, env.logger)
 	if err != nil {
