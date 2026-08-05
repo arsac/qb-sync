@@ -42,7 +42,7 @@ type fakeArr struct {
 	queries  []string
 }
 
-func newFakeArr(t *testing.T) (*httptest.Server, *fakeArr) {
+func newFakeArr(t *testing.T, categoryField, category string) (*httptest.Server, *fakeArr) {
 	t.Helper()
 
 	arr := &fakeArr{rejected: make(map[string]bool)}
@@ -51,6 +51,16 @@ func newFakeArr(t *testing.T) (*httptest.Server, *fakeArr) {
 	mux.HandleFunc("/api/v3/system/status", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"appName":"Radarr","version":"5.0.0"}`))
+	})
+	// Categories are discovered from the download client rather than
+	// configured, so the fake serves them the way *arr does: inside the fields
+	// array, under a name each app spells differently.
+	mux.HandleFunc("/api/v3/downloadclient", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"name":"qbit","enable":true,"protocol":"torrent",
+			"implementation":"QBittorrent","fields":[
+				{"name":"` + categoryField + `","value":"` + category + `"}
+			]}]`))
 	})
 	mux.HandleFunc("/api/v3/history", func(w http.ResponseWriter, r *http.Request) {
 		downloadID := r.URL.Query().Get("downloadId")
@@ -102,18 +112,14 @@ func TestE2E_ArrFilterSkipsRejectedTorrent(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	radarr, fake := newFakeArr(t)
+	radarr, fake := newFakeArr(t, "movieCategory", arrTestCategory)
 
 	// *arr is configured on the destination: that is where the lookup runs, and
 	// the source only relays. The destination server is in-process here, so the
 	// httptest server on 127.0.0.1 is reachable with no container networking.
 	env := SetupTestEnv(t, WithDestinationServerConfig(func(cfg *destination.ServerConfig) {
 		cfg.Arr = arr.Config{
-			Radarr: arr.InstanceConfig{
-				URL:        radarr.URL,
-				APIKey:     arrTestAPIKey,
-				Categories: []string{arrTestCategory},
-			},
+			Radarr: arr.InstanceConfig{URL: radarr.URL, APIKey: arrTestAPIKey},
 		}
 	}))
 
@@ -173,6 +179,84 @@ func TestE2E_ArrFilterSkipsRejectedTorrent(t *testing.T) {
 		assert.Equal(t, strings.ToUpper(wiredCDHash), q,
 			"downloadId must be uppercase: arr stores torrent.Hash.ToUpper() and compares exactly")
 	}
+
+	cancelOrchestrator()
+	select {
+	case <-orchestratorDone:
+	case <-time.After(15 * time.Second):
+		t.Log("orchestrator shutdown timed out (non-fatal)")
+	}
+
+	env.CleanupBothSides(ctx, wiredCDHash)
+}
+
+// TestE2E_ArrFilterDiscoversBothInstances covers the two-instance path end to
+// end: categories are discovered from each *arr separately, and a torrent is
+// routed to whichever claims its category.
+//
+// One instance would not catch a merge that dropped the other, nor the field
+// names differing between the apps - Sonarr calls it tvCategory where Radarr
+// calls it movieCategory, and only a two-app test exercises both.
+func TestE2E_ArrFilterDiscoversBothInstances(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+
+	t.Parallel()
+
+	const sonarrCategory = "tv-sonarr-test"
+
+	ctx := context.Background()
+	radarr, radarrFake := newFakeArr(t, "movieCategory", arrTestCategory)
+	sonarr, sonarrFake := newFakeArr(t, "tvCategory", sonarrCategory)
+
+	env := SetupTestEnv(t, WithDestinationServerConfig(func(cfg *destination.ServerConfig) {
+		cfg.Arr = arr.Config{
+			Radarr: arr.InstanceConfig{URL: radarr.URL, APIKey: arrTestAPIKey},
+			Sonarr: arr.InstanceConfig{URL: sonarr.URL, APIKey: arrTestAPIKey},
+		}
+	}))
+
+	env.CleanupBothSides(ctx, wiredCDHash)
+
+	// Reject it in Sonarr only, and file the torrent under Sonarr's category.
+	// If routing collapsed to one instance, or discovery only picked up Radarr,
+	// the torrent would sync and the tag would never appear.
+	sonarrFake.reject(wiredCDHash)
+
+	require.NoError(t, env.AddTorrentToSource(ctx, testTorrentURL, map[string]string{
+		"category": sonarrCategory,
+	}), "adding torrent to source")
+
+	require.NotNil(t, env.WaitForTorrent(env.SourceClient(), wiredCDHash, torrentAppearTimeout),
+		"torrent should appear in source qBittorrent")
+
+	require.Eventually(t, func() bool {
+		torrents, listErr := env.SourceClient().GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
+			Hashes: []string{wiredCDHash},
+		})
+		return listErr == nil && len(torrents) == 1 && torrents[0].Progress > 0
+	}, 2*time.Minute, 2*time.Second, "torrent should reach non-zero progress")
+
+	cfg := env.CreateSourceConfig(WithArrSkippedTag(defaultArrSkippedTag), WithMinSeedingTime(0))
+	task, dest, err := env.CreateSourceTask(cfg)
+	require.NoError(t, err)
+	defer dest.Close()
+
+	orchestratorCtx, cancelOrchestrator := context.WithCancel(ctx)
+	defer cancelOrchestrator()
+	orchestratorDone := make(chan error, 1)
+	go func() { orchestratorDone <- task.Run(orchestratorCtx) }()
+
+	env.WaitForSourceTag(ctx, wiredCDHash, defaultArrSkippedTag, arrTagTimeout,
+		"a torrent Sonarr rejected must be tagged, which requires Sonarr's category to have been discovered")
+
+	assert.False(t, env.DestinationHasTorrent(ctx, wiredCDHash),
+		"a torrent Sonarr rejected must never reach the destination")
+
+	// Sonarr was asked; Radarr owns a different category and should not have been.
+	assert.NotEmpty(t, sonarrFake.queried(), "Sonarr should have been queried for its own category")
+	assert.Empty(t, radarrFake.queried(), "Radarr should not be asked about a category Sonarr claims")
 
 	cancelOrchestrator()
 	select {
