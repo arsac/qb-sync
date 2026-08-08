@@ -214,87 +214,6 @@ func TestStreamingConstants(t *testing.T) {
 	}
 }
 
-func TestPieceKey(t *testing.T) {
-	tests := []struct {
-		hash     string
-		index    int32
-		expected string
-	}{
-		{"abc123", 0, "abc123:0"},
-		{"abc123", 1, "abc123:1"},
-		{"abc123", 100, "abc123:100"},
-		{"", 0, ":0"},
-	}
-
-	for _, tt := range tests {
-		result := pieceKey(tt.hash, tt.index)
-		if result != tt.expected {
-			t.Errorf("pieceKey(%q, %d) = %q, want %q", tt.hash, tt.index, result, tt.expected)
-		}
-	}
-}
-
-func TestParsePieceKey(t *testing.T) {
-	tests := []struct {
-		key           string
-		expectedHash  string
-		expectedIndex int32
-		expectedOK    bool
-	}{
-		{"abc123:0", "abc123", 0, true},
-		{"abc123:1", "abc123", 1, true},
-		{"abc123:100", "abc123", 100, true},
-		{":0", "", 0, true},
-		{"abc123", "", 0, false},     // No colon
-		{"abc123:", "", 0, false},    // No index
-		{"abc123:abc", "", 0, false}, // Invalid index
-		{"", "", 0, false},           // Empty string
-		{"a:b:c", "a", 0, false},     // Multiple colons (b:c is not a valid int)
-	}
-
-	for _, tt := range tests {
-		hash, index, ok := ParsePieceKey(tt.key)
-		if ok != tt.expectedOK {
-			t.Errorf("ParsePieceKey(%q) ok = %v, want %v", tt.key, ok, tt.expectedOK)
-			continue
-		}
-		if ok {
-			if hash != tt.expectedHash {
-				t.Errorf("ParsePieceKey(%q) hash = %q, want %q", tt.key, hash, tt.expectedHash)
-			}
-			if index != tt.expectedIndex {
-				t.Errorf("ParsePieceKey(%q) index = %d, want %d", tt.key, index, tt.expectedIndex)
-			}
-		}
-	}
-}
-
-func TestPieceKeyRoundTrip(t *testing.T) {
-	// Test that pieceKey and ParsePieceKey are inverses
-	testCases := []struct {
-		hash  string
-		index int32
-	}{
-		{"abc123def456", 0},
-		{"abc123def456", 42},
-		{"abc123def456", 12345},
-		{"", 0},
-	}
-
-	for _, tc := range testCases {
-		key := pieceKey(tc.hash, tc.index)
-		hash, index, ok := ParsePieceKey(key)
-		if !ok {
-			t.Errorf("ParsePieceKey(pieceKey(%q, %d)) failed", tc.hash, tc.index)
-			continue
-		}
-		if hash != tc.hash || index != tc.index {
-			t.Errorf("Round trip failed: (%q, %d) -> %q -> (%q, %d)",
-				tc.hash, tc.index, key, hash, index)
-		}
-	}
-}
-
 // TestFindLeastLoadedStreamLogic tests the selection logic conceptually.
 // Since we can't easily create a pool without a GRPCDestination,
 // we test the AdaptiveWindow behavior that underlies the selection.
@@ -305,9 +224,9 @@ func TestFindLeastLoadedStreamLogic(t *testing.T) {
 	w2 := congestion.NewAdaptiveWindow(config)
 
 	// w1 has 2 in-flight, w2 has 1 in-flight
-	w1.OnSend("piece:0")
-	w1.OnSend("piece:1")
-	w2.OnSend("piece:2")
+	w1.OnSend(congestion.PieceKey{Hash: "hash", Index: 0})
+	w1.OnSend(congestion.PieceKey{Hash: "hash", Index: 1})
+	w2.OnSend(congestion.PieceKey{Hash: "hash", Index: 2})
 
 	// Selection should prefer w2 (lower in-flight)
 	if w1.InFlight() <= w2.InFlight() {

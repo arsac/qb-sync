@@ -691,8 +691,12 @@ func TestAwaitCapacity_EveryReleasePathWakesAParkedSender(t *testing.T) {
 		name    string
 		release func(pool *StreamPool, ps *PooledStream)
 	}{
-		{"ack", func(pool *StreamPool, ps *PooledStream) { pool.AckPiece(ps, "a") }},
-		{"fail", func(pool *StreamPool, ps *PooledStream) { pool.FailPiece(ps, "a") }},
+		{"ack", func(pool *StreamPool, ps *PooledStream) {
+			pool.AckPiece(ps, congestion.PieceKey{Hash: "hash", Index: 0})
+		}},
+		{"fail", func(pool *StreamPool, ps *PooledStream) {
+			pool.FailPiece(ps, congestion.PieceKey{Hash: "hash", Index: 0})
+		}},
 		{"clear inflight", func(pool *StreamPool, _ *PooledStream) { pool.ClearAllInflight() }},
 	}
 
@@ -705,8 +709,8 @@ func TestAwaitCapacity_EveryReleasePathWakesAParkedSender(t *testing.T) {
 			})
 			defer cancel()
 
-			ps.window.TrySend("a")
-			ps.window.TrySend("b")
+			ps.window.TrySend(congestion.PieceKey{Hash: "hash", Index: 0})
+			ps.window.TrySend(congestion.PieceKey{Hash: "hash", Index: 1})
 			if pool.CanSend() {
 				t.Fatal("window should be full before the sender parks")
 			}
@@ -795,7 +799,7 @@ func TestDrainAndRemoveStream_HappyPath(t *testing.T) {
 	ps := newDrainTestStream(ctx, 1)
 
 	// Put one piece in-flight
-	ps.window.TrySend("piece:0")
+	ps.window.TrySend(congestion.PieceKey{Hash: "hash", Index: 0})
 	if ps.window.InFlight() != 1 {
 		t.Fatalf("expected 1 in-flight, got %d", ps.window.InFlight())
 	}
@@ -816,7 +820,7 @@ func TestDrainAndRemoveStream_HappyPath(t *testing.T) {
 	}
 
 	// Simulate in-flight piece completing
-	ps.window.OnFail("piece:0")
+	ps.window.OnFail(congestion.PieceKey{Hash: "hash", Index: 0})
 
 	// Drain should complete
 	select {
@@ -850,8 +854,8 @@ func TestDrainAndRemoveStream_Timeout(t *testing.T) {
 	ps := newDrainTestStream(ctx, 2)
 
 	// Put pieces in-flight that will never complete
-	ps.window.TrySend("piece:0")
-	ps.window.TrySend("piece:1")
+	ps.window.TrySend(congestion.PieceKey{Hash: "hash", Index: 0})
+	ps.window.TrySend(congestion.PieceKey{Hash: "hash", Index: 1})
 
 	pool := newDrainTestPool(ctx, cancel, ps)
 

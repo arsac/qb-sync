@@ -32,6 +32,15 @@ const (
 	DefaultPieceTimeout = 60 * time.Second
 )
 
+// PieceKey identifies one in-flight piece. A comparable struct rather than a
+// formatted "hash:index" string, so the send and ack paths key the in-flight
+// map directly instead of building a string per piece and taking it apart
+// again when a stale or cleared piece has to be requeued.
+type PieceKey struct {
+	Hash  string
+	Index int32
+}
+
 // AdaptiveWindow implements CUBIC congestion control (RFC 8312) adapted for
 // piece-level streaming. It adjusts the number of in-flight pieces based on
 // loss events rather than RTT ratios, making it robust on high-jitter links.
@@ -56,7 +65,7 @@ type AdaptiveWindow struct {
 	largestSentAtCutback int64 // Sequence at last loss reduction.
 
 	// Track in-flight pieces.
-	inflight     map[string]inflightPiece
+	inflight     map[PieceKey]inflightPiece
 	pieceTimeout time.Duration
 	mu           sync.Mutex
 
@@ -136,7 +145,7 @@ func NewAdaptiveWindow(config Config) *AdaptiveWindow {
 		pieceTimeout:         config.PieceTimeout,
 		largestAckedSeq:      -1,
 		largestSentAtCutback: -1,
-		inflight:             make(map[string]inflightPiece),
+		inflight:             make(map[PieceKey]inflightPiece),
 		nowFunc:              time.Now,
 	}
 }
@@ -170,7 +179,7 @@ func (w *AdaptiveWindow) CanSend() bool {
 // TrySend atomically checks if we can send and records the piece if so.
 // Returns true if the piece was recorded, false if window is full.
 // This avoids the TOCTOU race between CanSend and OnSend.
-func (w *AdaptiveWindow) TrySend(key string) bool {
+func (w *AdaptiveWindow) TrySend(key PieceKey) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -184,7 +193,7 @@ func (w *AdaptiveWindow) TrySend(key string) bool {
 
 // OnSend records that a piece was sent.
 // Prefer TrySend for atomic check-and-send to avoid TOCTOU races.
-func (w *AdaptiveWindow) OnSend(key string) {
+func (w *AdaptiveWindow) OnSend(key PieceKey) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -193,7 +202,7 @@ func (w *AdaptiveWindow) OnSend(key string) {
 
 // recordSend puts a piece in flight under a fresh sequence number, keeping the
 // first attempt's send time if the piece is already in flight. Must hold w.mu.
-func (w *AdaptiveWindow) recordSend(key string) {
+func (w *AdaptiveWindow) recordSend(key PieceKey) {
 	now := w.now()
 	w.lastSendSeq++
 
@@ -207,7 +216,7 @@ func (w *AdaptiveWindow) recordSend(key string) {
 }
 
 // OnAck records that a piece was acknowledged and adjusts the window.
-func (w *AdaptiveWindow) OnAck(key string) {
+func (w *AdaptiveWindow) OnAck(key PieceKey) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -337,7 +346,7 @@ func (w *AdaptiveWindow) cubicCongestionWindowAfterAck() int {
 
 // OnFail records that a piece failed (timeout or error).
 // Implements CUBIC multiplicative decrease with recovery deduplication.
-func (w *AdaptiveWindow) OnFail(key string) {
+func (w *AdaptiveWindow) OnFail(key PieceKey) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -390,26 +399,26 @@ func (w *AdaptiveWindow) updateSmoothedRTT(rtt time.Duration) {
 }
 
 // ClearInflight removes all in-flight tracking and returns the keys.
-func (w *AdaptiveWindow) ClearInflight() []string {
+func (w *AdaptiveWindow) ClearInflight() []PieceKey {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	keys := make([]string, 0, len(w.inflight))
+	keys := make([]PieceKey, 0, len(w.inflight))
 	for key := range w.inflight {
 		keys = append(keys, key)
 	}
-	w.inflight = make(map[string]inflightPiece)
+	w.inflight = make(map[PieceKey]inflightPiece)
 	return keys
 }
 
 // GetStaleKeys returns keys that have been in-flight longer than the piece timeout.
 // These should be marked as failed and retried.
-func (w *AdaptiveWindow) GetStaleKeys() []string {
+func (w *AdaptiveWindow) GetStaleKeys() []PieceKey {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	now := w.now()
-	var stale []string
+	var stale []PieceKey
 	for key, p := range w.inflight {
 		if now.Sub(p.sentAt) > w.pieceTimeout {
 			stale = append(stale, key)

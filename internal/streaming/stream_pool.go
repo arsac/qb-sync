@@ -877,14 +877,14 @@ func (p *StreamPool) publishCapacity() {
 
 // AckPiece retires an acknowledged piece from its stream's congestion window,
 // freeing the slot for a waiting sender.
-func (p *StreamPool) AckPiece(ps *PooledStream, key string) {
+func (p *StreamPool) AckPiece(ps *PooledStream, key congestion.PieceKey) {
 	ps.window.OnAck(key)
 	p.publishCapacity()
 }
 
 // FailPiece retires a piece that will not be acknowledged - failed, stale, or
 // abandoned before it was sent - from its stream's congestion window.
-func (p *StreamPool) FailPiece(ps *PooledStream, key string) {
+func (p *StreamPool) FailPiece(ps *PooledStream, key congestion.PieceKey) {
 	ps.window.OnFail(key)
 	p.publishCapacity()
 }
@@ -954,11 +954,11 @@ func (p *StreamPool) Stats() StreamPoolStats {
 
 // ClearAllInflight clears in-flight tracking from all streams.
 // Returns all keys that were in-flight.
-func (p *StreamPool) ClearAllInflight() []string {
+func (p *StreamPool) ClearAllInflight() []congestion.PieceKey {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	var allKeys []string
+	var allKeys []congestion.PieceKey
 	for _, ps := range p.streams {
 		keys := ps.window.ClearInflight()
 		allKeys = append(allKeys, keys...)
@@ -969,7 +969,7 @@ func (p *StreamPool) ClearAllInflight() []string {
 
 // StaleKey pairs a stale piece key with the stream whose congestion window owns it.
 type StaleKey struct {
-	Key    string
+	Key    congestion.PieceKey
 	Stream *PooledStream
 }
 

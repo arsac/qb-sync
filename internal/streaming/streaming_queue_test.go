@@ -52,7 +52,7 @@ func (s *concurrencyTrackingSource) GetTorrentMetadata(context.Context, string) 
 
 // makeTestPoolWithInflight creates a StreamPool with one PooledStream that has
 // in-flight pieces registered in its congestion window.
-func makeTestPoolWithInflight(t *testing.T, keys []string) *StreamPool {
+func makeTestPoolWithInflight(t *testing.T, keys []congestion.PieceKey) *StreamPool {
 	t.Helper()
 
 	logger := testLogger
@@ -87,7 +87,7 @@ func makeDrainTestQueue(t *testing.T) *BidiQueue {
 		tracker:             NewPieceMonitor(nil, nil, logger, DefaultPieceMonitorConfig()),
 		logger:              logger,
 		config:              DefaultBidiQueueConfig(),
-		pieceHashMismatches: make(map[string]int),
+		pieceHashMismatches: make(map[congestion.PieceKey]int),
 	}
 }
 
@@ -100,8 +100,8 @@ func TestDrainInFlightPool_ProcessesAcksWithCancelledContext(t *testing.T) {
 
 	hash := "testhash"
 	idx := int32(0)
-	key := pieceKey(hash, idx)
-	pool := makeTestPoolWithInflight(t, []string{key})
+	key := congestion.PieceKey{Hash: hash, Index: idx}
+	pool := makeTestPoolWithInflight(t, []congestion.PieceKey{key})
 
 	// The ack envelope carries the source stream so processAck updates the
 	// right window without an external lookup.
@@ -170,8 +170,8 @@ func TestDrainInFlightPool_MarksFailedOnPoolError(t *testing.T) {
 	q := makeDrainTestQueue(t)
 
 	hash := "testhash"
-	key := pieceKey(hash, 0)
-	pool := makeTestPoolWithInflight(t, []string{key})
+	key := congestion.PieceKey{Hash: hash, Index: 0}
+	pool := makeTestPoolWithInflight(t, []congestion.PieceKey{key})
 
 	// Send a stream error instead of an ack
 	pool.errs <- errors.New("stream broken")
@@ -233,7 +233,7 @@ func TestSenderWorkersConcurrency(t *testing.T) {
 		tracker:             tracker,
 		logger:              logger,
 		config:              config,
-		pieceHashMismatches: make(map[string]int),
+		pieceHashMismatches: make(map[congestion.PieceKey]int),
 	}
 
 	// Pool with one stream whose window has capacity (CanSend = true).
@@ -360,7 +360,7 @@ func TestDeliverPiece_RetriesAfterLosingWindowSlot(t *testing.T) {
 		tracker:             tracker,
 		logger:              testLogger,
 		config:              DefaultBidiQueueConfig(),
-		pieceHashMismatches: make(map[string]int),
+		pieceHashMismatches: make(map[congestion.PieceKey]int),
 	}
 
 	// One stream with a single-slot window, already occupied by another
@@ -375,7 +375,7 @@ func TestDeliverPiece_RetriesAfterLosingWindowSlot(t *testing.T) {
 		InitialWindow: 1,
 		PieceTimeout:  time.Minute,
 	})
-	const occupant = "otherhash:0"
+	occupant := congestion.PieceKey{Hash: "otherhash", Index: 0}
 	window.OnSend(occupant)
 	ps := &PooledStream{window: window, id: 0}
 	pool.mu.Lock()
@@ -435,7 +435,7 @@ func TestDeliverPiece_RetriesAfterLosingWindowSlot(t *testing.T) {
 
 // makeTestPoolWithStaleKeys creates a StreamPool with the given number of
 // streams, each with pieces that become stale after a short sleep.
-func makeTestPoolWithStaleKeys(t *testing.T, streamKeys [][]string) (*StreamPool, []*PooledStream) {
+func makeTestPoolWithStaleKeys(t *testing.T, streamKeys [][]congestion.PieceKey) (*StreamPool, []*PooledStream) {
 	t.Helper()
 
 	logger := testLogger
@@ -469,9 +469,11 @@ func makeTestPoolWithStaleKeys(t *testing.T, streamKeys [][]string) (*StreamPool
 func TestGetAllStaleKeys_PairsKeyWithOwningStream(t *testing.T) {
 	// Two streams, each with one piece. Verify that GetAllStaleKeys pairs
 	// each key with the correct owning PooledStream.
-	pool, streams := makeTestPoolWithStaleKeys(t, [][]string{
-		{"hash1:0"},
-		{"hash2:0"},
+	hash1Piece := congestion.PieceKey{Hash: "hash1", Index: 0}
+	hash2Piece := congestion.PieceKey{Hash: "hash2", Index: 0}
+	pool, streams := makeTestPoolWithStaleKeys(t, [][]congestion.PieceKey{
+		{hash1Piece},
+		{hash2Piece},
 	})
 	defer pool.cancel()
 
@@ -489,16 +491,16 @@ func TestGetAllStaleKeys_PairsKeyWithOwningStream(t *testing.T) {
 	}
 
 	// Build map for easier assertion.
-	byKey := make(map[string]*PooledStream, len(stale))
+	byKey := make(map[congestion.PieceKey]*PooledStream, len(stale))
 	for _, sk := range stale {
 		byKey[sk.Key] = sk.Stream
 	}
 
-	if byKey["hash1:0"] != streams[0] {
-		t.Errorf("hash1:0 should be paired with stream 0, got stream %d", byKey["hash1:0"].id)
+	if byKey[hash1Piece] != streams[0] {
+		t.Errorf("hash1 piece 0 should be paired with stream 0, got stream %d", byKey[hash1Piece].id)
 	}
-	if byKey["hash2:0"] != streams[1] {
-		t.Errorf("hash2:0 should be paired with stream 1, got stream %d", byKey["hash2:0"].id)
+	if byKey[hash2Piece] != streams[1] {
+		t.Errorf("hash2 piece 0 should be paired with stream 1, got stream %d", byKey[hash2Piece].id)
 	}
 }
 
@@ -506,9 +508,9 @@ func TestHandleStalePiecesPool_RemovesFromCorrectWindow(t *testing.T) {
 	// Stale pieces are reclaimed from the window of the stream that actually
 	// owns them, sourced via pool.GetAllStaleKeys() (which iterates each
 	// stream's own inflight map). No external piece-to-stream map is involved.
-	pool, streams := makeTestPoolWithStaleKeys(t, [][]string{
-		{"hash:0"}, // streamA — will have the stale key
-		{},         // streamB — empty
+	pool, streams := makeTestPoolWithStaleKeys(t, [][]congestion.PieceKey{
+		{{Hash: "hash", Index: 0}}, // streamA — will have the stale key
+		{},                         // streamB — empty
 	})
 	defer pool.cancel()
 
@@ -527,5 +529,46 @@ func TestHandleStalePiecesPool_RemovesFromCorrectWindow(t *testing.T) {
 	if streamA.window.InFlight() != 0 {
 		t.Errorf("streamA should have 0 in-flight after stale cleanup, got %d",
 			streamA.window.InFlight())
+	}
+}
+
+// TestRequeuePiece_MarksTheKeysOwnPiece pins that a piece leaving the
+// congestion window without an ack is requeued as itself. The key carries the
+// hash and index the sender put in flight, so a requeue that reads the wrong
+// field re-offers some other piece and abandons this one forever.
+func TestRequeuePiece_MarksTheKeysOwnPiece(t *testing.T) {
+	const piecesPerTorrent = 8
+
+	q := makeDrainTestQueue(t)
+	for _, hash := range []string{"hashA", "hashB"} {
+		q.tracker.torrents[hash] = &torrentState{
+			streamed: make([]bool, piecesPerTorrent),
+			failed:   make([]bool, piecesPerTorrent),
+		}
+	}
+
+	// Distinct index per torrent, so reading the wrong field of the key marks
+	// a piece that is not in flight rather than landing on the right one.
+	inFlight := []congestion.PieceKey{
+		{Hash: "hashA", Index: 2},
+		{Hash: "hashB", Index: 5},
+	}
+	pool := makeTestPoolWithInflight(t, inFlight)
+	defer pool.cancel()
+
+	q.markInFlightAsFailedPool(context.Background(), pool)
+
+	for _, key := range inFlight {
+		state := q.tracker.torrents[key.Hash]
+		state.mu.Lock()
+		failed := slices.Clone(state.failed)
+		state.mu.Unlock()
+
+		for i, isFailed := range failed {
+			want := i == int(key.Index)
+			if isFailed != want {
+				t.Errorf("%s piece %d failed = %v, want %v", key.Hash, i, isFailed, want)
+			}
+		}
 	}
 }

@@ -97,8 +97,8 @@ type BidiQueue struct {
 	limiter *rate.Limiter
 
 	// Track per-piece hash mismatch failures to prevent infinite retry loops.
-	// Key: pieceKey(hash, index), Value: consecutive mismatch count.
-	pieceHashMismatches   map[string]int
+	// Value: consecutive mismatch count.
+	pieceHashMismatches   map[congestion.PieceKey]int
 	pieceHashMismatchesMu sync.Mutex
 
 	bytesSent  atomic.Int64
@@ -141,7 +141,7 @@ func NewBidiQueue(
 		tracker:             tracker,
 		logger:              logger,
 		config:              config,
-		pieceHashMismatches: make(map[string]int),
+		pieceHashMismatches: make(map[congestion.PieceKey]int),
 	}
 
 	if config.MaxBytesPerSec > 0 {
@@ -176,7 +176,7 @@ func (q *BidiQueue) Stats() BidiQueueStats {
 
 // clearHashMismatch removes any tracked hash-mismatch counter for a piece.
 // Called when an ack comes back successful or when the mismatch limit is hit.
-func (q *BidiQueue) clearHashMismatch(key string) {
+func (q *BidiQueue) clearHashMismatch(key congestion.PieceKey) {
 	q.pieceHashMismatchesMu.Lock()
 	delete(q.pieceHashMismatches, key)
 	q.pieceHashMismatchesMu.Unlock()
@@ -477,7 +477,7 @@ func (q *BidiQueue) sendPiecePool(ctx context.Context, pool *StreamPool, piece *
 	sendStart := time.Now()
 	hash := piece.GetTorrentHash()
 	index := piece.GetIndex()
-	key := pieceKey(hash, index)
+	key := congestion.PieceKey{Hash: hash, Index: index}
 
 	// Drop pieces whose torrent was untracked between queue time and now.
 	// queueCompletedPieces enqueues with a snapshot of the torrent state, so
@@ -619,18 +619,14 @@ func (q *BidiQueue) handleStalePiecesPool(ctx context.Context, pool *StreamPool)
 	for _, sk := range staleKeys {
 		// Fail the piece on the stream that actually owns the key in its window.
 		pool.FailPiece(sk.Stream, sk.Key)
-		q.requeuePieceByKey(ctx, sk.Key)
+		q.requeuePiece(sk.Key)
 	}
 }
 
-// requeuePieceByKey parses a piece key and marks it as failed for retry.
-func (q *BidiQueue) requeuePieceByKey(ctx context.Context, key string) {
-	hash, index, ok := ParsePieceKey(key)
-	if !ok {
-		q.logger.WarnContext(ctx, "failed to parse piece key", "key", key)
-		return
-	}
-	q.tracker.MarkFailed(hash, int(index))
+// requeuePiece marks a piece that left the congestion window without an ack as
+// failed, so the next poll cycle re-offers it.
+func (q *BidiQueue) requeuePiece(key congestion.PieceKey) {
+	q.tracker.MarkFailed(key.Hash, int(key.Index))
 	q.piecesFail.Add(1)
 }
 
@@ -646,7 +642,7 @@ func (q *BidiQueue) markInFlightAsFailedPool(ctx context.Context, pool *StreamPo
 	)
 
 	for _, key := range keys {
-		q.requeuePieceByKey(ctx, key)
+		q.requeuePiece(key)
 	}
 }
 
@@ -658,7 +654,7 @@ func (q *BidiQueue) processAck(ctx context.Context, pool *StreamPool, env AckEnv
 	ps := env.Stream
 	hash := ack.GetTorrentHash()
 	index := int(ack.GetPieceIndex())
-	key := pieceKey(hash, int32(index))
+	key := congestion.PieceKey{Hash: hash, Index: ack.GetPieceIndex()}
 
 	streamID := -1
 	if ps != nil {
@@ -698,7 +694,7 @@ func (q *BidiQueue) processAck(ctx context.Context, pool *StreamPool, env AckEnv
 		switch ack.GetErrorCode() { //nolint:exhaustive // IO, FINALIZING, NONE handled by default.
 		case pb.PieceErrorCode_PIECE_ERROR_HASH_MISMATCH:
 			metrics.PieceHashMismatchTotal.Inc()
-			q.handleHashMismatch(ctx, hash, index, key, streamID, ack.GetError())
+			q.handleHashMismatch(ctx, key, streamID, ack.GetError())
 
 		case pb.PieceErrorCode_PIECE_ERROR_NOT_INITIALIZED:
 			// Clear init cache so next send triggers re-init
@@ -727,9 +723,7 @@ func (q *BidiQueue) processAck(ctx context.Context, pool *StreamPool, env AckEnv
 // can surface an INCOMPLETE error rather than retrying a corrupt piece forever.
 func (q *BidiQueue) handleHashMismatch(
 	ctx context.Context,
-	hash string,
-	index int,
-	key string,
+	key congestion.PieceKey,
 	streamID int,
 	errMsg string,
 ) {
@@ -742,10 +736,10 @@ func (q *BidiQueue) handleHashMismatch(
 	q.pieceHashMismatchesMu.Unlock()
 
 	if mismatches >= maxPieceHashMismatches {
-		q.tracker.MarkStreamed(hash, index)
+		q.tracker.MarkStreamed(key.Hash, int(key.Index))
 		q.logger.ErrorContext(ctx, "piece hash mismatch limit reached, forcing finalization attempt",
-			"hash", hash,
-			"piece", index,
+			"hash", key.Hash,
+			"piece", key.Index,
 			"stream", streamID,
 			"mismatches", mismatches,
 		)
@@ -753,8 +747,8 @@ func (q *BidiQueue) handleHashMismatch(
 	}
 
 	q.logger.ErrorContext(ctx, "piece hash mismatch, will retry",
-		"hash", hash,
-		"piece", index,
+		"hash", key.Hash,
+		"piece", key.Index,
 		"stream", streamID,
 		"mismatches", mismatches,
 		"error", errMsg,
