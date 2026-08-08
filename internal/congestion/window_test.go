@@ -321,6 +321,32 @@ func TestAdaptiveWindow_OriginalSendTime_RTTAccuracy(t *testing.T) {
 	}
 }
 
+// A retry gets a fresh sequence number, so its own failure is a new loss event
+// rather than one recovery dedup folds into the cutback that preceded it. The
+// send time carried across a retry is the first one; the sequence number is not.
+func TestAdaptiveWindow_RetryTakesAFreshSequence(t *testing.T) {
+	w, _ := newTestWindow(Config{
+		MinWindow:     2,
+		MaxWindow:     100,
+		InitialWindow: 50,
+	})
+
+	// Cut back once so largestSentAtCutback is set past piece:0's first send.
+	w.OnSend("piece:0")
+	w.OnSend("piece:cut")
+	w.OnFail("piece:cut")
+	afterCutback := w.Window()
+
+	// Retry piece:0 while it is still in flight, then fail it. The retry is a
+	// post-cutback send, so this is a distinct loss event and must reduce again.
+	w.OnSend("piece:0")
+	w.OnFail("piece:0")
+
+	if got := w.Window(); got >= afterCutback {
+		t.Errorf("expected a retry's failure to reduce the window below %d, got %d", afterCutback, got)
+	}
+}
+
 func TestAdaptiveWindow_ConfigValidation(t *testing.T) {
 	config := Config{
 		MinWindow:     100,
@@ -828,7 +854,7 @@ func TestOnAck_NotInFlight(t *testing.T) {
 	}
 }
 
-func TestClearInflight_ClearsPieceSeq(t *testing.T) {
+func TestClearInflight_DropsAllPieceState(t *testing.T) {
 	w, _ := newTestWindow(Config{
 		MinWindow:     2,
 		MaxWindow:     100,
@@ -840,10 +866,11 @@ func TestClearInflight_ClearsPieceSeq(t *testing.T) {
 
 	w.ClearInflight()
 
-	// After clear, pieceSeq should be empty.
+	// Send times, first-send times and sequence numbers all live in the one
+	// entry, so an empty map is the whole statement.
 	w.mu.Lock()
-	if len(w.pieceSeq) != 0 {
-		t.Errorf("expected pieceSeq to be empty after ClearInflight, got %d entries", len(w.pieceSeq))
+	if len(w.inflight) != 0 {
+		t.Errorf("expected inflight to be empty after ClearInflight, got %d entries", len(w.inflight))
 	}
 	w.mu.Unlock()
 }
@@ -888,5 +915,21 @@ func TestStats_Fields(t *testing.T) {
 	stats = w.Stats()
 	if stats.InRecovery {
 		t.Error("expected InRecovery=false after post-cutback ACK")
+	}
+}
+
+// BenchmarkSendAckCycle covers the per-piece congestion bookkeeping: every
+// streamed piece pays one TrySend and one OnAck on its stream's window.
+func BenchmarkSendAckCycle(b *testing.B) {
+	w := NewAdaptiveWindow(DefaultConfig())
+	keys := make([]string, DefaultInitialWindow)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c:%d", i)
+	}
+	b.ResetTimer()
+	for i := 0; b.Loop(); i++ {
+		key := keys[i%len(keys)]
+		w.TrySend(key)
+		w.OnAck(key)
 	}
 }
