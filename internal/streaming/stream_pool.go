@@ -620,6 +620,10 @@ func (p *StreamPool) undoProbe(unit scaleUnit) {
 // probeStream adds a stream on trial, with currentThroughput as its baseline.
 // A pool already at maxStreams simply ends the climb: nothing is armed, so the
 // next measurement scales normally. Must hold p.mu.
+//
+// The publishCapacity inside addStreamLocked is what makes the trial fair: the
+// sender pool runs one worker per stream, so the added stream wakes the sender
+// that was parked for want of one and starts carrying pieces before the verdict.
 func (p *StreamPool) probeStream(currentThroughput float64) {
 	if len(p.streams) >= p.maxStreams {
 		return
@@ -1023,6 +1027,28 @@ func (p *StreamPool) StreamCount() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return len(p.streams)
+}
+
+// SendableStreamCount returns how many streams still accept new pieces, which
+// is how many senders the pool can keep busy: a sender occupies one stream for
+// the whole of its read-then-send, and PieceStream.Send serializes on that
+// stream's own mutex, so two senders on one stream take turns.
+func (p *StreamPool) SendableStreamCount() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	count := 0
+	for _, ps := range p.streams {
+		if !ps.draining.Load() {
+			count++
+		}
+	}
+	return count
+}
+
+// MaxStreams returns the pool's stream ceiling. Fixed at construction.
+func (p *StreamPool) MaxStreams() int {
+	return p.maxStreams
 }
 
 // Stats returns aggregated statistics from all streams.

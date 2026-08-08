@@ -572,3 +572,135 @@ func TestRequeuePiece_MarksTheKeysOwnPiece(t *testing.T) {
 		}
 	}
 }
+
+// parkingSource is a mock PieceSource whose ReadPiece blocks until release is
+// closed, so the number of senders that got past the dequeue is observable as
+// the number of calls parked inside it.
+type parkingSource struct {
+	release   chan struct{}
+	entered   atomic.Int32
+	inFlight  atomic.Int32
+	maxInFlig atomic.Int32
+}
+
+func (s *parkingSource) ReadPiece(_ context.Context, _ *pb.Piece) ([]byte, error) {
+	s.entered.Add(1)
+	c := s.inFlight.Add(1)
+	defer s.inFlight.Add(-1)
+	for {
+		old := s.maxInFlig.Load()
+		if c <= old || s.maxInFlig.CompareAndSwap(old, c) {
+			break
+		}
+	}
+	<-s.release
+	return nil, errors.New("mock read error")
+}
+
+func (s *parkingSource) GetPieceStates(context.Context, string) ([]PieceState, error) {
+	return nil, nil
+}
+func (s *parkingSource) GetPieceHashes(context.Context, string) ([]string, error) { return nil, nil }
+
+func (s *parkingSource) GetTorrentMetadata(context.Context, string) (*TorrentMetadata, error) {
+	return nil, nil
+}
+
+// TestSenderWorkers_TrackTheStreamCount pins the rule that makes the pool's
+// adaptive stream scaling mean anything: a sender only dequeues while there is
+// a stream for it to drive, and a stream added to the pool wakes the sender
+// that was parked for want of one.
+//
+// Two senders are started against a one-stream pool with NumSenders=1, so the
+// second is outside the active set. Both pieces are already queued, so without
+// the gate both senders would be inside ReadPiece immediately.
+func TestSenderWorkers_TrackTheStreamCount(t *testing.T) {
+	const numPieces = 2
+
+	// Unwind order matters: the senders have to be released from ReadPiece and
+	// told to stop before the test can join them.
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	source := &parkingSource{release: make(chan struct{})}
+	defer close(source.release)
+
+	dest := &GRPCDestination{
+		initResults: map[string]*InitTorrentResult{"testhash": {}},
+	}
+	tracker := NewPieceMonitor(nil, nil, testLogger, DefaultPieceMonitorConfig())
+	tracker.torrents["testhash"] = &torrentState{
+		streamed: make([]bool, numPieces),
+		failed:   make([]bool, numPieces),
+	}
+
+	config := DefaultBidiQueueConfig()
+	config.NumSenders = 1
+	q := &BidiQueue{
+		source:              source,
+		dest:                dest,
+		tracker:             tracker,
+		logger:              testLogger,
+		config:              config,
+		pieceHashMismatches: make(map[congestion.PieceKey]int),
+	}
+
+	pool := makeTestPoolWithInflight(t, nil)
+	defer pool.cancel()
+
+	for i := range numPieces {
+		tracker.completed <- &pb.Piece{TorrentHash: "testhash", Index: int32(i)}
+	}
+
+	ctx := t.Context()
+	stopSender := make(chan struct{})
+	defer close(stopSender)
+
+	for id := range 2 {
+		wg.Go(func() { q.senderWorker(ctx, pool, stopSender, id) })
+	}
+
+	waitFor(t, "a sender to reach ReadPiece", func() bool {
+		return source.inFlight.Load() > 0
+	})
+	// Give the parked sender every chance to dequeue anyway.
+	time.Sleep(100 * time.Millisecond)
+	if got := source.maxInFlig.Load(); got != 1 {
+		t.Fatalf("senders inside ReadPiece with one stream = %d, want 1", got)
+	}
+
+	// Scale the pool up the way probeStream does, including the wakeup.
+	pool.mu.Lock()
+	pool.streams = append(pool.streams, &PooledStream{
+		window: congestion.NewAdaptiveWindow(congestion.DefaultConfig()),
+		id:     1,
+	})
+	pool.mu.Unlock()
+	pool.publishCapacity()
+
+	waitFor(t, "the parked sender to start driving the new stream", func() bool {
+		return source.maxInFlig.Load() == 2
+	})
+
+	// A draining stream is not claimable, so it must not entitle a sender to a
+	// turn either.
+	pool.mu.RLock()
+	pool.streams[1].draining.Store(true)
+	pool.mu.RUnlock()
+	if got := pool.SendableStreamCount(); got != 1 {
+		t.Errorf("SendableStreamCount with one stream draining = %d, want 1", got)
+	}
+}
+
+// waitFor polls cond until it holds or the deadline passes.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}

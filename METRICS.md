@@ -112,7 +112,7 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_write_workers_busy` | | Destination write workers currently processing |
 | `qbsync_grpc_connections_configured` | | Maximum TCP connections configured for gRPC streaming (source) |
 | `qbsync_grpc_connections_active` | | Current active TCP connections to destination server (source) |
-| `qbsync_sender_workers_configured` | | Concurrent sender workers configured (source) |
+| `qbsync_sender_workers_configured` | | Configured minimum concurrent sender workers (source); the active count is `max(this, qbsync_stream_pool_size)` |
 | `qbsync_arr_routed_categories` | `instance` | Categories currently routed to each *arr instance. Zero means the filter is inert for it: nothing routes there, so nothing is ever checked against it |
 | `qbsync_arr_circuit_breaker_state` | `instance` | *arr circuit breaker state (destination): 0=closed, 1=open, 2=half-open |
 | `qbsync_draining` | | Shutdown drain in progress: 1=draining, 0=normal (source) |

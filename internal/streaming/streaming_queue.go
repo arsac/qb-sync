@@ -31,7 +31,7 @@ const (
 	defaultCircuitBreakerPause    = 5 * time.Minute  // Longer pause after max failures
 	windowStatsInterval           = 5 * time.Second  // How often to log window stats
 	staleCheckInterval            = 10 * time.Second // How often to check for stale in-flight pieces
-	defaultNumSenders             = 4                // Concurrent sender workers (parallelizes ReadPiece + Send)
+	defaultNumSenders             = 4                // Minimum concurrent sender workers (parallelizes ReadPiece + Send)
 	maxPieceHashMismatches        = 5                // Per-piece hash mismatch limit before forcing finalization
 )
 
@@ -59,8 +59,9 @@ type BidiQueueConfig struct {
 	ReconnectBaseDelay time.Duration // Initial reconnect delay (default: 1s)
 	ReconnectMaxDelay  time.Duration // Maximum reconnect delay cap (default: 30s)
 
-	// Sender parallelism
-	NumSenders int // Concurrent sender workers (default: 4)
+	// Sender parallelism. This is the floor, not the cap: the pool runs one
+	// sender per stream, so adaptive scaling raises the active count above it.
+	NumSenders int // Minimum concurrent sender workers (default: 4)
 
 	// Adaptive window configuration (applied to each stream's congestion control)
 	AdaptiveWindow congestion.Config
@@ -300,11 +301,23 @@ func (q *BidiQueue) runStream(ctx context.Context) error {
 	}
 }
 
-// runSenderPool spawns N sender workers that pull from tracker.Completed() concurrently,
-// plus a dedicated stats reporter goroutine.
+// runSenderPool spawns the sender workers that pull from tracker.Completed()
+// concurrently, plus a dedicated stats reporter goroutine.
+//
+// One worker is started for every stream the pool could ever hold, but only
+// activeSenders of them dequeue at a time - the rest park in awaitTurn, holding
+// no piece buffer. That is what lets the pool's adaptive scaling mean anything:
+// a stream carries data only while a sender is driving it, so before this the
+// pool could add streams past NumSenders and they would sit idle, making every
+// stream probe measure noise and be undone. Sizing the resident worker set to
+// the ceiling instead of resizing it keeps the workers' lifecycle tied to the
+// stream session and nothing else.
 func (q *BidiQueue) runSenderPool(ctx context.Context, pool *StreamPool, stopSender <-chan struct{}) {
-	numSenders := q.config.NumSenders
-	q.logger.InfoContext(ctx, "starting sender workers", "count", numSenders)
+	numSenders := max(q.config.NumSenders, pool.MaxStreams())
+	q.logger.InfoContext(ctx, "starting sender workers",
+		"count", numSenders,
+		"active", q.activeSenders(pool),
+	)
 
 	var wg sync.WaitGroup
 
@@ -345,7 +358,7 @@ func (q *BidiQueue) runSenderPool(ctx context.Context, pool *StreamPool, stopSen
 // senderWorker is the per-piece send loop run by each sender goroutine.
 func (q *BidiQueue) senderWorker(ctx context.Context, pool *StreamPool, stopSender <-chan struct{}, id int) {
 	for {
-		if !q.awaitCapacity(ctx, pool, stopSender) {
+		if !q.awaitTurn(ctx, pool, stopSender, id) {
 			return
 		}
 
@@ -365,23 +378,65 @@ func (q *BidiQueue) senderWorker(ctx context.Context, pool *StreamPool, stopSend
 	}
 }
 
+// activeSenders reports how many of the resident sender workers may dequeue a
+// piece right now: one per stream the pool can send on, never fewer than the
+// configured NumSenders. The floor keeps the pre-existing behaviour of running
+// several senders over a small pool, which pipelines one sender's disk read
+// behind another's in-flight Send.
+func (q *BidiQueue) activeSenders(pool *StreamPool) int {
+	return max(q.config.NumSenders, pool.SendableStreamCount())
+}
+
+// awaitTurn blocks until this sender is within the active set and the pool can
+// accept another piece. Returns false when the worker should exit.
+//
+// The active-set check belongs here rather than in awaitCapacity because it is
+// only safe before a piece is dequeued: a sender that has already taken a piece
+// must be allowed to finish it even if the pool shrank underneath it, otherwise
+// the piece waits for a stream add that may never come.
+func (q *BidiQueue) awaitTurn(ctx context.Context, pool *StreamPool, stopSender <-chan struct{}, id int) bool {
+	return q.awaitPool(ctx, pool, stopSender, func() bool {
+		return id < q.activeSenders(pool) && pool.CanSend()
+	})
+}
+
 // awaitCapacity blocks until some stream in the pool can accept a piece.
 // Returns false when the worker should exit.
-//
-// The wakeup channel is taken before each capacity test, so a slot released in
-// between closes the channel this worker already holds and the select returns
-// at once. That ordering is what makes a periodic re-check unnecessary: no
-// release can land in a window where nobody is listening for it.
 func (q *BidiQueue) awaitCapacity(ctx context.Context, pool *StreamPool, stopSender <-chan struct{}) bool {
-	if pool.CanSend() {
+	return q.awaitPool(ctx, pool, stopSender, pool.CanSend)
+}
+
+// awaitPool blocks until ready reports true. Returns false when the worker
+// should exit.
+//
+// The wakeup channel is taken before each test, so a slot released in between
+// closes the channel this worker already holds and the select returns at once.
+// That ordering is what makes a periodic re-check unnecessary: no release can
+// land in a window where nobody is listening for it. Stream adds publish on the
+// same channel, which is what wakes a sender parked outside the active set.
+//
+// Only a genuinely full congestion window is counted, once per wait: a sender
+// parked because the pool has fewer streams than senders is idle capacity, not
+// link pressure, and there is one of those for every unused stream slot.
+func (q *BidiQueue) awaitPool(
+	ctx context.Context,
+	pool *StreamPool,
+	stopSender <-chan struct{},
+	ready func() bool,
+) bool {
+	if ready() {
 		return true
 	}
 
-	metrics.WindowFullTotal.Inc()
+	counted := false
 	for {
 		capacity := pool.CapacityWait()
-		if pool.CanSend() {
+		if ready() {
 			return true
+		}
+		if !counted && !pool.CanSend() {
+			metrics.WindowFullTotal.Inc()
+			counted = true
 		}
 		select {
 		case <-ctx.Done():

@@ -114,7 +114,7 @@ type SourceConfig struct {
 	PieceTimeout       time.Duration // Timeout for stale in-flight pieces (default: 60s)
 	MaxBytesPerSec     int64
 	ReconnectMaxDelay  time.Duration // Max reconnect backoff delay (default: 30s)
-	NumSenders         int           // Concurrent sender workers for streaming (default: 4)
+	NumSenders         int           // Minimum concurrent sender workers for streaming (default: 4)
 	MinGRPCConnections int           // Minimum TCP connections to destination server (default: 2)
 	MaxGRPCConnections int           // Maximum TCP connections to destination server (default: 8)
 	SourceRemovedTag   string        // Tag applied on destination when torrent is removed from source (empty to disable)
@@ -301,7 +301,7 @@ func SetupSourceFlags(cmd *cobra.Command) {
 	flags.Int(
 		"num-senders",
 		defaultNumSenders,
-		"Concurrent sender workers for streaming (increase for high-throughput links)",
+		"Minimum concurrent sender workers for streaming; the adaptive stream pool raises this",
 	)
 	flags.Int(
 		"min-connections",

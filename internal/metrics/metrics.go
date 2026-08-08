@@ -1018,12 +1018,14 @@ var (
 		},
 	)
 
-	// SenderWorkersConfigured tracks the number of concurrent sender goroutines.
+	// SenderWorkersConfigured tracks the configured floor on concurrent sender
+	// goroutines. The number actually dequeuing is max(this, stream pool size),
+	// so read it alongside qbsync_stream_pool_size.
 	SenderWorkersConfigured = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "sender_workers_configured",
-			Help:      "Number of concurrent sender workers configured for streaming",
+			Help:      "Configured minimum concurrent sender workers for streaming",
 		},
 	)
 )

@@ -59,7 +59,7 @@ All flags can be set via environment variables with the prefix `QBSYNC_SOURCE_` 
 | `QBSYNC_SOURCE_RATE_LIMIT` | `--rate-limit` | Max bytes/sec (0 = unlimited) | `0` |
 | `QBSYNC_SOURCE_PIECE_TIMEOUT` | `--piece-timeout` | Timeout for stale in-flight pieces (seconds) | `60` |
 | `QBSYNC_SOURCE_RECONNECT_MAX_DELAY` | `--reconnect-max-delay` | Max reconnect backoff delay (seconds) | `30` |
-| `QBSYNC_SOURCE_NUM_SENDERS` | `--num-senders` | Concurrent sender workers | `4` |
+| `QBSYNC_SOURCE_NUM_SENDERS` | `--num-senders` | Minimum concurrent sender workers; the adaptive stream pool runs one sender per stream, so the active count rises with it | `4` |
 | `QBSYNC_SOURCE_MIN_CONNECTIONS` | `--min-connections` | Minimum TCP connections to destination server | `2` |
 | `QBSYNC_SOURCE_MAX_CONNECTIONS` | `--max-connections` | Maximum TCP connections to destination server | `8` |
 | `QBSYNC_SOURCE_SYNCED_TAG` | `--synced-tag` | Tag for synced torrents (empty to disable) | `synced` |
