@@ -1336,3 +1336,111 @@ func TestVerifyConcurrency_HonorsConfigAndClamps(t *testing.T) {
 		})
 	}
 }
+
+// TestFinalizeFiles_ParallelSyncAndRename pins the phase-2 fan-out: every
+// non-hardlinked file must end up synced, closed, and renamed to its own final
+// path, with fi.path updated to match, while hardlink-complete files are left
+// untouched. Each file carries index-specific content and a distinct name, so a
+// cross-wired task (renaming file i onto file j's target) fails loudly rather
+// than passing on a shuffled-but-complete result set.
+func TestFinalizeFiles_ParallelSyncAndRename(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+	ctx := context.Background()
+
+	// More files than either concurrency limit so tasks genuinely overlap.
+	const numFiles = 96
+
+	dir := filepath.Join(tmpDir, "torrent")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	const (
+		shapeClosedPartial = iota // .partial on disk, no open handle
+		shapeOpenPartial          // .partial on disk with a live write handle
+		shapeHardlinked           // hardlink-complete: must not be renamed
+		shapeAlreadyFinal         // early-finalized: path already has no suffix
+		numShapes
+	)
+
+	type expectation struct {
+		fi        *serverFileInfo
+		shape     int
+		finalPath string
+		content   []byte
+	}
+
+	files := make([]*serverFileInfo, numFiles)
+	expected := make([]expectation, numFiles)
+	for i := range numFiles {
+		shape := i % numShapes
+		finalPath := filepath.Join(dir, fmt.Sprintf("file%03d.mkv", i))
+		content := fmt.Appendf(nil, "content-of-file-%03d", i)
+
+		onDisk := finalPath
+		if shape != shapeAlreadyFinal {
+			onDisk = finalPath + partialSuffix
+		}
+		if err := os.WriteFile(onDisk, content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		fi := &serverFileInfo{
+			path:     onDisk,
+			offset:   int64(i) * int64(len(content)),
+			size:     int64(len(content)),
+			selected: true,
+		}
+		if shape == shapeHardlinked {
+			fi.hardlink.state = hlStateComplete
+		}
+		if shape == shapeOpenPartial {
+			if err := fi.openForWrite(); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		files[i] = fi
+		expected[i] = expectation{fi: fi, shape: shape, finalPath: finalPath, content: content}
+	}
+
+	state := &serverTorrentState{
+		torrentMeta: torrentMeta{pieceLength: 16, totalSize: 16, files: files},
+		written:     bitset.New(1).Set(0),
+		statePath:   filepath.Join(tmpDir, ".state"),
+	}
+
+	if err := s.finalizeFiles(ctx, "testHash", state); err != nil {
+		t.Fatalf("finalizeFiles: %v", err)
+	}
+
+	for i, exp := range expected {
+		if exp.shape == shapeHardlinked {
+			// Skipped entirely: still .partial, in memory and on disk.
+			if exp.fi.path != exp.finalPath+partialSuffix {
+				t.Errorf("file %d (hardlinked): path = %q, want unchanged %q",
+					i, exp.fi.path, exp.finalPath+partialSuffix)
+			}
+			if _, err := os.Stat(exp.finalPath + partialSuffix); err != nil {
+				t.Errorf("file %d (hardlinked): .partial should still exist: %v", i, err)
+			}
+			continue
+		}
+
+		if exp.fi.path != exp.finalPath {
+			t.Errorf("file %d: path = %q, want %q", i, exp.fi.path, exp.finalPath)
+		}
+		if exp.fi.file != nil {
+			t.Errorf("file %d: handle should be closed after finalize", i)
+		}
+		got, err := os.ReadFile(exp.finalPath)
+		if err != nil {
+			t.Errorf("file %d: reading final path: %v", i, err)
+			continue
+		}
+		if string(got) != string(exp.content) {
+			t.Errorf("file %d: final path holds %q, want %q", i, got, exp.content)
+		}
+	}
+}

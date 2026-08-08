@@ -466,8 +466,6 @@ func (s *Server) relocateForSubPathChange(
 
 // finalizeFiles syncs all file handles, closes them, and renames from .partial to final.
 // Also resolves pending hardlinks by waiting for source files to complete.
-//
-//nolint:gocognit
 func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTorrentState) error {
 	// Phase 1: Resolve pending hardlinks without holding state.mu.
 	// Waiting on hardlink channels can block for up to defaultHardlinkWaitTimeout,
@@ -547,29 +545,64 @@ func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTo
 	defer state.mu.Unlock()
 
 	// Sync and close all file handles before rename.
-	// Fail early if any file can't be flushed — renaming unflushed files
+	// Fail early if any file can't be flushed - renaming unflushed files
 	// risks data loss, especially on NFS where sync is less reliable.
-	for _, fi := range state.files {
-		if fi.hardlink.state != hlStateComplete {
-			if err := s.closeFileHandle(ctx, hash, fi); err != nil {
-				return fmt.Errorf("flushing before rename: %w", err)
-			}
-		}
+	if err := s.syncAndCloseFiles(ctx, hash, state); err != nil {
+		return fmt.Errorf("flushing before rename: %w", err)
 	}
 
-	// Then rename partial files and update in-memory paths.
-	for _, fi := range state.files {
-		if fi.hardlink.state == hlStateComplete {
-			continue
-		}
-		if err := s.renamePartialFile(ctx, hash, fi); err != nil {
-			return err
-		}
-		fi.path = targetPath(fi)
+	if err := s.renamePartialFiles(ctx, hash, state); err != nil {
+		return err
 	}
 
 	s.flushWrittenState(ctx, hash, state)
 	return nil
+}
+
+// syncAndCloseFiles fsyncs and closes every file handle this torrent still owns.
+// Each file is an independent COMMIT + CLOSE round-trip against the NFS server,
+// so they run concurrently at the same width as the finalize-time dir fsyncs
+// rather than one at a time in front of the rename pass.
+//
+// Unlike setupFiles, a failure deliberately does not short-circuit the files not
+// yet started: closing every handle is what the success path does anyway and it
+// releases the fds regardless, while the caller skips the rename pass entirely
+// on any error.
+func (s *Server) syncAndCloseFiles(ctx context.Context, hash string, state *serverTorrentState) error {
+	g := new(errgroup.Group)
+	g.SetLimit(parentDirSyncConcurrency)
+	for _, fi := range state.files {
+		if fi.hardlink.state == hlStateComplete {
+			continue
+		}
+		g.Go(func() error { return s.closeFileHandle(ctx, hash, fi) })
+	}
+	return g.Wait()
+}
+
+// renamePartialFiles renames each .partial file to its final path and updates
+// the in-memory path. Renames are pure metadata round-trips against distinct
+// paths, so they fan out at the same width as the init-time per-file probes;
+// a season pack otherwise pays one serial NFS RENAME per file before the source
+// sees the torrent finalize.
+//
+// Each task owns one file's fi.path, and state.mu is held for the whole pass.
+func (s *Server) renamePartialFiles(ctx context.Context, hash string, state *serverTorrentState) error {
+	g := new(errgroup.Group)
+	g.SetLimit(fileSetupConcurrency)
+	for _, fi := range state.files {
+		if fi.hardlink.state == hlStateComplete {
+			continue
+		}
+		g.Go(func() error {
+			if err := s.renamePartialFile(ctx, hash, fi); err != nil {
+				return err
+			}
+			fi.path = targetPath(fi)
+			return nil
+		})
+	}
+	return g.Wait()
 }
 
 // closeFileHandle syncs and closes an open file handle.
