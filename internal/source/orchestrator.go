@@ -286,10 +286,15 @@ func (t *QBTask) runOnce(ctx context.Context) {
 		t.pruneCycleCount = 0
 		t.pruneStreaks()
 		t.pruneCompletedOnDest(ctx)
-		t.recheckFileSelections(ctx)
 		t.pruneStaleMonitorEntries(ctx)
 		t.recheckArrRejectedTorrents(ctx)
 	}
+
+	// One shard per cycle rather than the whole library every pruneCycleInterval
+	// cycles: each torrent is still rechecked exactly once per interval, but the
+	// round-trips are spread instead of bursting. pruneCycleCount cycles through
+	// every residue in [0, pruneCycleInterval) above, so it is the shard index.
+	t.recheckFileSelections(ctx, t.pruneCycleCount)
 }
 
 // Progress returns the streaming progress for a torrent.
@@ -322,9 +327,10 @@ func (t *QBTask) PruneCompletedOnDest(ctx context.Context) {
 	t.pruneCompletedOnDest(ctx)
 }
 
-// RecheckFileSelections is the exported version of recheckFileSelections for testing.
+// RecheckFileSelections is the exported version of recheckFileSelections for
+// testing. It covers every completed torrent rather than one cycle's shard.
 func (t *QBTask) RecheckFileSelections(ctx context.Context) {
-	t.recheckFileSelections(ctx)
+	t.recheckFileSelections(ctx, allShards)
 }
 
 // pruneCompletedOnDest hands off completed torrents whose source-side copy has
