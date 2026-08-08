@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/autobrr/go-qbittorrent"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/arsac/qb-sync/internal/metrics"
 	"github.com/arsac/qb-sync/internal/streaming"
@@ -22,6 +23,17 @@ import (
 )
 
 var _ streaming.PieceSource = (*Source)(nil)
+
+// fileIDProbeConcurrency bounds the parallel per-file identity probes in
+// buildFileInfos. Each probe is a single stat, so the caller is latency-bound
+// rather than CPU-bound and the width is chosen to hide NFS round-trip time -
+// the same reasoning as the destination's per-file setup fan-out.
+const fileIDProbeConcurrency = 32
+
+// fileIDProbe reports the device and inode currently backing a path.
+// [utils.GetFileID] in production; a parameter of buildFileInfos so a test can
+// observe how many probes are in flight at once.
+type fileIDProbe func(path string) (uint64, uint64, error)
 
 // fileHandleCache caches open file handles per torrent to avoid repeated
 // open/close syscalls on the source read path. [os.File.ReadAt] maps to pread(2)
@@ -380,47 +392,16 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 		return nil, fmt.Errorf("getting torrent files: %w", err)
 	}
 
-	// Sort files by Index to ensure correct offset calculation.
-	// qBittorrent may return files in any order, but torrent piece data
-	// is laid out according to the file order in the .torrent metadata.
-	// Note: Using sort.Slice because TorrentFiles has anonymous struct elements.
-	sortedQBFiles := make(qbittorrent.TorrentFiles, len(*qbFiles))
-	copy(sortedQBFiles, *qbFiles)
-	sort.Slice(sortedQBFiles, func(i, j int) bool {
-		return sortedQBFiles[i].Index < sortedQBFiles[j].Index
-	})
+	sortedQBFiles := sortedByIndex(*qbFiles)
 
 	// Must happen after sorting so detectRootFolder sees files in stable order.
 	contentDir := s.resolveContentBase(torrent, sortedQBFiles)
 
-	files := make([]*pb.FileInfo, len(sortedQBFiles))
-	var offset int64
-	for i, f := range sortedQBFiles {
-		files[i] = &pb.FileInfo{
-			Path:     f.Name,
-			Size:     f.Size,
-			Offset:   offset,
-			Selected: f.Priority > 0,
-		}
+	files := buildFileInfos(sortedQBFiles, contentDir, utils.GetFileID)
 
-		filePath := filepath.Join(contentDir, f.Name)
-		if dev, ino, fileIDErr := utils.GetFileID(filePath); fileIDErr == nil {
-			files[i].Inode = ino
-			files[i].Device = dev
-		}
-
-		offset += f.Size
-	}
-
-	pieceSize := int64(props.PieceSize)
-	numPieces := props.PiecesNum
-	if numPieces == 0 && pieceSize > 0 {
-		numPieces = int((torrent.TotalSize + pieceSize - 1) / pieceSize)
-	}
-
-	// Validate piece count fits in int32 (protobuf field type)
-	if numPieces > math.MaxInt32 {
-		return nil, fmt.Errorf("piece count %d exceeds maximum supported value", numPieces)
+	pieceSize, numPieces, err := pieceGeometry(props, torrent.TotalSize)
+	if err != nil {
+		return nil, err
 	}
 
 	torrentFile, err := s.client.ExportTorrentCtx(ctx, hash)
@@ -439,7 +420,7 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 			Name:        torrent.Name,
 			PieceSize:   pieceSize,
 			TotalSize:   torrent.TotalSize,
-			NumPieces:   int32(numPieces),
+			NumPieces:   numPieces,
 			Files:       files,
 			TorrentFile: torrentFile,
 			PieceHashes: pieceHashes,
@@ -447,6 +428,75 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 		},
 		ContentDir: contentDir,
 	}, nil
+}
+
+// pieceGeometry reports the torrent's piece size and piece count, deriving the
+// count from the total size when qBittorrent does not report one, and rejecting
+// a count that would not survive the int32 the protobuf carries it in.
+func pieceGeometry(props qbittorrent.TorrentProperties, totalSize int64) (int64, int32, error) {
+	pieceSize := int64(props.PieceSize)
+	numPieces := props.PiecesNum
+	if numPieces == 0 && pieceSize > 0 {
+		numPieces = int((totalSize + pieceSize - 1) / pieceSize)
+	}
+	if numPieces > math.MaxInt32 {
+		return 0, 0, fmt.Errorf("piece count %d exceeds maximum supported value", numPieces)
+	}
+	return pieceSize, int32(numPieces), nil
+}
+
+// sortedByIndex returns a copy of qbFiles ordered by file index. qBittorrent may
+// return files in any order, but torrent piece data is laid out in index order,
+// so the offsets assigned in buildFileInfos are only correct on a sorted list.
+// Note: [sort.Slice] because TorrentFiles has anonymous struct elements.
+func sortedByIndex(qbFiles qbittorrent.TorrentFiles) qbittorrent.TorrentFiles {
+	sorted := make(qbittorrent.TorrentFiles, len(qbFiles))
+	copy(sorted, qbFiles)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Index < sorted[j].Index
+	})
+	return sorted
+}
+
+// buildFileInfos assigns each file its byte offset in the torrent and stamps it
+// with the identity of the file currently occupying its path, which is what lets
+// the destination hardlink content it already holds instead of streaming it.
+//
+// The identity probes fan out because each is an independent stat - an NFS
+// LOOKUP round-trip on an exported content directory - and nothing here depends
+// on another file's answer. This runs on the torrent-init path ahead of the
+// first streamed piece and again on the sender's ENOENT metadata refresh, so in
+// series a many-file torrent paid one round-trip per file at both.
+//
+// Probing stays best-effort: a file that cannot be stat'd keeps a zero
+// inode/device and is simply not hardlink-eligible, exactly as before.
+func buildFileInfos(qbFiles qbittorrent.TorrentFiles, contentDir string, probe fileIDProbe) []*pb.FileInfo {
+	files := make([]*pb.FileInfo, len(qbFiles))
+	var offset int64
+	for i, f := range qbFiles {
+		files[i] = &pb.FileInfo{
+			Path:     f.Name,
+			Size:     f.Size,
+			Offset:   offset,
+			Selected: f.Priority > 0,
+		}
+		offset += f.Size
+	}
+
+	g := new(errgroup.Group)
+	g.SetLimit(fileIDProbeConcurrency)
+	for i, f := range qbFiles {
+		g.Go(func() error {
+			if dev, ino, fileIDErr := probe(filepath.Join(contentDir, f.Name)); fileIDErr == nil {
+				files[i].Device = dev
+				files[i].Inode = ino
+			}
+			return nil
+		})
+	}
+	_ = g.Wait()
+
+	return files
 }
 
 // ReadPiece reads a piece's data from disk.
