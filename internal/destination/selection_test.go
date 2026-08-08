@@ -194,6 +194,102 @@ func TestCalculatePiecesCovered_UnselectedFiles(t *testing.T) {
 	})
 }
 
+// classifyPieceScan is the pre-binary-search full scan, kept as the oracle for
+// TestClassifyPiece_MatchesFullScan.
+func classifyPieceScan(m *torrentMeta, pieceIdx int) pieceClass {
+	pieceStart := int64(pieceIdx) * m.pieceLength
+	pieceEnd := min(pieceStart+m.pieceLength, m.totalSize)
+
+	hasSelected, hasUnselected := false, false
+	for _, f := range m.files {
+		if f.offset >= pieceEnd || f.offset+f.size <= pieceStart {
+			continue
+		}
+		if f.selected {
+			hasSelected = true
+		} else {
+			hasUnselected = true
+		}
+	}
+	switch {
+	case hasSelected && hasUnselected:
+		return pieceBoundary
+	case !hasSelected:
+		return pieceNoSelectedOverlap
+	default:
+		return pieceFullySelected
+	}
+}
+
+// coveredScan is the pre-binary-search full scan for calculatePiecesCovered.
+func coveredScan(m *torrentMeta, pieceIdx int) bool {
+	pieceStart := int64(pieceIdx) * m.pieceLength
+	pieceEnd := min(pieceStart+m.pieceLength, m.totalSize)
+	for _, f := range m.files {
+		if f.offset < pieceEnd && f.offset+f.size > pieceStart && !f.skipForWriteData() {
+			return false
+		}
+	}
+	return true
+}
+
+// mixedLayoutMeta builds a contiguous multi-file torrent whose file sizes cross
+// piece boundaries in every direction: sub-piece files, exact multiples, and
+// files spanning many pieces, with zero-length files wedged between.
+func mixedLayoutMeta(fileCount int) torrentMeta {
+	const pieceLength int64 = 1 << 14
+	sizes := []int64{pieceLength / 3, pieceLength, pieceLength*2 + 7, 0, pieceLength/2 + 1, pieceLength * 5}
+
+	var offset int64
+	files := make([]*serverFileInfo, 0, fileCount)
+	for i := range fileCount {
+		size := sizes[i%len(sizes)]
+		hlState := hlStateNone
+		if i%7 == 0 {
+			hlState = hlStateComplete
+		}
+		files = append(files, &serverFileInfo{
+			offset:   offset,
+			size:     size,
+			selected: i%4 != 0,
+			hardlink: hardlinkInfo{state: hlState},
+		})
+		offset += size
+	}
+	return torrentMeta{pieceLength: pieceLength, totalSize: offset, files: files}
+}
+
+// TestClassifyPiece_MatchesFullScan pins the binary-search narrowing in
+// classifyPiece and calculatePiecesCovered against the full scan they replaced.
+// An off-by-one in the search bound or the break condition would drop the first
+// or last overlapping file, silently mis-classifying boundary pieces.
+func TestClassifyPiece_MatchesFullScan(t *testing.T) {
+	t.Parallel()
+
+	meta := mixedLayoutMeta(64)
+	covered := meta.calculatePiecesCovered()
+	for p := range int(meta.numPieces()) {
+		if got, want := meta.classifyPiece(p), classifyPieceScan(&meta, p); got != want {
+			t.Fatalf("classifyPiece(%d) = %d, want %d", p, got, want)
+		}
+		if got, want := covered[p], coveredScan(&meta, p); got != want {
+			t.Fatalf("calculatePiecesCovered()[%d] = %v, want %v", p, got, want)
+		}
+	}
+}
+
+func BenchmarkClassifyPiece(b *testing.B) {
+	meta := mixedLayoutMeta(400)
+	numPieces := int(meta.numPieces())
+
+	b.ReportAllocs()
+	for i := 0; b.Loop(); i++ {
+		if meta.classifyPiece(i%numPieces) == pieceNoSelectedOverlap {
+			continue
+		}
+	}
+}
+
 // --- writePieceData tests with unselected files ---
 
 func TestWritePieceData_SkipsUnselectedFiles(t *testing.T) {

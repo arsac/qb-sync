@@ -119,8 +119,11 @@ func (m *torrentMeta) calculatePiecesCovered() []bool {
 
 		// Piece is covered if every overlapping file is hardlinked, pending, or unselected.
 		covered := true
-		for _, f := range m.files {
-			if f.offset < pieceEnd && f.offset+f.size > pieceStart && !f.skipForWriteData() {
+		for _, f := range m.files[m.firstFileEndingAfter(pieceStart):] {
+			if f.offset >= pieceEnd {
+				break
+			}
+			if !f.skipForWriteData() {
 				covered = false
 				break
 			}

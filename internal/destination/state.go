@@ -64,15 +64,7 @@ func (s *serverTorrentState) writePieceData(offset int64, data []byte) error {
 	remaining := data
 	currentOffset := offset
 
-	// Files are constructed sorted by offset (qbclient/source.go assigns
-	// monotonically-increasing offsets). Binary-search past every file whose
-	// end is at or before currentOffset — for many-file torrents (season
-	// packs, archives) this turns the per-piece scan from O(F) into O(log F).
-	startIdx := sort.Search(len(s.files), func(i int) bool {
-		return s.files[i].offset+s.files[i].size > currentOffset
-	})
-
-	for _, fi := range s.files[startIdx:] {
+	for _, fi := range s.files[s.firstFileEndingAfter(currentOffset):] {
 		if len(remaining) == 0 {
 			break
 		}
@@ -106,6 +98,20 @@ func (s *serverTorrentState) writePieceData(offset int64, data []byte) error {
 	}
 
 	return nil
+}
+
+// firstFileEndingAfter returns the index of the first file whose data extends
+// past offset, so callers can iterate only the files a byte range actually
+// touches instead of scanning the whole torrent.
+//
+// Valid because files are constructed sorted by offset and contiguous
+// (qbclient/source.go assigns offsets as a running sum), which makes each
+// file's end offset monotonically non-decreasing. For many-file torrents
+// (season packs, archives) this turns per-piece work from O(F) into O(log F).
+func (m *torrentMeta) firstFileEndingAfter(offset int64) int {
+	return sort.Search(len(m.files), func(i int) bool {
+		return m.files[i].offset+m.files[i].size > offset
+	})
 }
 
 // buildReadyResponse creates a successful READY response with piece information.
@@ -164,9 +170,9 @@ func (m *torrentMeta) classifyPiece(pieceIdx int) pieceClass {
 	hasSelected := false
 	hasUnselected := false
 
-	for _, f := range m.files {
-		if f.offset >= pieceEnd || f.offset+f.size <= pieceStart {
-			continue
+	for _, f := range m.files[m.firstFileEndingAfter(pieceStart):] {
+		if f.offset >= pieceEnd {
+			break
 		}
 		if f.selected {
 			hasSelected = true
