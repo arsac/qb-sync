@@ -344,9 +344,23 @@ func (d *GRPCDestination) CheckTorrentStatus(ctx context.Context, hash string) (
 // its own - it is what detects stream death, and Close waits on the done channel
 // it closes.
 func (d *GRPCDestination) OpenStream(ctx context.Context, logger *slog.Logger) (*PieceStream, error) {
-	connIdx := d.streamConnIdx()
+	return d.OpenStreamOn(ctx, logger, d.streamConnIdx())
+}
 
+// OpenStreamOn opens a stream pinned to a specific connection instead of taking
+// the next round-robin one. A freshly added connection carries no traffic until
+// a stream lands on it, and round-robin gives no guarantee the next stream will
+// be that one, so the connection-level scaling probe pins its stream here.
+func (d *GRPCDestination) OpenStreamOn(
+	ctx context.Context,
+	logger *slog.Logger,
+	connIdx int,
+) (*PieceStream, error) {
 	d.mu.RLock()
+	if connIdx < 0 || connIdx >= len(d.clients) {
+		d.mu.RUnlock()
+		return nil, fmt.Errorf("connection index %d out of range (%d connections)", connIdx, len(d.clients))
+	}
 	client := d.clients[connIdx]
 	d.mu.RUnlock()
 	streamCtx, streamCancel := context.WithCancel(ctx)
@@ -478,24 +492,26 @@ func (d *GRPCDestination) ClearInitCache() {
 	d.mu.Unlock()
 }
 
-// AddConnection creates a new TCP connection and appends it to the pool.
+// AddConnection creates a new TCP connection, appends it to the pool and
+// returns its index. The connection carries nothing until a stream is opened on
+// it, so the caller is expected to follow up with OpenStreamOn at that index.
 // Returns error if already at max connections.
-func (d *GRPCDestination) AddConnection() error {
+func (d *GRPCDestination) AddConnection() (int, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	if len(d.conns) >= d.maxConns {
-		return errors.New("at maximum connection count")
+		return 0, errors.New("at maximum connection count")
 	}
 
 	conn, err := grpc.NewClient(d.addr, d.opts...)
 	if err != nil {
-		return fmt.Errorf("failed to create connection: %w", err)
+		return 0, fmt.Errorf("failed to create connection: %w", err)
 	}
 
 	d.conns = append(d.conns, conn)
 	d.clients = append(d.clients, pb.NewQBSyncServiceClient(conn))
-	return nil
+	return len(d.conns) - 1, nil
 }
 
 // RemoveConnection removes the connection at expectedIdx. The caller must

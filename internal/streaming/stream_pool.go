@@ -356,13 +356,19 @@ func (p *StreamPool) ackDeliveryTimeout() time.Duration {
 	return ackDeliverTimeout
 }
 
-// addStreamLocked adds a new stream to the pool. Must hold p.mu write lock.
+// addStreamLocked adds a new stream to the pool on the destination's next
+// round-robin connection. Must hold p.mu write lock.
 func (p *StreamPool) addStreamLocked() error {
+	return p.addStreamOnLocked(p.dest.streamConnIdx())
+}
+
+// addStreamOnLocked adds a new stream pinned to connIdx. Must hold p.mu write lock.
+func (p *StreamPool) addStreamOnLocked(connIdx int) error {
 	if len(p.streams) >= p.maxStreams {
 		return errors.New("pool at maximum capacity")
 	}
 
-	stream, err := p.dest.OpenStream(p.ctx, p.logger)
+	stream, err := p.dest.OpenStreamOn(p.ctx, p.logger, connIdx)
 	if err != nil {
 		return fmt.Errorf("opening stream: %w", err)
 	}
@@ -644,12 +650,37 @@ func (p *StreamPool) probeStream(currentThroughput float64) {
 
 // probeConnection adds a TCP connection on trial, with currentThroughput as its
 // baseline, and reports whether one was added. Must hold p.mu.
+//
+// The connection is added together with a stream pinned to it. Existing streams
+// keep the connection they were opened on, so a bare connection carries no
+// traffic at all and the probe would measure a flat interval and always undo
+// itself. That also makes the stream ceiling a precondition: with no room for a
+// stream there is nothing to drive the connection, so no probe is armed.
 func (p *StreamPool) probeConnection(currentThroughput float64) bool {
 	if p.dest.ConnectionCount() >= p.dest.MaxConnections() {
 		return false
 	}
-	if err := p.dest.AddConnection(); err != nil {
+	if len(p.streams) >= p.maxStreams {
+		p.logger.InfoContext(p.ctx, "skipping connection add, no stream slot to drive it",
+			"streams", len(p.streams),
+			"maxStreams", p.maxStreams,
+		)
+		return false
+	}
+
+	connIdx, err := p.dest.AddConnection()
+	if err != nil {
 		p.logger.WarnContext(p.ctx, "failed to add connection", "error", err)
+		return false
+	}
+	if streamErr := p.addStreamOnLocked(connIdx); streamErr != nil {
+		metrics.StreamOpenErrorsTotal.WithLabelValues(metrics.ModeSource).Inc()
+		p.logger.WarnContext(p.ctx, "failed to open stream on new connection, reverting",
+			"error", streamErr,
+		)
+		if removeErr := p.dest.RemoveConnection(connIdx); removeErr != nil {
+			p.logger.WarnContext(p.ctx, "failed to remove unused connection", "error", removeErr)
+		}
 		return false
 	}
 	p.probe = &scaleProbe{unit: unitConnection, baseline: currentThroughput, addedAt: time.Now()}
@@ -657,8 +688,10 @@ func (p *StreamPool) probeConnection(currentThroughput float64) bool {
 	connCount := p.dest.ConnectionCount()
 	metrics.GRPCConnectionsActive.Set(float64(connCount))
 	metrics.ConnectionScaleEventsTotal.WithLabelValues(metrics.DirectionUp).Inc()
+	metrics.StreamPoolSize.Set(float64(len(p.streams)))
 	p.logger.InfoContext(p.ctx, "added TCP connection",
 		"connections", connCount,
+		"streams", len(p.streams),
 		"throughputMBps", currentThroughput/grpcutil.BytesPerMB,
 	)
 	return true

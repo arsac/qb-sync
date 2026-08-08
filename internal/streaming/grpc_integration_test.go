@@ -625,7 +625,7 @@ func TestIntegration_AddConnection_Success(t *testing.T) {
 		t.Fatalf("initial ConnectionCount = %d, want 1", d.ConnectionCount())
 	}
 
-	if addErr := d.AddConnection(); addErr != nil {
+	if _, addErr := d.AddConnection(); addErr != nil {
 		t.Fatalf("AddConnection: %v", addErr)
 	}
 
@@ -657,7 +657,7 @@ func TestIntegration_AddConnection_AtMax(t *testing.T) {
 	}
 	defer d.Close()
 
-	addErr := d.AddConnection()
+	_, addErr := d.AddConnection()
 	if addErr == nil {
 		t.Fatal("expected error when adding connection at max, got nil")
 	}
@@ -684,7 +684,7 @@ func TestIntegration_RemoveConnection_Success(t *testing.T) {
 	defer d.Close()
 
 	// Add a connection first so we can remove it
-	if addErr := d.AddConnection(); addErr != nil {
+	if _, addErr := d.AddConnection(); addErr != nil {
 		t.Fatalf("AddConnection: %v", addErr)
 	}
 	if d.ConnectionCount() != 2 {
@@ -745,10 +745,10 @@ func TestIntegration_RemoveConnection_IndexMismatch(t *testing.T) {
 	defer d.Close()
 
 	// Add two connections (total: 3)
-	if addErr := d.AddConnection(); addErr != nil {
+	if _, addErr := d.AddConnection(); addErr != nil {
 		t.Fatalf("AddConnection 1: %v", addErr)
 	}
-	if addErr := d.AddConnection(); addErr != nil {
+	if _, addErr := d.AddConnection(); addErr != nil {
 		t.Fatalf("AddConnection 2: %v", addErr)
 	}
 
@@ -792,7 +792,7 @@ func TestIntegration_AddRemoveConnection_Concurrent(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 5 {
 		wg.Go(func() {
-			_ = d.AddConnection()
+			_, _ = d.AddConnection()
 		})
 	}
 	wg.Wait()

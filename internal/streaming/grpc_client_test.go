@@ -1,11 +1,13 @@
 package streaming
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -960,6 +962,122 @@ func TestHandlePlateau_TriggersConnectionAdd(t *testing.T) {
 	pool.mu.Unlock()
 }
 
+// TestProbeConnection_PinsAStreamToTheNewConnection verifies that a probed
+// connection arrives with a stream on it. Existing streams keep the connection
+// they were opened on, so a bare connection would carry no traffic at all and
+// its probe could only ever measure a flat interval and undo itself.
+func TestProbeConnection_PinsAStreamToTheNewConnection(t *testing.T) {
+	t.Parallel()
+
+	newProbePool := func(t *testing.T) (*GRPCDestination, *StreamPool) {
+		t.Helper()
+		addr := startTestGRPCServerAddr(t, func(stream pb.QBSyncService_StreamPiecesBidiServer) error {
+			<-stream.Context().Done()
+			return stream.Context().Err()
+		})
+
+		dest, err := NewGRPCDestination(addr, 1, 4)
+		if err != nil {
+			t.Fatalf("NewGRPCDestination: %v", err)
+		}
+		t.Cleanup(func() { _ = dest.Close() })
+
+		ctx, cancel := context.WithCancel(context.Background())
+		pool := newAdaptiveScalingTestPool(ctx, cancel, dest, newStubPooledStreams(MinPoolSize))
+
+		// Cleanups run LIFO, so the join must be registered before the cancel
+		// that releases the probed stream's receive loop.
+		t.Cleanup(pool.wg.Wait)
+		t.Cleanup(cancel)
+		return dest, pool
+	}
+
+	t.Run("stream lands on the added connection", func(t *testing.T) {
+		t.Parallel()
+		dest, pool := newProbePool(t)
+
+		pool.mu.Lock()
+		added := pool.probeConnection(100.0)
+		streams := slices.Clone(pool.streams)
+		pool.mu.Unlock()
+
+		if !added {
+			t.Fatal("probeConnection reported no add")
+		}
+		if dest.ConnectionCount() != 2 {
+			t.Fatalf("connections = %d, want 2", dest.ConnectionCount())
+		}
+		if len(streams) != MinPoolSize+1 {
+			t.Fatalf("streams = %d, want %d", len(streams), MinPoolSize+1)
+		}
+		// Round-robin would hand out connection 0 here (streamIdx is untouched
+		// by the stub streams), so index 1 pins that the stream is pinned.
+		if got := streams[len(streams)-1].stream.connIdx; got != 1 {
+			t.Fatalf("new stream connIdx = %d, want 1 (the connection just added)", got)
+		}
+	})
+
+	t.Run("declines without touching the destination when no stream slot is free", func(t *testing.T) {
+		t.Parallel()
+		dest, pool := newProbePool(t)
+
+		// The stream-open failure would revert the connection anyway, so what
+		// the up-front check buys is that a routine at-max-streams plateau
+		// neither dials the destination nor reports a stream-open error.
+		var logs bytes.Buffer
+		pool.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+		pool.mu.Lock()
+		pool.maxStreams = len(pool.streams)
+		added := pool.probeConnection(100.0)
+		probe := pool.probe
+		streamCount := len(pool.streams)
+		pool.mu.Unlock()
+
+		if added {
+			t.Fatal("probeConnection added a connection with no stream slot to drive it")
+		}
+		if probe != nil {
+			t.Fatal("no probe should be armed when nothing was added")
+		}
+		if dest.ConnectionCount() != 1 {
+			t.Fatalf("connections = %d, want 1", dest.ConnectionCount())
+		}
+		if streamCount != MinPoolSize {
+			t.Fatalf("streams = %d, want %d", streamCount, MinPoolSize)
+		}
+		if logs.Len() != 0 {
+			t.Fatalf("a full stream pool is not an error, but probeConnection logged: %s", logs.String())
+		}
+	})
+
+	t.Run("undoing the probe sheds the stream with the connection", func(t *testing.T) {
+		t.Parallel()
+		dest, pool := newProbePool(t)
+
+		pool.mu.Lock()
+		if !pool.probeConnection(100.0) {
+			pool.mu.Unlock()
+			t.Fatal("probeConnection reported no add")
+		}
+		pool.probe.addedAt = time.Now().Add(-(probeSettleIntervals + 1) * defaultScaleInterval)
+		// Flat throughput: the add did not pay for itself.
+		pool.evaluateProbe(100.0)
+		pool.mu.Unlock()
+
+		// The drain runs asynchronously; poll the observables rather than
+		// joining pool.wg, which also holds every stream's receive loop.
+		deadline := time.Now().Add(5 * time.Second)
+		for dest.ConnectionCount() != 1 || pool.StreamCount() != MinPoolSize {
+			if time.Now().After(deadline) {
+				t.Fatalf("after undo: connections = %d (want 1), streams = %d (want %d)",
+					dest.ConnectionCount(), pool.StreamCount(), MinPoolSize)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
+}
+
 // newStubPooledStreams creates n PooledStreams with stub PieceStreams
 // assigned to connection index 0. Useful for tests that need non-nil
 // streams but don't exercise actual stream I/O.
@@ -1233,7 +1351,7 @@ func TestDiminishingReturns_TriggersScaleDown(t *testing.T) {
 	defer dest.Close()
 
 	// Add a connection so we can observe scale-down attempt
-	if addErr := dest.AddConnection(); addErr != nil {
+	if _, addErr := dest.AddConnection(); addErr != nil {
 		t.Fatalf("AddConnection: %v", addErr)
 	}
 
