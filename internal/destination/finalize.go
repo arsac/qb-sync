@@ -663,7 +663,7 @@ func (s *Server) renamePartialFiles(ctx context.Context, hash string, state *ser
 			if err := s.renamePartialFile(ctx, hash, fi); err != nil {
 				return err
 			}
-			fi.path = targetPath(fi)
+			fi.setPath(targetPath(fi))
 			return nil
 		})
 	}
@@ -1076,7 +1076,7 @@ func (s *Server) recoverAffectedFile(
 	}
 
 	defer func() {
-		fi.earlyFinalized = false
+		fi.readmitWrites()
 		fi.recalcPiecesWritten(state.written)
 	}()
 
@@ -1093,7 +1093,7 @@ func (s *Server) recoverAffectedFile(
 		}
 
 		fi.hardlink.state = hlStateNone
-		fi.path = targetPath(fi) + partialSuffix
+		fi.setPath(targetPath(fi) + partialSuffix)
 		return
 	}
 
@@ -1112,7 +1112,7 @@ func (s *Server) recoverAffectedFile(
 		)
 		return
 	}
-	fi.path = partialPath
+	fi.setPath(partialPath)
 }
 
 // handleExistingFinalization handles a FinalizeTorrent call when background

@@ -1228,3 +1228,163 @@ func TestStartPreVerify_NoCandidates(t *testing.T) {
 		t.Error("startPreVerify registered a pass with no candidate files")
 	}
 }
+
+// newOnePieceFileState builds a single-file, single-piece torrent whose piece
+// hash is that of wantData, with onDisk already written at the .partial path.
+// Returns the state and its one file.
+func newOnePieceFileState(t *testing.T, dir, hash string, wantData, onDisk []byte) *serverTorrentState {
+	t.Helper()
+
+	partialPath := filepath.Join(dir, hash+".bin"+partialSuffix)
+	if err := os.WriteFile(partialPath, onDisk, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	return &serverTorrentState{
+		torrentMeta: torrentMeta{
+			pieceHashes: []string{utils.ComputeSHA1(wantData)},
+			pieceLength: int64(len(wantData)),
+			totalSize:   int64(len(wantData)),
+			files: []*serverFileInfo{{
+				path:        partialPath,
+				size:        int64(len(wantData)),
+				offset:      0,
+				firstPiece:  0,
+				lastPiece:   0,
+				piecesTotal: 1,
+				selected:    true,
+			}},
+		},
+		written:   boolSliceToBitSet([]bool{true}),
+		statePath: filepath.Join(dir, hash+".state"),
+	}
+}
+
+// TestEarlyFinalize_WriteHandoffIsExclusive pins the handoff of a completed
+// file from the write path to its background early finalization. The source
+// re-sends a piece it considers stale, so a duplicate WritePiece can be inside
+// writePieceData for a file whose last piece another worker just wrote - the
+// one case where the write path and an early finalization touch the same file
+// at the same time. The handoff has to drain that write before syncing and
+// closing the handle, and reject the ones that arrive afterwards rather than
+// recreating the .partial the rename just consumed.
+func TestEarlyFinalize_WriteHandoffIsExclusive(t *testing.T) {
+	t.Parallel()
+
+	pieceData := []byte("early-finalize handoff piece")
+
+	t.Run("waits for an in-flight write before taking the handle", func(t *testing.T) {
+		t.Parallel()
+
+		s, tmpDir := newTestDestServer(t)
+		hash := "handoff-drain"
+		state := newOnePieceFileState(t, tmpDir, hash, pieceData, pieceData)
+		fi := state.files[0]
+
+		// Stand in for a duplicate piece parked inside writeAt, which holds
+		// fileMu.RLock for the duration of its WriteAt.
+		fi.fileMu.RLock()
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			s.checkFileCompletions(hash, state, 0)
+		}()
+
+		select {
+		case <-done:
+			fi.fileMu.RUnlock()
+			t.Fatal("handed the write handle to early finalization while a write was in flight")
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		fi.fileMu.RUnlock()
+
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("checkFileCompletions never returned after the write drained")
+		}
+
+		waitEarlyFinalize(t, state)
+		if !fi.earlyFinalized {
+			t.Fatal("file should be early-finalized once the handoff completed")
+		}
+	})
+
+	t.Run("drops a duplicate write instead of recreating the partial", func(t *testing.T) {
+		t.Parallel()
+
+		s, tmpDir := newTestDestServer(t)
+		hash := "handoff-duplicate"
+		state := newOnePieceFileState(t, tmpDir, hash, pieceData, pieceData)
+		fi := state.files[0]
+		partialPath := fi.path
+
+		state.mu.Lock()
+		s.checkFileCompletions(hash, state, 0)
+		state.mu.Unlock()
+		waitEarlyFinalize(t, state)
+
+		// A duplicate that passed writePiece's already-written check before the
+		// file completed reaches writePieceData after the rename.
+		if writeErr := state.writePieceData(0, pieceData); writeErr != nil {
+			t.Fatalf("duplicate write after early finalization: %v", writeErr)
+		}
+
+		// Reopening is what makes a duplicate dangerous: between the rename and
+		// the path update it recreates the .partial the rename consumed, and
+		// after it leaves a second handle on a file already synced and closed.
+		fi.fileMu.RLock()
+		reopened := fi.file != nil
+		fi.fileMu.RUnlock()
+		if reopened {
+			t.Error("duplicate write reopened an early-finalized file")
+		}
+		if _, statErr := os.Stat(partialPath); !os.IsNotExist(statErr) {
+			t.Errorf("duplicate write recreated the renamed .partial: stat err = %v", statErr)
+		}
+		final, readErr := os.ReadFile(targetPath(fi))
+		if readErr != nil {
+			t.Fatalf("cannot read finalized file: %v", readErr)
+		}
+		if string(final) != string(pieceData) {
+			t.Errorf("finalized content = %q, want %q", final, pieceData)
+		}
+	})
+
+	t.Run("re-admits writes when early finalization defers the file", func(t *testing.T) {
+		t.Parallel()
+
+		s, tmpDir := newTestDestServer(t)
+		hash := "handoff-deferred"
+		corrupt := append([]byte("XX"), pieceData[2:]...)
+		state := newOnePieceFileState(t, tmpDir, hash, pieceData, corrupt)
+		fi := state.files[0]
+
+		state.mu.Lock()
+		s.checkFileCompletions(hash, state, 0)
+		state.mu.Unlock()
+		waitEarlyFinalize(t, state)
+
+		if fi.earlyFinalized {
+			t.Fatal("file should not be early-finalized when read-back verification fails")
+		}
+
+		// The source re-streams the piece the failed verify cleared; it has to
+		// reach disk, not be dropped as a duplicate of a finalized file.
+		if writeErr := state.writePieceData(0, pieceData); writeErr != nil {
+			t.Fatalf("re-streamed write after deferred early finalization: %v", writeErr)
+		}
+
+		got, readErr := os.ReadFile(fi.path)
+		if readErr != nil {
+			t.Fatalf("cannot read partial file: %v", readErr)
+		}
+		if string(got) != string(pieceData) {
+			t.Errorf("re-streamed content = %q, want %q", got, pieceData)
+		}
+	})
+}

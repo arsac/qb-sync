@@ -12,11 +12,15 @@ import (
 
 // openForWrite lazily opens the file for writing, creating and pre-allocating it if needed.
 // Protected by fileMu so it can be called outside state.mu for concurrent disk I/O.
+//
+// Declines to open an early-finalized file: its data is complete, verified and
+// renamed into place, so opening f.path would recreate the .partial the rename
+// consumed. writeAt turns that into a dropped write.
 func (f *serverFileInfo) openForWrite() error {
 	f.fileMu.Lock()
 	defer f.fileMu.Unlock()
 
-	if f.file != nil {
+	if f.file != nil || f.earlyFinalized {
 		return nil
 	}
 
@@ -36,25 +40,69 @@ func (f *serverFileInfo) openForWrite() error {
 }
 
 // writeAt ensures the file is open and writes data at the given offset.
-// Holds fileMu.RLock during the write so closeFileHandle (which acquires
-// the exclusive lock) blocks until all in-flight writes complete.
+// Holds fileMu.RLock during the write so closeFileHandle and takeWriteHandle
+// (which acquire the exclusive lock) block until all in-flight writes complete.
 func (f *serverFileInfo) writeAt(data []byte, offset int64) error {
 	// Ensure file is open (uses exclusive lock internally for creation).
 	if openErr := f.openForWrite(); openErr != nil {
 		return openErr
 	}
 
-	// Read-lock for the actual write — concurrent writes to different
+	// Read-lock for the actual write - concurrent writes to different
 	// offsets are safe (pwrite), while Close waits for all to drain.
 	f.fileMu.RLock()
 	defer f.fileMu.RUnlock()
 
 	if f.file == nil {
+		if f.earlyFinalized {
+			// Every piece overlapping this file was written and read-back
+			// verified before it was renamed, so the only writes that reach
+			// here are duplicates the source re-sent after a stale ack.
+			return nil
+		}
 		return fmt.Errorf("file closed during write: %s", f.path)
 	}
 
 	_, writeErr := f.file.WriteAt(data, offset)
 	return writeErr
+}
+
+// takeWriteHandle closes a completed file to further writes and hands its write
+// handle to an early finalization. Blocks until in-flight writeAt calls drain,
+// so the returned handle is owned exclusively by the caller and safe to sync,
+// read back and close.
+//
+// Caller must hold state.mu: path, file and earlyFinalized are documented as
+// state.mu-guarded but the write path reads them under fileMu alone, so every
+// writer holds both locks and each reader may hold either.
+func (f *serverFileInfo) takeWriteHandle() *os.File {
+	f.fileMu.Lock()
+	defer f.fileMu.Unlock()
+
+	fh := f.file
+	f.file = nil
+	f.earlyFinalized = true
+	return fh
+}
+
+// readmitWrites re-admits writes to a file whose early finalization did not
+// stick, either because it deferred the file back to finalizeFiles or because
+// finalize-time verification failed and its pieces will be re-streamed.
+// Caller must hold state.mu.
+func (f *serverFileInfo) readmitWrites() {
+	f.fileMu.Lock()
+	defer f.fileMu.Unlock()
+
+	f.earlyFinalized = false
+}
+
+// setPath records the file's new location after a rename.
+// Caller must hold state.mu.
+func (f *serverFileInfo) setPath(path string) {
+	f.fileMu.Lock()
+	defer f.fileMu.Unlock()
+
+	f.path = path
 }
 
 // writePieceData writes piece data to the correct file(s) based on offset.

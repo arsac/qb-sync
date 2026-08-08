@@ -97,10 +97,12 @@ func (s *Server) writePiece(ctx context.Context, req *pb.WritePieceRequest) writ
 		}
 	}
 
-	// Disk I/O outside state.mu: writePieceData only touches immutable metadata
-	// (files slice, offsets) and file handles that are safe to use without the lock
-	// because the early-written check above ensures no concurrent writer for the
-	// same piece, and finalization check prevents races with file rename.
+	// Disk I/O outside state.mu: writePieceData reads immutable metadata (files
+	// slice, offsets) directly, and reaches each file's path and handle through
+	// writeAt, which holds fileMu. That covers the one overlap state.mu would
+	// otherwise be needed for: a duplicate the source re-sent can still be here
+	// when another worker's write completes the file and hands it to an early
+	// finalization that renames it.
 	if writeErr := state.writePieceData(req.GetOffset(), data); writeErr != nil {
 		metrics.PieceWriteErrorsTotal.WithLabelValues(metrics.ModeDestination).Inc()
 		return writePieceError(fmt.Sprintf("write failed: %v", writeErr), pb.PieceErrorCode_PIECE_ERROR_IO)
@@ -403,10 +405,12 @@ func (s *Server) checkFileCompletions(
 // workers and that piece's memory budget for the whole read-back. Both are
 // released immediately now.
 //
-// Caller must hold state.mu. The handle snapshot and earlyFinalized flag are
-// taken here, under the lock, so no concurrent WritePiece can reopen the file
-// or re-enter this path, and the in-flight count is raised before the lock is
-// dropped so FinalizeTorrent cannot start underneath the goroutine.
+// Caller must hold state.mu. takeWriteHandle drains in-flight writes and closes
+// the file to further ones before handing over its handle, so no concurrent
+// WritePiece can be writing through the handle this goroutine is about to sync
+// and close, or reopen the .partial it is about to rename away. The in-flight
+// count is raised before the lock is dropped so FinalizeTorrent cannot start
+// underneath the goroutine.
 func (s *Server) startEarlyFinalize(
 	hash string,
 	state *serverTorrentState,
@@ -419,9 +423,7 @@ func (s *Server) startEarlyFinalize(
 		return
 	}
 
-	fh := fi.file
-	fi.file = nil
-	fi.earlyFinalized = true
+	fh := fi.takeWriteHandle()
 
 	state.earlyFinalizing++
 	s.bgWg.Go(func() {
@@ -464,7 +466,7 @@ func (s *Server) earlyFinalizeFile(
 	defer state.mu.Unlock()
 
 	if syncCloseErr != nil {
-		fi.earlyFinalized = false
+		fi.readmitWrites()
 		// Reopen the file so finalizeFiles() can retry the sync.
 		// The original handle was closed by syncAndCloseHandle even on error.
 		if reopenErr := fi.openForWrite(); reopenErr != nil {
@@ -477,7 +479,7 @@ func (s *Server) earlyFinalizeFile(
 	}
 
 	if len(failedPieces) > 0 {
-		fi.earlyFinalized = false
+		fi.readmitWrites()
 		for _, p := range failedPieces {
 			state.written.Clear(uint(p))
 			fi.piecesWritten--
@@ -500,7 +502,7 @@ func (s *Server) earlyFinalizeFile(
 	}
 
 	if err := s.renamePartialFile(ctx, hash, fi); err != nil {
-		fi.earlyFinalized = false
+		fi.readmitWrites()
 		// Sync succeeded, rename didn't. fi.file is nil (closed by
 		// syncVerifyClose). Reopen so a concurrent WritePiece doesn't
 		// race with finalizeFiles' retry on a nil handle, and so the
@@ -516,7 +518,7 @@ func (s *Server) earlyFinalizeFile(
 
 	markInteriorVerified(state, fi, nil)
 
-	fi.path = targetPath(fi)
+	fi.setPath(targetPath(fi))
 	metrics.FilesEarlyFinalizedTotal.Inc()
 	s.logger.InfoContext(ctx, "file early-finalized",
 		"hash", hash, "file", fi.path, "fileIndex", fileIndex)

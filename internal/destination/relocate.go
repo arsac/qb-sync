@@ -72,7 +72,7 @@ func updateStateAfterRelocate(state *serverTorrentState, basePath, oldSubPath, n
 		if relErr != nil {
 			return fmt.Errorf("computing relative path for %s from %s: %w", fi.path, oldBase, relErr)
 		}
-		fi.path = filepath.Join(newBase, rel)
+		fi.setPath(filepath.Join(newBase, rel))
 	}
 
 	state.saveSubPath = newSubPath

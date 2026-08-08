@@ -67,6 +67,9 @@ func (i *inProgressInode) close() {
 //
 //	file, path, earlyFinalized, piecesWritten,
 //	hardlink.state (transitions through hardlink state machine during finalization)
+//
+// file, path and earlyFinalized are also read under fileMu by the write path,
+// so they are mutated only through the serverFileInfo methods that hold both.
 type torrentMeta struct {
 	pieceHashes []string          // SHA1 hashes per piece for verification
 	pieceLength int64             // Size of each piece (last piece may be smaller)
@@ -323,14 +326,16 @@ func (h *hardlinkInfo) markComplete() {
 //
 //	path, earlyFinalized, piecesWritten, hardlink.state
 //
-// The file handle is protected by fileMu (not state.mu) so that
-// openForWrite can be called outside state.mu for concurrent disk I/O.
+// The write path (openForWrite/writeAt) runs outside state.mu for concurrent
+// disk I/O and reads path, file and earlyFinalized under fileMu, so those three
+// are written under both locks and read under either. See takeWriteHandle,
+// readmitWrites and setPath, which are the only ways to mutate them.
 type serverFileInfo struct {
 	path   string       // Full path on disk (mutable: renamed during early finalize)
 	size   int64        // File size
 	offset int64        // Offset within torrent's total data
 	file   *os.File     // Open file handle (lazy opened, protected by fileMu)
-	fileMu sync.RWMutex // Protects file handle open/close/write
+	fileMu sync.RWMutex // Protects file handle open/close/write, plus path and earlyFinalized
 
 	// Hardlink tracking (state machine for cross-torrent file dedup)
 	hardlink hardlinkInfo
