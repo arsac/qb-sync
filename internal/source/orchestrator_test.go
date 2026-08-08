@@ -54,6 +54,13 @@ type mockQBClient struct {
 	getTorrentsCalls atomic.Int64
 	getFilesCalls    atomic.Int64
 
+	// Per-hash file listings for tests that need distinguishable file sets.
+	// Read-only once the test has started, so safe under a concurrent fan-out.
+	filesByHash map[string]qbittorrent.TorrentFiles
+	// filesHook runs at the top of GetFilesInformationCtx, letting a test
+	// observe or park concurrent calls.
+	filesHook func(hash string)
+
 	freeSpaceOnDisk int64
 	freeSpaceErr    error
 }
@@ -96,9 +103,16 @@ func (m *mockQBClient) GetTorrentPropertiesCtx(
 
 func (m *mockQBClient) GetFilesInformationCtx(
 	_ context.Context,
-	_ string,
+	hash string,
 ) (*qbittorrent.TorrentFiles, error) {
 	m.getFilesCalls.Add(1)
+	if m.filesHook != nil {
+		m.filesHook(hash)
+	}
+	if m.filesByHash != nil {
+		files := m.filesByHash[hash]
+		return &files, nil
+	}
 	return &qbittorrent.TorrentFiles{}, nil
 }
 

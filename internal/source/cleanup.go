@@ -9,10 +9,18 @@ import (
 	"strings"
 
 	"github.com/autobrr/go-qbittorrent"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/arsac/qb-sync/internal/metrics"
 	"github.com/arsac/qb-sync/internal/utils"
 )
+
+// hardlinkScanConcurrency bounds how many torrents are probed at once when
+// building the hardlink groups. Sized to overlap the per-file stats and the
+// client-side cost of each file-information request without burying the
+// PieceMonitor's piece-state polls - which run 8-wide against the same
+// single-threaded qBittorrent WebUI - behind a deep request queue.
+const hardlinkScanConcurrency = 8
 
 // cleanupStats holds counters from a single source cleanup cycle for metrics and logging.
 type cleanupStats struct {
@@ -248,31 +256,7 @@ func (t *QBTask) groupHardlinkedTorrents(ctx context.Context, torrents []qbittor
 	}
 
 	// Phase 1: stat each file, build (device,inode) -> []torrentHash map.
-	// Keying on inode alone would falsely group files that share an inode number
-	// across different filesystems (e.g., separate volumes mounted under the same root).
-	type fileKey struct{ dev, ino uint64 }
-	fileKeyToHashes := make(map[fileKey][]string)
-	for _, torrent := range torrents {
-		files, err := t.cycleFilesFor(ctx, torrent.Hash)
-		if err != nil {
-			t.logger.WarnContext(ctx, "failed to get files", "hash", torrent.Hash, "error", err)
-			continue
-		}
-		if files == nil {
-			continue
-		}
-
-		contentDir := t.source.ResolveContentDir(torrent.SavePath)
-		for _, f := range files {
-			path := filepath.Join(contentDir, f.Name)
-			dev, ino, statErr := utils.GetFileID(path)
-			if statErr != nil || ino == 0 {
-				continue
-			}
-			key := fileKey{dev: dev, ino: ino}
-			fileKeyToHashes[key] = append(fileKeyToHashes[key], torrent.Hash)
-		}
-	}
+	fileKeyToHashes := t.collectFileOwners(ctx, torrents)
 
 	// Phase 2: Union-find — for each file shared by multiple torrents, union their groups
 	uf := newUnionFind()
@@ -298,6 +282,67 @@ func (t *QBTask) groupHardlinkedTorrents(ctx context.Context, torrents []qbittor
 	}
 
 	return groups
+}
+
+// fileKey identifies a file on disk. Keying on inode alone would falsely group
+// files that share an inode number across different filesystems (e.g. separate
+// volumes mounted under the same root).
+type fileKey struct{ dev, ino uint64 }
+
+// collectFileOwners maps each file's (device, inode) to the torrents holding it.
+//
+// Probing one torrent costs a file-information round-trip plus one stat per
+// file, and every torrent known to be complete on destination is probed, so
+// serially this put the whole synced library's worth of round-trip latency on
+// the orchestrator goroutine - delaying the next cycle's finalization polls and
+// new-torrent admission. The probes are independent, so they fan out; results
+// are merged in torrent order afterwards so the grouping does not depend on
+// which probe finished first.
+func (t *QBTask) collectFileOwners(
+	ctx context.Context,
+	torrents []qbittorrent.Torrent,
+) map[fileKey][]string {
+	keysPerTorrent := make([][]fileKey, len(torrents))
+
+	var g errgroup.Group
+	g.SetLimit(hardlinkScanConcurrency)
+	for i, torrent := range torrents {
+		g.Go(func() error {
+			keysPerTorrent[i] = t.torrentFileKeys(ctx, torrent)
+			return nil
+		})
+	}
+	_ = g.Wait() // torrentFileKeys reports its own failures and never returns one
+
+	owners := make(map[fileKey][]string)
+	for i, keys := range keysPerTorrent {
+		for _, key := range keys {
+			owners[key] = append(owners[key], torrents[i].Hash)
+		}
+	}
+	return owners
+}
+
+// torrentFileKeys returns the (device, inode) of every file of one torrent that
+// exists on disk. A torrent whose files cannot be listed contributes nothing,
+// which leaves it in a group of its own.
+func (t *QBTask) torrentFileKeys(ctx context.Context, torrent qbittorrent.Torrent) []fileKey {
+	files, err := t.cycleFilesFor(ctx, torrent.Hash)
+	if err != nil {
+		t.logger.WarnContext(ctx, "failed to get files", "hash", torrent.Hash, "error", err)
+		return nil
+	}
+
+	contentDir := t.source.ResolveContentDir(torrent.SavePath)
+	keys := make([]fileKey, 0, len(files))
+	for _, f := range files {
+		dev, ino, statErr := utils.GetFileID(filepath.Join(contentDir, f.Name))
+		if statErr != nil || ino == 0 {
+			continue
+		}
+		keys = append(keys, fileKey{dev: dev, ino: ino})
+	}
+	return keys
 }
 
 func newTorrentGroup(torrents []qbittorrent.Torrent) torrentGroup {
