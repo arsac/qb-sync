@@ -3,6 +3,7 @@ package destination
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1712,6 +1713,89 @@ func TestRelocateFiles(t *testing.T) {
 			t.Errorf("expected moved=0, got %d", moved)
 		}
 	})
+}
+
+// TestRelocateFiles_FanOutMovesEveryFileToItsOwnPath pins the two things
+// relocateFiles' per-file fan-out can get wrong that a serial loop could not: a
+// task operating on another task's relPath, and a failure inside a task being
+// swallowed instead of returned. Every file carries content derived from its own
+// index in both its .partial and finalized form, so a cross-wired task lands the
+// wrong bytes at a path that exists either way. The files share four parent
+// directories, which also puts concurrent MkdirAll of the same path under -race.
+func TestRelocateFiles_FanOutMovesEveryFileToItsOwnPath(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	const numFiles = 64
+
+	relPathOf := func(i int) string {
+		return fmt.Sprintf("data/dir%d/file%02d.mkv", i%4, i)
+	}
+	partialBody := func(i int) string { return fmt.Sprintf("partial-%d", i) }
+	finalBody := func(i int) string { return fmt.Sprintf("final-%d", i) }
+
+	newFixture := func(t *testing.T) (*Server, string, []string) {
+		t.Helper()
+		tmpDir := t.TempDir()
+		s := &Server{config: ServerConfig{BasePath: tmpDir}, logger: testLogger(t)}
+		relPaths := make([]string, numFiles)
+		for i := range numFiles {
+			relPaths[i] = relPathOf(i)
+			old := filepath.Join(tmpDir, relPaths[i])
+			writeTestFile(t, old+partialSuffix, []byte(partialBody(i)))
+			writeTestFile(t, old, []byte(finalBody(i)))
+		}
+		return s, tmpDir, relPaths
+	}
+
+	t.Run("every file lands at its own new path with its own content", func(t *testing.T) {
+		t.Parallel()
+		s, tmpDir, relPaths := newFixture(t)
+
+		moved, err := s.relocateFiles(ctx, "fanout", relPaths, "", "movies")
+		if err != nil {
+			t.Fatalf("relocateFiles: %v", err)
+		}
+		if moved != 2*numFiles {
+			t.Errorf("moved = %d, want %d", moved, 2*numFiles)
+		}
+
+		for i := range numFiles {
+			newBase := filepath.Join(tmpDir, "movies", relPaths[i])
+			assertFileContent(t, newBase+partialSuffix, partialBody(i))
+			assertFileContent(t, newBase, finalBody(i))
+
+			oldBase := filepath.Join(tmpDir, relPaths[i])
+			assertFileNotExists(t, oldBase+partialSuffix, "partial should have moved")
+			assertFileNotExists(t, oldBase, "finalized file should have moved")
+		}
+	})
+
+	t.Run("a failure inside the fan-out is reported", func(t *testing.T) {
+		t.Parallel()
+		s, tmpDir, relPaths := newFixture(t)
+
+		// Occupy the new sub-path's "data" component with a regular file so
+		// MkdirAll of every file's target directory fails.
+		writeTestFile(t, filepath.Join(tmpDir, "movies", "data"), []byte("not a directory"))
+
+		if _, err := s.relocateFiles(ctx, "fanout-fail", relPaths, "", "movies"); err == nil {
+			t.Fatal("relocateFiles returned nil, want the per-file MkdirAll failure")
+		}
+	})
+}
+
+// assertFileContent fails the test unless path holds exactly want.
+func assertFileContent(t *testing.T, path, want string) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Errorf("reading %s: %v", path, err)
+		return
+	}
+	if string(got) != want {
+		t.Errorf("%s holds %q, want %q", path, got, want)
+	}
 }
 
 func TestUpdateStateAfterRelocate(t *testing.T) {
