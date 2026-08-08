@@ -151,7 +151,7 @@ type serverTorrentState struct {
 	written          *bitset.BitSet // Bitmap of written pieces (use Count()/Len() instead of separate counter)
 	verified         *bitset.BitSet // Bitmap of pieces already hash-verified post-disk-flush; pieces with this bit set may be skipped during verifyFinalizedPieces
 	dirty            bool           // Whether state needs to be flushed
-	piecesSinceFlush int            // Pieces written since last flush (for count-based trigger)
+	piecesSinceFlush int            // Pieces written since the last flush; a flush subtracts what its own snapshot covered
 	flushGen         uint64         // Monotonic counter incremented on every successful state flush
 	initializing     atomic.Bool    // True while disk I/O is in progress; set once before publication, never written again.
 

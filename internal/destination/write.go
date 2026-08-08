@@ -392,15 +392,9 @@ func (s *Server) earlyFinalizeFile(
 			fi.piecesWritten--
 		}
 		state.dirty = true
-		if state.statePath != "" {
-			if saveErr := s.saveState(state.statePath, state.written); saveErr != nil {
-				metrics.StateSaveErrorsTotal.WithLabelValues(metrics.ModeDestination).Inc()
-				s.logger.ErrorContext(ctx, "failed to persist state after verify failure",
-					"hash", hash, "file", fi.path, "error", saveErr)
-			} else {
-				state.dirty = false
-				state.flushGen++
-			}
+		if saveErr := s.persistWritten(state); saveErr != nil {
+			s.logger.ErrorContext(ctx, "failed to persist state after verify failure",
+				"hash", hash, "file", fi.path, "error", saveErr)
 		}
 		metrics.EarlyFinalizeVerifyFailuresTotal.Inc()
 		s.logger.WarnContext(ctx, "early verify failed, pieces will be re-streamed",

@@ -284,14 +284,12 @@ func (s *Server) cleanup() {
 
 	for hash, state := range torrents {
 		state.mu.Lock()
-		if state.dirty && state.statePath != "" {
-			if saveErr := s.saveState(state.statePath, state.written); saveErr != nil {
+		if state.dirty {
+			if saveErr := s.persistWritten(state); saveErr != nil {
 				s.logger.Warn("failed to save state on cleanup",
 					"hash", hash,
 					"error", saveErr,
 				)
-			} else {
-				state.flushGen++
 			}
 		}
 		for _, fi := range state.files {

@@ -781,18 +781,12 @@ func (s *Server) syncFileParentDirs(ctx context.Context, hash string, state *ser
 
 // flushWrittenState persists the written bitmap to disk.
 func (s *Server) flushWrittenState(ctx context.Context, hash string, state *serverTorrentState) {
-	if state.statePath == "" {
-		return
-	}
-
-	if saveErr := s.saveState(state.statePath, state.written); saveErr != nil {
+	if saveErr := s.persistWritten(state); saveErr != nil {
 		s.logger.WarnContext(ctx, "failed to save final state",
 			"hash", hash,
 			"error", saveErr,
 		)
-		return
 	}
-	state.flushGen++
 }
 
 // registerFinalizedInodes registers inodes for files we wrote (not hardlinked)
@@ -1065,14 +1059,11 @@ func (s *Server) recoverVerificationFailure(
 
 	// Persist the recovered state.
 	state.dirty = true
-	if saveErr := s.doSaveState(state.statePath, state.written); saveErr != nil {
-		metrics.StateSaveErrorsTotal.WithLabelValues(metrics.ModeDestination).Inc()
+	if saveErr := s.persistWritten(state); saveErr != nil {
 		s.logger.ErrorContext(ctx, "failed to persist state after verification recovery",
 			"hash", hash,
 			"error", saveErr,
 		)
-	} else {
-		state.flushGen++
 	}
 
 	s.logger.InfoContext(ctx, "recovered from verification failure",
