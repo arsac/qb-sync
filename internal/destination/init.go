@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"github.com/bits-and-blooms/bitset"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/arsac/qb-sync/internal/metrics"
 	pb "github.com/arsac/qb-sync/proto"
@@ -264,7 +265,40 @@ func (s *Server) initNewTorrent(
 		"piecesHave", haveCount,
 	)
 
+	s.startPreVerify(hash, state)
+
 	return state.buildReadyResponse()
+}
+
+// startPreVerify kicks off the read-back verification of files that were already
+// complete on disk at init, so it overlaps the transfer instead of the finalize
+// stall. Nothing downstream depends on it finishing: it only ever adds skips for
+// verifyFinalizedPieces, so a cancelled or never-launched pass just leaves the
+// pre-change amount of work at finalize.
+//
+// The pass gets its own context, registered on the state, so finalization can
+// stop it once it starts reading the same bytes back itself - see stopPreVerify.
+func (s *Server) startPreVerify(hash string, state *serverTorrentState) {
+	if s.config.DryRun || len(state.pieceHashes) == 0 || len(preVerifyCandidates(state)) == 0 {
+		return
+	}
+	if s.bgCtx.Err() != nil {
+		return
+	}
+
+	ctx, cancel := context.WithCancel(s.bgCtx)
+	done := make(chan struct{})
+
+	state.mu.Lock()
+	state.preVerifyCancel = cancel
+	state.preVerifyDone = done
+	state.mu.Unlock()
+
+	s.bgWg.Go(func() {
+		defer close(done)
+		defer cancel()
+		s.preVerifyCompleteFiles(ctx, hash, state)
+	})
 }
 
 // maybeRelocateSubPath checks whether the persisted sub-path differs from the
@@ -497,13 +531,35 @@ func (s *Server) setupFiles(
 	files := make([]*serverFileInfo, len(reqFiles))
 	results := make([]*pb.HardlinkResult, len(reqFiles))
 
+	// Each file costs several independent NFS round-trips (MkdirAll, plus a
+	// stat of the final and .partial paths, plus any hardlink probing) and a
+	// season pack carries hundreds of them, so a serial pass puts seconds of
+	// pure latency in front of the first streamed piece. Slots are written by
+	// index, and concurrent hardlink resolution is already the normal case -
+	// the inode registry arbitrates it with an atomic RegisterInProgress.
+	//
+	// The group carries a context so the first MkdirAll failure short-circuits
+	// the files not yet started, matching the serial version's early return
+	// rather than registering in-progress inodes for a torrent that is about
+	// to be rejected.
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(fileSetupConcurrency)
 	for i, f := range reqFiles {
-		fileInfo, result, err := s.setupFile(ctx, hash, f, i, saveSubPath)
-		if err != nil {
-			return nil, nil, err
-		}
-		files[i] = fileInfo
-		results[i] = result
+		g.Go(func() error {
+			if ctxErr := gctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			fileInfo, result, err := s.setupFile(ctx, hash, f, i, saveSubPath)
+			if err != nil {
+				return err
+			}
+			files[i] = fileInfo
+			results[i] = result
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, nil, err
 	}
 
 	return files, results, nil

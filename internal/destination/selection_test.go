@@ -1,7 +1,9 @@
 package destination
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -194,6 +196,102 @@ func TestCalculatePiecesCovered_UnselectedFiles(t *testing.T) {
 	})
 }
 
+// classifyPieceScan is the pre-binary-search full scan, kept as the oracle for
+// TestClassifyPiece_MatchesFullScan.
+func classifyPieceScan(m *torrentMeta, pieceIdx int) pieceClass {
+	pieceStart := int64(pieceIdx) * m.pieceLength
+	pieceEnd := min(pieceStart+m.pieceLength, m.totalSize)
+
+	hasSelected, hasUnselected := false, false
+	for _, f := range m.files {
+		if f.offset >= pieceEnd || f.offset+f.size <= pieceStart {
+			continue
+		}
+		if f.selected {
+			hasSelected = true
+		} else {
+			hasUnselected = true
+		}
+	}
+	switch {
+	case hasSelected && hasUnselected:
+		return pieceBoundary
+	case !hasSelected:
+		return pieceNoSelectedOverlap
+	default:
+		return pieceFullySelected
+	}
+}
+
+// coveredScan is the pre-binary-search full scan for calculatePiecesCovered.
+func coveredScan(m *torrentMeta, pieceIdx int) bool {
+	pieceStart := int64(pieceIdx) * m.pieceLength
+	pieceEnd := min(pieceStart+m.pieceLength, m.totalSize)
+	for _, f := range m.files {
+		if f.offset < pieceEnd && f.offset+f.size > pieceStart && !f.skipForWriteData() {
+			return false
+		}
+	}
+	return true
+}
+
+// mixedLayoutMeta builds a contiguous multi-file torrent whose file sizes cross
+// piece boundaries in every direction: sub-piece files, exact multiples, and
+// files spanning many pieces, with zero-length files wedged between.
+func mixedLayoutMeta(fileCount int) torrentMeta {
+	const pieceLength int64 = 1 << 14
+	sizes := []int64{pieceLength / 3, pieceLength, pieceLength*2 + 7, 0, pieceLength/2 + 1, pieceLength * 5}
+
+	var offset int64
+	files := make([]*serverFileInfo, 0, fileCount)
+	for i := range fileCount {
+		size := sizes[i%len(sizes)]
+		hlState := hlStateNone
+		if i%7 == 0 {
+			hlState = hlStateComplete
+		}
+		files = append(files, &serverFileInfo{
+			offset:   offset,
+			size:     size,
+			selected: i%4 != 0,
+			hardlink: hardlinkInfo{state: hlState},
+		})
+		offset += size
+	}
+	return torrentMeta{pieceLength: pieceLength, totalSize: offset, files: files}
+}
+
+// TestClassifyPiece_MatchesFullScan pins the binary-search narrowing in
+// classifyPiece and calculatePiecesCovered against the full scan they replaced.
+// An off-by-one in the search bound or the break condition would drop the first
+// or last overlapping file, silently mis-classifying boundary pieces.
+func TestClassifyPiece_MatchesFullScan(t *testing.T) {
+	t.Parallel()
+
+	meta := mixedLayoutMeta(64)
+	covered := meta.calculatePiecesCovered()
+	for p := range int(meta.numPieces()) {
+		if got, want := meta.classifyPiece(p), classifyPieceScan(&meta, p); got != want {
+			t.Fatalf("classifyPiece(%d) = %d, want %d", p, got, want)
+		}
+		if got, want := covered[p], coveredScan(&meta, p); got != want {
+			t.Fatalf("calculatePiecesCovered()[%d] = %v, want %v", p, got, want)
+		}
+	}
+}
+
+func BenchmarkClassifyPiece(b *testing.B) {
+	meta := mixedLayoutMeta(400)
+	numPieces := int(meta.numPieces())
+
+	b.ReportAllocs()
+	for i := 0; b.Loop(); i++ {
+		if meta.classifyPiece(i%numPieces) == pieceNoSelectedOverlap {
+			continue
+		}
+	}
+}
+
 // --- writePieceData tests with unselected files ---
 
 func TestWritePieceData_SkipsUnselectedFiles(t *testing.T) {
@@ -251,6 +349,120 @@ func TestWritePieceData_SkipsUnselectedFiles(t *testing.T) {
 	}
 }
 
+// TestWritePieceData_UnselectedFileStillConsumesItsShare pins that a file which
+// takes no data does not shift the bytes behind it. The walk apportions every
+// overlapping file's range and writeAt drops the ones that decline, so a
+// declining file in the MIDDLE of a piece is the case where treating "skipped"
+// as "contributed nothing" would silently write the wrong bytes to the next
+// file. The existing coverage only ever declines the last file of a piece.
+func TestWritePieceData_UnselectedFileStillConsumesItsShare(t *testing.T) {
+	t.Parallel()
+	_, tmpDir := newTestDestServer(t)
+
+	head := filepath.Join(tmpDir, "head.bin.partial")
+	tail := filepath.Join(tmpDir, "tail.bin.partial")
+	state := &serverTorrentState{
+		torrentMeta: torrentMeta{
+			pieceLength: 150,
+			totalSize:   150,
+			files: []*serverFileInfo{
+				{path: head, size: 50, offset: 0, selected: true},
+				{path: filepath.Join(tmpDir, "middle.bin"), size: 50, offset: 50, selected: false},
+				{path: tail, size: 50, offset: 100, selected: true},
+			},
+		},
+	}
+	for _, path := range []string{head, tail} {
+		if err := os.WriteFile(path, make([]byte, 50), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	data := make([]byte, 150)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	if err := state.writePieceData(0, data); err != nil {
+		t.Fatalf("writePieceData: %v", err)
+	}
+
+	for _, tc := range []struct {
+		path string
+		want []byte
+	}{
+		{head, data[0:50]},
+		{tail, data[100:150]},
+	} {
+		content, err := os.ReadFile(tc.path)
+		if err != nil {
+			t.Fatalf("reading %s: %v", tc.path, err)
+		}
+		if !bytes.Equal(content, tc.want) {
+			t.Errorf("%s = %v, want %v", filepath.Base(tc.path), content[:8], tc.want[:8])
+		}
+	}
+}
+
+// TestWritePieceData_LeavesHardlinkedFilesUntouched pins that a file whose data
+// arrived by hardlink takes no piece data. The hardlink shares its inode with
+// another torrent's file, so a write lands in that torrent's data too - and the
+// source streams these pieces whenever a boundary piece also covers a file this
+// torrent really is writing.
+func TestWritePieceData_LeavesHardlinkedFilesUntouched(t *testing.T) {
+	t.Parallel()
+	_, tmpDir := newTestDestServer(t)
+
+	original := []byte("data owned by the source torrent")
+	streamedPath := filepath.Join(tmpDir, "streamed.bin.partial")
+	if err := os.WriteFile(streamedPath, make([]byte, len(original)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		hlState hardlinkState
+	}{
+		{"complete", hlStateComplete},
+		{"pending", hlStatePending},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			linkedPath := filepath.Join(tmpDir, tc.name+".bin")
+			if err := os.WriteFile(linkedPath, original, 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			size := int64(len(original))
+			state := &serverTorrentState{
+				torrentMeta: torrentMeta{
+					pieceLength: 2 * size,
+					totalSize:   2 * size,
+					files: []*serverFileInfo{
+						{path: streamedPath, size: size, offset: 0, selected: true},
+						{
+							path: linkedPath, size: size, offset: size, selected: true,
+							hardlink: hardlinkInfo{state: tc.hlState},
+						},
+					},
+				},
+			}
+
+			data := bytes.Repeat([]byte{0xAA}, int(2*size))
+			if err := state.writePieceData(0, data); err != nil {
+				t.Fatalf("writePieceData: %v", err)
+			}
+
+			got, err := os.ReadFile(linkedPath)
+			if err != nil {
+				t.Fatalf("reading hardlinked file: %v", err)
+			}
+			if !bytes.Equal(got, original) {
+				t.Errorf("hardlinked file = %q, want it untouched (%q)", got, original)
+			}
+		})
+	}
+}
+
 // --- setupFile tests for unselected files ---
 
 func TestSetupFile_UnselectedFile(t *testing.T) {
@@ -295,6 +507,74 @@ func TestSetupFile_UnselectedFile(t *testing.T) {
 			t.Error("unselected file should have no special flags in result")
 		}
 	})
+}
+
+// TestSetupFiles_ResultsAlignWithRequestOrder pins the invariant the parallel
+// fan-out in setupFiles could break: files[i] and results[i] must describe
+// reqFiles[i]. Every file gets a distinct on-disk shape (pre-existing, resumed
+// .partial, fresh, unselected) so a mis-indexed slot is visible rather than
+// hidden behind identical outcomes. Run under -race, the shared parent
+// directory also exercises concurrent MkdirAll of the same path.
+func TestSetupFiles_ResultsAlignWithRequestOrder(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+
+	const numFiles = 64
+	reqFiles := make([]*pb.FileInfo, numFiles)
+	for i := range numFiles {
+		rel := filepath.Join("pack", fmt.Sprintf("f%02d.bin", i))
+		size := int64(100 + i)
+		reqFiles[i] = &pb.FileInfo{
+			Path:     rel,
+			Size:     size,
+			Offset:   int64(i) * 1000,
+			Selected: i%4 != 3,
+		}
+		abs := filepath.Join(tmpDir, rel)
+		switch i % 4 {
+		case 0: // pre-existing at the final path
+			writeTestFile(t, abs, make([]byte, size))
+		case 1: // resumed .partial from an interrupted sync
+			writeTestFile(t, abs+partialSuffix, make([]byte, size))
+		}
+	}
+
+	files, results, err := s.setupFiles(context.Background(), "hash1", reqFiles, "")
+	if err != nil {
+		t.Fatalf("setupFiles: %v", err)
+	}
+	if len(files) != numFiles || len(results) != numFiles {
+		t.Fatalf("got %d files / %d results, want %d each", len(files), len(results), numFiles)
+	}
+
+	for i, f := range reqFiles {
+		fi := files[i]
+		if fi == nil {
+			t.Fatalf("file %d: nil entry", i)
+		}
+		if fi.size != f.GetSize() || fi.offset != f.GetOffset() || fi.selected != f.GetSelected() {
+			t.Errorf("file %d: got size=%d offset=%d selected=%v, want %d/%d/%v",
+				i, fi.size, fi.offset, fi.selected, f.GetSize(), f.GetOffset(), f.GetSelected())
+		}
+		if results[i].GetFileIndex() != int32(i) {
+			t.Errorf("file %d: result carries fileIndex %d", i, results[i].GetFileIndex())
+		}
+
+		final := filepath.Join(tmpDir, f.GetPath())
+		wantPath, wantPreExisting := final+partialSuffix, false
+		switch i % 4 {
+		case 0:
+			wantPath, wantPreExisting = final, true
+		case 3: // unselected: final path, no .partial
+			wantPath = final
+		}
+		if fi.path != wantPath {
+			t.Errorf("file %d: path = %q, want %q", i, fi.path, wantPath)
+		}
+		if results[i].GetPreExisting() != wantPreExisting {
+			t.Errorf("file %d: preExisting = %v, want %v", i, results[i].GetPreExisting(), wantPreExisting)
+		}
+	}
 }
 
 // --- FinalizeTorrent with partial selection ---
@@ -372,6 +652,10 @@ func TestFinalizeTorrent_PartialSelection(t *testing.T) {
 	if wc != 2 {
 		t.Errorf("writtenCount = %d, want 2", wc)
 	}
+
+	// FinalizeTorrent defers with BUSY while an early finalization is still
+	// reading a completed file back, so let those land first.
+	waitEarlyFinalize(t, state)
 
 	// FinalizeTorrent should succeed with only selected pieces written
 	fResp, fErr := s.FinalizeTorrent(ctx, &pb.FinalizeTorrentRequest{

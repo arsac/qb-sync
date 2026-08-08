@@ -3,7 +3,11 @@ package streaming
 import (
 	"context"
 	"errors"
+	"fmt"
+	"maps"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,8 +27,8 @@ func newTestMonitor() *PieceMonitor {
 	}
 }
 
-// newTestState builds a torrentState with empty streamed/failed slices.
-// numPieces sets both slice lengths and the meta NumPieces field.
+// newTestState builds a torrentState with empty streamed/failed/queued slices.
+// numPieces sets every slice length and the meta NumPieces field.
 func newTestState(numPieces int) *torrentState {
 	return &torrentState{
 		meta: &TorrentMetadata{
@@ -34,6 +38,7 @@ func newTestState(numPieces int) *torrentState {
 		},
 		streamed: make([]bool, numPieces),
 		failed:   make([]bool, numPieces),
+		queued:   make([]bool, numPieces),
 	}
 }
 
@@ -225,7 +230,7 @@ func TestPieceMonitor_MarkStreamed(t *testing.T) {
 
 		// Set failed flag first
 		state := monitor.torrents[hash]
-		state.failed[3] = true
+		state.markFailed(3)
 
 		// Mark as streamed
 		monitor.MarkStreamed(hash, 3)
@@ -322,10 +327,10 @@ func TestPieceMonitor_GetProgress(t *testing.T) {
 
 		// Mark some pieces as streamed and failed
 		state := monitor.torrents[hash]
-		state.streamed[0] = true
-		state.streamed[1] = true
-		state.streamed[2] = true
-		state.failed[3] = true
+		state.markStreamed(0)
+		state.markStreamed(1)
+		state.markStreamed(2)
+		state.markFailed(3)
 
 		progress, err := monitor.GetProgress(hash)
 		if err != nil {
@@ -362,7 +367,7 @@ func TestPieceMonitor_GetProgress(t *testing.T) {
 		numPieces := 5
 		state := newTestState(numPieces)
 		for i := range state.streamed {
-			state.streamed[i] = true
+			state.markStreamed(i)
 		}
 		monitor.torrents[hash] = state
 
@@ -425,7 +430,7 @@ func TestPieceMonitor_ResyncStreamed(t *testing.T) {
 		// Simulate: source thinks all 10 are streamed
 		state := monitor.torrents[hash]
 		for i := range state.streamed {
-			state.streamed[i] = true
+			state.markStreamed(i)
 		}
 
 		// Destination only has 7 pieces (0-6)
@@ -458,8 +463,8 @@ func TestPieceMonitor_ResyncStreamed(t *testing.T) {
 
 		state := monitor.torrents[hash]
 		// Pieces 2 and 3 are failed
-		state.failed[2] = true
-		state.failed[3] = true
+		state.markFailed(2)
+		state.markFailed(3)
 
 		// Destination has piece 2 but not 3
 		writtenOnCold := []bool{false, false, true, false, false}
@@ -483,8 +488,8 @@ func TestPieceMonitor_ResyncStreamed(t *testing.T) {
 		monitor.torrents[hash] = newTestState(numPieces)
 
 		state := monitor.torrents[hash]
-		state.streamed[0] = true
-		state.streamed[2] = true
+		state.markStreamed(0)
+		state.markStreamed(2)
 
 		writtenOnCold := []bool{true, false, true, false, false}
 		reset := monitor.ResyncStreamed(hash, writtenOnCold)
@@ -502,7 +507,7 @@ func TestPieceMonitor_ResyncStreamed(t *testing.T) {
 
 		state := monitor.torrents[hash]
 		for i := range state.streamed {
-			state.streamed[i] = true
+			state.markStreamed(i)
 		}
 
 		// Destination reports fewer pieces than tracker has
@@ -635,6 +640,78 @@ func TestDeselectedPieceMask(t *testing.T) {
 	})
 }
 
+// deselectedPieceMaskFullScan is the pre-narrowing implementation, kept as an
+// oracle: it visits every file for every piece, so it cannot drop the first or
+// last overlapping file the way a mis-stated binary search can.
+func deselectedPieceMaskFullScan(files []*pb.FileInfo, numPieces int32, pieceSize, totalSize int64) []bool {
+	mask := make([]bool, numPieces)
+	for pieceIdx := range numPieces {
+		pieceStart := int64(pieceIdx) * pieceSize
+		pieceEnd := min(pieceStart+pieceSize, totalSize)
+		allDeselected := true
+		for _, f := range files {
+			fEnd := f.GetOffset() + f.GetSize()
+			if f.GetOffset() < pieceEnd && fEnd > pieceStart && f.GetSelected() {
+				allDeselected = false
+				break
+			}
+		}
+		mask[pieceIdx] = allDeselected
+	}
+	return mask
+}
+
+// mixedSelectionLayout builds an offset-sorted, contiguous file list mixing the
+// shapes that distinguish a correct narrowing from a subtly wrong one: files
+// smaller than a piece, files that end exactly on a piece boundary, files
+// spanning several pieces, and zero-length files wedged at file boundaries
+// (which end exactly where the next file starts).
+func mixedSelectionLayout(pieceSize int64) ([]*pb.FileInfo, int32, int64) {
+	sizes := []int64{
+		pieceSize / 3, 0, pieceSize, pieceSize * 3, 1, 0,
+		pieceSize*2 + 1, pieceSize - 1, 0, pieceSize / 2,
+	}
+	var files []*pb.FileInfo
+	var offset int64
+	for i := range 40 {
+		size := sizes[i%len(sizes)]
+		files = append(files, &pb.FileInfo{
+			Path:     fmt.Sprintf("f%02d.bin", i),
+			Size:     size,
+			Offset:   offset,
+			Selected: i%3 != 0,
+		})
+		offset += size
+	}
+	return files, int32((offset + pieceSize - 1) / pieceSize), offset
+}
+
+func TestDeselectedPieceMask_MatchesFullScan(t *testing.T) {
+	for _, pieceSize := range []int64{16, 100, 4096} {
+		files, numPieces, totalSize := mixedSelectionLayout(pieceSize)
+
+		got := DeselectedPieceMask(files, numPieces, pieceSize, totalSize)
+		want := deselectedPieceMaskFullScan(files, numPieces, pieceSize, totalSize)
+		if !slices.Equal(got, want) {
+			t.Fatalf("pieceSize %d: narrowed mask differs from full scan\ngot  %v\nwant %v",
+				pieceSize, got, want)
+		}
+		// Guard against a layout that makes the comparison vacuous.
+		if !slices.Contains(want, true) || !slices.Contains(want, false) {
+			t.Fatalf("pieceSize %d: layout produced a uniform mask, test proves nothing", pieceSize)
+		}
+	}
+}
+
+func BenchmarkDeselectedPieceMask(b *testing.B) {
+	const pieceSize = 4096
+	files, numPieces, totalSize := mixedSelectionLayout(pieceSize)
+	b.ResetTimer()
+	for b.Loop() {
+		DeselectedPieceMask(files, numPieces, pieceSize, totalSize)
+	}
+}
+
 func TestPieceMonitor_RemovalNotification_Integration(t *testing.T) {
 	t.Run("removal notification blocks until received", func(t *testing.T) {
 		monitor := newTestMonitor()
@@ -756,4 +833,730 @@ func TestGetProgress_ReportsTheStallSignal(t *testing.T) {
 		t.Errorf("Available = %d, want %d: every piece is downloaded on the source and unstreamed",
 			progress.Available, numPieces)
 	}
+}
+
+// fanoutProbeSource records the concurrency pollActiveTorrents achieves and
+// returns a piece-state pattern derived from the requested hash, so a poll that
+// applied one torrent's states to another's state is detectable.
+//
+// Each call parks until releaseTarget calls are simultaneously in flight. A
+// serial poll can never reach that, so a watchdog started on the first call
+// releases everyone after fanoutProbeTimeout - long enough that the fan-out
+// wins the race on any machine, short enough that a regression fails rather
+// than hangs.
+type fanoutProbeSource struct {
+	numPieces     int
+	releaseTarget int64
+
+	inFlight atomic.Int64
+	maxSeen  atomic.Int64
+
+	releaseOnce sync.Once
+	release     chan struct{}
+	armOnce     sync.Once
+
+	callsMu sync.Mutex
+	calls   map[string]int
+}
+
+const fanoutProbeTimeout = 2 * time.Second
+
+func newFanoutProbeSource(numPieces int, releaseTarget int64) *fanoutProbeSource {
+	return &fanoutProbeSource{
+		numPieces:     numPieces,
+		releaseTarget: releaseTarget,
+		release:       make(chan struct{}),
+		calls:         make(map[string]int),
+	}
+}
+
+func (s *fanoutProbeSource) releaseAll() {
+	s.releaseOnce.Do(func() { close(s.release) })
+}
+
+// downloadedPiece maps a hash to the single piece index it reports as
+// downloaded: "t03" -> 3. Distinct per torrent so a cross-wired result is a
+// mismatch rather than an indistinguishable duplicate.
+func (s *fanoutProbeSource) downloadedPiece(hash string) int {
+	idx := 0
+	for _, c := range hash[1:] {
+		idx = idx*10 + int(c-'0')
+	}
+	return idx
+}
+
+func (s *fanoutProbeSource) GetPieceStates(_ context.Context, hash string) ([]PieceState, error) {
+	s.armOnce.Do(func() { time.AfterFunc(fanoutProbeTimeout, s.releaseAll) })
+
+	n := s.inFlight.Add(1)
+	for {
+		seen := s.maxSeen.Load()
+		if n <= seen || s.maxSeen.CompareAndSwap(seen, n) {
+			break
+		}
+	}
+	if n >= s.releaseTarget {
+		s.releaseAll()
+	}
+	<-s.release
+	s.inFlight.Add(-1)
+
+	s.callsMu.Lock()
+	s.calls[hash]++
+	s.callsMu.Unlock()
+
+	states := make([]PieceState, s.numPieces)
+	states[s.downloadedPiece(hash)] = PieceStateDownloaded
+	return states, nil
+}
+
+func (s *fanoutProbeSource) GetPieceHashes(context.Context, string) ([]string, error) {
+	return make([]string, s.numPieces), nil
+}
+
+func (s *fanoutProbeSource) GetTorrentMetadata(context.Context, string) (*TorrentMetadata, error) {
+	return nil, errors.New("not used")
+}
+
+func (s *fanoutProbeSource) ReadPiece(context.Context, *pb.Piece) ([]byte, error) {
+	return nil, errors.New("not used")
+}
+
+// TestPollActiveTorrents_FansOutWithoutCrossWiring pins both halves of the
+// concurrent poll: the per-torrent piece-state fetches overlap (a serial loop
+// only ever reaches an in-flight count of 1), and every torrent's states are
+// applied to its own torrentState.
+func TestPollActiveTorrents_FansOutWithoutCrossWiring(t *testing.T) {
+	t.Parallel()
+
+	const (
+		numTorrents = 20
+		numPieces   = 32
+	)
+
+	src := newFanoutProbeSource(numPieces, pollPieceStatesConcurrency)
+	monitor := newTestMonitor()
+	monitor.source = src
+
+	hashes := make([]string, numTorrents)
+	for i := range numTorrents {
+		hash := fmt.Sprintf("t%02d", i)
+		hashes[i] = hash
+		state := newTestState(numPieces)
+		state.meta.TorrentHash = hash
+		state.meta.PieceSize = 1
+		state.meta.TotalSize = numPieces
+		monitor.torrents[hash] = state
+	}
+
+	monitor.pollActiveTorrents(context.Background())
+
+	if got := src.maxSeen.Load(); got < pollPieceStatesConcurrency {
+		t.Errorf("max concurrent GetPieceStates = %d, want %d: piece-state polls did not overlap",
+			got, pollPieceStatesConcurrency)
+	}
+
+	src.callsMu.Lock()
+	calls := len(src.calls)
+	src.callsMu.Unlock()
+	if calls != numTorrents {
+		t.Errorf("polled %d distinct torrents, want %d", calls, numTorrents)
+	}
+
+	for _, hash := range hashes {
+		state := monitor.torrents[hash]
+		want := src.downloadedPiece(hash)
+		for i, ps := range state.lastStates {
+			downloaded := ps == PieceStateDownloaded
+			if downloaded != (i == want) {
+				t.Fatalf("%s: piece %d downloaded=%v, want downloaded only at %d "+
+					"(states applied to the wrong torrent)", hash, i, downloaded, want)
+			}
+		}
+	}
+
+	// Each torrent queues exactly its own downloaded piece.
+	queued := make(map[string]int32)
+	for range numTorrents {
+		select {
+		case piece := <-monitor.Completed():
+			queued[piece.GetTorrentHash()] = piece.GetIndex()
+		default:
+			t.Fatalf("expected %d queued pieces, got %d", numTorrents, len(queued))
+		}
+	}
+	for _, hash := range hashes {
+		idx, ok := queued[hash]
+		if !ok {
+			t.Errorf("%s queued no piece", hash)
+			continue
+		}
+		if int(idx) != src.downloadedPiece(hash) {
+			t.Errorf("%s queued piece %d, want %d", hash, idx, src.downloadedPiece(hash))
+		}
+	}
+}
+
+// newBacklogState builds a torrentState whose pieces are all downloaded and
+// none streamed, i.e. the state of a torrent whose data is already on disk when
+// the sync starts.
+func newBacklogState(numPieces int) (*torrentState, []PieceState) {
+	st := newTestState(numPieces)
+	st.meta.InitTorrentRequest.TorrentHash = "backlog"
+	st.meta.InitTorrentRequest.PieceSize = 1 << 20
+	st.meta.InitTorrentRequest.TotalSize = int64(numPieces) << 20
+	st.hashes = make([]string, numPieces)
+
+	current := make([]PieceState, numPieces)
+	for i := range current {
+		current[i] = PieceStateDownloaded
+	}
+	return st, current
+}
+
+// TestQueueCompletedPieces_LeavesRoomForOtherTorrents pins why the queued bit
+// exists. Every tracked torrent shares one completed channel, and the scan
+// re-offers every un-streamed piece for as long as there is room, so a torrent
+// with fewer pieces than the channel has slots used to fill it with repeat copies
+// of its own pieces and starve every other torrent of a slot entirely.
+func TestQueueCompletedPieces_LeavesRoomForOtherTorrents(t *testing.T) {
+	ctx := context.Background()
+
+	const (
+		queueSlots     = 8
+		piecesPerToken = 3
+		ticks          = 3
+	)
+
+	monitor := newTestMonitor()
+	monitor.completed = make(chan *pb.Piece, queueSlots)
+	monitor.queueFullLogNano.Store(time.Now().UnixNano()) // suppress the rate-limited warn
+
+	busy, busyStates := newBacklogState(piecesPerToken)
+	quiet, quietStates := newBacklogState(piecesPerToken)
+	quiet.meta.InitTorrentRequest.TorrentHash = "quiet"
+
+	// The busy torrent is polled repeatedly while no sender dequeues anything.
+	for range ticks {
+		monitor.queueCompletedPieces(ctx, busy, busyStates)
+	}
+	if got := monitor.queueCompletedPieces(ctx, quiet, quietStates); got != piecesPerToken {
+		t.Fatalf("second torrent queued %d of %d pieces after %d ticks of the first; "+
+			"repeat offers crowded it out", got, piecesPerToken, ticks)
+	}
+
+	perHash := map[string]int{}
+	for len(monitor.completed) > 0 {
+		perHash[(<-monitor.completed).GetTorrentHash()]++
+	}
+	want := map[string]int{"backlog": piecesPerToken, "quiet": piecesPerToken}
+	if !maps.Equal(perHash, want) {
+		t.Errorf("queue holds %v, want %v (one copy of each torrent's pieces)", perHash, want)
+	}
+}
+
+func TestQueueCompletedPieces_StopsWhenTheQueueIsFull(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("queues every eligible piece while there is room", func(t *testing.T) {
+		monitor := newTestMonitor()
+		st, current := newBacklogState(6)
+		current[1] = PieceStateNotDownloaded
+		st.markStreamed(3)
+
+		if got := monitor.queueCompletedPieces(ctx, st, current); got != 4 {
+			t.Fatalf("queued %d pieces, want 4", got)
+		}
+		var indices []int32
+		for len(monitor.completed) > 0 {
+			indices = append(indices, (<-monitor.completed).GetIndex())
+		}
+		if !slices.Equal(indices, []int32{0, 2, 4, 5}) {
+			t.Errorf("queued indices %v, want [0 2 4 5]", indices)
+		}
+	})
+
+	t.Run("fills the queue to capacity and stops there", func(t *testing.T) {
+		monitor := newTestMonitor()
+		monitor.completed = make(chan *pb.Piece, 3)
+		st, current := newBacklogState(500)
+
+		if got := monitor.queueCompletedPieces(ctx, st, current); got != 3 {
+			t.Fatalf("queued %d pieces, want 3", got)
+		}
+		var indices []int32
+		for len(monitor.completed) > 0 {
+			indices = append(indices, (<-monitor.completed).GetIndex())
+		}
+		if !slices.Equal(indices, []int32{0, 1, 2}) {
+			t.Errorf("queued indices %v, want [0 1 2]", indices)
+		}
+	})
+
+	// Re-offering is the only retry mechanism the scan has, and the queued bit is
+	// what keeps it from re-offering pieces still sitting in the channel: only
+	// the piece a sender actually took comes back. That single re-offer is what
+	// makes the sender's in-flight skip (see
+	// TestSendPiecePool_SkipsPieceAlreadyInFlight) load bearing rather than
+	// defensive - without it, it becomes a second disk read and a second copy
+	// over the link for every piece on the wire.
+	t.Run("re-offers only the dequeued piece, not the ones still queued", func(t *testing.T) {
+		monitor := newTestMonitor()
+		st, current := newBacklogState(4)
+		monitor.torrents["backlog"] = st
+
+		if got := monitor.queueCompletedPieces(ctx, st, current); got != 4 {
+			t.Fatalf("queued %d pieces, want 4", got)
+		}
+		// A sender takes piece 0 off the queue and is still waiting on its ack.
+		if idx := (<-monitor.completed).GetIndex(); idx != 0 {
+			t.Fatalf("dequeued piece %d, want 0", idx)
+		}
+		monitor.NoteDequeued("backlog", 0)
+
+		if got := monitor.queueCompletedPieces(ctx, st, current); got != 1 {
+			t.Fatalf("re-queued %d pieces on the next tick, want 1", got)
+		}
+		var queued []int32
+		for len(monitor.completed) > 0 {
+			queued = append(queued, (<-monitor.completed).GetIndex())
+		}
+		if !slices.Equal(queued, []int32{1, 2, 3, 0}) {
+			t.Errorf("queue contents %v, want [1 2 3 0] (only the dequeued piece re-offered)", queued)
+		}
+	})
+
+	// The scan is what holds the torrent's write lock, which every send and ack
+	// contends on, so a full queue has to cost O(1) rather than one discarded
+	// *pb.Piece per remaining index.
+	t.Run("an already-full queue costs constant work", func(t *testing.T) {
+		const numPieces = 2000
+		monitor := newTestMonitor()
+		monitor.completed = make(chan *pb.Piece, 1)
+		monitor.completed <- &pb.Piece{}
+		monitor.queueFullLogNano.Store(time.Now().UnixNano()) // suppress the rate-limited warn
+		st, current := newBacklogState(numPieces)
+
+		allocs := testing.AllocsPerRun(20, func() {
+			if got := monitor.queueCompletedPieces(ctx, st, current); got != 0 {
+				t.Fatalf("queued %d pieces into a full queue, want 0", got)
+			}
+		})
+		if allocs > 20 {
+			t.Errorf("full-queue scan of %d pieces made %.0f allocs, want <= 20 "+
+				"(scan does not stop at the full queue)", numPieces, allocs)
+		}
+	})
+}
+
+// countingStateSource records every GetPieceStates call and reports every piece
+// downloaded except the indices in missing.
+type countingStateSource struct {
+	numPieces int
+	missing   map[int]bool
+
+	calls atomic.Int64
+}
+
+func (s *countingStateSource) GetPieceStates(context.Context, string) ([]PieceState, error) {
+	s.calls.Add(1)
+	states := make([]PieceState, s.numPieces)
+	for i := range states {
+		if s.missing[i] {
+			states[i] = PieceStateNotDownloaded
+			continue
+		}
+		states[i] = PieceStateDownloaded
+	}
+	return states, nil
+}
+
+func (s *countingStateSource) GetPieceHashes(context.Context, string) ([]string, error) {
+	return make([]string, s.numPieces), nil
+}
+
+func (s *countingStateSource) GetTorrentMetadata(context.Context, string) (*TorrentMetadata, error) {
+	return &TorrentMetadata{InitTorrentRequest: &pb.InitTorrentRequest{
+		TorrentHash: "h1",
+		NumPieces:   int32(s.numPieces),
+		PieceSize:   1,
+		TotalSize:   int64(s.numPieces),
+	}}, nil
+}
+
+func (s *countingStateSource) ReadPiece(context.Context, *pb.Piece) ([]byte, error) {
+	return nil, errors.New("not used")
+}
+
+// drainCompleted empties the completed channel and returns how many pieces it
+// held, noting each dequeue the way a sender worker does so the next scan is
+// free to offer the piece again.
+func drainCompleted(monitor *PieceMonitor) int {
+	n := 0
+	for {
+		select {
+		case piece := <-monitor.completed:
+			monitor.NoteDequeued(piece.GetTorrentHash(), int(piece.GetIndex()))
+			n++
+		default:
+			return n
+		}
+	}
+}
+
+// TestPollTorrentPieces_ReusesStatesTheSourceCannotChange pins the refetch gate.
+//
+// The scan must still run every tick - it is what re-offers pieces the queue had
+// no room for - but once the source holds every piece the array it scans is
+// constant, and refetching it costs a round-trip plus two N-element allocations
+// per torrent per tick for the whole transfer and the finalization wait after it.
+func TestPollTorrentPieces_ReusesStatesTheSourceCannotChange(t *testing.T) {
+	t.Parallel()
+
+	const numPieces = 8
+
+	setup := func(t *testing.T, missing map[int]bool) (*PieceMonitor, *countingStateSource) {
+		t.Helper()
+		source := &countingStateSource{numPieces: numPieces, missing: missing}
+		monitor := newTestMonitor()
+		monitor.source = source
+		if err := monitor.startTracking(context.Background(), "h1", nil); err != nil {
+			t.Fatalf("startTracking: %v", err)
+		}
+		if got := source.calls.Load(); got != 1 {
+			t.Fatalf("GetPieceStates calls after startTracking = %d, want 1", got)
+		}
+		return monitor, source
+	}
+
+	t.Run("a source that holds every piece is asked once", func(t *testing.T) {
+		t.Parallel()
+		monitor, source := setup(t, nil)
+
+		for tick := range 3 {
+			if got := drainCompleted(monitor); got != numPieces {
+				t.Fatalf("tick %d queued %d pieces, want %d: the scan must run from the cache too",
+					tick, got, numPieces)
+			}
+			if err := monitor.pollTorrentPieces(context.Background(), "h1"); err != nil {
+				t.Fatalf("pollTorrentPieces: %v", err)
+			}
+		}
+
+		if got := source.calls.Load(); got != 1 {
+			t.Errorf("GetPieceStates calls = %d, want 1: a constant piece-state array was refetched", got)
+		}
+	})
+
+	t.Run("a piece the source is still missing forces a refetch", func(t *testing.T) {
+		t.Parallel()
+		monitor, source := setup(t, map[int]bool{numPieces - 1: true})
+
+		for range 2 {
+			if err := monitor.pollTorrentPieces(context.Background(), "h1"); err != nil {
+				t.Fatalf("pollTorrentPieces: %v", err)
+			}
+		}
+
+		if got := source.calls.Load(); got != 3 {
+			t.Errorf("GetPieceStates calls = %d, want 3: an incomplete source must be re-asked every tick", got)
+		}
+	})
+
+	t.Run("the cache expires so a lost source is noticed", func(t *testing.T) {
+		t.Parallel()
+		monitor, source := setup(t, nil)
+
+		if err := monitor.pollTorrentPieces(context.Background(), "h1"); err != nil {
+			t.Fatalf("pollTorrentPieces: %v", err)
+		}
+		if got := source.calls.Load(); got != 1 {
+			t.Fatalf("GetPieceStates calls = %d, want 1 before the cache expires", got)
+		}
+
+		state, ok := monitor.torrents["h1"]
+		if !ok {
+			t.Fatal("torrent not tracked")
+		}
+		state.mu.Lock()
+		state.statesFetchedAt = state.statesFetchedAt.Add(-sourceCompleteRefetchInterval)
+		state.mu.Unlock()
+
+		if err := monitor.pollTorrentPieces(context.Background(), "h1"); err != nil {
+			t.Fatalf("pollTorrentPieces: %v", err)
+		}
+		if got := source.calls.Load(); got != 2 {
+			t.Errorf("GetPieceStates calls = %d, want 2: the cache must expire", got)
+		}
+	})
+}
+
+// streamAll queues and acks every piece so the scan cursor reaches the end of
+// the torrent, which is where a resync has to be able to rewind it from.
+func streamAll(t *testing.T, monitor *PieceMonitor, st *torrentState, current []PieceState) {
+	t.Helper()
+	ctx := context.Background()
+	hash := st.meta.GetTorrentHash()
+	monitor.torrents[hash] = st
+
+	if got := monitor.queueCompletedPieces(ctx, st, current); got != len(current) {
+		t.Fatalf("initial scan queued %d pieces, want %d", got, len(current))
+	}
+	for len(monitor.completed) > 0 {
+		monitor.MarkStreamed(hash, int((<-monitor.completed).GetIndex()))
+	}
+	if got := monitor.queueCompletedPieces(ctx, st, current); got != 0 {
+		t.Fatalf("scan after full streaming queued %d pieces, want 0", got)
+	}
+	if st.firstUnstreamedScanIdx != len(current) {
+		t.Fatalf("cursor at %d after full streaming, want %d", st.firstUnstreamedScanIdx, len(current))
+	}
+}
+
+// queuedIndices drains the completed channel and returns what the scan offered.
+func queuedIndices(monitor *PieceMonitor) []int32 {
+	var indices []int32
+	for len(monitor.completed) > 0 {
+		indices = append(indices, (<-monitor.completed).GetIndex())
+	}
+	return indices
+}
+
+// A resync is how the destination's verification-failure recovery reaches the
+// source: it clears the written bits of the corrupted pieces, answers
+// FINALIZE_ERROR_INCOMPLETE, and the source un-marks them so the next poll
+// re-offers them. The scan cursor only moves forward on its own, so without a
+// rewind the re-offer never happens and the torrent stalls until the retry
+// guard quarantines it as sync-failed.
+func TestResyncStreamed_ReOffersPiecesBelowTheScanCursor(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("a piece the destination lost is offered again", func(t *testing.T) {
+		monitor := newTestMonitor()
+		st, current := newBacklogState(10)
+		streamAll(t, monitor, st, current)
+
+		destHas := make([]bool, len(current))
+		for i := range destHas {
+			destHas[i] = true
+		}
+		destHas[3] = false
+
+		if reset := monitor.ResyncStreamed(st.meta.GetTorrentHash(), destHas); reset != 1 {
+			t.Fatalf("resync reset %d pieces, want 1", reset)
+		}
+		monitor.queueCompletedPieces(ctx, st, current)
+		if got := queuedIndices(monitor); !slices.Equal(got, []int32{3}) {
+			t.Errorf("re-offered %v, want [3]", got)
+		}
+	})
+
+	t.Run("the cursor rewinds to the lowest lost piece", func(t *testing.T) {
+		monitor := newTestMonitor()
+		st, current := newBacklogState(10)
+		streamAll(t, monitor, st, current)
+
+		destHas := make([]bool, len(current))
+		for i := range destHas {
+			destHas[i] = true
+		}
+		destHas[2], destHas[7] = false, false
+
+		if reset := monitor.ResyncStreamed(st.meta.GetTorrentHash(), destHas); reset != 2 {
+			t.Fatalf("resync reset %d pieces, want 2", reset)
+		}
+		if st.firstUnstreamedScanIdx != 2 {
+			t.Errorf("cursor at %d, want 2 (the lowest un-marked piece)", st.firstUnstreamedScanIdx)
+		}
+		monitor.queueCompletedPieces(ctx, st, current)
+		if got := queuedIndices(monitor); !slices.Equal(got, []int32{2, 7}) {
+			t.Errorf("re-offered %v, want [2 7]", got)
+		}
+	})
+
+	// The cursor is what keeps the per-tick scan off the streamed prefix, so a
+	// resync that un-marks nothing must leave it where it was rather than
+	// rewinding defensively.
+	t.Run("a resync that loses nothing leaves the cursor alone", func(t *testing.T) {
+		monitor := newTestMonitor()
+		st, current := newBacklogState(10)
+		streamAll(t, monitor, st, current)
+
+		destHas := make([]bool, len(current))
+		for i := range destHas {
+			destHas[i] = true
+		}
+
+		if reset := monitor.ResyncStreamed(st.meta.GetTorrentHash(), destHas); reset != 0 {
+			t.Fatalf("resync reset %d pieces, want 0", reset)
+		}
+		if st.firstUnstreamedScanIdx != len(current) {
+			t.Errorf("cursor at %d, want %d", st.firstUnstreamedScanIdx, len(current))
+		}
+		monitor.queueCompletedPieces(ctx, st, current)
+		if got := queuedIndices(monitor); got != nil {
+			t.Errorf("re-offered %v, want nothing", got)
+		}
+	})
+}
+
+// progressByScan recomputes the three progress counts the way GetProgress did
+// before torrentState maintained them incrementally: one pass over the
+// per-piece slices. It is the oracle the counters must agree with, and shares
+// no code with them.
+func progressByScan(s *torrentState) (int, int, int) {
+	var streamed, failed, available int
+	for i := range s.streamed {
+		if s.streamed[i] {
+			streamed++
+			continue
+		}
+		if s.failed[i] {
+			failed++
+		}
+		if i < len(s.lastStates) && s.lastStates[i] == PieceStateDownloaded {
+			available++
+		}
+	}
+	return streamed, failed, available
+}
+
+// assertCountsMatchScan fails if any derived count has drifted from the slices.
+func assertCountsMatchScan(t *testing.T, step string, s *torrentState) {
+	t.Helper()
+	streamed, failed, available := progressByScan(s)
+	if s.streamedCount != streamed {
+		t.Errorf("%s: streamedCount %d, scan says %d", step, s.streamedCount, streamed)
+	}
+	if s.failedCount != failed {
+		t.Errorf("%s: failedCount %d, scan says %d", step, s.failedCount, failed)
+	}
+	if s.availableCount != available {
+		t.Errorf("%s: availableCount %d, scan says %d", step, s.availableCount, available)
+	}
+}
+
+// pieceStatesFromSeed builds a deterministic downloaded/not-downloaded pattern.
+func pieceStatesFromSeed(numPieces, seed int) []PieceState {
+	states := make([]PieceState, numPieces)
+	for i := range states {
+		states[i] = PieceStateNotDownloaded
+		if (i*seed+seed)%3 != 0 {
+			states[i] = PieceStateDownloaded
+		}
+	}
+	return states
+}
+
+// TestTorrentState_CountsTrackTheSlices drives every mutator through a
+// deterministic sequence that interleaves marking, un-marking, failing and
+// replacing the source's piece-state array, checking after each step that the
+// incrementally maintained counts still equal a full rescan.
+func TestTorrentState_CountsTrackTheSlices(t *testing.T) {
+	const numPieces = 24
+	now := time.Now()
+
+	state := newTestState(numPieces)
+	state.setPieceStates(pieceStatesFromSeed(numPieces, 1), now)
+	assertCountsMatchScan(t, "initial states", state)
+
+	// A failure on an un-streamed piece, then the same piece streaming: the
+	// failure must be counted and then given back.
+	state.markFailed(4)
+	assertCountsMatchScan(t, "failed 4", state)
+	state.markStreamed(4)
+	assertCountsMatchScan(t, "streamed 4 (was failed)", state)
+
+	// Failing an already-streamed piece is ignored, so nothing is owed twice.
+	state.markFailed(4)
+	assertCountsMatchScan(t, "failed 4 again while streamed", state)
+
+	// A spread of marks, including repeats and pieces the source does not hold.
+	for _, i := range []int{0, 1, 2, 2, 7, 9, 12, 12, 20, 23} {
+		state.markStreamed(i)
+		assertCountsMatchScan(t, fmt.Sprintf("streamed %d", i), state)
+	}
+
+	for _, i := range []int{3, 5, 11, 18} {
+		state.markFailed(i)
+		assertCountsMatchScan(t, fmt.Sprintf("failed %d", i), state)
+	}
+
+	// Un-marking must return pieces to available when the source still has them,
+	// including pieces that were never streamed (a no-op for the counts).
+	for _, i := range []int{2, 2, 9, 15, 23} {
+		state.unmarkStreamed(i)
+		assertCountsMatchScan(t, fmt.Sprintf("unmarked %d", i), state)
+	}
+
+	// A refetch that changes which pieces the source holds; availableCount is
+	// the one count that cannot be carried over.
+	for seed := 2; seed <= 4; seed++ {
+		state.setPieceStates(pieceStatesFromSeed(numPieces, seed), now)
+		assertCountsMatchScan(t, fmt.Sprintf("refetched states seed %d", seed), state)
+		state.markStreamed(seed)
+		state.unmarkStreamed(seed + 1)
+		assertCountsMatchScan(t, fmt.Sprintf("marks after refetch seed %d", seed), state)
+	}
+}
+
+// TestGetProgress_MatchesAFullScanThroughThePublicAPI runs the same agreement
+// check through the exported entry points a live transfer uses, so a mutator
+// reached only from one of them cannot drift unnoticed.
+func TestGetProgress_MatchesAFullScanThroughThePublicAPI(t *testing.T) {
+	const numPieces = 16
+	hash := "abc123"
+
+	monitor := newTestMonitor()
+	state := newTestState(numPieces)
+	state.setPieceStates(pieceStatesFromSeed(numPieces, 1), time.Now())
+	monitor.torrents[hash] = state
+
+	check := func(step string) {
+		t.Helper()
+		progress, err := monitor.GetProgress(hash)
+		if err != nil {
+			t.Fatalf("%s: GetProgress: %v", step, err)
+		}
+		streamed, failed, available := progressByScan(state)
+		if progress.Streamed != streamed || progress.Failed != failed || progress.Available != available {
+			t.Errorf("%s: progress (%d streamed, %d failed, %d available), scan says (%d, %d, %d)",
+				step, progress.Streamed, progress.Failed, progress.Available, streamed, failed, available)
+		}
+		if want := streamed == numPieces; progress.Complete != want {
+			t.Errorf("%s: Complete %v, want %v", step, progress.Complete, want)
+		}
+	}
+
+	check("fresh")
+
+	monitor.MarkFailed(hash, 5)
+	monitor.MarkFailed(hash, 6)
+	check("after MarkFailed")
+
+	monitor.MarkStreamed(hash, 5)
+	check("after MarkStreamed of a failed piece")
+
+	written := make([]bool, numPieces)
+	for _, i := range []int{0, 1, 2, 3, 6} {
+		written[i] = true
+	}
+	monitor.MarkStreamedBatch(hash, written)
+	check("after MarkStreamedBatch")
+
+	destHas := make([]bool, numPieces)
+	for i := range destHas {
+		destHas[i] = i%2 == 0
+	}
+	monitor.ResyncStreamed(hash, destHas)
+	check("after ResyncStreamed")
+
+	// Every piece streamed: the completion flag the maindata poll reads on every
+	// tick must come out of the same counter.
+	all := make([]bool, numPieces)
+	for i := range all {
+		all[i] = true
+	}
+	monitor.MarkStreamedBatch(hash, all)
+	check("after marking every piece")
 }

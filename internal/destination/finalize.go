@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -50,6 +51,22 @@ func (s *Server) FinalizeTorrent(
 		result, done := state.finalization.result, state.finalization.done
 		state.mu.Unlock()
 		return s.handleExistingFinalization(hash, state, result, done)
+	}
+	// Background early finalizations own their files' handles, paths and
+	// written bits until they land. Defer rather than race them: the source
+	// retries a BUSY response without penalty, and the count can only fall,
+	// since activating finalization below is what stops new ones starting.
+	if state.earlyFinalizing > 0 {
+		inFlight := state.earlyFinalizing
+		state.mu.Unlock()
+		s.logger.InfoContext(ctx, "finalization deferred: early finalizations in flight",
+			"hash", hash, "files", inFlight)
+		metrics.FinalizeBusyTotal.WithLabelValues(metrics.ReasonEarlyFinalizing).Inc()
+		return &pb.FinalizeTorrentResponse{
+			Success:   false,
+			Error:     fmt.Sprintf("early finalization in progress for %d file(s)", inFlight),
+			ErrorCode: pb.FinalizeErrorCode_FINALIZE_ERROR_BUSY,
+		}, nil
 	}
 	// Create finalizeDone immediately so concurrent polls always see it.
 	done := state.finalization.start()
@@ -232,6 +249,12 @@ func (s *Server) runDiskStage(
 	// Derived from s.bgCtx so server shutdown cancels in-flight work.
 	ctx, cancel := context.WithTimeout(s.bgCtx, computeDiskStageTimeout(state.totalSize))
 	defer cancel()
+
+	// The init-time pre-verification pass exists to get read-back work done
+	// while the transfer is still running. That window has closed, and it reads
+	// the same pieces this stage is about to read, so let it go rather than
+	// have two passes competing for the same NFS reads.
+	state.stopPreVerify()
 
 	// Sync parent directories before verification to ensure NFS has flushed
 	// file data and renames to the server. Without this, verification can
@@ -466,80 +489,9 @@ func (s *Server) relocateForSubPathChange(
 
 // finalizeFiles syncs all file handles, closes them, and renames from .partial to final.
 // Also resolves pending hardlinks by waiting for source files to complete.
-//
-//nolint:gocognit
 func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTorrentState) error {
-	// Phase 1: Resolve pending hardlinks without holding state.mu.
-	// Waiting on hardlink channels can block for up to defaultHardlinkWaitTimeout,
-	// and holding the lock would block all WritePiece calls for that duration.
-	// Safe because: files slice is immutable after init, and finalizing=true prevents writes.
-	for _, fi := range state.files {
-		if fi.hardlink.state != hlStatePending {
-			continue
-		}
-
-		s.logger.DebugContext(ctx, "waiting for pending hardlink source",
-			"hash", hash,
-			"target", fi.path,
-			"source", fi.hardlink.sourcePath,
-		)
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(defaultHardlinkWaitTimeout):
-			return fmt.Errorf("timeout waiting for pending hardlink source %s (waited %v)",
-				fi.hardlink.sourcePath, defaultHardlinkWaitTimeout)
-		case <-fi.hardlink.doneCh:
-			// Source is ready
-		}
-
-		sourcePath := filepath.Join(s.config.BasePath, fi.hardlink.sourcePath)
-		// Defense in depth: tryHardlinkFromInProgress already screens for
-		// cross-filesystem cases at init time, but if BasePath layout changed
-		// between init and finalize (rare: bind-mount swap, filesystem remount)
-		// the os.Link below would fail with EXDEV. Detect upfront for a
-		// clearer error.
-		if !sameFilesystem(sourcePath, filepath.Dir(fi.path)) {
-			return fmt.Errorf("pending hardlink %s -> %s spans filesystems (source removed or remounted?)",
-				sourcePath, fi.path)
-		}
-		// Validate the source's final size matches what THIS torrent's metadata
-		// expects before linking. tryHardlinkFromRegistered does the same check
-		// against its on-disk view; the in-progress path has historically relied
-		// on the assumption that two torrents sharing a (Dev, Ino) share the
-		// same file size. That assumption breaks under inode recycling or stale
-		// in-progress entries from a crashed prior run, and a wrong-sized link
-		// makes destination qB reject the torrent at AddTorrent with
-		// "mismatching file size", with no way to recover short of manual
-		// cleanup. Fail finalize so the source re-streams instead.
-		if sourceInfo, statErr := os.Stat(sourcePath); statErr != nil {
-			return fmt.Errorf("stat'ing pending hardlink source %s: %w", sourcePath, statErr)
-		} else if sourceInfo.Size() != fi.size {
-			return fmt.Errorf("pending hardlink source %s has size %d, expected %d "+
-				"(stale FileID or source-torrent metadata divergence)",
-				sourcePath, sourceInfo.Size(), fi.size)
-		}
-		if linkErr := os.Link(sourcePath, fi.path); linkErr != nil {
-			if os.IsExist(linkErr) {
-				s.logger.DebugContext(ctx, "pending hardlink target already exists",
-					"hash", hash,
-					"target", fi.path,
-				)
-			} else {
-				return fmt.Errorf("creating pending hardlink %s -> %s: %w",
-					sourcePath, fi.path, linkErr)
-			}
-		} else {
-			metrics.HardlinksCreatedTotal.Inc()
-			s.logger.InfoContext(ctx, "created pending hardlink",
-				"hash", hash,
-				"source", sourcePath,
-				"target", fi.path,
-			)
-		}
-
-		fi.hardlink.markComplete()
+	if err := s.resolvePendingHardlinks(ctx, hash, state); err != nil {
+		return err
 	}
 
 	// Phase 2: Sync, close, and rename under lock.
@@ -547,29 +499,181 @@ func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTo
 	defer state.mu.Unlock()
 
 	// Sync and close all file handles before rename.
-	// Fail early if any file can't be flushed — renaming unflushed files
+	// Fail early if any file can't be flushed - renaming unflushed files
 	// risks data loss, especially on NFS where sync is less reliable.
-	for _, fi := range state.files {
-		if fi.hardlink.state != hlStateComplete {
-			if err := s.closeFileHandle(ctx, hash, fi); err != nil {
-				return fmt.Errorf("flushing before rename: %w", err)
-			}
-		}
+	if err := s.syncAndCloseFiles(ctx, hash, state); err != nil {
+		return fmt.Errorf("flushing before rename: %w", err)
 	}
 
-	// Then rename partial files and update in-memory paths.
-	for _, fi := range state.files {
-		if fi.hardlink.state == hlStateComplete {
-			continue
-		}
-		if err := s.renamePartialFile(ctx, hash, fi); err != nil {
-			return err
-		}
-		fi.path = targetPath(fi)
+	if err := s.renamePartialFiles(ctx, hash, state); err != nil {
+		return err
 	}
 
 	s.flushWrittenState(ctx, hash, state)
 	return nil
+}
+
+// resolvePendingHardlinks waits for every file whose data another torrent is
+// still writing and links it into place once that torrent finalizes.
+//
+// Runs without state.mu: a wait can block for up to defaultHardlinkWaitTimeout
+// and holding the lock would stall every WritePiece for that long. Safe because
+// the files slice is immutable after init and each task owns exactly one file;
+// the one shared field a task mutates, fi.hardlink.state, is published under
+// state.mu because a WritePiece that entered writePieceData before finalization
+// became active is still reading it.
+//
+// The waits run concurrently. Serially, a torrent with files pending on several
+// different source torrents burned one full timeout per file before reporting
+// the first source that never arrived, and every resolved file paid its
+// stat/link round-trips in front of the next file's wait. The group carries a
+// context so the first failure cancels the siblings still parked on a timeout
+// whose outcome no longer matters.
+//
+// The waits themselves are deliberately uncapped - a capped group would park
+// later files behind earlier ones, reintroducing exactly the serialization this
+// fan-out removes - so the bound is applied to the link work each wait unblocks,
+// at the same width as the other per-file metadata passes.
+func (s *Server) resolvePendingHardlinks(ctx context.Context, hash string, state *serverTorrentState) error {
+	linkSlots := semaphore.NewWeighted(fileSetupConcurrency)
+	g, gctx := errgroup.WithContext(ctx)
+	for _, fi := range state.files {
+		if fi.hardlink.state != hlStatePending {
+			continue
+		}
+		g.Go(func() error { return s.resolvePendingHardlink(gctx, hash, state, linkSlots, fi) })
+	}
+	return g.Wait()
+}
+
+// resolvePendingHardlink waits for one file's source torrent to finish writing
+// it, then hardlinks it into place under a linkSlots slot.
+func (s *Server) resolvePendingHardlink(
+	ctx context.Context,
+	hash string,
+	state *serverTorrentState,
+	linkSlots *semaphore.Weighted,
+	fi *serverFileInfo,
+) error {
+	s.logger.DebugContext(ctx, "waiting for pending hardlink source",
+		"hash", hash,
+		"target", fi.path,
+		"source", fi.hardlink.sourcePath,
+	)
+
+	timer := time.NewTimer(defaultHardlinkWaitTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return fmt.Errorf("timeout waiting for pending hardlink source %s (waited %v)",
+			fi.hardlink.sourcePath, defaultHardlinkWaitTimeout)
+	case <-fi.hardlink.doneCh:
+		// Source is ready
+	}
+
+	if acqErr := linkSlots.Acquire(ctx, 1); acqErr != nil {
+		return acqErr
+	}
+	defer linkSlots.Release(1)
+
+	sourcePath := filepath.Join(s.config.BasePath, fi.hardlink.sourcePath)
+	// Defense in depth: tryHardlinkFromInProgress already screens for
+	// cross-filesystem cases at init time, but if BasePath layout changed
+	// between init and finalize (rare: bind-mount swap, filesystem remount)
+	// the os.Link below would fail with EXDEV. Detect upfront for a
+	// clearer error.
+	if !sameFilesystem(sourcePath, filepath.Dir(fi.path)) {
+		return fmt.Errorf("pending hardlink %s -> %s spans filesystems (source removed or remounted?)",
+			sourcePath, fi.path)
+	}
+	// Validate the source's final size matches what THIS torrent's metadata
+	// expects before linking. tryHardlinkFromRegistered does the same check
+	// against its on-disk view; the in-progress path has historically relied
+	// on the assumption that two torrents sharing a (Dev, Ino) share the
+	// same file size. That assumption breaks under inode recycling or stale
+	// in-progress entries from a crashed prior run, and a wrong-sized link
+	// makes destination qB reject the torrent at AddTorrent with
+	// "mismatching file size", with no way to recover short of manual
+	// cleanup. Fail finalize so the source re-streams instead.
+	if sourceInfo, statErr := os.Stat(sourcePath); statErr != nil {
+		return fmt.Errorf("stat'ing pending hardlink source %s: %w", sourcePath, statErr)
+	} else if sourceInfo.Size() != fi.size {
+		return fmt.Errorf("pending hardlink source %s has size %d, expected %d "+
+			"(stale FileID or source-torrent metadata divergence)",
+			sourcePath, sourceInfo.Size(), fi.size)
+	}
+	if linkErr := os.Link(sourcePath, fi.path); linkErr != nil {
+		if os.IsExist(linkErr) {
+			s.logger.DebugContext(ctx, "pending hardlink target already exists",
+				"hash", hash,
+				"target", fi.path,
+			)
+		} else {
+			return fmt.Errorf("creating pending hardlink %s -> %s: %w",
+				sourcePath, fi.path, linkErr)
+		}
+	} else {
+		metrics.HardlinksCreatedTotal.Inc()
+		s.logger.InfoContext(ctx, "created pending hardlink",
+			"hash", hash,
+			"source", sourcePath,
+			"target", fi.path,
+		)
+	}
+
+	state.mu.Lock()
+	fi.setHardlinkState(hlStateComplete)
+	state.mu.Unlock()
+	return nil
+}
+
+// syncAndCloseFiles fsyncs and closes every file handle this torrent still owns.
+// Each file is an independent COMMIT + CLOSE round-trip against the NFS server,
+// so they run concurrently at the same width as the finalize-time dir fsyncs
+// rather than one at a time in front of the rename pass.
+//
+// Unlike setupFiles, a failure deliberately does not short-circuit the files not
+// yet started: closing every handle is what the success path does anyway and it
+// releases the fds regardless, while the caller skips the rename pass entirely
+// on any error.
+func (s *Server) syncAndCloseFiles(ctx context.Context, hash string, state *serverTorrentState) error {
+	g := new(errgroup.Group)
+	g.SetLimit(parentDirSyncConcurrency)
+	for _, fi := range state.files {
+		if fi.hardlink.state == hlStateComplete {
+			continue
+		}
+		g.Go(func() error { return s.closeFileHandle(ctx, hash, fi) })
+	}
+	return g.Wait()
+}
+
+// renamePartialFiles renames each .partial file to its final path and updates
+// the in-memory path. Renames are pure metadata round-trips against distinct
+// paths, so they fan out at the same width as the init-time per-file probes;
+// a season pack otherwise pays one serial NFS RENAME per file before the source
+// sees the torrent finalize.
+//
+// Each task owns one file's fi.path, and state.mu is held for the whole pass.
+func (s *Server) renamePartialFiles(ctx context.Context, hash string, state *serverTorrentState) error {
+	g := new(errgroup.Group)
+	g.SetLimit(fileSetupConcurrency)
+	for _, fi := range state.files {
+		if fi.hardlink.state == hlStateComplete {
+			continue
+		}
+		g.Go(func() error {
+			if err := s.renamePartialFile(ctx, hash, fi); err != nil {
+				return err
+			}
+			fi.setPath(targetPath(fi))
+			return nil
+		})
+	}
+	return g.Wait()
 }
 
 // closeFileHandle syncs and closes an open file handle.
@@ -677,18 +781,12 @@ func (s *Server) syncFileParentDirs(ctx context.Context, hash string, state *ser
 
 // flushWrittenState persists the written bitmap to disk.
 func (s *Server) flushWrittenState(ctx context.Context, hash string, state *serverTorrentState) {
-	if state.statePath == "" {
-		return
-	}
-
-	if saveErr := s.saveState(state.statePath, state.written); saveErr != nil {
+	if saveErr := s.persistWritten(state); saveErr != nil {
 		s.logger.WarnContext(ctx, "failed to save final state",
 			"hash", hash,
 			"error", saveErr,
 		)
-		return
 	}
-	state.flushGen++
 }
 
 // registerFinalizedInodes registers inodes for files we wrote (not hardlinked)
@@ -707,8 +805,6 @@ func (s *Server) registerFinalizedInodes(ctx context.Context, hash string, state
 //   - (nil, nil) — all pieces verified OK
 //   - (failedPieces, nil) — piece-level corruption, recovery needed
 //   - (nil, err) — system error (context cancel, idle timeout)
-//
-//nolint:gocognit
 func (s *Server) verifyFinalizedPieces(
 	ctx context.Context,
 	hash string,
@@ -725,97 +821,44 @@ func (s *Server) verifyFinalizedPieces(
 		)
 	}
 
-	pieceSize := state.pieceLength
-	totalSize := state.totalSize
 	numPieces := len(state.pieceHashes)
 
 	s.logger.InfoContext(ctx, "verifying finalized pieces",
 		"hash", hash,
 		"pieces", numPieces,
-		"pieceSize", pieceSize,
+		"pieceSize", state.pieceLength,
 	)
 
 	// Create a context with progress-based idle timeout.
 	// The cancel func is called by the idle watchdog if no progress is made.
+	// The pass reads through idleCtx, not ctx, so a hung NFS read cannot
+	// outlive the watchdog.
 	idleCtx, idleCancel := context.WithCancel(ctx)
 	defer idleCancel()
-
-	// Verify pieces in parallel — all accessed state fields (pieceHashes,
-	// pieceLength, totalSize, files) are immutable at this point (finalizing=true).
-	//
-	// Worker-pool pattern (rather than one goroutine per piece) so each worker
-	// holds a per-goroutine FdCache that reuses file handles across all the
-	// pieces it processes. Reusing fds removes one open+close (LOOKUP+OPEN+
-	// CLOSE) RTT per piece per file region — the dominant verify cost on NFS
-	// for multi-file torrents.
-	g, gCtx := errgroup.WithContext(idleCtx)
 
 	var verified atomic.Int64
 	var lastProgress atomic.Value // stores time.Time of last verified piece
 	lastProgress.Store(time.Now())
 
-	var failedMu sync.Mutex
-	var failedPieces []int
+	go s.verifyIdleWatchdog(ctx, idleCtx, hash, numPieces, &verified, &lastProgress, idleCancel)
 
-	go s.verifyIdleWatchdog(ctx, gCtx, hash, numPieces, &verified, &lastProgress, idleCancel)
-
-	pieceCh := make(chan int, len(state.pieceHashes))
-	for i, expectedHash := range state.pieceHashes {
-		if expectedHash == "" {
-			continue
-		}
-		// Boundary pieces (spanning selected + unselected) can't be read back
-		// — the unselected file's data doesn't exist on disk. Those were
-		// hash-verified at write time.
-		if state.classifyPiece(i) != pieceFullySelected {
-			continue
-		}
-		// Pieces already verified post-flush via earlyFinalizeFile are skipped.
-		// Pieces NOT in that set still need a finalize-time read-back:
-		// hardlinked-file pieces (skipForWriteData skipped writePiece's hash
-		// check) and pieces in files that didn't go through earlyFinalizeFile.
-		if state.verified != nil && state.verified.Test(uint(i)) {
-			verified.Add(1)
+	// All state fields the pass reads (pieceHashes, pieceLength, totalSize,
+	// files) are immutable at this point (finalizing=true).
+	failedPieces := s.verifyPieceSet(idleCtx, hash, state, finalizedRegions(state),
+		piecesNeedingReadBack(state, &verified, &lastProgress),
+		func() {
 			lastProgress.Store(time.Now())
-			continue
-		}
-		pieceCh <- i
-	}
-	close(pieceCh)
-
-	for range s.verifyConcurrency() {
-		g.Go(func() error {
-			cache := utils.NewFdCache()
-			defer cache.Close()
-			for i := range pieceCh {
-				if err := gCtx.Err(); err != nil {
-					return err
-				}
-				offset := int64(i) * pieceSize
-				size := pieceSize
-				if offset+size > totalSize {
-					size = totalSize - offset
-				}
-				// gCtx (not ctx): the idle watchdog cancels gCtx, and
-				// ReadPieceFromFilesCached checks it between file regions —
-				// using ctx would let a hung NFS read outlive the watchdog.
-				if !s.verifyOnePiece(gCtx, cache, hash, state, i, offset, size, state.pieceHashes[i]) {
-					failedMu.Lock()
-					failedPieces = append(failedPieces, i)
-					failedMu.Unlock()
-				}
-				lastProgress.Store(time.Now())
-				if count := verified.Add(1); count%50 == 0 || count == int64(numPieces) {
-					s.logger.DebugContext(ctx, "verification progress",
-						"hash", hash, "verified", count, "total", numPieces,
-					)
-				}
+			if count := verified.Add(1); count%50 == 0 || count == int64(numPieces) {
+				s.logger.DebugContext(ctx, "verification progress",
+					"hash", hash, "verified", count, "total", numPieces,
+				)
 			}
-			return nil
 		})
-	}
 
-	if err := g.Wait(); err != nil {
+	// An interrupted pass reports every piece it never read as failed. That is
+	// the right answer for callers that only add skips, but here it would
+	// re-stream an intact torrent, so a cancelled pass is a system error.
+	if err := idleCtx.Err(); err != nil {
 		return nil, err
 	}
 
@@ -832,31 +875,153 @@ func (s *Server) verifyFinalizedPieces(
 	return nil, nil
 }
 
-// verifyOnePiece reads a single piece from finalized files and verifies its hash.
-// Returns true if the piece is valid, false if it's corrupted or unreadable.
-// The cache is used to reuse fds across pieces processed by the same worker
-// goroutine — must be the worker's own cache, not shared.
+// verifyPieceSet read-back-verifies pieces by reading each one through regions
+// and comparing its SHA1, returning the indices that failed, ascending. This is
+// the one read-back verify implementation: full finalization runs it over the
+// whole torrent's files, early finalization and the init-time pre-verify pass
+// run it over a single file's region.
+//
+// Worker-pool pattern (rather than one goroutine per piece) so each worker holds
+// a per-goroutine FdCache that reuses file handles across all the pieces it
+// processes, plus one pieceLength buffer resliced per piece. Reusing fds removes
+// an open+close (LOOKUP+OPEN+CLOSE) RTT per piece per file region - the dominant
+// verify cost on NFS for multi-file torrents. Work is handed out in runs of
+// consecutive pieces (see verifyChunkSize) so each worker reads one file
+// forwards rather than striding through every file in the set.
+//
+// Fails closed on cancellation: the pass stops reading but still reports every
+// piece it never got to as failed, so "absent from the result" always means
+// "read back and hashed correctly". onVerified, when non-nil, is called once per
+// piece disposed of, from arbitrary worker goroutines.
+func (s *Server) verifyPieceSet(
+	ctx context.Context,
+	hash string,
+	state *serverTorrentState,
+	regions []utils.FileRegion,
+	pieces []int,
+	onVerified func(),
+) []int {
+	workers := min(s.verifyConcurrency(), len(pieces))
+	job := &verifyJob{
+		hash:       hash,
+		state:      state,
+		regions:    regions,
+		pieces:     pieces,
+		onVerified: onVerified,
+		chunk:      verifyChunkSize(len(pieces), workers),
+	}
+
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Go(func() { s.verifyWorker(ctx, job) })
+	}
+	wg.Wait()
+
+	sort.Ints(job.failed)
+	return job.failed
+}
+
+// verifyJob is the state one read-back verify pass shares across its workers:
+// the inputs (immutable for the pass), the cursor workers claim runs of pieces
+// off, and the collector for the pieces that failed.
+type verifyJob struct {
+	hash       string
+	state      *serverTorrentState
+	regions    []utils.FileRegion
+	pieces     []int
+	onVerified func()
+
+	chunk int
+	next  atomic.Int64
+
+	failedMu sync.Mutex
+	failed   []int
+}
+
+// verifyWorker claims runs of consecutive pieces off the job's cursor until the
+// set is exhausted, reading each through its own fd cache and piece buffer -
+// both of which must stay this goroutine's own.
+func (s *Server) verifyWorker(ctx context.Context, job *verifyJob) {
+	cache := utils.NewFdCache()
+	defer cache.Close()
+	buf := make([]byte, job.state.pieceLength)
+
+	for {
+		start := int(job.next.Add(int64(job.chunk))) - job.chunk
+		if start >= len(job.pieces) {
+			return
+		}
+		for _, p := range job.pieces[start:min(start+job.chunk, len(job.pieces))] {
+			if !s.verifyOnePiece(ctx, cache, job.hash, job.state, job.regions, buf, p) {
+				job.failedMu.Lock()
+				job.failed = append(job.failed, p)
+				job.failedMu.Unlock()
+			}
+			if job.onVerified != nil {
+				job.onVerified()
+			}
+		}
+	}
+}
+
+// verifyChunkSize returns how many consecutive pieces one verify worker claims
+// per turn from the shared cursor.
+//
+// Claiming a single piece per turn hands each worker a stride-W read pattern:
+// its reads on any one file land pieceLength*W apart, which is not a sequential
+// stream to either the NFS client's readahead or the server's, so every read
+// pays the full round trip with nothing prefetched behind it. On a multi-file
+// torrent it also spreads every worker across every file, so the per-goroutine
+// FdCache opens W handles per file (W*F LOOKUP+OPEN round trips, and that many
+// fds held open for the pass) instead of one.
+//
+// A run keeps a worker inside one file reading forwards. The cap is what keeps
+// the cursor doing its other job: with several chunks per worker, a run that
+// hits slow storage is absorbed by the others instead of extending the pass.
+// Below the cap the split is exactly one run per worker, which is still
+// balanced because every piece costs the same read.
+func verifyChunkSize(pieces, workers int) int {
+	if workers <= 0 {
+		return 1
+	}
+	return max(1, min(verifyChunkPieces, pieces/workers))
+}
+
+// verifyOnePiece reads piece p through regions into buf (resliced to the piece's
+// size - the final piece is the only short one) and reports whether its hash
+// matches. Pieces with no known hash pass trivially. The cache and buffer are
+// reused across the pieces processed by one worker goroutine, so both must be
+// that worker's own, not shared.
 func (s *Server) verifyOnePiece(
 	ctx context.Context,
 	cache *utils.FdCache,
 	hash string,
 	state *serverTorrentState,
-	pieceIdx int,
-	offset, size int64,
-	expectedHash string,
+	regions []utils.FileRegion,
+	buf []byte,
+	p int,
 ) bool {
-	data, readErr := s.readPieceFromFinalizedFiles(ctx, cache, state, offset, size)
-	if readErr != nil {
+	if ctx.Err() != nil {
+		return false
+	}
+	if state.pieceHashes[p] == "" {
+		return true
+	}
+
+	offset := int64(p) * state.pieceLength
+	data := buf[:min(state.pieceLength, state.totalSize-offset)]
+
+	if readErr := utils.ReadPieceFromFilesCached(ctx, cache, regions, offset, data); readErr != nil {
 		metrics.VerificationErrorsTotal.WithLabelValues(metrics.ModeDestination).Inc()
 		s.logger.WarnContext(ctx, "piece read failed during verification",
-			"hash", hash, "piece", pieceIdx, "error", readErr,
+			"hash", hash, "piece", p, "error", readErr,
 		)
 		return false
 	}
-	if hashErr := utils.VerifyPieceHash(data, expectedHash); hashErr != nil {
+	if hashErr := utils.VerifyPieceHash(data, state.pieceHashes[p]); hashErr != nil {
 		metrics.VerificationErrorsTotal.WithLabelValues(metrics.ModeDestination).Inc()
 		s.logger.WarnContext(ctx, "piece hash mismatch during verification",
-			"hash", hash, "piece", pieceIdx, "error", hashErr,
+			"hash", hash, "piece", p, "error", hashErr,
 		)
 		return false
 	}
@@ -878,8 +1043,9 @@ func computeDiskStageTimeout(totalSize int64) time.Duration {
 }
 
 // verifyConcurrency returns the operator-configured per-piece read concurrency
-// for verifyFinalizedPieces, falling back to the default. Higher values speed
-// up finalize on healthy storage; on undersized NFS exports they can compound
+// for a read-back verify pass (verifyFinalizedPieces plus verifyFilePieces, at
+// both init pre-verification and early finalization), falling back to the default. Higher values speed up
+// verification on healthy storage; on undersized NFS exports they can compound
 // queue depth on the server.
 // Clamped to maxVerifyConcurrencyCap defensively: ServerConfig.Validate is
 // not on the startup path (internal/config validates there), so an
@@ -947,14 +1113,11 @@ func (s *Server) recoverVerificationFailure(
 
 	// Persist the recovered state.
 	state.dirty = true
-	if saveErr := s.doSaveState(state.statePath, state.written); saveErr != nil {
-		metrics.StateSaveErrorsTotal.WithLabelValues(metrics.ModeDestination).Inc()
+	if saveErr := s.persistWritten(state); saveErr != nil {
 		s.logger.ErrorContext(ctx, "failed to persist state after verification recovery",
 			"hash", hash,
 			"error", saveErr,
 		)
-	} else {
-		state.flushGen++
 	}
 
 	s.logger.InfoContext(ctx, "recovered from verification failure",
@@ -994,7 +1157,7 @@ func (s *Server) recoverAffectedFile(
 	}
 
 	defer func() {
-		fi.earlyFinalized = false
+		fi.readmitWrites()
 		fi.recalcPiecesWritten(state.written)
 	}()
 
@@ -1010,15 +1173,15 @@ func (s *Server) recoverAffectedFile(
 				"hash", hash, "path", fi.path, "error", removeErr)
 		}
 
-		fi.hardlink.state = hlStateNone
-		fi.path = targetPath(fi) + partialSuffix
+		fi.setHardlinkState(hlStateNone)
+		fi.setPath(targetPath(fi) + partialSuffix)
 		return
 	}
 
 	// Normal (streamed) files: rename back to .partial (skip if already .partial).
 	// Even if rename fails, the deferred cleanup keeps earlyFinalized and
 	// piecesWritten consistent with state.written.
-	if strings.HasSuffix(fi.path, partialSuffix) {
+	if !atFinalPath(fi) {
 		return
 	}
 	partialPath := fi.path + partialSuffix
@@ -1030,7 +1193,7 @@ func (s *Server) recoverAffectedFile(
 		)
 		return
 	}
-	fi.path = partialPath
+	fi.setPath(partialPath)
 }
 
 // handleExistingFinalization handles a FinalizeTorrent call when background
@@ -1073,14 +1236,46 @@ func (s *Server) handleExistingFinalization(
 	}, nil
 }
 
-// readPieceFromFinalizedFiles reads piece data from finalized (non-.partial)
-// files using the supplied cache for fd reuse.
-func (s *Server) readPieceFromFinalizedFiles(
-	ctx context.Context, cache *utils.FdCache, state *serverTorrentState, offset, size int64,
-) ([]byte, error) {
+// piecesNeedingReadBack returns the piece indices that still need a
+// finalize-time read-back. Pieces skipped because they were already verified
+// count as progress immediately, so the idle watchdog doesn't fire on a torrent
+// that needs few or no re-reads.
+func piecesNeedingReadBack(
+	state *serverTorrentState, verified *atomic.Int64, lastProgress *atomic.Value,
+) []int {
+	pieces := make([]int, 0, len(state.pieceHashes))
+	for i, expectedHash := range state.pieceHashes {
+		if expectedHash == "" {
+			continue
+		}
+		// Boundary pieces (spanning selected + unselected) can't be read back
+		// - the unselected file's data doesn't exist on disk. Those were
+		// hash-verified at write time.
+		if state.classifyPiece(i) != pieceFullySelected {
+			continue
+		}
+		// Pieces already verified post-flush via earlyFinalizeFile are skipped.
+		// Pieces NOT in that set still need a finalize-time read-back:
+		// hardlinked-file pieces (skipForWriteData skipped writePiece's hash
+		// check) and pieces in files that didn't go through earlyFinalizeFile.
+		if state.verified != nil && state.verified.Test(uint(i)) {
+			verified.Add(1)
+			lastProgress.Store(time.Now())
+			continue
+		}
+		pieces = append(pieces, i)
+	}
+	return pieces
+}
+
+// finalizedRegions maps a torrent's files to their finalized (non-.partial)
+// read regions. Safe to build once per verify pass because state.files is
+// immutable while finalizing; doing it per piece cost a slice allocation plus
+// a targetPath string allocation per file on every read.
+func finalizedRegions(state *serverTorrentState) []utils.FileRegion {
 	regions := make([]utils.FileRegion, len(state.files))
 	for i, fi := range state.files {
 		regions[i] = utils.FileRegion{Path: targetPath(fi), Offset: fi.offset, Size: fi.size}
 	}
-	return utils.ReadPieceFromFilesCached(ctx, cache, regions, offset, size)
+	return regions
 }

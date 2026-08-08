@@ -44,16 +44,17 @@ const (
 	// can exceed finalizeConnTimeout and prevent recovery after a server restart.
 	maxReconnectBackoff = 5 * time.Second
 
-	// ackWriteTimeout is how long receiveAcks waits to write an ack to the channel
-	// before treating the stream as stuck. If forwardAcks is slow draining the channel,
-	// this prevents receiveAcks from blocking forever and never calling Recv() again
-	// (which is the only way to detect stream death and trigger ps.cancel()).
-	ackWriteTimeout = 30 * time.Second
+	// ackDeliverTimeout is how long the pool waits to hand an ack to its
+	// aggregated channel before treating the stream as stuck. If the ack
+	// processor stops draining, this prevents the receive loop from blocking
+	// forever and never calling Recv() again (which is the only way to detect
+	// stream death and trigger ps.cancel()).
+	ackDeliverTimeout = 30 * time.Second
 
 	// sendTimeout is how long Send waits for the gRPC stream.Send to complete.
 	// gRPC Send() blocks on HTTP/2 flow control when the receiver stops consuming.
-	// Since Send doesn't accept a context, the caller-side timer cancels the stream
-	// context if the sendLoop's stream.Send doesn't return in time.
+	// Since Send doesn't accept a context, a timer armed around the call cancels
+	// the stream context if stream.Send doesn't return in time.
 	sendTimeout = 30 * time.Second
 
 	// gRPC connect backoff parameters.
@@ -338,10 +339,28 @@ func (d *GRPCDestination) CheckTorrentStatus(ctx context.Context, hash string) (
 // OpenStream opens a bidirectional stream for high-throughput piece transfer.
 // Each stream gets its own cancellable context so a stuck Send() can be
 // unblocked without tearing down the entire pool.
+//
+// No goroutine is started here. The caller must run receiveAcks with a sink of
+// its own - it is what detects stream death, and Close waits on the done channel
+// it closes.
 func (d *GRPCDestination) OpenStream(ctx context.Context, logger *slog.Logger) (*PieceStream, error) {
-	connIdx := d.streamConnIdx()
+	return d.OpenStreamOn(ctx, logger, d.streamConnIdx())
+}
 
+// OpenStreamOn opens a stream pinned to a specific connection instead of taking
+// the next round-robin one. A freshly added connection carries no traffic until
+// a stream lands on it, and round-robin gives no guarantee the next stream will
+// be that one, so the connection-level scaling probe pins its stream here.
+func (d *GRPCDestination) OpenStreamOn(
+	ctx context.Context,
+	logger *slog.Logger,
+	connIdx int,
+) (*PieceStream, error) {
 	d.mu.RLock()
+	if connIdx < 0 || connIdx >= len(d.clients) {
+		d.mu.RUnlock()
+		return nil, fmt.Errorf("connection index %d out of range (%d connections)", connIdx, len(d.clients))
+	}
 	client := d.clients[connIdx]
 	d.mu.RUnlock()
 	streamCtx, streamCancel := context.WithCancel(ctx)
@@ -352,25 +371,14 @@ func (d *GRPCDestination) OpenStream(ctx context.Context, logger *slog.Logger) (
 		return nil, fmt.Errorf("failed to open stream: %w", err)
 	}
 
-	ps := &PieceStream{
-		connIdx:  connIdx,
-		ctx:      streamCtx,
-		cancel:   streamCancel,
-		stream:   stream,
-		logger:   logger,
-		acks:     make(chan *pb.PieceAck, DefaultAckChannelSize),
-		ackReady: make(chan struct{}, 1), // Signal when acks are processed
-		done:     make(chan struct{}),
-		errors:   make(chan error, 1),
-		sendCh:   make(chan *sendRequest), // unbuffered: natural backpressure
-		stopSend: make(chan struct{}),
-		sendDone: make(chan struct{}),
-	}
-
-	go ps.receiveAcks()
-	go ps.sendLoop()
-
-	return ps, nil
+	return &PieceStream{
+		connIdx: connIdx,
+		ctx:     streamCtx,
+		cancel:  streamCancel,
+		stream:  stream,
+		logger:  logger,
+		done:    make(chan struct{}),
+	}, nil
 }
 
 // FinalizeTorrent requests the destination server to finalize a torrent:
@@ -484,24 +492,26 @@ func (d *GRPCDestination) ClearInitCache() {
 	d.mu.Unlock()
 }
 
-// AddConnection creates a new TCP connection and appends it to the pool.
+// AddConnection creates a new TCP connection, appends it to the pool and
+// returns its index. The connection carries nothing until a stream is opened on
+// it, so the caller is expected to follow up with OpenStreamOn at that index.
 // Returns error if already at max connections.
-func (d *GRPCDestination) AddConnection() error {
+func (d *GRPCDestination) AddConnection() (int, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	if len(d.conns) >= d.maxConns {
-		return errors.New("at maximum connection count")
+		return 0, errors.New("at maximum connection count")
 	}
 
 	conn, err := grpc.NewClient(d.addr, d.opts...)
 	if err != nil {
-		return fmt.Errorf("failed to create connection: %w", err)
+		return 0, fmt.Errorf("failed to create connection: %w", err)
 	}
 
 	d.conns = append(d.conns, conn)
 	d.clients = append(d.clients, pb.NewQBSyncServiceClient(conn))
-	return nil
+	return len(d.conns) - 1, nil
 }
 
 // RemoveConnection removes the connection at expectedIdx. The caller must

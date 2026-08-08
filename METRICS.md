@@ -45,14 +45,14 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_piece_write_errors_total` | `mode` | Piece write failures (file open/truncate/write) |
 | `qbsync_state_save_errors_total` | `mode` | Failures saving torrent state to disk |
 | `qbsync_file_sync_errors_total` | `mode` | File sync/close failures before finalization rename |
-| `qbsync_verification_errors_total` | `mode` | Piece verification failures during finalization |
+| `qbsync_verification_errors_total` | `mode` | Piece read-back verification failures (early finalization, init-time pre-verify, full finalization) |
 | `qbsync_hardlink_errors_total` | `mode` | Hardlink creation failures |
 | `qbsync_stale_inode_evictions_total` | | Inode registry entries evicted due to recycled source inodes |
 | `qbsync_stream_open_errors_total` | `mode` | Stream open or poll failures |
 | `qbsync_cleanup_groups_total` | `result` | Hardlink groups processed during source cleanup |
 | `qbsync_cleanup_torrents_handed_off_total` | | Torrents handed off from source to destination |
 | `qbsync_idle_poll_skips_total` | | Piece poll skips due to idle torrent detection |
-| `qbsync_cycle_cache_hits_total` | | Per-cycle completed-torrents cache reuses |
+| `qbsync_cycle_cache_hits_total` | | Per-cycle source torrent list reuses |
 | `qbsync_health_check_cache_total` | `result` | Health check cache hits/misses |
 | `qbsync_file_handle_cache_total` | `result` | File handle cache lookups (hit/miss) on source |
 | `qbsync_file_handle_evictions_total` | | File handle evictions (stale retry, fallback, or full evict) |
@@ -71,7 +71,7 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_partial_selection_recovery_total` | `result` | Recovery attempts for stuck partial-selection torrents — `success` if priorities persisted on retry, `failure` if budget exhausted (destination) |
 | `qbsync_post_add_rechecks_total` | | Auto-triggered qB rechecks for torrents that landed in an error state right after AddTorrent — typically NFS attribute-cache staleness on destination qB's mount (destination) |
 | `qbsync_abort_file_deletions_skipped_total` | `reason` | AbortTorrent file deletions suppressed by safety guards — `in_qb` (per call: torrent already in destination qB), `pre_existing` (per file: setupFile reused operator data), `unselected` (per file: deselected file we never wrote) (destination) |
-| `qbsync_finalize_busy_total` | `reason` | BUSY (congestion) responses returned to source — `queue_timeout` (stage queue saturated) or `qb_checking` (qB still rechecking at budget expiry). BUSY torrents are waiting, NOT failed: they don't get the sync-failed tag and don't count toward the retry cap (destination) |
+| `qbsync_finalize_busy_total` | `reason` | BUSY (congestion) responses returned to source — `queue_timeout` (stage queue saturated), `qb_checking` (qB still rechecking at budget expiry), or `early_finalizing` (a completed file is still being read back and verified in the background). BUSY torrents are waiting, NOT failed: they don't get the sync-failed tag and don't count toward the retry cap (destination) |
 | `qbsync_orphan_cleanup_skipped_total` | `reason` | Orphan-cleanup attempts suppressed by safety checks — `in_qb` (torrent registered in destination qB but **not** seeding-side complete: download-side/checking/error state or <100% — never deleted, never marked; a genuinely stuck torrent worth investigating), `qb_unreachable` (destination qB returned an error during the safety check; sustained increments mean orphans accumulating because qB is offline / misconfigured) (destination) |
 | `qbsync_arr_decisions_total` | `instance`, `outcome` | *arr filter decisions (destination): `synced`, `skipped`, `failed_open`. Rising `failed_open` means torrents are syncing unfiltered because *arr could not be reached - the filter is deliberately fail-open, so this is not a sync failure |
 | `qbsync_arr_skip_total` | `instance`, `reason` | Torrents skipped on an *arr verdict (destination): `download_ignored`, `download_failed` |
@@ -112,7 +112,7 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_write_workers_busy` | | Destination write workers currently processing |
 | `qbsync_grpc_connections_configured` | | Maximum TCP connections configured for gRPC streaming (source) |
 | `qbsync_grpc_connections_active` | | Current active TCP connections to destination server (source) |
-| `qbsync_sender_workers_configured` | | Concurrent sender workers configured (source) |
+| `qbsync_sender_workers_configured` | | Configured minimum concurrent sender workers (source); the active count is `max(this, qbsync_stream_pool_size)` |
 | `qbsync_arr_routed_categories` | `instance` | Categories currently routed to each *arr instance. Zero means the filter is inert for it: nothing routes there, so nothing is ever checked against it |
 | `qbsync_arr_circuit_breaker_state` | `instance` | *arr circuit breaker state (destination): 0=closed, 1=open, 2=half-open |
 | `qbsync_draining` | | Shutdown drain in progress: 1=draining, 0=normal (source) |

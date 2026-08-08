@@ -12,6 +12,13 @@ import (
 	"github.com/arsac/qb-sync/internal/streaming"
 )
 
+// errSourceTorrentGone reports that source qB answered the lookup and does not
+// have the torrent. Distinct from a fetch failure: qB was reachable, so the
+// torrent really is gone rather than momentarily unreachable. Finalization
+// cannot succeed without the source record, so retrying is pointless - the
+// torrent is handled as a removal instead.
+var errSourceTorrentGone = errors.New("torrent not found")
+
 // collectProgress takes one progress snapshot per tracked torrent for the
 // cycle. Both the finalization pass and the stall pass need it, and GetProgress
 // scans the whole piece bitmap under the monitor's read lock, so sampling twice
@@ -58,7 +65,7 @@ func (t *QBTask) finalizeCompletedStreams(
 			continue
 		}
 
-		finalizeErr := t.finalizeTorrent(ctx, hash)
+		finalizeErr := t.finalizeCycleTorrent(ctx, hash)
 		if finalizeErr == nil {
 			t.markTorrentSynced(ctx, hash, tracked[hash])
 			continue
@@ -106,6 +113,15 @@ func (t *QBTask) handleFinalizeError(ctx context.Context, hash string, finalizeE
 		return false
 	case errors.Is(finalizeErr, streaming.ErrFinalizeNotFound):
 		t.handleNotFoundFinalization(ctx, hash)
+		return false
+	case errors.Is(finalizeErr, errSourceTorrentGone):
+		// The source record is finalization's input, so no number of retries
+		// makes this one succeed; without it the destination's data can't be
+		// added to qB either. Hand it to the removal path, which prefers a
+		// handoff when the torrent already completed and only aborts when the
+		// data is unusable. Matches PieceMonitor, which treats a source 404 as
+		// a removal rather than a fault.
+		t.handleTorrentRemoval(ctx, hash)
 		return false
 	}
 
@@ -249,7 +265,9 @@ func (t *QBTask) applySyncedTag(ctx context.Context, hash string) {
 	}
 }
 
-// finalizeTorrent calls the destination server to finalize the torrent.
+// finalizeTorrent fetches the source torrent record and finalizes it on the
+// destination. Callers already holding the record should use
+// finalizeKnownTorrent instead.
 func (t *QBTask) finalizeTorrent(ctx context.Context, hash string) error {
 	torrents, err := t.srcClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{
 		Hashes: []string{hash},
@@ -258,10 +276,36 @@ func (t *QBTask) finalizeTorrent(ctx context.Context, hash string) error {
 		return fmt.Errorf("getting torrent info: %w", err)
 	}
 	if len(torrents) == 0 {
-		return fmt.Errorf("torrent not found: %s", hash)
+		return fmt.Errorf("%w: %s", errSourceTorrentGone, hash)
 	}
 
-	torrent := torrents[0]
+	return t.finalizeKnownTorrent(ctx, torrents[0])
+}
+
+// finalizeCycleTorrent finalizes a tracked torrent using the record the cycle
+// already fetched, falling back to a per-torrent fetch when the hash is absent
+// from the cycle list (the torrent left the source, which finalizeTorrent
+// reports as not found - the behaviour handleFinalizeError already expects).
+//
+// The refetch is worth avoiding because it is per torrent and per cycle: the
+// destination finalizes one torrent at a time, so every other completed torrent
+// is re-offered on each cycle and answered with BUSY or VERIFYING - and each one
+// was first spending a torrents/info round-trip on the same single-threaded
+// WebUI the PieceMonitor polls piece states on twice a second for the torrents
+// still streaming. The whole list is already in memory by then.
+//
+// Runs on the runOnce goroutine, which owns cycleTorrents.
+func (t *QBTask) finalizeCycleTorrent(ctx context.Context, hash string) error {
+	if torrent := t.findTorrentByHash(hash); torrent != nil {
+		metrics.CycleCacheHitsTotal.Inc()
+		return t.finalizeKnownTorrent(ctx, *torrent)
+	}
+	return t.finalizeTorrent(ctx, hash)
+}
+
+// finalizeKnownTorrent calls the destination server to finalize the torrent.
+func (t *QBTask) finalizeKnownTorrent(ctx context.Context, torrent qbittorrent.Torrent) error {
+	hash := torrent.Hash
 
 	// Derive saveSubPath from ContentPath + file root rather than torrent.SavePath:
 	// SavePath drifts from disk reality after Auto-TMM moves or Set Location.

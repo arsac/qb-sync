@@ -671,8 +671,9 @@ func TestWriteAt_ProtectedByFileMu(t *testing.T) {
 
 	filePath := filepath.Join(tmpDir, "test.bin")
 	fi := &serverFileInfo{
-		path: filePath,
-		size: 100,
+		path:     filePath,
+		size:     100,
+		selected: true,
 	}
 
 	// Write some data.
@@ -712,8 +713,9 @@ func TestCloseFileHandle_WaitsForInFlightWrites(t *testing.T) {
 
 	filePath := filepath.Join(tmpDir, "test.bin")
 	fi := &serverFileInfo{
-		path: filePath,
-		size: 1024,
+		path:     filePath,
+		size:     1024,
+		selected: true,
 	}
 
 	// Open the file.

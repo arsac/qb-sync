@@ -82,6 +82,9 @@ const (
 	ReasonQueueTimeout = "queue_timeout"
 	// ReasonQBChecking marks BUSY caused by qB still checking at budget expiry.
 	ReasonQBChecking = "qb_checking"
+	// ReasonEarlyFinalizing marks BUSY caused by background early finalizations
+	// still reading back a completed file.
+	ReasonEarlyFinalizing = "early_finalizing"
 
 	// ReasonSkipNotSyncable and its siblings label SkippedTorrents: why a source
 	// torrent is not eligible for sync. Without these, a torrent broken on the
@@ -341,7 +344,9 @@ var (
 		[]string{LabelMode},
 	)
 
-	// VerificationErrorsTotal counts piece verification failures during finalization.
+	// VerificationErrorsTotal counts per-piece read-back verification failures,
+	// across all three passes that read pieces back: early finalization, the
+	// init-time pre-verify pass, and full finalization.
 	VerificationErrorsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: namespace,
@@ -419,12 +424,13 @@ var (
 		},
 	)
 
-	// CycleCacheHitsTotal counts times fetchTorrentsCompletedOnDest reused the per-cycle cache.
+	// CycleCacheHitsTotal counts times an orchestrator pass reused the cycle's
+	// source torrent list instead of refetching it from qBittorrent.
 	CycleCacheHitsTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "cycle_cache_hits_total",
-			Help:      "Total times the per-cycle completed torrents cache was reused",
+			Help:      "Total times the per-cycle source torrent list was reused",
 		},
 	)
 
@@ -482,7 +488,7 @@ var (
 	)
 
 	// AckChannelBlockedTotal counts times the ack channel was full for longer than the write timeout,
-	// forcing receiveAcks to exit. Indicates forwardAcks is too slow draining acks.
+	// forcing receiveAcks to exit. Indicates the ack processor is too slow draining acks.
 	AckChannelBlockedTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: namespace,
@@ -1013,12 +1019,14 @@ var (
 		},
 	)
 
-	// SenderWorkersConfigured tracks the number of concurrent sender goroutines.
+	// SenderWorkersConfigured tracks the configured floor on concurrent sender
+	// goroutines. The number actually dequeuing is max(this, stream pool size),
+	// so read it alongside qbsync_stream_pool_size.
 	SenderWorkersConfigured = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "sender_workers_configured",
-			Help:      "Number of concurrent sender workers configured for streaming",
+			Help:      "Configured minimum concurrent sender workers for streaming",
 		},
 	)
 )

@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/bits-and-blooms/bitset"
+	"golang.org/x/sync/errgroup"
 
 	"google.golang.org/protobuf/proto"
 
@@ -82,6 +83,34 @@ func (s *Server) doSaveState(path string, written *bitset.BitSet) error {
 		return s.saveStateFunc(path, written)
 	}
 	return s.saveState(path, written)
+}
+
+// persistWritten checkpoints the torrent's written bitmap outside the periodic
+// flusher, for callers that just changed it and cannot wait for the next tick.
+// A torrent with no state file is a no-op.
+//
+// On success the disk copy matches memory exactly, so the dirty flag and the
+// pending-piece count are cleared - otherwise the flusher rewrites the same
+// bytes on its next tick. flushGen is bumped so a flush already in flight with
+// an older snapshot discards its bookkeeping instead of undoing this one.
+//
+// Callers own the failure log because the severity differs: losing a checkpoint
+// that cleared failed pieces is worse than losing a routine one. Caller must
+// hold state.mu.
+func (s *Server) persistWritten(state *serverTorrentState) error {
+	if state.statePath == "" {
+		return nil
+	}
+
+	if saveErr := s.doSaveState(state.statePath, state.written); saveErr != nil {
+		metrics.StateSaveErrorsTotal.WithLabelValues(metrics.ModeDestination).Inc()
+		return saveErr
+	}
+
+	state.dirty = false
+	state.piecesSinceFlush = 0
+	state.flushGen++
+	return nil
 }
 
 func savePersistedMeta(path string, meta *pb.PersistedTorrentMeta) error {
@@ -167,7 +196,13 @@ func (s *Server) clearStalePieces(
 	written *bitset.BitSet,
 	files []*serverFileInfo,
 ) {
-	for _, fi := range files {
+	// Probe existence in parallel: every stat is an independent NFS LOOKUP
+	// round-trip on the init critical path, and nothing here depends on
+	// another file's answer. Bitmap mutation stays serial below.
+	missing := make([]bool, len(files))
+	g := new(errgroup.Group)
+	g.SetLimit(fileSetupConcurrency)
+	for i, fi := range files {
 		// skipForWriteData covers unselected files and files whose data is
 		// supplied via hardlinks (pending/complete). Those are created at
 		// finalize time, not by streaming, so the bitmap may legitimately
@@ -175,7 +210,16 @@ func (s *Server) clearStalePieces(
 		if fi.skipForWriteData() || fi.earlyFinalized {
 			continue
 		}
-		if _, err := os.Stat(fi.path); err == nil {
+		g.Go(func() error {
+			_, statErr := os.Stat(fi.path)
+			missing[i] = statErr != nil
+			return nil
+		})
+	}
+	_ = g.Wait()
+
+	for i, fi := range files {
+		if !missing[i] {
 			continue
 		}
 

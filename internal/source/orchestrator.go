@@ -96,8 +96,10 @@ type QBTask struct {
 	pruneCycleCount int
 
 	// Per-cycle cache of torrents to avoid redundant GetTorrentsCtx calls.
-	// Set by trackNewTorrents, consumed by fetchTorrentsCompletedOnDest, reset each cycle.
-	// nil means not yet fetched this cycle; non-nil (even empty) means cached.
+	// Set by trackNewTorrents, read through cycleTorrentList and
+	// findTorrentByHash, reset each cycle. nil means not yet fetched this
+	// cycle; non-nil (even empty) means cached. Unsynchronized: only the
+	// runOnce goroutine may touch it, unlike cycleFiles below.
 	cycleTorrents []qbittorrent.Torrent
 
 	// Per-cycle cache of file-information results to avoid redundant
@@ -284,10 +286,15 @@ func (t *QBTask) runOnce(ctx context.Context) {
 		t.pruneCycleCount = 0
 		t.pruneStreaks()
 		t.pruneCompletedOnDest(ctx)
-		t.recheckFileSelections(ctx)
 		t.pruneStaleMonitorEntries(ctx)
 		t.recheckArrRejectedTorrents(ctx)
 	}
+
+	// One shard per cycle rather than the whole library every pruneCycleInterval
+	// cycles: each torrent is still rechecked exactly once per interval, but the
+	// round-trips are spread instead of bursting. pruneCycleCount cycles through
+	// every residue in [0, pruneCycleInterval) above, so it is the shard index.
+	t.recheckFileSelections(ctx, t.pruneCycleCount)
 }
 
 // Progress returns the streaming progress for a torrent.
@@ -320,9 +327,10 @@ func (t *QBTask) PruneCompletedOnDest(ctx context.Context) {
 	t.pruneCompletedOnDest(ctx)
 }
 
-// RecheckFileSelections is the exported version of recheckFileSelections for testing.
+// RecheckFileSelections is the exported version of recheckFileSelections for
+// testing. It covers every completed torrent rather than one cycle's shard.
 func (t *QBTask) RecheckFileSelections(ctx context.Context) {
-	t.recheckFileSelections(ctx)
+	t.recheckFileSelections(ctx, allShards)
 }
 
 // pruneCompletedOnDest hands off completed torrents whose source-side copy has
@@ -338,7 +346,7 @@ func (t *QBTask) RecheckFileSelections(ctx context.Context) {
 // On handoff failure the cache entry is left in place so the next cycle
 // retries; on success (or in dry-run) the entry is pruned to bound cache size.
 func (t *QBTask) pruneCompletedOnDest(ctx context.Context) {
-	torrents, err := t.srcClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{})
+	torrents, err := t.cycleTorrentList(ctx)
 	if err != nil {
 		t.logger.WarnContext(ctx, "failed to fetch torrents for cache pruning", "error", err)
 		return

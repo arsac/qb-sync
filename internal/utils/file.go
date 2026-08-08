@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"syscall"
 )
 
@@ -20,62 +21,95 @@ type FileRegion struct {
 	Size   int64  // Total size of this file
 }
 
-// ReadPieceFromFiles reads piece data that may span multiple files.
-// Files must be ordered by offset. Allocates one buffer of pieceSize bytes
-// and reads each file's contribution into the appropriate slice — no per-chunk
-// allocation or append/copy.
-func ReadPieceFromFiles(files []FileRegion, pieceOffset, pieceSize int64) ([]byte, error) {
-	buf := make([]byte, pieceSize)
-	written := int64(0)
+// FirstFileEndingAfter returns the index of the first file whose data extends
+// past offset, where end reports a file's exclusive end offset in the torrent's
+// byte space. Everything before that index is irrelevant to a byte range
+// starting at offset, so callers iterate only the files the range actually
+// touches instead of scanning the whole torrent - O(log F) instead of O(F) per
+// piece, which is the difference between millions and thousands of iterations
+// for a many-file torrent's per-piece passes.
+//
+// Valid because a torrent's files are offset-sorted and contiguous (each
+// offset is a running sum over the index-sorted file list), which makes end
+// offsets monotonically non-decreasing. The predicate must be strictly greater:
+// a zero-length file wedged at a file boundary ends exactly at offset and
+// contributes nothing to a range starting there.
+func FirstFileEndingAfter[T any](files []T, offset int64, end func(T) int64) int {
+	return sort.Search(len(files), func(i int) bool {
+		return end(files[i]) > offset
+	})
+}
+
+// Span is a file's placement in a torrent's byte space, the only thing
+// [WalkPieceRegions] needs to know about a caller's file type.
+type Span struct {
+	Offset int64
+	Size   int64
+}
+
+// End reports the span's exclusive end offset.
+func (s Span) End() int64 { return s.Offset + s.Size }
+
+// RegionSpan reports a region's span, for [WalkPieceRegions].
+func RegionSpan(f FileRegion) Span { return Span{Offset: f.Offset, Size: f.Size} }
+
+// WalkPieceRegions maps the piece of len(buf) bytes starting at pieceOffset onto
+// the files backing it and hands each file's contribution to visit. files must
+// be offset-sorted and contiguous, with span reporting each one's placement in
+// the torrent's byte space; only the files overlapping the piece are visited,
+// and visit receives their index in files, the offset to start at inside that
+// file, and the sub-slice of buf that region backs.
+//
+// A region left untouched by visit keeps whatever buf already held, which is how
+// the source zero-fills files that don't exist on disk and how the destination
+// drops the share of files that take no data. The walk still apportions those
+// regions, so declining one never shifts the bytes that follow it.
+//
+// Every per-piece transfer in the codebase - source read, destination write,
+// finalize read-back - walks the same file/piece geometry, so this is the one
+// place the boundary arithmetic and the full-coverage requirement are stated.
+func WalkPieceRegions[T any](
+	files []T,
+	span func(T) Span,
+	pieceOffset int64,
+	buf []byte,
+	visit func(i int, f T, fileOffset int64, region []byte) error,
+) error {
+	end := func(f T) int64 { return span(f).End() }
+
+	pieceSize := int64(len(buf))
+	covered := int64(0)
 	currentOffset := pieceOffset
 
-	for _, f := range files {
-		if written >= pieceSize {
+	for i := FirstFileEndingAfter(files, pieceOffset, end); i < len(files); i++ {
+		f := files[i]
+		if covered >= pieceSize {
 			break
 		}
 
-		fileEnd := f.Offset + f.Size
-		if fileEnd <= currentOffset {
+		s := span(f)
+
+		// Zero-length files sit at a boundary the walk has already passed, so
+		// they survive the search above without contributing anything.
+		if s.End() <= currentOffset {
 			continue
 		}
 
-		fileReadOffset := max(currentOffset-f.Offset, 0)
-		availableInFile := f.Size - fileReadOffset
-		toRead := min(pieceSize-written, availableInFile)
+		regionOffset := max(currentOffset-s.Offset, 0)
+		toProcess := min(pieceSize-covered, s.Size-regionOffset)
 
-		if err := readChunkInto(f.Path, fileReadOffset, buf[written:written+toRead]); err != nil {
-			return nil, fmt.Errorf("reading from %s at offset %d: %w", f.Path, fileReadOffset, err)
+		if err := visit(i, f, regionOffset, buf[covered:covered+toProcess]); err != nil {
+			return err
 		}
 
-		written += toRead
-		currentOffset += toRead
+		covered += toProcess
+		currentOffset += toProcess
 	}
 
-	if written < pieceSize {
-		return nil, fmt.Errorf("short read: got %d bytes, want %d", written, pieceSize)
+	if covered < pieceSize {
+		return fmt.Errorf("piece at offset %d: files cover only %d of %d bytes", pieceOffset, covered, pieceSize)
 	}
-	return buf, nil
-}
-
-// ReadChunkFromFile reads a chunk of data from a file at a specific offset.
-func ReadChunkFromFile(path string, offset, size int64) ([]byte, error) {
-	data := make([]byte, size)
-	if err := readChunkInto(path, offset, data); err != nil {
-		return nil, err
-	}
-	return data, nil
-}
-
-// readChunkInto reads len(buf) bytes from path starting at offset directly
-// into buf. Returns an error on short read or any error other than [io.EOF]
-// at the end of the read.
-func readChunkInto(path string, offset int64, buf []byte) error {
-	file, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	return readAtFull(file, buf, offset, path)
+	return nil
 }
 
 // readAtFull issues a single ReadAt and treats short reads as errors. EOF is
@@ -140,51 +174,32 @@ func (c *FdCache) Close() {
 	c.fds = nil
 }
 
-// ReadPieceFromFilesCached is the cached variant of ReadPieceFromFiles. The
-// caller-supplied FdCache must be used by exactly one goroutine. Honors ctx
+// ReadPieceFromFilesCached fills the caller-supplied buf (its length is the
+// piece size) through cached file handles, so a verify worker can reuse one
+// buffer across every piece it processes instead of allocating a piece-sized
+// buffer per read.
+//
+// The caller-supplied FdCache must be used by exactly one goroutine. Honors ctx
 // cancellation between file regions (regular-file ReadAt on Unix can't be
 // interrupted mid-syscall, but the regular cancellation check prevents
 // queueing further work after the verify-idle watchdog fires).
 func ReadPieceFromFilesCached(
-	ctx context.Context, cache *FdCache, files []FileRegion, pieceOffset, pieceSize int64,
-) ([]byte, error) {
-	buf := make([]byte, pieceSize)
-	written := int64(0)
-	currentOffset := pieceOffset
-
-	for _, f := range files {
-		if written >= pieceSize {
-			break
-		}
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-
-		fileEnd := f.Offset + f.Size
-		if fileEnd <= currentOffset {
-			continue
-		}
-
-		fileReadOffset := max(currentOffset-f.Offset, 0)
-		availableInFile := f.Size - fileReadOffset
-		toRead := min(pieceSize-written, availableInFile)
-
-		fd, openErr := cache.Open(f.Path)
-		if openErr != nil {
-			return nil, fmt.Errorf("opening %s: %w", f.Path, openErr)
-		}
-		if err := readAtFull(fd, buf[written:written+toRead], fileReadOffset, f.Path); err != nil {
-			return nil, fmt.Errorf("reading from %s at offset %d: %w", f.Path, fileReadOffset, err)
-		}
-
-		written += toRead
-		currentOffset += toRead
-	}
-
-	if written < pieceSize {
-		return nil, fmt.Errorf("short read: got %d bytes, want %d", written, pieceSize)
-	}
-	return buf, nil
+	ctx context.Context, cache *FdCache, files []FileRegion, pieceOffset int64, buf []byte,
+) error {
+	return WalkPieceRegions(files, RegionSpan, pieceOffset, buf,
+		func(_ int, f FileRegion, fileOffset int64, dst []byte) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			fd, openErr := cache.Open(f.Path)
+			if openErr != nil {
+				return fmt.Errorf("opening %s: %w", f.Path, openErr)
+			}
+			if err := readAtFull(fd, dst, fileOffset, f.Path); err != nil {
+				return fmt.Errorf("reading from %s at offset %d: %w", f.Path, fileOffset, err)
+			}
+			return nil
+		})
 }
 
 // AreHardlinked reports whether two paths refer to the same underlying file (i.e., share an inode).

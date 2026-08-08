@@ -1,6 +1,7 @@
 package destination
 
 import (
+	"context"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -66,6 +67,10 @@ func (i *inProgressInode) close() {
 //
 //	file, path, earlyFinalized, piecesWritten,
 //	hardlink.state (transitions through hardlink state machine during finalization)
+//
+// file, path, earlyFinalized and hardlink.state are also read under fileMu by
+// the write path, so they are mutated only through the serverFileInfo methods
+// that hold both.
 type torrentMeta struct {
 	pieceHashes []string          // SHA1 hashes per piece for verification
 	pieceLength int64             // Size of each piece (last piece may be smaller)
@@ -119,8 +124,11 @@ func (m *torrentMeta) calculatePiecesCovered() []bool {
 
 		// Piece is covered if every overlapping file is hardlinked, pending, or unselected.
 		covered := true
-		for _, f := range m.files {
-			if f.offset < pieceEnd && f.offset+f.size > pieceStart && !f.skipForWriteData() {
+		for _, f := range m.files[m.firstFileEndingAfter(pieceStart):] {
+			if f.offset >= pieceEnd {
+				break
+			}
+			if !f.skipForWriteData() {
 				covered = false
 				break
 			}
@@ -143,7 +151,7 @@ type serverTorrentState struct {
 	written          *bitset.BitSet // Bitmap of written pieces (use Count()/Len() instead of separate counter)
 	verified         *bitset.BitSet // Bitmap of pieces already hash-verified post-disk-flush; pieces with this bit set may be skipped during verifyFinalizedPieces
 	dirty            bool           // Whether state needs to be flushed
-	piecesSinceFlush int            // Pieces written since last flush (for count-based trigger)
+	piecesSinceFlush int            // Pieces written since the last flush; a flush subtracts what its own snapshot covered
 	flushGen         uint64         // Monotonic counter incremented on every successful state flush
 	initializing     atomic.Bool    // True while disk I/O is in progress; set once before publication, never written again.
 
@@ -162,8 +170,52 @@ type serverTorrentState struct {
 	// Use start()/reset()/storeResult() methods for transitions.
 	finalization finalizationState
 
+	// earlyFinalizing counts background early finalizations in flight. Each
+	// owns its file's handle, path and written bits for the duration, so
+	// FinalizeTorrent refuses to start while any is running. Incremented and
+	// read under mu, which is also what makes the refusal airtight: a
+	// WritePiece can only launch one while holding mu with finalization
+	// inactive, and finalization can only activate while holding mu with the
+	// count at zero.
+	earlyFinalizing int
+
+	// preVerifyCancel stops the init-time pre-verification pass and
+	// preVerifyDone is closed when it has exited. Both are nil once the pass
+	// has been stopped or was never started. See stopPreVerify.
+	preVerifyCancel context.CancelFunc
+	preVerifyDone   chan struct{}
+
 	// Cached for re-initialization (hardlink info for logging)
 	hardlinkResults []*pb.HardlinkResult
+}
+
+// stopPreVerify cancels the init-time pre-verification pass and waits for it to
+// exit. Idempotent, and a no-op when no pass was started.
+//
+// The pass reads back exactly the pieces verifyFinalizedPieces is about to read,
+// so once finalization's disk stage starts, leaving it running would read the
+// same bytes off NFS twice, concurrently. Everything it already marked verified
+// still counts; the rest is picked up by the finalize pass, which reads the
+// whole torrent's outstanding pieces at full verify concurrency rather than one
+// file at a time.
+func (s *serverTorrentState) stopPreVerify() {
+	s.mu.Lock()
+	cancel, done := s.preVerifyCancel, s.preVerifyDone
+	s.preVerifyCancel, s.preVerifyDone = nil, nil
+	s.mu.Unlock()
+
+	if cancel == nil {
+		return
+	}
+	cancel()
+	<-done
+}
+
+// finishEarlyFinalize retires one background early finalization.
+func (s *serverTorrentState) finishEarlyFinalize() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.earlyFinalizing--
 }
 
 // touch records that a source has just asked about this torrent.
@@ -238,8 +290,9 @@ type finalizeResult struct {
 // State machine: None -> InProgress (first writer) or Pending (wait for another) -> Complete.
 //
 // sourceFileID, sourcePath, and doneCh are immutable after init.
-// state is mutable and requires the parent serverTorrentState.mu.
-// Use applyOutcome() during init and markComplete() during finalization.
+// state is mutable: applyOutcome() sets it during init, before the torrent is
+// reachable by any other goroutine, after which it may only be changed through
+// serverFileInfo.setHardlinkState.
 type hardlinkInfo struct {
 	state        hardlinkState // Current state in the hardlink state machine
 	sourceFileID FileID        // Source file ID for registration (immutable after init)
@@ -257,13 +310,6 @@ func (h *hardlinkInfo) applyOutcome(outcome hardlinkOutcome) {
 	}
 }
 
-// markComplete transitions the hardlink state to Complete.
-// Called during finalization after a pending hardlink is resolved.
-// Caller must hold state.mu.
-func (h *hardlinkInfo) markComplete() {
-	h.state = hlStateComplete
-}
-
 // serverFileInfo holds information about a file in a torrent.
 //
 // Immutable fields (set during init, safe to read without state.mu):
@@ -275,14 +321,17 @@ func (h *hardlinkInfo) markComplete() {
 //
 //	path, earlyFinalized, piecesWritten, hardlink.state
 //
-// The file handle is protected by fileMu (not state.mu) so that
-// openForWrite can be called outside state.mu for concurrent disk I/O.
+// The write path (openForWrite/writeAt) runs outside state.mu for concurrent
+// disk I/O and reads path, file, earlyFinalized and hardlink.state under fileMu,
+// so those four are written under both locks and read under either. See
+// takeWriteHandle, readmitWrites, setPath and setHardlinkState, which are the
+// only ways to mutate them.
 type serverFileInfo struct {
 	path   string       // Full path on disk (mutable: renamed during early finalize)
 	size   int64        // File size
 	offset int64        // Offset within torrent's total data
 	file   *os.File     // Open file handle (lazy opened, protected by fileMu)
-	fileMu sync.RWMutex // Protects file handle open/close/write
+	fileMu sync.RWMutex // Protects file handle open/close/write, plus path and earlyFinalized
 
 	// Hardlink tracking (state machine for cross-torrent file dedup)
 	hardlink hardlinkInfo
@@ -300,6 +349,7 @@ type serverFileInfo struct {
 
 // skipForWriteData reports whether this file should be skipped during piece write.
 // True for unselected files, or files that are hardlinked/pending hardlink.
+// Caller must hold state.mu or fileMu; the write path reaches it via declinesWrites.
 func (f *serverFileInfo) skipForWriteData() bool {
 	return !f.selected || f.hardlink.state == hlStateComplete || f.hardlink.state == hlStatePending
 }

@@ -126,6 +126,22 @@ func (ts *torrentStore) abortInodesForFiles(hash string, files []*serverFileInfo
 	}
 }
 
+// retireState releases the background work a dropped entry still owns: the
+// init-time pre-verification pass and any in-progress inode registrations.
+// Must be called after releasing ts.mu, matching the documented lock ordering
+// (store.mu -> state.mu -> InodeRegistry locks).
+//
+// Every caller that drops an entry is either deleting the torrent's files or
+// re-creating them from scratch, so a pass still reading them is pure wasted
+// NFS I/O - and on NFS, unlinking a file a reader still holds open leaves a
+// .nfsXXXX silly-rename behind until that reader closes its handle. Stopping
+// the pass here rather than at each caller keeps it paired with the entry drop
+// the same way the inode abort already is.
+func (ts *torrentStore) retireState(hash string, state *serverTorrentState) {
+	state.stopPreVerify()
+	ts.abortInodesForFiles(hash, state.files)
+}
+
 // Commit replaces the sentinel with real state. Checks file path collisions
 // and registers paths atomically. On collision, removes the sentinel and
 // aborts any in-progress inode registrations from setupFiles.
@@ -176,20 +192,20 @@ func (ts *torrentStore) dropEntryLocked(hash string) (*serverTorrentState, bool)
 	return state, true
 }
 
-// Remove deletes a torrent, unregisters file paths, and aborts any in-progress
-// inodes for the hash. Returns the old state for caller cleanup. No-op if not found.
+// Remove deletes a torrent, unregisters file paths, and retires the background
+// work it owned. Returns the old state for caller cleanup. No-op if not found.
 func (ts *torrentStore) Remove(hash string) *serverTorrentState {
 	ts.mu.Lock()
 	state, exists := ts.dropEntryLocked(hash)
 	ts.mu.Unlock()
 	if exists {
-		ts.abortInodesForFiles(hash, state.files)
+		ts.retireState(hash, state)
 	}
 	return state
 }
 
 // Drain removes all entries and returns them. Used for shutdown.
-// Aborts in-progress inodes for all drained entries, matching Remove behavior.
+// Retires background work for all drained entries, matching Remove behavior.
 func (ts *torrentStore) Drain() map[string]*serverTorrentState {
 	ts.mu.Lock()
 	old := ts.entries
@@ -198,7 +214,7 @@ func (ts *torrentStore) Drain() map[string]*serverTorrentState {
 	ts.mu.Unlock()
 
 	for hash, state := range old {
-		ts.abortInodesForFiles(hash, state.files)
+		ts.retireState(hash, state)
 	}
 
 	return old
@@ -217,9 +233,11 @@ func (ts *torrentStore) BeginAbort(hash string, ch chan struct{}) (*serverTorren
 	state, exists := ts.dropEntryLocked(hash)
 	ts.mu.Unlock()
 
-	// Abort in-progress inodes outside the lock (matching Remove behavior).
+	// Retire background work outside the lock (matching Remove behavior). The
+	// pass must be stopped before AbortTorrent starts unlinking the very files
+	// it is reading.
 	if exists {
-		ts.abortInodesForFiles(hash, state.files)
+		ts.retireState(hash, state)
 	}
 
 	return state, nil
@@ -263,7 +281,7 @@ func (ts *torrentStore) BeginReclaim(
 	ts.mu.Unlock()
 
 	if exists {
-		ts.abortInodesForFiles(hash, state.files)
+		ts.retireState(hash, state)
 	}
 	return true
 }

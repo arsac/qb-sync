@@ -23,10 +23,6 @@ const (
 	// streamingRateLimiterBurst is the burst size for rate limiting (1MB).
 	streamingRateLimiterBurst = grpcutil.BytesPerMB
 
-	// senderRetryBackoff is the safety-net polling interval for sender workers
-	// when no stream has capacity. Handles missed AckReady signals and stale-cleanup capacity changes.
-	senderRetryBackoff = 50 * time.Millisecond
-
 	drainTimeout                  = 30 * time.Second
 	reconnectBaseDelay            = 1 * time.Second
 	reconnectMaxDelay             = 30 * time.Second
@@ -35,9 +31,15 @@ const (
 	defaultCircuitBreakerPause    = 5 * time.Minute  // Longer pause after max failures
 	windowStatsInterval           = 5 * time.Second  // How often to log window stats
 	staleCheckInterval            = 10 * time.Second // How often to check for stale in-flight pieces
-	defaultNumSenders             = 4                // Concurrent sender workers (parallelizes ReadPiece + Send)
+	defaultNumSenders             = 4                // Minimum concurrent sender workers (parallelizes ReadPiece + Send)
 	maxPieceHashMismatches        = 5                // Per-piece hash mismatch limit before forcing finalization
 )
+
+// errWindowFull reports that every stream in the pool was at its congestion
+// window limit when the sender tried to claim a slot. It is contention, not a
+// fault: the piece was never read or transmitted, so the sender keeps it and
+// retries rather than counting a failure.
+var errWindowFull = errors.New("window full")
 
 // BidiQueueConfig configures the bidirectional streaming work queue.
 type BidiQueueConfig struct {
@@ -57,8 +59,9 @@ type BidiQueueConfig struct {
 	ReconnectBaseDelay time.Duration // Initial reconnect delay (default: 1s)
 	ReconnectMaxDelay  time.Duration // Maximum reconnect delay cap (default: 30s)
 
-	// Sender parallelism
-	NumSenders int // Concurrent sender workers (default: 4)
+	// Sender parallelism. This is the floor, not the cap: the pool runs one
+	// sender per stream, so adaptive scaling raises the active count above it.
+	NumSenders int // Minimum concurrent sender workers (default: 4)
 
 	// Adaptive window configuration (applied to each stream's congestion control)
 	AdaptiveWindow congestion.Config
@@ -95,8 +98,8 @@ type BidiQueue struct {
 	limiter *rate.Limiter
 
 	// Track per-piece hash mismatch failures to prevent infinite retry loops.
-	// Key: pieceKey(hash, index), Value: consecutive mismatch count.
-	pieceHashMismatches   map[string]int
+	// Value: consecutive mismatch count.
+	pieceHashMismatches   map[congestion.PieceKey]int
 	pieceHashMismatchesMu sync.Mutex
 
 	bytesSent  atomic.Int64
@@ -139,7 +142,7 @@ func NewBidiQueue(
 		tracker:             tracker,
 		logger:              logger,
 		config:              config,
-		pieceHashMismatches: make(map[string]int),
+		pieceHashMismatches: make(map[congestion.PieceKey]int),
 	}
 
 	if config.MaxBytesPerSec > 0 {
@@ -174,7 +177,7 @@ func (q *BidiQueue) Stats() BidiQueueStats {
 
 // clearHashMismatch removes any tracked hash-mismatch counter for a piece.
 // Called when an ack comes back successful or when the mismatch limit is hit.
-func (q *BidiQueue) clearHashMismatch(key string) {
+func (q *BidiQueue) clearHashMismatch(key congestion.PieceKey) {
 	q.pieceHashMismatchesMu.Lock()
 	delete(q.pieceHashMismatches, key)
 	q.pieceHashMismatchesMu.Unlock()
@@ -249,7 +252,6 @@ func (q *BidiQueue) runStream(ctx context.Context) error {
 	q.dest.ClearInitCache()
 
 	poolConfig := StreamPoolConfig{
-		NumStreams:     q.config.NumStreams,
 		MaxNumStreams:  q.config.MaxNumStreams,
 		AdaptiveWindow: q.config.AdaptiveWindow,
 		Adaptive:       q.config.AdaptivePool,
@@ -299,11 +301,23 @@ func (q *BidiQueue) runStream(ctx context.Context) error {
 	}
 }
 
-// runSenderPool spawns N sender workers that pull from tracker.Completed() concurrently,
-// plus a dedicated stats reporter goroutine.
+// runSenderPool spawns the sender workers that pull from tracker.Completed()
+// concurrently, plus a dedicated stats reporter goroutine.
+//
+// One worker is started for every stream the pool could ever hold, but only
+// activeSenders of them dequeue at a time - the rest park in awaitTurn, holding
+// no piece buffer. That is what lets the pool's adaptive scaling mean anything:
+// a stream carries data only while a sender is driving it, so before this the
+// pool could add streams past NumSenders and they would sit idle, making every
+// stream probe measure noise and be undone. Sizing the resident worker set to
+// the ceiling instead of resizing it keeps the workers' lifecycle tied to the
+// stream session and nothing else.
 func (q *BidiQueue) runSenderPool(ctx context.Context, pool *StreamPool, stopSender <-chan struct{}) {
-	numSenders := q.config.NumSenders
-	q.logger.InfoContext(ctx, "starting sender workers", "count", numSenders)
+	numSenders := max(q.config.NumSenders, pool.MaxStreams())
+	q.logger.InfoContext(ctx, "starting sender workers",
+		"count", numSenders,
+		"active", q.activeSenders(pool),
+	)
 
 	var wg sync.WaitGroup
 
@@ -344,22 +358,8 @@ func (q *BidiQueue) runSenderPool(ctx context.Context, pool *StreamPool, stopSen
 // senderWorker is the per-piece send loop run by each sender goroutine.
 func (q *BidiQueue) senderWorker(ctx context.Context, pool *StreamPool, stopSender <-chan struct{}, id int) {
 	for {
-		// Wait for any stream to have capacity.
-		if !pool.CanSend() {
-			metrics.WindowFullTotal.Inc()
-			for !pool.CanSend() {
-				select {
-				case <-ctx.Done():
-					return
-				case <-stopSender:
-					return
-				case <-pool.AckReady():
-					// Fast path: woken by ack arrival.
-				case <-time.After(senderRetryBackoff):
-					// Safety net: recheck capacity periodically.
-					// Handles missed AckReady signals and stale-cleanup capacity changes.
-				}
-			}
+		if !q.awaitTurn(ctx, pool, stopSender, id) {
+			return
 		}
 
 		select {
@@ -371,16 +371,119 @@ func (q *BidiQueue) senderWorker(ctx context.Context, pool *StreamPool, stopSend
 			if !ok {
 				return
 			}
-			if err := q.sendPiecePool(ctx, pool, piece); err != nil {
-				q.logger.ErrorContext(ctx, "failed to send piece",
-					"hash", piece.GetTorrentHash(),
-					"piece", piece.GetIndex(),
-					"sender", id,
-					"error", err,
-				)
-				q.tracker.MarkFailed(piece.GetTorrentHash(), int(piece.GetIndex()))
-				q.piecesFail.Add(1)
+			q.tracker.NoteDequeued(piece.GetTorrentHash(), int(piece.GetIndex()))
+			if !q.deliverPiece(ctx, pool, stopSender, piece, id) {
+				return
 			}
+		}
+	}
+}
+
+// activeSenders reports how many of the resident sender workers may dequeue a
+// piece right now: one per stream the pool can send on, never fewer than the
+// configured NumSenders. The floor keeps the pre-existing behaviour of running
+// several senders over a small pool, which pipelines one sender's disk read
+// behind another's in-flight Send.
+func (q *BidiQueue) activeSenders(pool *StreamPool) int {
+	return max(q.config.NumSenders, pool.SendableStreamCount())
+}
+
+// awaitTurn blocks until this sender is within the active set and the pool can
+// accept another piece. Returns false when the worker should exit.
+//
+// The active-set check belongs here rather than in awaitCapacity because it is
+// only safe before a piece is dequeued: a sender that has already taken a piece
+// must be allowed to finish it even if the pool shrank underneath it, otherwise
+// the piece waits for a stream add that may never come.
+func (q *BidiQueue) awaitTurn(ctx context.Context, pool *StreamPool, stopSender <-chan struct{}, id int) bool {
+	return q.awaitPool(ctx, pool, stopSender, func() bool {
+		return id < q.activeSenders(pool) && pool.CanSend()
+	})
+}
+
+// awaitCapacity blocks until some stream in the pool can accept a piece.
+// Returns false when the worker should exit.
+func (q *BidiQueue) awaitCapacity(ctx context.Context, pool *StreamPool, stopSender <-chan struct{}) bool {
+	return q.awaitPool(ctx, pool, stopSender, pool.CanSend)
+}
+
+// awaitPool blocks until ready reports true. Returns false when the worker
+// should exit.
+//
+// The wakeup channel is taken before each test, so a slot released in between
+// closes the channel this worker already holds and the select returns at once.
+// That ordering is what makes a periodic re-check unnecessary: no release can
+// land in a window where nobody is listening for it. Stream adds publish on the
+// same channel, which is what wakes a sender parked outside the active set.
+//
+// Only a genuinely full congestion window is counted, once per wait: a sender
+// parked because the pool has fewer streams than senders is idle capacity, not
+// link pressure, and there is one of those for every unused stream slot.
+func (q *BidiQueue) awaitPool(
+	ctx context.Context,
+	pool *StreamPool,
+	stopSender <-chan struct{},
+	ready func() bool,
+) bool {
+	if ready() {
+		return true
+	}
+
+	counted := false
+	for {
+		capacity := pool.CapacityWait()
+		if ready() {
+			return true
+		}
+		if !counted && !pool.CanSend() {
+			metrics.WindowFullTotal.Inc()
+			counted = true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-stopSender:
+			return false
+		case <-capacity:
+		}
+	}
+}
+
+// deliverPiece sends one dequeued piece, re-attempting for as long as the only
+// thing stopping it is a full congestion window. Returns false when the worker
+// should exit.
+//
+// Senders check pool capacity before dequeuing but claim a window slot inside
+// sendPiecePool, so a piece can still arrive at a pool that filled up in
+// between - a saturated window is the steady state congestion control aims for,
+// not a fault. Handing the piece back to the tracker cost it a full
+// PollInterval, since queueCompletedPieces only re-offers pieces on the next
+// tick, and inflated the failure counters with contention.
+func (q *BidiQueue) deliverPiece(
+	ctx context.Context,
+	pool *StreamPool,
+	stopSender <-chan struct{},
+	piece *pb.Piece,
+	id int,
+) bool {
+	for {
+		sendErr := q.sendPiecePool(ctx, pool, piece)
+		if sendErr == nil {
+			return true
+		}
+		if !errors.Is(sendErr, errWindowFull) {
+			q.logger.ErrorContext(ctx, "failed to send piece",
+				"hash", piece.GetTorrentHash(),
+				"piece", piece.GetIndex(),
+				"sender", id,
+				"error", sendErr,
+			)
+			q.tracker.MarkFailed(piece.GetTorrentHash(), int(piece.GetIndex()))
+			q.piecesFail.Add(1)
+			return true
+		}
+		if !q.awaitCapacity(ctx, pool, stopSender) {
+			return false
 		}
 	}
 }
@@ -427,74 +530,126 @@ func (q *BidiQueue) ensureTorrentInitialized(ctx context.Context, hash string) e
 // sendPiecePool reads piece data and sends it over the best available stream.
 func (q *BidiQueue) sendPiecePool(ctx context.Context, pool *StreamPool, piece *pb.Piece) error {
 	sendStart := time.Now()
-	hash := piece.GetTorrentHash()
-	index := piece.GetIndex()
-	key := pieceKey(hash, index)
+	key := congestion.PieceKey{Hash: piece.GetTorrentHash(), Index: piece.GetIndex()}
 
-	// Drop pieces whose torrent was untracked between queue time and now.
-	// queueCompletedPieces enqueues with a snapshot of the torrent state, so
-	// a concurrent Untrack (e.g., torrent removed from source mid-stream)
-	// can leave stale pieces in the channel. Sending them would re-init the
-	// torrent on destination and produce PIECE_ERROR_NOT_INITIALIZED noise.
-	if !q.tracker.IsTracked(hash) {
-		q.logger.DebugContext(ctx, "dropping queued piece for untracked torrent",
-			"hash", hash, "piece", index,
+	reason, prepErr := q.prepareSend(ctx, pool, key)
+	if prepErr != nil {
+		return prepErr
+	}
+	if reason != "" {
+		q.logger.DebugContext(ctx, "skipping queued piece",
+			"hash", key.Hash,
+			"piece", key.Index,
+			"reason", reason,
 		)
 		return nil
 	}
 
-	if err := q.ensureTorrentInitialized(ctx, hash); err != nil {
-		return err
-	}
-
-	// Skip pieces already covered (e.g. hardlinked on destination before this piece was dequeued)
-	if q.tracker.IsPieceStreamed(hash, int(index)) {
-		q.logger.DebugContext(ctx, "skipping piece covered by hardlink",
-			"hash", hash,
-			"piece", index,
-		)
-		return nil
-	}
-
-	// Acquire window slot BEFORE the disk read so we fail fast when the
+	// Claim the window slot BEFORE the disk read so we fail fast when the
 	// window is full, avoiding a wasted NFS I/O round-trip.
-	ps, selectErr := pool.SelectStream()
-	if selectErr != nil {
-		return fmt.Errorf("selecting stream: %w", selectErr)
-	}
-
-	if !ps.window.TrySend(key) {
+	ps, claimErr := pool.ClaimStream(key)
+	if errors.Is(claimErr, errWindowFull) {
 		q.logger.DebugContext(ctx, "window full, skipping disk read",
-			"hash", hash,
-			"piece", index,
-			"stream", ps.id,
+			"hash", key.Hash,
+			"piece", key.Index,
 		)
-		return errors.New("window full")
+		return errWindowFull
+	}
+	if claimErr != nil {
+		return fmt.Errorf("claiming stream: %w", claimErr)
 	}
 
+	return q.sendClaimedPiece(ctx, pool, ps, piece, key, sendStart)
+}
+
+// prepareSend runs the pre-send gate for one piece: it lazily initializes the
+// piece's torrent on the destination and reports why the piece need not be sent,
+// or "" when it should be. The three drop conditions all cost nothing to detect
+// and all avoid a full piece read off NFS plus a copy over the link.
+//
+// The initialization sits between the first check and the rest deliberately.
+// Sending a piece for an untracked torrent would re-init a torrent the source
+// has already dropped, so that check has to precede it; and InitTorrent is what
+// marks the pieces the destination already holds as streamed, so the streamed
+// check has to follow it to catch a first piece the destination hardlinked.
+func (q *BidiQueue) prepareSend(ctx context.Context, pool *StreamPool, key congestion.PieceKey) (string, error) {
+	// queueCompletedPieces enqueues with a snapshot of the torrent state, so a
+	// concurrent Untrack (e.g. torrent removed from source mid-stream) can leave
+	// stale pieces in the channel.
+	if !q.tracker.IsTracked(key.Hash) {
+		return "torrent untracked", nil
+	}
+
+	if err := q.ensureTorrentInitialized(ctx, key.Hash); err != nil {
+		return "", err
+	}
+
+	// Already covered, e.g. hardlinked on the destination before this piece was
+	// dequeued, or acked from an earlier send of the same piece.
+	if q.tracker.IsPieceStreamed(key.Hash, int(key.Index)) {
+		return "already streamed", nil
+	}
+
+	// Another sender already has this piece on the wire. The monitor clears a
+	// piece's queued bit the moment a sender dequeues it (NoteDequeued), which is
+	// what keeps the scan a self-healing retry, so every poll tick from then until
+	// the ack lands offers the piece again. Sending it again would put two copies
+	// under a single congestion-window key, which the first ack then retires.
+	//
+	// Safe as a drop rather than a deferral: a piece that never gets acked is
+	// retired from the window by the stale sweep or by stream teardown, both of
+	// which requeue it through MarkFailed, so nothing here is the last chance to
+	// send it.
+	if pool.IsInFlight(key) {
+		return "already in flight", nil
+	}
+
+	return "", nil
+}
+
+// sendClaimedPiece reads and transmits a piece that already holds a congestion
+// window slot, releasing the slot on any failure so the piece is requeued.
+func (q *BidiQueue) sendClaimedPiece(
+	ctx context.Context,
+	pool *StreamPool,
+	ps *PooledStream,
+	piece *pb.Piece,
+	key congestion.PieceKey,
+	sendStart time.Time,
+) error {
 	data, err := q.source.ReadPiece(ctx, piece)
 	if err != nil {
-		ps.window.OnFail(key)
+		pool.FailPiece(ps, key)
+		// A read that fails because source qB no longer has the torrent is
+		// proof of a removal, and the only proof available once the monitor
+		// has stopped polling this torrent - it stops as soon as every piece
+		// state is known, so a torrent deleted after that point is invisible
+		// to the poll path. Without this the senders requeue the same pieces
+		// indefinitely, hammering qB for a torrent that cannot come back.
+		// removeAndNotify is idempotent, so concurrent senders notify once.
+		if errors.Is(err, ErrTorrentNotFound) && q.tracker != nil {
+			q.tracker.handleTorrentNotFound(ctx, key.Hash)
+		}
 		return fmt.Errorf("reading piece: %w", err)
 	}
 
 	if q.limiter != nil {
 		if waitErr := q.waitForRateLimit(ctx, len(data)); waitErr != nil {
-			ps.window.OnFail(key)
+			pool.FailPiece(ps, key)
 			return fmt.Errorf("rate limit: %w", waitErr)
 		}
 	}
 
 	req := &pb.WritePieceRequest{
-		TorrentHash: hash,
-		PieceIndex:  index,
+		TorrentHash: key.Hash,
+		PieceIndex:  key.Index,
 		Offset:      piece.GetOffset(),
 		Size:        piece.GetSize(),
 		Data:        data,
 	}
 
 	if sendErr := ps.stream.Send(req); sendErr != nil {
-		ps.window.OnFail(key)
+		pool.FailPiece(ps, key)
 		return fmt.Errorf("sending: %w", sendErr)
 	}
 
@@ -506,8 +661,8 @@ func (q *BidiQueue) sendPiecePool(ctx context.Context, pool *StreamPool, piece *
 	ps.bytesSent.Add(int64(len(data)))
 
 	q.logger.DebugContext(ctx, "sent piece",
-		"hash", hash,
-		"piece", index,
+		"hash", key.Hash,
+		"piece", key.Index,
 		"size", len(data),
 		"stream", ps.id,
 		"window", ps.window.Window(),
@@ -551,8 +706,7 @@ func (q *BidiQueue) runAckProcessorPool(
 			q.handleStalePiecesPool(ctx, pool)
 
 		case env := <-pool.Acks():
-			q.processAck(ctx, env)
-			pool.NotifyAckProcessed()
+			q.processAck(ctx, pool, env)
 		}
 	}
 }
@@ -570,20 +724,16 @@ func (q *BidiQueue) handleStalePiecesPool(ctx context.Context, pool *StreamPool)
 	)
 
 	for _, sk := range staleKeys {
-		// OnFail on the stream that actually owns the key in its window.
-		sk.Stream.window.OnFail(sk.Key)
-		q.requeuePieceByKey(ctx, sk.Key)
+		// Fail the piece on the stream that actually owns the key in its window.
+		pool.FailPiece(sk.Stream, sk.Key)
+		q.requeuePiece(sk.Key)
 	}
 }
 
-// requeuePieceByKey parses a piece key and marks it as failed for retry.
-func (q *BidiQueue) requeuePieceByKey(ctx context.Context, key string) {
-	hash, index, ok := ParsePieceKey(key)
-	if !ok {
-		q.logger.WarnContext(ctx, "failed to parse piece key", "key", key)
-		return
-	}
-	q.tracker.MarkFailed(hash, int(index))
+// requeuePiece marks a piece that left the congestion window without an ack as
+// failed, so the next poll cycle re-offers it.
+func (q *BidiQueue) requeuePiece(key congestion.PieceKey) {
+	q.tracker.MarkFailed(key.Hash, int(key.Index))
 	q.piecesFail.Add(1)
 }
 
@@ -599,19 +749,19 @@ func (q *BidiQueue) markInFlightAsFailedPool(ctx context.Context, pool *StreamPo
 	)
 
 	for _, key := range keys {
-		q.requeuePieceByKey(ctx, key)
+		q.requeuePiece(key)
 	}
 }
 
 // processAck handles a single acknowledgment using the correct stream's window.
 // The envelope carries the source stream so no external piece-to-stream
 // lookup is needed.
-func (q *BidiQueue) processAck(ctx context.Context, env AckEnvelope) {
+func (q *BidiQueue) processAck(ctx context.Context, pool *StreamPool, env AckEnvelope) {
 	ack := env.Ack
 	ps := env.Stream
 	hash := ack.GetTorrentHash()
 	index := int(ack.GetPieceIndex())
-	key := pieceKey(hash, int32(index))
+	key := congestion.PieceKey{Hash: hash, Index: ack.GetPieceIndex()}
 
 	streamID := -1
 	if ps != nil {
@@ -621,7 +771,7 @@ func (q *BidiQueue) processAck(ctx context.Context, env AckEnvelope) {
 	if ack.GetSuccess() {
 		// Update adaptive window with RTT measurement
 		if ps != nil {
-			ps.window.OnAck(key)
+			pool.AckPiece(ps, key)
 			ps.piecesOK.Add(1)
 		}
 
@@ -640,7 +790,7 @@ func (q *BidiQueue) processAck(ctx context.Context, env AckEnvelope) {
 	} else {
 		// Reduce window on failure
 		if ps != nil {
-			ps.window.OnFail(key)
+			pool.FailPiece(ps, key)
 			ps.piecesFail.Add(1)
 		}
 
@@ -651,7 +801,7 @@ func (q *BidiQueue) processAck(ctx context.Context, env AckEnvelope) {
 		switch ack.GetErrorCode() { //nolint:exhaustive // IO, FINALIZING, NONE handled by default.
 		case pb.PieceErrorCode_PIECE_ERROR_HASH_MISMATCH:
 			metrics.PieceHashMismatchTotal.Inc()
-			q.handleHashMismatch(ctx, hash, index, key, streamID, ack.GetError())
+			q.handleHashMismatch(ctx, key, streamID, ack.GetError())
 
 		case pb.PieceErrorCode_PIECE_ERROR_NOT_INITIALIZED:
 			// Clear init cache so next send triggers re-init
@@ -680,9 +830,7 @@ func (q *BidiQueue) processAck(ctx context.Context, env AckEnvelope) {
 // can surface an INCOMPLETE error rather than retrying a corrupt piece forever.
 func (q *BidiQueue) handleHashMismatch(
 	ctx context.Context,
-	hash string,
-	index int,
-	key string,
+	key congestion.PieceKey,
 	streamID int,
 	errMsg string,
 ) {
@@ -695,10 +843,10 @@ func (q *BidiQueue) handleHashMismatch(
 	q.pieceHashMismatchesMu.Unlock()
 
 	if mismatches >= maxPieceHashMismatches {
-		q.tracker.MarkStreamed(hash, index)
+		q.tracker.MarkStreamed(key.Hash, int(key.Index))
 		q.logger.ErrorContext(ctx, "piece hash mismatch limit reached, forcing finalization attempt",
-			"hash", hash,
-			"piece", index,
+			"hash", key.Hash,
+			"piece", key.Index,
 			"stream", streamID,
 			"mismatches", mismatches,
 		)
@@ -706,8 +854,8 @@ func (q *BidiQueue) handleHashMismatch(
 	}
 
 	q.logger.ErrorContext(ctx, "piece hash mismatch, will retry",
-		"hash", hash,
-		"piece", index,
+		"hash", key.Hash,
+		"piece", key.Index,
 		"stream", streamID,
 		"mismatches", mismatches,
 		"error", errMsg,
@@ -757,7 +905,7 @@ func (q *BidiQueue) drainInFlightPool(ctx context.Context, pool *StreamPool) {
 			return
 
 		case env := <-pool.Acks():
-			q.processAck(ctx, env)
+			q.processAck(ctx, pool, env)
 		}
 	}
 

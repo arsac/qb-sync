@@ -1,11 +1,13 @@
 package streaming
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -49,33 +51,55 @@ func (m *mockBidiStream) RecvMsg(any) error            { return nil }
 
 var testLogger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 
-// newClosedDonePooledStream builds a PooledStream whose underlying PieceStream
-// has its done channel pre-closed. Used by forwardAcks tests that simulate a
-// stream that has already exited. errs is the error channel given to the
-// inner PieceStream (caller decides whether to seed it with an error).
-func newClosedDonePooledStream(id int, errs chan error) *PooledStream {
-	streamDone := make(chan struct{})
-	close(streamDone)
-	return &PooledStream{
-		stream: &PieceStream{
-			done:     streamDone,
-			errors:   errs,
-			acks:     make(chan *pb.PieceAck, 10),
-			ackReady: make(chan struct{}, 1),
-		},
-		id: id,
+// newAckSinkTestPool returns a minimal StreamPool wired up for poolAckSink
+// tests with channel buffers sized for "small but non-blocking" use.
+func newAckSinkTestPool(ctx context.Context) *StreamPool {
+	return &StreamPool{
+		ctx:          ctx,
+		errs:         make(chan error, 10),
+		acks:         make(chan AckEnvelope, 10),
+		capacityWait: make(chan struct{}),
+		logger:       testLogger,
 	}
 }
 
-// newForwardAcksTestPool returns a minimal StreamPool wired up for forwardAcks
-// tests with channel buffers sized for "small but non-blocking" use.
-func newForwardAcksTestPool(ctx context.Context) *StreamPool {
-	return &StreamPool{
-		ctx:      ctx,
-		errs:     make(chan error, 10),
-		acks:     make(chan AckEnvelope, 10),
-		ackReady: make(chan struct{}, 10),
-		logger:   testLogger,
+// chanAckSink stands in for the pool in PieceStream receive-loop tests: it
+// collects acks and records the stream-end error. deliverAck gives up after
+// timeout, mirroring poolAckSink's behaviour when the consumer stops draining.
+type chanAckSink struct {
+	acks    chan *pb.PieceAck
+	ended   chan error
+	timeout time.Duration
+}
+
+func newChanAckSink(ackBufSize int, timeout time.Duration) *chanAckSink {
+	if timeout <= 0 {
+		timeout = ackDeliverTimeout
+	}
+	return &chanAckSink{
+		acks:    make(chan *pb.PieceAck, ackBufSize),
+		ended:   make(chan error, 1),
+		timeout: timeout,
+	}
+}
+
+func (s *chanAckSink) deliverAck(ctx context.Context, ack *pb.PieceAck) bool {
+	timer := time.NewTimer(s.timeout)
+	defer timer.Stop()
+	select {
+	case s.acks <- ack:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return false
+	}
+}
+
+func (s *chanAckSink) streamEnded(err error) {
+	select {
+	case s.ended <- err:
+	default:
 	}
 }
 
@@ -94,7 +118,7 @@ func newAdaptiveScalingTestPool(
 		streams:       streams,
 		errs:          make(chan error, 10),
 		acks:          make(chan AckEnvelope, 10),
-		ackReady:      make(chan struct{}, 10),
+		capacityWait:  make(chan struct{}),
 		maxStreams:    MaxPoolSize,
 	}
 }
@@ -104,8 +128,9 @@ func newAdaptiveScalingTestPool(
 // tests where the stream is meaningfully exercised but isolation from a real
 // gRPC transport is desired.
 func newDrainTestStream(ctx context.Context, id int) *PooledStream {
+	stream, _ := newTestPieceStream(ctx, &mockBidiStream{})
 	return &PooledStream{
-		stream: newTestPieceStream(ctx, &mockBidiStream{}),
+		stream: stream,
 		window: congestion.NewAdaptiveWindow(congestion.Config{
 			InitialWindow: 10, MinWindow: 2, MaxWindow: 10,
 		}),
@@ -129,40 +154,34 @@ func newDrainTestPool(ctx context.Context, cancel context.CancelFunc, ps *Pooled
 // newTestPieceStream creates a PieceStream with a mock stream for testing.
 // The mock's ctx is set to the derived stream context so its default Recv
 // unblocks when the stream is closed.
-func newTestPieceStream(parentCtx context.Context, mock *mockBidiStream) *PieceStream {
+func newTestPieceStream(parentCtx context.Context, mock *mockBidiStream) (*PieceStream, *chanAckSink) {
 	return newTestPieceStreamWithOptions(parentCtx, mock, DefaultAckChannelSize, 0, 0)
 }
 
-// newTestPieceStreamWithOptions creates a PieceStream with configurable ack channel
-// buffer size and timeout overrides. Zero timeout means use the package-level const.
+// newTestPieceStreamWithOptions creates a PieceStream with configurable sink ack
+// buffer size and timeout overrides. Zero timeout means use the package-level
+// const. Returns the stream and the sink its receive loop feeds.
 func newTestPieceStreamWithOptions(
 	parentCtx context.Context,
 	mock *mockBidiStream,
 	ackBufSize int,
 	ackTimeout, sndTimeout time.Duration,
-) *PieceStream {
+) (*PieceStream, *chanAckSink) {
 	streamCtx, streamCancel := context.WithCancel(parentCtx)
 	mock.ctx = streamCtx
 
 	ps := &PieceStream{
-		ctx:                     streamCtx,
-		cancel:                  streamCancel,
-		stream:                  mock,
-		logger:                  testLogger,
-		acks:                    make(chan *pb.PieceAck, ackBufSize),
-		ackReady:                make(chan struct{}, 1),
-		done:                    make(chan struct{}),
-		errors:                  make(chan error, 1),
-		sendCh:                  make(chan *sendRequest),
-		stopSend:                make(chan struct{}),
-		sendDone:                make(chan struct{}),
-		ackWriteTimeoutOverride: ackTimeout,
-		sendTimeoutOverride:     sndTimeout,
+		ctx:                 streamCtx,
+		cancel:              streamCancel,
+		stream:              mock,
+		logger:              testLogger,
+		done:                make(chan struct{}),
+		sendTimeoutOverride: sndTimeout,
 	}
 
-	go ps.receiveAcks()
-	go ps.sendLoop()
-	return ps
+	sink := newChanAckSink(ackBufSize, ackTimeout)
+	go ps.receiveAcks(sink)
+	return ps, sink
 }
 
 // TestSend_NormalSendSucceeds verifies that a non-blocking Send returns
@@ -174,7 +193,7 @@ func TestSend_NormalSendSucceeds(t *testing.T) {
 		sendFunc: func(*pb.WritePieceRequest) error { return nil },
 	}
 
-	ps := newTestPieceStream(context.Background(), mock)
+	ps, _ := newTestPieceStream(context.Background(), mock)
 	defer ps.Close()
 
 	if err := ps.Send(&pb.WritePieceRequest{TorrentHash: "test"}); err != nil {
@@ -192,7 +211,7 @@ func TestSend_StreamErrorPropagates(t *testing.T) {
 		sendFunc: func(*pb.WritePieceRequest) error { return expectedErr },
 	}
 
-	ps := newTestPieceStream(context.Background(), mock)
+	ps, _ := newTestPieceStream(context.Background(), mock)
 	defer ps.Close()
 
 	err := ps.Send(&pb.WritePieceRequest{TorrentHash: "test"})
@@ -201,9 +220,64 @@ func TestSend_StreamErrorPropagates(t *testing.T) {
 	}
 }
 
+// TestSend_SerializesConcurrentSenders verifies that concurrent Send callers
+// never overlap inside stream.Send. gRPC allows only one sender goroutine per
+// stream, and the sender pool routinely has several workers on one stream.
+func TestSend_SerializesConcurrentSenders(t *testing.T) {
+	t.Parallel()
+
+	const (
+		senders       = 8
+		sendsPerActor = 25
+	)
+
+	var inFlight, maxInFlight atomic.Int32
+	mock := &mockBidiStream{
+		sendFunc: func(*pb.WritePieceRequest) error {
+			now := inFlight.Add(1)
+			for {
+				peak := maxInFlight.Load()
+				if now <= peak || maxInFlight.CompareAndSwap(peak, now) {
+					break
+				}
+			}
+			// Widen the overlap window so an unserialized send is caught by
+			// the counter, not just by the race detector.
+			time.Sleep(50 * time.Microsecond)
+			inFlight.Add(-1)
+			return nil
+		},
+	}
+
+	ps, _ := newTestPieceStream(context.Background(), mock)
+	defer ps.Close()
+
+	var sendErrs atomic.Int32
+	done := make(chan struct{})
+	for range senders {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			for range sendsPerActor {
+				if err := ps.Send(&pb.WritePieceRequest{TorrentHash: "test"}); err != nil {
+					sendErrs.Add(1)
+				}
+			}
+		}()
+	}
+	for range senders {
+		<-done
+	}
+
+	if peak := maxInFlight.Load(); peak != 1 {
+		t.Fatalf("concurrent stream.Send calls: peak in-flight = %d, want 1", peak)
+	}
+	if n := sendErrs.Load(); n != 0 {
+		t.Fatalf("expected no send errors, got %d", n)
+	}
+}
+
 // TestSend_AfterCloseSendReturnsError verifies that calling Send after CloseSend
-// returns an error instead of panicking. Before the stopSend fix, this would
-// panic with "send on closed channel" because CloseSend closed sendCh directly.
+// returns an error rather than pushing a piece onto a half-closed stream.
 func TestSend_AfterCloseSendReturnsError(t *testing.T) {
 	t.Parallel()
 
@@ -211,7 +285,7 @@ func TestSend_AfterCloseSendReturnsError(t *testing.T) {
 		sendFunc: func(*pb.WritePieceRequest) error { return nil },
 	}
 
-	ps := newTestPieceStream(context.Background(), mock)
+	ps, _ := newTestPieceStream(context.Background(), mock)
 	defer ps.Close()
 
 	// Close the send side first.
@@ -257,7 +331,7 @@ func TestSend_ReceiveExitUnblocksSend(t *testing.T) {
 		return nil, errors.New("stream reset by peer")
 	}
 
-	ps := newTestPieceStream(context.Background(), mock)
+	ps, _ := newTestPieceStream(context.Background(), mock)
 	defer ps.Close()
 
 	start := time.Now()
@@ -276,13 +350,14 @@ func TestSend_ReceiveExitUnblocksSend(t *testing.T) {
 	t.Logf("Send unblocked in %v with error: %v", elapsed, err)
 }
 
-// TestReceiveAcks_AckChannelBlockedTimeout verifies that when the ack channel
-// is full and nobody is draining it, receiveAcks exits after the ack write
-// timeout, calling ps.cancel() to unblock any stuck Send().
+// TestReceiveAcks_AckChannelBlockedTimeout verifies that when the sink stops
+// accepting acks, receiveAcks exits, calling ps.cancel() to unblock any stuck
+// Send().
 //
-// This covers the deadlock scenario where forwardAcks is slow → ps.acks fills
-// → receiveAcks blocks on channel write → never calls Recv() again → can't
-// detect stream death → ps.cancel() never fires → Send() stuck forever.
+// This covers the deadlock scenario where the ack consumer stalls → the sink
+// stops accepting → receiveAcks would otherwise block and never call Recv()
+// again → can't detect stream death → ps.cancel() never fires → Send() stuck
+// forever.
 func TestReceiveAcks_AckChannelBlockedTimeout(t *testing.T) {
 	t.Parallel()
 
@@ -296,14 +371,14 @@ func TestReceiveAcks_AckChannelBlockedTimeout(t *testing.T) {
 		},
 	}
 
-	// Unbuffered ack channel: first ack write blocks immediately.
-	ps := newTestPieceStreamWithOptions(context.Background(), mock, 0, testTimeout, 0)
+	// Unbuffered sink: the first ack delivery blocks immediately.
+	ps, _ := newTestPieceStreamWithOptions(context.Background(), mock, 0, testTimeout, 0)
 	defer ps.Close()
 
 	start := time.Now()
 	select {
 	case <-ps.done:
-		// receiveAcks exited due to ack write timeout — correct.
+		// receiveAcks exited because the sink stopped accepting — correct.
 	case <-time.After(5 * time.Second):
 		t.Fatal("receiveAcks didn't exit after ack channel blocked")
 	}
@@ -328,7 +403,7 @@ func TestReceiveAcks_AckChannelBlockedTimeout(t *testing.T) {
 //
 // This covers the deadlock scenario where both paths are stuck:
 // - Send() blocked on HTTP/2 flow control (destination not consuming)
-// - receiveAcks() blocked on ack channel write (forwardAcks slow)
+// - receiveAcks() blocked delivering an ack (the ack processor is slow)
 // The send timeout is the independent safety net that breaks the cycle.
 func TestSend_TimeoutCancelsStream(t *testing.T) {
 	t.Parallel()
@@ -345,7 +420,7 @@ func TestSend_TimeoutCancelsStream(t *testing.T) {
 	// Default recvFunc blocks until context cancel — simulates receiveAcks
 	// being stuck (unable to detect stream death independently).
 
-	ps := newTestPieceStreamWithOptions(context.Background(), mock, DefaultAckChannelSize, 0, testTimeout)
+	ps, _ := newTestPieceStreamWithOptions(context.Background(), mock, DefaultAckChannelSize, 0, testTimeout)
 	defer ps.Close()
 
 	start := time.Now()
@@ -396,13 +471,13 @@ func TestReceiveAcks_NoTimeoutWhenAcksConsumed(t *testing.T) {
 	}
 
 	// Small buffer to create backpressure, but we drain fast enough.
-	ps := newTestPieceStreamWithOptions(context.Background(), mock, 5, testTimeout, 0)
+	ps, sink := newTestPieceStreamWithOptions(context.Background(), mock, 5, testTimeout, 0)
 	defer ps.Close()
 
 	// Consume all acks.
 	for range numAcks {
 		select {
-		case <-ps.acks:
+		case <-sink.acks:
 		case <-time.After(2 * time.Second):
 			t.Fatal("timed out waiting for ack")
 		}
@@ -412,36 +487,73 @@ func TestReceiveAcks_NoTimeoutWhenAcksConsumed(t *testing.T) {
 	close(received)
 	<-ps.done
 
-	// If the ack write timeout fired spuriously, the context would be cancelled
-	// with no error on the errors channel. Check that the stream ended due to
-	// the Recv error, not the timeout.
+	// If the delivery timeout fired spuriously, the stream would have ended with
+	// no error reported. Check that it ended on the Recv error instead.
 	select {
-	case err := <-ps.errors:
+	case err := <-sink.ended:
 		if err == nil || err.Error() != "done" {
 			t.Fatalf("expected 'done' error from Recv, got %v", err)
 		}
 	default:
-		// No error means receiveAcks saw context cancel or EOF — also acceptable
-		// since we closed the mock.
+		t.Fatal("stream ended without reporting the Recv error to the sink")
 	}
 }
 
-// TestForwardAcks_NotifiesPoolOnSilentStreamDeath verifies that when a stream's
-// Done() fires but no error is pending on the Errors() channel (e.g., send
-// timeout cancelled the context), forwardAcks sends a synthetic error to
-// pool.errs so the ack processor can trigger reconnection.
-//
-// Without this fix, forwardAcks exits silently and the ack processor never
-// learns the stream died, causing a permanent sender deadlock.
-func TestForwardAcks_NotifiesPoolOnSilentStreamDeath(t *testing.T) {
+// newAckSinkFor builds a poolAckSink for a bare PooledStream with the given id.
+func newAckSinkFor(pool *StreamPool, id int) *poolAckSink {
+	return newPoolAckSink(pool, &PooledStream{id: id})
+}
+
+// TestDeliverAck_StreamCancelReleasesBlockedDelivery verifies that a delivery
+// parked on a full aggregated channel is released by the stream's own context,
+// not only by the pool's. drainAndRemoveStream closes a scaled-down stream
+// while the pool keeps running, and Close waits on the receive loop - without
+// the stream-context escape that wait would park for the whole delivery
+// timeout.
+func TestDeliverAck_StreamCancelReleasesBlockedDelivery(t *testing.T) {
 	t.Parallel()
 
-	// Stream done, no error pending.
-	ps := newClosedDonePooledStream(42, make(chan error, 1))
-	pool := newForwardAcksTestPool(t.Context())
+	pool := newAckSinkTestPool(t.Context())
+	pool.ackDeliveryTimeoutOverride = time.Hour // Only a cancel can release this.
+	for len(pool.acks) < cap(pool.acks) {
+		pool.acks <- AckEnvelope{}
+	}
 
-	pool.wg.Add(1)
-	go pool.forwardAcks(ps)
+	streamCtx, streamCancel := context.WithCancel(context.Background())
+	sink := newAckSinkFor(pool, 5)
+
+	returned := make(chan bool, 1)
+	go func() { returned <- sink.deliverAck(streamCtx, &pb.PieceAck{}) }()
+
+	select {
+	case <-returned:
+		t.Fatal("deliverAck returned before the stream was cancelled")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	streamCancel()
+	select {
+	case ok := <-returned:
+		if ok {
+			t.Fatal("deliverAck reported success without delivering the ack")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("deliverAck stayed parked after the stream was cancelled")
+	}
+}
+
+// TestStreamEnded_NotifiesPoolOnSilentStreamDeath verifies that when a stream's
+// receive loop exits without an error of its own (e.g. a send timeout cancelled
+// the context), the sink publishes a synthetic error to pool.errs so the ack
+// processor can trigger reconnection.
+//
+// Without it the stream dies silently and the ack processor never learns, which
+// is a permanent sender deadlock.
+func TestStreamEnded_NotifiesPoolOnSilentStreamDeath(t *testing.T) {
+	t.Parallel()
+
+	pool := newAckSinkTestPool(t.Context())
+	newAckSinkFor(pool, 42).streamEnded(nil)
 
 	select {
 	case err := <-pool.errs:
@@ -449,30 +561,23 @@ func TestForwardAcks_NotifiesPoolOnSilentStreamDeath(t *testing.T) {
 			t.Fatal("expected non-nil synthetic error")
 		}
 		t.Logf("received synthetic error: %v", err)
-	case <-time.After(1 * time.Second):
-		t.Fatal("timed out waiting for synthetic error — forwardAcks exited silently")
+	default:
+		t.Fatal("stream died silently — no error published to the pool")
 	}
 }
 
-// TestForwardAcks_NoSpuriousErrorOnCleanShutdown verifies that when the pool
-// context is cancelled (clean shutdown via pool.Close), forwardAcks does NOT
-// send a synthetic error to pool.errs. Only unexpected stream deaths should
-// generate errors.
-func TestForwardAcks_NoSpuriousErrorOnCleanShutdown(t *testing.T) {
+// TestStreamEnded_NoSpuriousErrorOnCleanShutdown verifies that when the pool
+// context is cancelled (clean shutdown via pool.Close), a stream ending without
+// an error of its own does NOT produce a synthetic error. Only unexpected
+// stream deaths should generate errors.
+func TestStreamEnded_NoSpuriousErrorOnCleanShutdown(t *testing.T) {
 	t.Parallel()
 
-	// Stream done, no error pending.
-	ps := newClosedDonePooledStream(7, make(chan error, 1))
-
-	// Pool context already cancelled — simulates clean shutdown.
 	poolCtx, poolCancel := context.WithCancel(context.Background())
 	poolCancel()
 
-	pool := newForwardAcksTestPool(poolCtx)
-
-	pool.wg.Add(1)
-	go pool.forwardAcks(ps)
-	pool.wg.Wait()
+	pool := newAckSinkTestPool(poolCtx)
+	newAckSinkFor(pool, 7).streamEnded(nil)
 
 	select {
 	case err := <-pool.errs:
@@ -482,48 +587,41 @@ func TestForwardAcks_NoSpuriousErrorOnCleanShutdown(t *testing.T) {
 	}
 }
 
-// TestForwardAcks_DrainsErrorOnStreamClose verifies that forwardAcks drains
-// any pending error from the stream's error channel after Done() fires.
-//
-// Without the error drain fix, when both Done() and Errors() are ready
-// simultaneously, Go's select picks randomly. If Done() wins, forwardAcks
-// returns without forwarding the error, leaving the ack processor unaware
-// of stream death. The fix makes the Done() case explicitly drain pending
-// errors before returning.
-//
-// Multiple iterations make the select race deterministic: without the fix,
-// ~50% of iterations would miss the error.
-func TestForwardAcks_DrainsErrorOnStreamClose(t *testing.T) {
+// TestStreamEnded_ForwardsRealStreamError verifies that a stream error is
+// published verbatim rather than replaced by the synthetic one, and that it is
+// published even while the pool context is cancelled — a real failure racing
+// shutdown still has to reach the ack processor.
+func TestStreamEnded_ForwardsRealStreamError(t *testing.T) {
 	t.Parallel()
 
-	const iterations = 50
-
-	for i := range iterations {
-		func() {
-			// Create a PieceStream with a pending error and closed done channel.
-			streamErrors := make(chan error, 1)
-			streamErrors <- errors.New("stream reset by peer")
-			ps := newClosedDonePooledStream(i, streamErrors)
+	for _, tc := range []struct {
+		name       string
+		cancelPool bool
+	}{
+		{name: "pool_running"},
+		{name: "pool_closing", cancelPool: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
 			poolCtx, poolCancel := context.WithCancel(context.Background())
 			defer poolCancel()
+			if tc.cancelPool {
+				poolCancel()
+			}
 
-			pool := newForwardAcksTestPool(poolCtx)
+			pool := newAckSinkTestPool(poolCtx)
+			newAckSinkFor(pool, 3).streamEnded(errors.New("stream reset by peer"))
 
-			pool.wg.Add(1)
-			go pool.forwardAcks(ps)
-
-			// forwardAcks should forward the error regardless of select ordering.
 			select {
 			case err := <-pool.errs:
 				if err == nil || err.Error() != "stream reset by peer" {
-					t.Errorf("iteration %d: expected 'stream reset by peer', got %v", i, err)
+					t.Fatalf("expected 'stream reset by peer', got %v", err)
 				}
-			case <-time.After(1 * time.Second):
-				t.Fatalf("iteration %d: timed out waiting for error to be forwarded "+
-					"(select race dropped the error)", i)
+			default:
+				t.Fatal("stream error was dropped instead of published to the pool")
 			}
-		}()
+		})
 	}
 }
 
@@ -535,262 +633,130 @@ func newTestPoolWithWindow(windowCfg congestion.Config) (*StreamPool, *PooledStr
 	ctx, cancel := context.WithCancel(context.Background())
 	ps := &PooledStream{
 		stream: &PieceStream{
-			done:     make(chan struct{}),
-			errors:   make(chan error, 1),
-			acks:     make(chan *pb.PieceAck, 10),
-			ackReady: make(chan struct{}, 1),
+			done: make(chan struct{}),
 		},
 		window: congestion.NewAdaptiveWindow(windowCfg),
 		id:     0,
 	}
 	pool := &StreamPool{
-		ctx:      ctx,
-		cancel:   cancel,
-		errs:     make(chan error, 10),
-		acks:     make(chan AckEnvelope, 10),
-		ackReady: make(chan struct{}, 4),
-		logger:   testLogger,
-		streams:  []*PooledStream{ps},
+		ctx:          ctx,
+		cancel:       cancel,
+		errs:         make(chan error, 10),
+		acks:         make(chan AckEnvelope, 10),
+		capacityWait: make(chan struct{}),
+		logger:       testLogger,
+		streams:      []*PooledStream{ps},
 	}
 	return pool, ps, cancel
 }
 
-// TestSenderLoop_PollingFallbackUnblocks verifies that the sender's polling
-// fallback wakes it up when CanSend() becomes true without any AckReady
-// signal. This is the safety net for missed signals. The test's replicated
-// wait loop uses a 1s timer (rather than the production senderRetryBackoff)
-// so the wake source is unambiguously the timer rather than scheduling.
-//
-// Setup: window=2, 2 pieces in-flight (CanSend=false). After 200ms, OnFail
-// frees a slot (CanSend=true) but nobody signals ackReady. The wait loop
-// should unblock via the timer, not immediately and not never.
-func TestSenderLoop_PollingFallbackUnblocks(t *testing.T) {
+// TestCapacityWait_ClosesTheChannelHandedOutBefore pins the close-and-replace
+// contract awaitCapacity relies on: the channel a sender took before testing
+// CanSend is the one a later release closes, so a release published between
+// that test and the sender's select cannot be missed.
+func TestCapacityWait_ClosesTheChannelHandedOutBefore(t *testing.T) {
 	t.Parallel()
 
-	pool, ps, cancel := newTestPoolWithWindow(congestion.Config{
-		InitialWindow: 2, MinWindow: 2, MaxWindow: 2,
-	})
+	pool, _, cancel := newTestPoolWithWindow(congestion.DefaultConfig())
 	defer cancel()
 
-	// Fill window: 2 TrySend calls → CanSend()=false.
-	ps.window.TrySend("a")
-	ps.window.TrySend("b")
-	if pool.CanSend() {
-		t.Fatal("expected CanSend()=false after filling window")
+	held := pool.CapacityWait()
+	select {
+	case <-held:
+		t.Fatal("capacity channel was already closed before any release")
+	default:
 	}
 
-	// After 200ms, free capacity without signaling ackReady.
-	go func() {
-		time.Sleep(200 * time.Millisecond)
-		ps.window.OnFail("a")
-	}()
+	pool.publishCapacity()
 
-	// Replicate the sender's wait loop.
-	start := time.Now()
-	for !pool.CanSend() {
-		select {
-		case <-pool.AckReady():
-			// Should NOT fire — nobody signals it.
-			t.Fatal("unexpected AckReady signal")
-		case <-time.After(1 * time.Second):
-			// Polling fallback — this is the expected wake path.
-		}
+	select {
+	case <-held:
+	default:
+		t.Fatal("release did not close the channel the waiter was already holding")
 	}
-	elapsed := time.Since(start)
 
-	// Should unblock between ~1s (timer) and ~2s. If it took <500ms, the
-	// timer wasn't the wake source. If it took >3s, something is wrong.
-	if elapsed < 500*time.Millisecond {
-		t.Fatalf("unblocked too fast (%v) — polling fallback didn't fire", elapsed)
+	select {
+	case <-pool.CapacityWait():
+		t.Fatal("replacement channel is closed, so the next wait would spin")
+	default:
 	}
-	if elapsed > 3*time.Second {
-		t.Fatalf("took too long (%v) — polling fallback didn't work", elapsed)
-	}
-	t.Logf("sender unblocked via polling fallback in %v", elapsed)
 }
 
-// TestSenderLoop_NotifyAckProcessedUnblocks verifies that NotifyAckProcessed
-// wakes the sender immediately after OnAck reduces inflight, preventing the
-// signal race where the sender consumes the enqueue-time ackReady signal
-// before the ack processor has called OnAck.
-//
-// The race:
-//  1. forwardAcks enqueues ack → signals ackReady
-//  2. Sender wakes, checks CanSend()=false (OnAck hasn't fired yet)
-//  3. Sender goes back to waiting — signal consumed
-//  4. Ack processor calls OnAck → CanSend()=true
-//  5. NotifyAckProcessed() signals ackReady again ← THIS is the fix
-//  6. Sender wakes, checks CanSend()=true → proceeds
-//
-// Without NotifyAckProcessed, step 5 never happens and the sender waits
-// until the 1s polling fallback fires.
-func TestSenderLoop_NotifyAckProcessedUnblocks(t *testing.T) {
+// TestAwaitCapacity_EveryReleasePathWakesAParkedSender covers each pool
+// operation that frees a congestion-window slot. Nothing polls behind
+// awaitCapacity, so a path that releases capacity without publishing leaves
+// the sender parked forever - which is what each subtest fails on.
+func TestAwaitCapacity_EveryReleasePathWakesAParkedSender(t *testing.T) {
 	t.Parallel()
 
-	pool, ps, cancel := newTestPoolWithWindow(congestion.Config{
-		InitialWindow: 2, MinWindow: 2, MaxWindow: 2,
-	})
-	defer cancel()
-
-	// Fill window.
-	ps.window.TrySend("a")
-	ps.window.TrySend("b")
-	if pool.CanSend() {
-		t.Fatal("expected CanSend()=false after filling window")
+	cases := []struct {
+		name    string
+		release func(pool *StreamPool, ps *PooledStream)
+	}{
+		{"ack", func(pool *StreamPool, ps *PooledStream) {
+			pool.AckPiece(ps, congestion.PieceKey{Hash: "hash", Index: 0})
+		}},
+		{"fail", func(pool *StreamPool, ps *PooledStream) {
+			pool.FailPiece(ps, congestion.PieceKey{Hash: "hash", Index: 0})
+		}},
+		{"clear inflight", func(pool *StreamPool, _ *PooledStream) { pool.ClearAllInflight() }},
 	}
 
-	// Simulate the race: enqueue-time signal arrives first, sender consumes
-	// it, then ack processor calls OnAck + NotifyAckProcessed.
-	go func() {
-		// Step 1: forwardAcks signals ackReady (enqueue-time).
-		pool.ackReady <- struct{}{}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-		// Small delay to ensure the sender wakes and re-checks CanSend()=false.
-		time.Sleep(50 * time.Millisecond)
+			pool, ps, cancel := newTestPoolWithWindow(congestion.Config{
+				InitialWindow: 2, MinWindow: 2, MaxWindow: 2,
+			})
+			defer cancel()
 
-		// Step 4-5: Ack processor calls OnAck, then NotifyAckProcessed.
-		ps.window.OnFail("a") // Simulates OnAck reducing inflight.
-		pool.NotifyAckProcessed()
-	}()
+			ps.window.TrySend(congestion.PieceKey{Hash: "hash", Index: 0})
+			ps.window.TrySend(congestion.PieceKey{Hash: "hash", Index: 1})
+			if pool.CanSend() {
+				t.Fatal("window should be full before the sender parks")
+			}
 
-	// Replicate the sender's wait loop.
-	start := time.Now()
-	for !pool.CanSend() {
-		select {
-		case <-pool.AckReady():
-			// May fire from either the enqueue signal or NotifyAckProcessed.
-		case <-time.After(1 * time.Second):
-			// Polling fallback — if we reach here, NotifyAckProcessed didn't work.
-		}
+			q := &BidiQueue{logger: testLogger}
+			stopSender := make(chan struct{})
+			defer close(stopSender)
+
+			returned := make(chan bool, 1)
+			go func() {
+				returned <- q.awaitCapacity(context.Background(), pool, stopSender)
+			}()
+
+			select {
+			case <-returned:
+				t.Fatal("awaitCapacity returned while the window was still full")
+			case <-time.After(100 * time.Millisecond):
+			}
+
+			tc.release(pool, ps)
+
+			select {
+			case ok := <-returned:
+				if !ok {
+					t.Fatal("awaitCapacity reported worker exit, want capacity available")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("awaitCapacity stayed parked: this release path published no capacity signal")
+			}
+		})
 	}
-	elapsed := time.Since(start)
-
-	// Should unblock within ~100ms (50ms goroutine delay + scheduling), NOT
-	// after the 1s polling fallback.
-	if elapsed > 500*time.Millisecond {
-		t.Fatalf("took %v — NotifyAckProcessed didn't wake the sender (fell through to polling fallback)", elapsed)
-	}
-	t.Logf("sender unblocked via NotifyAckProcessed in %v", elapsed)
 }
 
-// TestSenderLoop_NotifyAckProcessedWithoutPolling verifies that removing the
-// polling fallback, the sender still unblocks via NotifyAckProcessed alone.
-// This proves NotifyAckProcessed is sufficient for correctness independent
-// of the polling safety net.
-func TestSenderLoop_NotifyAckProcessedWithoutPolling(t *testing.T) {
+// TestStreamEnded_SilentExitOnRemovedFlag verifies that a stream the pool
+// deliberately drained out reports nothing, even though closing it produces a
+// context error the receive loop hands to the sink.
+func TestStreamEnded_SilentExitOnRemovedFlag(t *testing.T) {
 	t.Parallel()
 
-	pool, ps, cancel := newTestPoolWithWindow(congestion.Config{
-		InitialWindow: 2, MinWindow: 2, MaxWindow: 2,
-	})
-	defer cancel()
+	pool := newAckSinkTestPool(t.Context())
+	ps := &PooledStream{id: 99}
+	ps.removed.Store(true) // Mark as intentionally removed
 
-	ps.window.TrySend("a")
-	ps.window.TrySend("b")
-
-	// Simulate: enqueue signal consumed, then OnAck + NotifyAckProcessed.
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		ps.window.OnFail("a")
-		pool.NotifyAckProcessed()
-	}()
-
-	// Wait loop WITHOUT polling fallback — only AckReady.
-	start := time.Now()
-	for !pool.CanSend() {
-		select {
-		case <-pool.AckReady():
-		case <-time.After(5 * time.Second):
-			t.Fatal("sender stuck — NotifyAckProcessed didn't fire")
-		}
-	}
-	elapsed := time.Since(start)
-
-	if elapsed > 500*time.Millisecond {
-		t.Fatalf("took %v — too slow for NotifyAckProcessed alone", elapsed)
-	}
-	t.Logf("sender unblocked via NotifyAckProcessed (no polling) in %v", elapsed)
-}
-
-// TestSenderLoop_SignalRaceWithoutNotify demonstrates that without
-// NotifyAckProcessed, the signal race causes the sender to miss the
-// state change and fall through to the polling fallback (1s+ delay).
-// This is a regression test — if NotifyAckProcessed were removed, this
-// test would show the latency penalty.
-func TestSenderLoop_SignalRaceWithoutNotify(t *testing.T) {
-	t.Parallel()
-
-	pool, ps, cancel := newTestPoolWithWindow(congestion.Config{
-		InitialWindow: 2, MinWindow: 2, MaxWindow: 2,
-	})
-	defer cancel()
-
-	ps.window.TrySend("a")
-	ps.window.TrySend("b")
-
-	// Simulate the race WITHOUT NotifyAckProcessed:
-	// 1. Enqueue signal fires
-	// 2. Sender wakes, CanSend()=false (OnAck hasn't happened)
-	// 3. OnAck fires, but no new signal
-	go func() {
-		// Enqueue-time signal.
-		pool.ackReady <- struct{}{}
-		// Delay, then free capacity without signaling.
-		time.Sleep(50 * time.Millisecond)
-		ps.window.OnFail("a")
-		// Deliberately NO NotifyAckProcessed() call.
-	}()
-
-	// Wait loop — will consume the enqueue signal, re-check CanSend()=false,
-	// then fall through to the 1s polling timer.
-	start := time.Now()
-	attempts := 0
-	for !pool.CanSend() {
-		attempts++
-		if attempts > 10 {
-			t.Fatal("too many loop iterations")
-		}
-		select {
-		case <-pool.AckReady():
-			// Consumes the enqueue signal — but CanSend() is still false.
-		case <-time.After(1 * time.Second):
-			// Polling fallback rescues us.
-		}
-	}
-	elapsed := time.Since(start)
-
-	// Without NotifyAckProcessed, sender falls through to the 1s timer.
-	// This proves the polling fallback is needed as a safety net.
-	if elapsed < 500*time.Millisecond {
-		// This can happen if scheduling allows OnFail to complete before
-		// the sender re-checks — non-deterministic but acceptable.
-		t.Logf("sender unblocked quickly (%v) — race went the other way this time", elapsed)
-	} else {
-		t.Logf("sender fell through to polling fallback (%v) — demonstrates the race", elapsed)
-	}
-	// Key assertion: must eventually unblock (not hang forever).
-	if elapsed > 3*time.Second {
-		t.Fatalf("took too long (%v) — polling fallback didn't work", elapsed)
-	}
-
-	_ = "test uses fmt" // Ensure fmt import is used.
-}
-
-// TestForwardAcks_SilentExitOnRemovedFlag verifies that when a stream's Done()
-// fires and the removed flag is set (graceful drain), forwardAcks exits silently
-// without sending any error to pool.errs.
-func TestForwardAcks_SilentExitOnRemovedFlag(t *testing.T) {
-	t.Parallel()
-
-	ps := newClosedDonePooledStream(99, make(chan error, 1))
-	// Mark as intentionally removed
-	ps.removed.Store(true)
-
-	pool := newForwardAcksTestPool(t.Context())
-
-	pool.wg.Add(1)
-	go pool.forwardAcks(ps)
-	pool.wg.Wait()
+	newPoolAckSink(pool, ps).streamEnded(context.Canceled)
 
 	select {
 	case err := <-pool.errs:
@@ -835,7 +801,7 @@ func TestDrainAndRemoveStream_HappyPath(t *testing.T) {
 	ps := newDrainTestStream(ctx, 1)
 
 	// Put one piece in-flight
-	ps.window.TrySend("piece:0")
+	ps.window.TrySend(congestion.PieceKey{Hash: "hash", Index: 0})
 	if ps.window.InFlight() != 1 {
 		t.Fatalf("expected 1 in-flight, got %d", ps.window.InFlight())
 	}
@@ -856,7 +822,7 @@ func TestDrainAndRemoveStream_HappyPath(t *testing.T) {
 	}
 
 	// Simulate in-flight piece completing
-	ps.window.OnFail("piece:0")
+	ps.window.OnFail(congestion.PieceKey{Hash: "hash", Index: 0})
 
 	// Drain should complete
 	select {
@@ -890,8 +856,8 @@ func TestDrainAndRemoveStream_Timeout(t *testing.T) {
 	ps := newDrainTestStream(ctx, 2)
 
 	// Put pieces in-flight that will never complete
-	ps.window.TrySend("piece:0")
-	ps.window.TrySend("piece:1")
+	ps.window.TrySend(congestion.PieceKey{Hash: "hash", Index: 0})
+	ps.window.TrySend(congestion.PieceKey{Hash: "hash", Index: 1})
 
 	pool := newDrainTestPool(ctx, cancel, ps)
 
@@ -979,18 +945,137 @@ func TestHandlePlateau_TriggersConnectionAdd(t *testing.T) {
 		t.Fatalf("expected 2 connections after plateau, got %d", dest.ConnectionCount())
 	}
 
-	// Verify state was set for diminishing returns check
+	// Verify the connection was added on trial, not kept unconditionally
 	pool.mu.Lock()
-	if !pool.connectionScaleCheckPending {
-		t.Error("connectionScaleCheckPending should be true after connection add")
+	if pool.probe == nil {
+		t.Fatal("a probe should be armed after connection add")
 	}
-	if pool.preConnectionThroughput != 100.0 {
-		t.Errorf("preConnectionThroughput = %f, want 100.0", pool.preConnectionThroughput)
+	if pool.probe.unit != unitConnection {
+		t.Errorf("probe unit = %q, want %q", pool.probe.unit, unitConnection)
+	}
+	if pool.probe.baseline != 100.0 {
+		t.Errorf("probe baseline = %f, want 100.0", pool.probe.baseline)
 	}
 	if pool.plateauCount != 0 {
 		t.Errorf("plateauCount should be reset to 0, got %d", pool.plateauCount)
 	}
 	pool.mu.Unlock()
+}
+
+// TestProbeConnection_PinsAStreamToTheNewConnection verifies that a probed
+// connection arrives with a stream on it. Existing streams keep the connection
+// they were opened on, so a bare connection would carry no traffic at all and
+// its probe could only ever measure a flat interval and undo itself.
+func TestProbeConnection_PinsAStreamToTheNewConnection(t *testing.T) {
+	t.Parallel()
+
+	newProbePool := func(t *testing.T) (*GRPCDestination, *StreamPool) {
+		t.Helper()
+		addr := startTestGRPCServerAddr(t, func(stream pb.QBSyncService_StreamPiecesBidiServer) error {
+			<-stream.Context().Done()
+			return stream.Context().Err()
+		})
+
+		dest, err := NewGRPCDestination(addr, 1, 4)
+		if err != nil {
+			t.Fatalf("NewGRPCDestination: %v", err)
+		}
+		t.Cleanup(func() { _ = dest.Close() })
+
+		ctx, cancel := context.WithCancel(context.Background())
+		pool := newAdaptiveScalingTestPool(ctx, cancel, dest, newStubPooledStreams(MinPoolSize))
+
+		// Cleanups run LIFO, so the join must be registered before the cancel
+		// that releases the probed stream's receive loop.
+		t.Cleanup(pool.wg.Wait)
+		t.Cleanup(cancel)
+		return dest, pool
+	}
+
+	t.Run("stream lands on the added connection", func(t *testing.T) {
+		t.Parallel()
+		dest, pool := newProbePool(t)
+
+		pool.mu.Lock()
+		added := pool.probeConnection(100.0)
+		streams := slices.Clone(pool.streams)
+		pool.mu.Unlock()
+
+		if !added {
+			t.Fatal("probeConnection reported no add")
+		}
+		if dest.ConnectionCount() != 2 {
+			t.Fatalf("connections = %d, want 2", dest.ConnectionCount())
+		}
+		if len(streams) != MinPoolSize+1 {
+			t.Fatalf("streams = %d, want %d", len(streams), MinPoolSize+1)
+		}
+		// Round-robin would hand out connection 0 here (streamIdx is untouched
+		// by the stub streams), so index 1 pins that the stream is pinned.
+		if got := streams[len(streams)-1].stream.connIdx; got != 1 {
+			t.Fatalf("new stream connIdx = %d, want 1 (the connection just added)", got)
+		}
+	})
+
+	t.Run("declines without touching the destination when no stream slot is free", func(t *testing.T) {
+		t.Parallel()
+		dest, pool := newProbePool(t)
+
+		// The stream-open failure would revert the connection anyway, so what
+		// the up-front check buys is that a routine at-max-streams plateau
+		// neither dials the destination nor reports a stream-open error.
+		var logs bytes.Buffer
+		pool.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+		pool.mu.Lock()
+		pool.maxStreams = len(pool.streams)
+		added := pool.probeConnection(100.0)
+		probe := pool.probe
+		streamCount := len(pool.streams)
+		pool.mu.Unlock()
+
+		if added {
+			t.Fatal("probeConnection added a connection with no stream slot to drive it")
+		}
+		if probe != nil {
+			t.Fatal("no probe should be armed when nothing was added")
+		}
+		if dest.ConnectionCount() != 1 {
+			t.Fatalf("connections = %d, want 1", dest.ConnectionCount())
+		}
+		if streamCount != MinPoolSize {
+			t.Fatalf("streams = %d, want %d", streamCount, MinPoolSize)
+		}
+		if logs.Len() != 0 {
+			t.Fatalf("a full stream pool is not an error, but probeConnection logged: %s", logs.String())
+		}
+	})
+
+	t.Run("undoing the probe sheds the stream with the connection", func(t *testing.T) {
+		t.Parallel()
+		dest, pool := newProbePool(t)
+
+		pool.mu.Lock()
+		if !pool.probeConnection(100.0) {
+			pool.mu.Unlock()
+			t.Fatal("probeConnection reported no add")
+		}
+		pool.probe.addedAt = time.Now().Add(-(probeSettleIntervals + 1) * defaultScaleInterval)
+		// Flat throughput: the add did not pay for itself.
+		pool.evaluateProbe(100.0)
+		pool.mu.Unlock()
+
+		// The drain runs asynchronously; poll the observables rather than
+		// joining pool.wg, which also holds every stream's receive loop.
+		deadline := time.Now().Add(5 * time.Second)
+		for dest.ConnectionCount() != 1 || pool.StreamCount() != MinPoolSize {
+			if time.Now().After(deadline) {
+				t.Fatalf("after undo: connections = %d (want 1), streams = %d (want %d)",
+					dest.ConnectionCount(), pool.StreamCount(), MinPoolSize)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
 }
 
 // newStubPooledStreams creates n PooledStreams with stub PieceStreams
@@ -1001,20 +1086,220 @@ func newStubPooledStreams(n int) []*PooledStream {
 	for i := range n {
 		streams[i] = &PooledStream{
 			stream: &PieceStream{
-				connIdx:  0,
-				done:     make(chan struct{}),
-				errors:   make(chan error, 1),
-				acks:     make(chan *pb.PieceAck, 1),
-				ackReady: make(chan struct{}, 1),
-				sendCh:   make(chan *sendRequest),
-				stopSend: make(chan struct{}),
-				sendDone: make(chan struct{}),
+				connIdx: 0,
+				done:    make(chan struct{}),
 			},
 			window: congestion.NewAdaptiveWindow(congestion.DefaultConfig()),
 			id:     i,
 		}
 	}
 	return streams
+}
+
+// measureInterval drives one throughput measurement: it attributes totalBytes
+// cumulative bytes to the pool's first stream and backdates the measurement
+// baseline by two seconds, so updateThroughput sees a full interval.
+func measureInterval(pool *StreamPool, totalBytes int64) {
+	pool.mu.Lock()
+	pool.streams[0].bytesSent.Store(totalBytes)
+	pool.lastMeasureTime = time.Now().Add(-2 * time.Second)
+	pool.mu.Unlock()
+
+	pool.updateThroughput()
+}
+
+// TestUpdateThroughput_ScalesOnMeasuredChange pins the wiring between the
+// throughput measurement and the scaling decision: the decision has to compare
+// a new measurement against the PREVIOUS interval's, so a caller that publishes
+// the new value as lastThroughput first leaves every change ratio at zero and
+// the pool permanently stuck on the plateau path. The applyScalingDecision
+// tests seed lastThroughput by hand and so cannot see that.
+func TestUpdateThroughput_ScalesOnMeasuredChange(t *testing.T) {
+	t.Parallel()
+
+	addr := startTestGRPCServerAddr(t, func(stream pb.QBSyncService_StreamPiecesBidiServer) error {
+		<-stream.Context().Done()
+		return stream.Context().Err()
+	})
+
+	t.Run("increase scales up", func(t *testing.T) {
+		t.Parallel()
+
+		dest, err := NewGRPCDestination(addr, 1, 4)
+		if err != nil {
+			t.Fatalf("NewGRPCDestination: %v", err)
+		}
+		defer dest.Close()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		pool := newAdaptiveScalingTestPool(ctx, cancel, dest, newStubPooledStreams(MinPoolSize))
+
+		measureInterval(pool, 10<<20) // baseline: 5 MB/s
+		measureInterval(pool, 30<<20) // 10 MB/s, +100%
+
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+		if got := len(pool.streams); got != MinPoolSize+1 {
+			t.Errorf("streams = %d, want %d: a doubling of throughput did not scale the pool up", got, MinPoolSize+1)
+		}
+	})
+
+	t.Run("decrease scales down", func(t *testing.T) {
+		t.Parallel()
+
+		dest, err := NewGRPCDestination(addr, 1, 4)
+		if err != nil {
+			t.Fatalf("NewGRPCDestination: %v", err)
+		}
+		defer dest.Close()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		streams := make([]*PooledStream, MinPoolSize+1)
+		for i := range streams {
+			streams[i] = newDrainTestStream(ctx, i)
+		}
+		pool := newAdaptiveScalingTestPool(ctx, cancel, dest, streams)
+
+		measureInterval(pool, 30<<20) // baseline: 15 MB/s
+		measureInterval(pool, 40<<20) // 5 MB/s, -67%
+
+		pool.wg.Wait() // drainAndRemoveStream
+
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+		if got := len(pool.streams); got != MinPoolSize {
+			t.Errorf("streams = %d, want %d: a collapse in throughput did not scale the pool down", got, MinPoolSize)
+		}
+		if !pool.scalingPaused {
+			t.Error("scaling should be paused after a scale-down")
+		}
+	})
+}
+
+// TestScaleUp_ProbedStreamMustPayForItself pins the mechanism that keeps the
+// pool from ratcheting: a stream added because throughput rose is on trial, and
+// the interval after it settles decides whether it stays. Without the trial the
+// pool adds above +5% but only sheds below -15%, so link noise alone walks it
+// to maxStreams regardless of what the added streams carry.
+func TestScaleUp_ProbedStreamMustPayForItself(t *testing.T) {
+	t.Parallel()
+
+	addr := startTestGRPCServerAddr(t, func(stream pb.QBSyncService_StreamPiecesBidiServer) error {
+		<-stream.Context().Done()
+		return stream.Context().Err()
+	})
+
+	// scaleUpFromBaseline drives the two measurement intervals that add a stream
+	// and arm its probe, and returns the pool sitting on that pending verdict.
+	scaleUpFromBaseline := func(t *testing.T) *StreamPool {
+		t.Helper()
+
+		dest, err := NewGRPCDestination(addr, 1, 4)
+		if err != nil {
+			t.Fatalf("NewGRPCDestination: %v", err)
+		}
+		t.Cleanup(func() { _ = dest.Close() })
+
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+
+		pool := newAdaptiveScalingTestPool(ctx, cancel, dest, newStubPooledStreams(MinPoolSize))
+
+		measureInterval(pool, 10<<20) // baseline: 5 MB/s
+		measureInterval(pool, 30<<20) // 10 MB/s, +100% -> probe a stream
+
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+		if len(pool.streams) != MinPoolSize+1 {
+			t.Fatalf("streams = %d, want %d after scale-up", len(pool.streams), MinPoolSize+1)
+		}
+		if pool.probe == nil || pool.probe.unit != unitStream {
+			t.Fatalf("probe = %+v, want a stream probe", pool.probe)
+		}
+		return pool
+	}
+
+	// settleProbe backdates the pending probe past its settle window so the next
+	// measurement delivers the verdict.
+	settleProbe := func(pool *StreamPool) {
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+		pool.probe.addedAt = time.Now().Add(-(probeSettleIntervals + 1) * defaultScaleInterval)
+	}
+
+	t.Run("verdict waits out the settle window", func(t *testing.T) {
+		t.Parallel()
+
+		pool := scaleUpFromBaseline(t)
+
+		// A doubling one interval in is not yet attributable to the new stream,
+		// and acting on it would add a second stream whose contribution then
+		// pollutes the first one's verdict.
+		measureInterval(pool, 70<<20)
+
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+		if got := len(pool.streams); got != MinPoolSize+1 {
+			t.Errorf("streams = %d, want %d: the pool scaled while a probe was pending", got, MinPoolSize+1)
+		}
+		if pool.probe == nil {
+			t.Error("probe should still be pending before its settle window elapses")
+		}
+	})
+
+	t.Run("unhelpful add is undone", func(t *testing.T) {
+		t.Parallel()
+
+		pool := scaleUpFromBaseline(t)
+		settleProbe(pool)
+
+		measureInterval(pool, 50<<20) // still 10 MB/s: the added stream carried nothing
+
+		// drainAndRemoveStream runs as a goroutine. Poll rather than joining
+		// pool.wg, which also holds the added stream's receive loop and so would
+		// hang instead of failing if the stream is never drained.
+		deadline := time.Now().Add(2 * time.Second)
+		for pool.StreamCount() > MinPoolSize && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+		if got := len(pool.streams); got != MinPoolSize {
+			t.Errorf("streams = %d, want %d: a stream that added no throughput was kept", got, MinPoolSize)
+		}
+		if pool.probe != nil {
+			t.Error("probe should be cleared once its verdict is in")
+		}
+		if !pool.scalingPaused {
+			t.Error("scaling should be paused after an add is undone")
+		}
+	})
+
+	t.Run("paying add is kept and earns another", func(t *testing.T) {
+		t.Parallel()
+
+		pool := scaleUpFromBaseline(t)
+		settleProbe(pool)
+
+		measureInterval(pool, 70<<20) // 20 MB/s: the added stream doubled throughput
+
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+		if got := len(pool.streams); got != MinPoolSize+2 {
+			t.Errorf("streams = %d, want %d: an effective add did not earn a staircase step", got, MinPoolSize+2)
+		}
+		if pool.probe == nil || pool.probe.unit != unitStream {
+			t.Fatalf("probe = %+v, want a fresh stream probe", pool.probe)
+		}
+		if pool.scalingPaused {
+			t.Error("scaling should not be paused while the staircase is still climbing")
+		}
+	})
 }
 
 // TestHandlePlateau_FullSaturationPauses verifies that when at max connections
@@ -1066,7 +1351,7 @@ func TestDiminishingReturns_TriggersScaleDown(t *testing.T) {
 	defer dest.Close()
 
 	// Add a connection so we can observe scale-down attempt
-	if addErr := dest.AddConnection(); addErr != nil {
+	if _, addErr := dest.AddConnection(); addErr != nil {
 		t.Fatalf("AddConnection: %v", addErr)
 	}
 
@@ -1078,20 +1363,22 @@ func TestDiminishingReturns_TriggersScaleDown(t *testing.T) {
 
 	pool.mu.Lock()
 
-	// Simulate: connection was added, check pending, barely any improvement
-	pool.connectionScaleCheckPending = true
-	pool.preConnectionThroughput = 100.0
-	pool.connectionAddedTime = time.Now().Add(-3 * defaultScaleInterval) // Past check window
-	pool.lastThroughput = 102.0                                          // Only 2% improvement
+	// Simulate: connection was added on trial, barely any improvement since
+	pool.probe = &scaleProbe{
+		unit:     unitConnection,
+		baseline: 100.0,
+		addedAt:  time.Now().Add(-3 * defaultScaleInterval), // Past check window
+	}
 
-	// Current throughput: 102 MB/s (2% improvement < 5% threshold)
-	pool.applyScalingDecision(102.0)
+	// Current throughput: 102 MB/s, only 2% above the probe's baseline,
+	// below the 5% threshold that would call the connection add effective.
+	pool.applyScalingDecision(102.0, 102.0)
 
 	if !pool.scalingPaused {
 		t.Error("scaling should be paused after diminishing returns")
 	}
-	if pool.connectionScaleCheckPending {
-		t.Error("connectionScaleCheckPending should be cleared")
+	if pool.probe != nil {
+		t.Error("probe should be cleared")
 	}
 	pool.mu.Unlock()
 
@@ -1104,8 +1391,9 @@ func TestDiminishingReturns_TriggersScaleDown(t *testing.T) {
 	}
 }
 
-// TestDiminishingReturns_GoodImprovement verifies that when a connection
-// add yields >= 5% improvement, scaling continues normally.
+// TestDiminishingReturns_GoodImprovement verifies that a connection add
+// yielding >= 5% improvement is kept and earns another step of the staircase:
+// a second connection, itself on trial against the improved baseline.
 func TestDiminishingReturns_GoodImprovement(t *testing.T) {
 	t.Parallel()
 
@@ -1127,21 +1415,32 @@ func TestDiminishingReturns_GoodImprovement(t *testing.T) {
 
 	pool.mu.Lock()
 
-	// Simulate: connection added, 10% improvement (above 5% threshold)
-	pool.connectionScaleCheckPending = true
-	pool.preConnectionThroughput = 100.0
-	pool.connectionAddedTime = time.Now().Add(-3 * defaultScaleInterval)
-	pool.lastThroughput = 110.0
+	// Simulate: connection added on trial, 10% improvement (above 5% threshold)
+	pool.probe = &scaleProbe{
+		unit:     unitConnection,
+		baseline: 100.0,
+		addedAt:  time.Now().Add(-3 * defaultScaleInterval),
+	}
 
-	pool.applyScalingDecision(110.0)
+	pool.applyScalingDecision(110.0, 110.0)
 
 	if pool.scalingPaused {
 		t.Error("scaling should NOT be paused after good improvement")
 	}
-	if pool.connectionScaleCheckPending {
-		t.Error("connectionScaleCheckPending should be cleared after check")
+	if pool.probe == nil {
+		t.Fatal("an effective add should earn another probe, not clear scaling state")
+	}
+	if pool.probe.unit != unitConnection {
+		t.Errorf("next probe unit = %q, want %q", pool.probe.unit, unitConnection)
+	}
+	if pool.probe.baseline != 110.0 {
+		t.Errorf("next probe baseline = %f, want 110.0 (the improved throughput)", pool.probe.baseline)
 	}
 	pool.mu.Unlock()
+
+	if dest.ConnectionCount() != 2 {
+		t.Fatalf("connections = %d, want 2 after the staircase step", dest.ConnectionCount())
+	}
 }
 
 // stubClient is a minimal QBSyncServiceClient for testing round-robin distribution.

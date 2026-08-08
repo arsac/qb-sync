@@ -3,6 +3,7 @@ package destination
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -966,6 +967,176 @@ func TestAbortTorrent_ClosesFileHandles(t *testing.T) {
 	}
 }
 
+// TestAbortTorrent_FanOutAppliesEachFilesOwnDisposition pins that the parallel
+// per-file cleanup pass keeps each file matched with its own path, its own
+// hardlink result and its own open handle. Every file carries index-derived
+// content and a distinct name, and the four on-disk shapes are interleaved so a
+// task that reads a neighbour's hardlinkResults entry deletes an operator's file
+// or preserves one of ours.
+func TestAbortTorrent_FanOutAppliesEachFilesOwnDisposition(t *testing.T) {
+	const numFiles = 64
+
+	s := newAbortTestServer(t)
+	hash := "abc123"
+	dataDir := filepath.Join(s.config.BasePath, "data")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	files := make([]*serverFileInfo, 0, numFiles+1)
+	results := make([]*pb.HardlinkResult, 0, numFiles+1)
+	shouldSurvive := make(map[string]bool, numFiles+1)
+
+	for i := range numFiles {
+		path := filepath.Join(dataDir, fmt.Sprintf("file-%02d.partial", i))
+		content := []byte(strings.Repeat(fmt.Sprintf("%02d", i), i+1))
+		if err := os.WriteFile(path, content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		fi := &serverFileInfo{path: path, size: int64(len(content)), selected: true}
+		result := &pb.HardlinkResult{FileIndex: int32(i)}
+
+		switch i % 4 {
+		case 0: // streamed partial with a live write handle - deleted, handle closed
+			f, openErr := os.OpenFile(path, os.O_WRONLY, 0o644)
+			if openErr != nil {
+				t.Fatal(openErr)
+			}
+			fi.file = f
+		case 1: // operator data setupFile reused - preserved
+			result.PreExisting = true
+		case 2: // deselected - never written by us, so preserved
+			fi.selected = false
+		case 3: // plain streamed partial - deleted
+		}
+
+		shouldSurvive[path] = i%4 == 1 || i%4 == 2
+		files = append(files, fi)
+		results = append(results, result)
+	}
+
+	// A path that cannot be unlinked (a non-empty directory) must be reported
+	// rather than swallowed by the fan-out.
+	undeletable := filepath.Join(dataDir, "undeletable")
+	if err := os.MkdirAll(filepath.Join(undeletable, "child"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	files = append(files, &serverFileInfo{path: undeletable, size: 1, selected: true})
+	results = append(results, &pb.HardlinkResult{FileIndex: int32(numFiles)})
+	shouldSurvive[undeletable] = true
+
+	s.store.entries[hash] = &serverTorrentState{
+		torrentMeta:     torrentMeta{files: files},
+		hardlinkResults: results,
+	}
+
+	resp, err := s.AbortTorrent(context.Background(), &pb.AbortTorrentRequest{
+		TorrentHash: hash,
+		DeleteFiles: true,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.GetSuccess() {
+		t.Error("expected partial-cleanup failure to be reported for the undeletable path")
+	}
+	if got, want := resp.GetFilesDeleted(), int32(numFiles/2); got != want {
+		t.Errorf("filesDeleted = %d, want %d", got, want)
+	}
+
+	for i, fi := range files {
+		_, statErr := os.Stat(fi.path)
+		if shouldSurvive[fi.path] && statErr != nil {
+			t.Errorf("file %d (%s) should have been preserved: %v", i, fi.path, statErr)
+		}
+		if !shouldSurvive[fi.path] && !os.IsNotExist(statErr) {
+			t.Errorf("file %d (%s) should have been deleted, stat: %v", i, fi.path, statErr)
+		}
+		if fi.file != nil {
+			t.Errorf("file %d (%s) still holds an open handle", i, fi.path)
+		}
+	}
+}
+
+// TestAbortTorrent_CleansUpFilesConcurrently pins that one slow file no longer
+// holds up the rest. Holding a file's fileMu parks exactly the task that would
+// close its handle, so a serial pass cannot reach any later file; the fan-out
+// clears every other file while that one waits.
+func TestAbortTorrent_CleansUpFilesConcurrently(t *testing.T) {
+	const numFiles = 40
+
+	s := newAbortTestServer(t)
+	hash := "abc123"
+	dataDir := filepath.Join(s.config.BasePath, "data")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	files := make([]*serverFileInfo, numFiles)
+	for i := range files {
+		path := filepath.Join(dataDir, fmt.Sprintf("file-%02d.partial", i))
+		if err := os.WriteFile(path, []byte{byte(i)}, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		files[i] = &serverFileInfo{path: path, size: 1, selected: true}
+	}
+	s.store.entries[hash] = &serverTorrentState{torrentMeta: torrentMeta{files: files}}
+
+	files[0].fileMu.Lock()
+	parked := true
+	defer func() {
+		if parked {
+			files[0].fileMu.Unlock()
+		}
+	}()
+
+	// Reported through the channel rather than with t.Errorf: on a serial
+	// regression this goroutine outlives the test's t.Fatal below.
+	type abortOutcome struct {
+		resp *pb.AbortTorrentResponse
+		err  error
+	}
+	done := make(chan abortOutcome, 1)
+	go func() {
+		resp, abortErr := s.AbortTorrent(context.Background(), &pb.AbortTorrentRequest{
+			TorrentHash: hash,
+			DeleteFiles: true,
+		})
+		done <- abortOutcome{resp: resp, err: abortErr}
+	}()
+
+	deadline := time.After(10 * time.Second)
+	for {
+		if _, statErr := os.Stat(files[numFiles-1].path); os.IsNotExist(statErr) {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("last file still present while the first file's handle is parked: cleanup is serial")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	if _, statErr := os.Stat(files[0].path); statErr != nil {
+		t.Errorf("parked file should not have been deleted yet: %v", statErr)
+	}
+
+	parked = false
+	files[0].fileMu.Unlock()
+
+	select {
+	case outcome := <-done:
+		if outcome.err != nil {
+			t.Fatalf("unexpected error: %v", outcome.err)
+		}
+		if got := outcome.resp.GetFilesDeleted(); got != numFiles {
+			t.Errorf("filesDeleted = %d, want %d", got, numFiles)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("AbortTorrent did not return after the parked handle was released")
+	}
+}
+
 func TestAbortTorrent_ConcurrentRequests(t *testing.T) {
 	s := newAbortTestServer(t)
 	ctx := context.Background()
@@ -1712,6 +1883,89 @@ func TestRelocateFiles(t *testing.T) {
 			t.Errorf("expected moved=0, got %d", moved)
 		}
 	})
+}
+
+// TestRelocateFiles_FanOutMovesEveryFileToItsOwnPath pins the two things
+// relocateFiles' per-file fan-out can get wrong that a serial loop could not: a
+// task operating on another task's relPath, and a failure inside a task being
+// swallowed instead of returned. Every file carries content derived from its own
+// index in both its .partial and finalized form, so a cross-wired task lands the
+// wrong bytes at a path that exists either way. The files share four parent
+// directories, which also puts concurrent MkdirAll of the same path under -race.
+func TestRelocateFiles_FanOutMovesEveryFileToItsOwnPath(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	const numFiles = 64
+
+	relPathOf := func(i int) string {
+		return fmt.Sprintf("data/dir%d/file%02d.mkv", i%4, i)
+	}
+	partialBody := func(i int) string { return fmt.Sprintf("partial-%d", i) }
+	finalBody := func(i int) string { return fmt.Sprintf("final-%d", i) }
+
+	newFixture := func(t *testing.T) (*Server, string, []string) {
+		t.Helper()
+		tmpDir := t.TempDir()
+		s := &Server{config: ServerConfig{BasePath: tmpDir}, logger: testLogger(t)}
+		relPaths := make([]string, numFiles)
+		for i := range numFiles {
+			relPaths[i] = relPathOf(i)
+			old := filepath.Join(tmpDir, relPaths[i])
+			writeTestFile(t, old+partialSuffix, []byte(partialBody(i)))
+			writeTestFile(t, old, []byte(finalBody(i)))
+		}
+		return s, tmpDir, relPaths
+	}
+
+	t.Run("every file lands at its own new path with its own content", func(t *testing.T) {
+		t.Parallel()
+		s, tmpDir, relPaths := newFixture(t)
+
+		moved, err := s.relocateFiles(ctx, "fanout", relPaths, "", "movies")
+		if err != nil {
+			t.Fatalf("relocateFiles: %v", err)
+		}
+		if moved != 2*numFiles {
+			t.Errorf("moved = %d, want %d", moved, 2*numFiles)
+		}
+
+		for i := range numFiles {
+			newBase := filepath.Join(tmpDir, "movies", relPaths[i])
+			assertFileContent(t, newBase+partialSuffix, partialBody(i))
+			assertFileContent(t, newBase, finalBody(i))
+
+			oldBase := filepath.Join(tmpDir, relPaths[i])
+			assertFileNotExists(t, oldBase+partialSuffix, "partial should have moved")
+			assertFileNotExists(t, oldBase, "finalized file should have moved")
+		}
+	})
+
+	t.Run("a failure inside the fan-out is reported", func(t *testing.T) {
+		t.Parallel()
+		s, tmpDir, relPaths := newFixture(t)
+
+		// Occupy the new sub-path's "data" component with a regular file so
+		// MkdirAll of every file's target directory fails.
+		writeTestFile(t, filepath.Join(tmpDir, "movies", "data"), []byte("not a directory"))
+
+		if _, err := s.relocateFiles(ctx, "fanout-fail", relPaths, "", "movies"); err == nil {
+			t.Fatal("relocateFiles returned nil, want the per-file MkdirAll failure")
+		}
+	})
+}
+
+// assertFileContent fails the test unless path holds exactly want.
+func assertFileContent(t *testing.T, path, want string) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Errorf("reading %s: %v", path, err)
+		return
+	}
+	if string(got) != want {
+		t.Errorf("%s holds %q, want %q", path, got, want)
+	}
 }
 
 func TestUpdateStateAfterRelocate(t *testing.T) {

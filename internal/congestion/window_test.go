@@ -20,6 +20,12 @@ func (c *mockClock) Now() time.Time { return c.now }
 
 func (c *mockClock) Advance(d time.Duration) { c.now = c.now.Add(d) }
 
+// pk builds a distinct in-flight piece key from a group name and an index, so
+// a test can put as many pieces in flight as it needs without collisions.
+func pk(group string, index int) PieceKey {
+	return PieceKey{Hash: group, Index: int32(index)}
+}
+
 // newTestWindow creates a window with mock clock and fills inflight to make it cwnd-limited.
 func newTestWindow(config Config) (*AdaptiveWindow, *mockClock) {
 	w := NewAdaptiveWindow(config)
@@ -30,7 +36,7 @@ func newTestWindow(config Config) (*AdaptiveWindow, *mockClock) {
 
 // sendAndAck sends a piece, advances the clock by rtt, then acks it.
 // The window must have capacity and the piece must saturate the window for growth.
-func sendAndAck(w *AdaptiveWindow, key string, clock *mockClock, rtt time.Duration) {
+func sendAndAck(w *AdaptiveWindow, key PieceKey, clock *mockClock, rtt time.Duration) {
 	w.OnSend(key)
 	clock.Advance(rtt)
 	w.OnAck(key)
@@ -73,9 +79,9 @@ func TestAdaptiveWindow_CanSend(t *testing.T) {
 		t.Error("expected CanSend() to be true")
 	}
 
-	w.OnSend("piece:0")
-	w.OnSend("piece:1")
-	w.OnSend("piece:2")
+	w.OnSend(pk("piece", 0))
+	w.OnSend(pk("piece", 1))
+	w.OnSend(pk("piece", 2))
 
 	if w.CanSend() {
 		t.Error("expected CanSend() to be false when window full")
@@ -94,14 +100,14 @@ func TestAdaptiveWindow_OnAck(t *testing.T) {
 	}
 	w := NewAdaptiveWindow(config)
 
-	w.OnSend("piece:0")
+	w.OnSend(pk("piece", 0))
 	if w.InFlight() != 1 {
 		t.Errorf("expected 1 inflight, got %d", w.InFlight())
 	}
 
 	time.Sleep(10 * time.Millisecond)
 
-	w.OnAck("piece:0")
+	w.OnAck(pk("piece", 0))
 	if w.InFlight() != 0 {
 		t.Errorf("expected 0 inflight after ack, got %d", w.InFlight())
 	}
@@ -125,8 +131,8 @@ func TestAdaptiveWindow_OnFail(t *testing.T) {
 
 	initialWindow := w.Window()
 
-	w.OnSend("piece:0")
-	w.OnFail("piece:0")
+	w.OnSend(pk("piece", 0))
+	w.OnFail(pk("piece", 0))
 
 	// CUBIC uses 0.7x reduction.
 	expected := int(float64(initialWindow) * cubicBeta)
@@ -149,7 +155,7 @@ func TestAdaptiveWindow_MinWindowFloor(t *testing.T) {
 
 	// Fail many pieces to drive window down via CUBIC beta reduction.
 	for i := range 20 {
-		key := fmt.Sprintf("piece:%d", i)
+		key := pk("piece", i)
 		w.OnSend(key)
 		w.OnFail(key)
 	}
@@ -165,9 +171,9 @@ func TestAdaptiveWindow_MinWindowFloor(t *testing.T) {
 func TestAdaptiveWindow_ClearInflight(t *testing.T) {
 	w := NewAdaptiveWindow(DefaultConfig())
 
-	w.OnSend("piece:0")
-	w.OnSend("piece:1")
-	w.OnSend("piece:2")
+	w.OnSend(pk("piece", 0))
+	w.OnSend(pk("piece", 1))
+	w.OnSend(pk("piece", 2))
 
 	if w.InFlight() != 3 {
 		t.Errorf("expected 3 inflight, got %d", w.InFlight())
@@ -192,29 +198,29 @@ func TestAdaptiveWindow_TrySend(t *testing.T) {
 	}
 	w := NewAdaptiveWindow(config)
 
-	if !w.TrySend("piece:0") {
+	if !w.TrySend(pk("piece", 0)) {
 		t.Error("expected TrySend to succeed with capacity")
 	}
 	if w.InFlight() != 1 {
 		t.Errorf("expected 1 inflight, got %d", w.InFlight())
 	}
 
-	if !w.TrySend("piece:1") {
+	if !w.TrySend(pk("piece", 1)) {
 		t.Error("expected TrySend to succeed")
 	}
-	if !w.TrySend("piece:2") {
+	if !w.TrySend(pk("piece", 2)) {
 		t.Error("expected TrySend to succeed")
 	}
 
-	if w.TrySend("piece:3") {
+	if w.TrySend(pk("piece", 3)) {
 		t.Error("expected TrySend to fail when window full")
 	}
 	if w.InFlight() != 3 {
 		t.Errorf("expected 3 inflight (piece:3 should not be added), got %d", w.InFlight())
 	}
 
-	w.OnAck("piece:0")
-	if !w.TrySend("piece:3") {
+	w.OnAck(pk("piece", 0))
+	if !w.TrySend(pk("piece", 3)) {
 		t.Error("expected TrySend to succeed after ack freed capacity")
 	}
 }
@@ -227,11 +233,11 @@ func TestAdaptiveWindow_TrySend_Idempotent(t *testing.T) {
 	}
 	w := NewAdaptiveWindow(config)
 
-	if !w.TrySend("piece:0") {
+	if !w.TrySend(pk("piece", 0)) {
 		t.Error("expected first TrySend to succeed")
 	}
 
-	if !w.TrySend("piece:0") {
+	if !w.TrySend(pk("piece", 0)) {
 		t.Error("expected second TrySend for same key to succeed")
 	}
 	if w.InFlight() != 1 {
@@ -248,8 +254,8 @@ func TestAdaptiveWindow_GetStaleKeys(t *testing.T) {
 	}
 	w := NewAdaptiveWindow(config)
 
-	w.OnSend("piece:0")
-	w.OnSend("piece:1")
+	w.OnSend(pk("piece", 0))
+	w.OnSend(pk("piece", 1))
 
 	stale := w.GetStaleKeys()
 	if len(stale) != 0 {
@@ -263,7 +269,7 @@ func TestAdaptiveWindow_GetStaleKeys(t *testing.T) {
 		t.Errorf("expected 2 stale keys after timeout, got %d", len(stale))
 	}
 
-	w.OnSend("piece:2")
+	w.OnSend(pk("piece", 2))
 
 	stale = w.GetStaleKeys()
 	if len(stale) != 2 {
@@ -280,7 +286,7 @@ func TestAdaptiveWindow_GetStaleKeys_AfterRetry(t *testing.T) {
 	}
 	w := NewAdaptiveWindow(config)
 
-	w.OnSend("piece:0")
+	w.OnSend(pk("piece", 0))
 
 	time.Sleep(60 * time.Millisecond)
 
@@ -289,7 +295,7 @@ func TestAdaptiveWindow_GetStaleKeys_AfterRetry(t *testing.T) {
 		t.Errorf("expected 1 stale key, got %d", len(stale))
 	}
 
-	w.OnSend("piece:0")
+	w.OnSend(pk("piece", 0))
 
 	stale = w.GetStaleKeys()
 	if len(stale) != 0 {
@@ -305,19 +311,45 @@ func TestAdaptiveWindow_OriginalSendTime_RTTAccuracy(t *testing.T) {
 	}
 	w := NewAdaptiveWindow(config)
 
-	w.OnSend("piece:0")
+	w.OnSend(pk("piece", 0))
 	time.Sleep(20 * time.Millisecond)
 
 	// "Retry" the piece.
-	w.OnSend("piece:0")
+	w.OnSend(pk("piece", 0))
 	time.Sleep(10 * time.Millisecond)
 
 	// RTT should be based on ORIGINAL send time (~30ms), not retry (~10ms).
-	w.OnAck("piece:0")
+	w.OnAck(pk("piece", 0))
 
 	stats := w.Stats()
 	if stats.MinRTT < 25*time.Millisecond {
 		t.Errorf("RTT should be based on original send time (~30ms), got %v", stats.MinRTT)
+	}
+}
+
+// A retry gets a fresh sequence number, so its own failure is a new loss event
+// rather than one recovery dedup folds into the cutback that preceded it. The
+// send time carried across a retry is the first one; the sequence number is not.
+func TestAdaptiveWindow_RetryTakesAFreshSequence(t *testing.T) {
+	w, _ := newTestWindow(Config{
+		MinWindow:     2,
+		MaxWindow:     100,
+		InitialWindow: 50,
+	})
+
+	// Cut back once so largestSentAtCutback is set past piece:0's first send.
+	w.OnSend(pk("piece", 0))
+	w.OnSend(pk("cut", 0))
+	w.OnFail(pk("cut", 0))
+	afterCutback := w.Window()
+
+	// Retry piece:0 while it is still in flight, then fail it. The retry is a
+	// post-cutback send, so this is a distinct loss event and must reduce again.
+	w.OnSend(pk("piece", 0))
+	w.OnFail(pk("piece", 0))
+
+	if got := w.Window(); got >= afterCutback {
+		t.Errorf("expected a retry's failure to reduce the window below %d, got %d", afterCutback, got)
 	}
 }
 
@@ -382,9 +414,9 @@ func TestSlowStart_ExponentialGrowth(t *testing.T) {
 	// roughly doubles the window.
 	for i := range n {
 		window := w.Window()
-		keys := make([]string, window)
+		keys := make([]PieceKey, window)
 		for j := range window {
-			key := fmt.Sprintf("piece:%d:%d", i, j)
+			key := pk(fmt.Sprintf("batch%d", i), j)
 			keys[j] = key
 			w.OnSend(key)
 		}
@@ -421,8 +453,8 @@ func TestSlowStart_ExitOnLoss(t *testing.T) {
 	}
 
 	// Trigger a loss.
-	w.OnSend("piece:0")
-	w.OnFail("piece:0")
+	w.OnSend(pk("piece", 0))
+	w.OnFail(pk("piece", 0))
 
 	stats := w.Stats()
 
@@ -452,18 +484,18 @@ func TestRecovery_NoGrowthDuringRecovery(t *testing.T) {
 
 	// Send several pieces.
 	for i := range 50 {
-		w.OnSend(fmt.Sprintf("piece:%d", i))
+		w.OnSend(pk("piece", i))
 	}
 
 	// Fail one to enter recovery.
-	w.OnFail("piece:25")
+	w.OnFail(pk("piece", 25))
 	windowAfterLoss := w.Window()
 
 	// ACK pieces that were sent before the cutback (they have seq <= largestSentAtCutback).
 	// These should not grow the window.
 	clock.Advance(100 * time.Millisecond)
 	for i := range 25 {
-		w.OnAck(fmt.Sprintf("piece:%d", i))
+		w.OnAck(pk("piece", i))
 	}
 
 	if w.Window() != windowAfterLoss {
@@ -485,22 +517,22 @@ func TestRecovery_ExitOnNewAck(t *testing.T) {
 
 	// Send pieces to fill window.
 	for i := range 50 {
-		w.OnSend(fmt.Sprintf("piece:%d", i))
+		w.OnSend(pk("piece", i))
 	}
 
 	// Fail one to enter recovery.
-	w.OnFail("piece:0")
+	w.OnFail(pk("piece", 0))
 
 	// ACK remaining pre-cutback pieces (still in recovery).
 	clock.Advance(100 * time.Millisecond)
 	for i := 1; i < 50; i++ {
-		w.OnAck(fmt.Sprintf("piece:%d", i))
+		w.OnAck(pk("piece", i))
 	}
 
 	// Now send a NEW piece (post-cutback sequence).
-	w.OnSend("piece:new")
+	w.OnSend(pk("new", 0))
 	clock.Advance(100 * time.Millisecond)
-	w.OnAck("piece:new")
+	w.OnAck(pk("new", 0))
 
 	// Should have exited recovery (new piece seq > largestSentAtCutback).
 	if w.Stats().InRecovery {
@@ -518,17 +550,17 @@ func TestRecovery_MultipleLossesSameWindow(t *testing.T) {
 
 	// Send a batch of pieces.
 	for i := range 100 {
-		w.OnSend(fmt.Sprintf("piece:%d", i))
+		w.OnSend(pk("piece", i))
 	}
 
 	// First loss triggers reduction.
-	w.OnFail("piece:0")
+	w.OnFail(pk("piece", 0))
 	windowAfterFirstLoss := w.Window()
 
 	// Second and third losses from the same batch should NOT reduce further.
 	// These pieces have seq <= largestSentAtCutback.
-	w.OnFail("piece:1")
-	w.OnFail("piece:2")
+	w.OnFail(pk("piece", 1))
+	w.OnFail(pk("piece", 2))
 
 	if w.Window() != windowAfterFirstLoss {
 		t.Errorf("expected no additional reduction for same-batch losses, window was %d, now %d",
@@ -545,8 +577,8 @@ func TestCubic_GrowthAfterLoss(t *testing.T) {
 	w, clock := newTestWindow(config)
 
 	// Exit slow start by triggering a loss.
-	w.OnSend("piece:init")
-	w.OnFail("piece:init")
+	w.OnSend(pk("init", 0))
+	w.OnFail(pk("init", 0))
 
 	beta := cubicBeta // runtime variable to avoid constant-folding.
 	expectedAfterLoss := int(float64(100) * beta)
@@ -562,9 +594,9 @@ func TestCubic_GrowthAfterLoss(t *testing.T) {
 
 	for round := range 30 {
 		window := w.Window()
-		keys := make([]string, window)
+		keys := make([]PieceKey, window)
 		for j := range window {
-			key := fmt.Sprintf("piece:r%d:%d", round, j)
+			key := pk(fmt.Sprintf("round%d", round), j)
 			keys[j] = key
 			w.OnSend(key)
 		}
@@ -606,8 +638,8 @@ func TestCubic_TCPFriendlyMode(t *testing.T) {
 	w, clock := newTestWindow(config)
 
 	// Trigger a loss to exit slow start and set a low W_max.
-	w.OnSend("piece:init")
-	w.OnFail("piece:init")
+	w.OnSend(pk("init", 0))
+	w.OnFail(pk("init", 0))
 
 	beta := cubicBeta // runtime variable to avoid constant-folding.
 	expectedAfterLoss := int(float64(10) * beta)
@@ -619,9 +651,9 @@ func TestCubic_TCPFriendlyMode(t *testing.T) {
 	// Send enough ACKs to observe Reno growth.
 	for round := range 20 {
 		window := w.Window()
-		keys := make([]string, window)
+		keys := make([]PieceKey, window)
 		for j := range window {
-			key := fmt.Sprintf("piece:r%d:%d", round, j)
+			key := pk(fmt.Sprintf("round%d", round), j)
 			keys[j] = key
 			w.OnSend(key)
 		}
@@ -648,9 +680,9 @@ func TestCubic_RespectsMaxWindow(t *testing.T) {
 	// Slow start should be capped at maxWindow.
 	for round := range 50 {
 		window := w.Window()
-		keys := make([]string, window)
+		keys := make([]PieceKey, window)
 		for j := range window {
-			key := fmt.Sprintf("piece:r%d:%d", round, j)
+			key := pk(fmt.Sprintf("round%d", round), j)
 			keys[j] = key
 			w.OnSend(key)
 		}
@@ -678,7 +710,7 @@ func TestApplicationLimited_NoGrowth(t *testing.T) {
 	// Send only 1 piece when window is 50 — far below capacity.
 	// This is application-limited.
 	for range 20 {
-		sendAndAck(w, fmt.Sprintf("piece:%d", clock.now.UnixNano()), clock, 100*time.Millisecond)
+		sendAndAck(w, pk("piece", int(clock.now.UnixNano())), clock, 100*time.Millisecond)
 	}
 
 	// Window should not have grown (application-limited, inflight << window).
@@ -696,8 +728,8 @@ func TestLoss_CompetingFlows(t *testing.T) {
 	w, _ := newTestWindow(config)
 
 	// First loss: lastMaxWindow should be set to current window.
-	w.OnSend("piece:0")
-	w.OnFail("piece:0")
+	w.OnSend(pk("piece", 0))
+	w.OnFail(pk("piece", 0))
 
 	// lastMaxWindow should be 100 (original window).
 	// Window should be 100 * cubicBeta.
@@ -710,8 +742,8 @@ func TestLoss_CompetingFlows(t *testing.T) {
 
 	// Second loss while window is still below lastMaxWindow (100).
 	// This triggers competing flow detection: lastMaxWindow = window * cubicBetaLastMax.
-	w.OnSend("piece:1")
-	w.OnFail("piece:1")
+	w.OnSend(pk("piece", 1))
+	w.OnFail(pk("piece", 1))
 
 	windowAt70 := expectedFirst
 	expectedLastMax := int(float64(windowAt70) * betaLastMax)
@@ -725,8 +757,8 @@ func TestLoss_CompetingFlows(t *testing.T) {
 	// cubicK is computed from the reduced lastMaxWindow (59), not 100.
 	// We can verify indirectly: a third loss while window < lastMaxWindow
 	// should apply betaLastMax again.
-	w.OnSend("piece:2")
-	w.OnFail("piece:2")
+	w.OnSend(pk("piece", 2))
+	w.OnFail(pk("piece", 2))
 
 	// window was 49, lastMaxWindow should have been set via betaLastMax (49 < 59).
 	tw := float64(expectedWindow) * beta
@@ -749,8 +781,8 @@ func TestCubic_ConcaveConvexTransition(t *testing.T) {
 	w, clock := newTestWindow(config)
 
 	// Loss to enter congestion avoidance.
-	w.OnSend("piece:init")
-	w.OnFail("piece:init")
+	w.OnSend(pk("init", 0))
+	w.OnFail(pk("init", 0))
 	// Window = 100*cubicBeta, lastMaxWindow = 100.
 
 	windowReachedMax := false
@@ -765,9 +797,9 @@ func TestCubic_ConcaveConvexTransition(t *testing.T) {
 			windowPastMax = true
 			break
 		}
-		keys := make([]string, window)
+		keys := make([]PieceKey, window)
 		for j := range window {
-			key := fmt.Sprintf("piece:r%d:%d", round, j)
+			key := pk(fmt.Sprintf("round%d", round), j)
 			keys[j] = key
 			w.OnSend(key)
 		}
@@ -804,7 +836,7 @@ func TestOnFail_NotInFlight(t *testing.T) {
 	initial := w.Window()
 
 	// Failing a piece that's not in-flight should be a no-op.
-	w.OnFail("not-in-flight")
+	w.OnFail(pk("not-in-flight", 0))
 
 	if w.Window() != initial {
 		t.Errorf("expected no window change for non-inflight piece, was %d, got %d", initial, w.Window())
@@ -821,29 +853,30 @@ func TestOnAck_NotInFlight(t *testing.T) {
 	initial := w.Window()
 
 	// ACKing a piece that's not in-flight should be a no-op.
-	w.OnAck("not-in-flight")
+	w.OnAck(pk("not-in-flight", 0))
 
 	if w.Window() != initial {
 		t.Errorf("expected no window change for non-inflight piece, was %d, got %d", initial, w.Window())
 	}
 }
 
-func TestClearInflight_ClearsPieceSeq(t *testing.T) {
+func TestClearInflight_DropsAllPieceState(t *testing.T) {
 	w, _ := newTestWindow(Config{
 		MinWindow:     2,
 		MaxWindow:     100,
 		InitialWindow: 50,
 	})
 
-	w.OnSend("piece:0")
-	w.OnSend("piece:1")
+	w.OnSend(pk("piece", 0))
+	w.OnSend(pk("piece", 1))
 
 	w.ClearInflight()
 
-	// After clear, pieceSeq should be empty.
+	// Send times, first-send times and sequence numbers all live in the one
+	// entry, so an empty map is the whole statement.
 	w.mu.Lock()
-	if len(w.pieceSeq) != 0 {
-		t.Errorf("expected pieceSeq to be empty after ClearInflight, got %d entries", len(w.pieceSeq))
+	if len(w.inflight) != 0 {
+		t.Errorf("expected inflight to be empty after ClearInflight, got %d entries", len(w.inflight))
 	}
 	w.mu.Unlock()
 }
@@ -869,8 +902,8 @@ func TestStats_Fields(t *testing.T) {
 	}
 
 	// Trigger a loss to enter recovery.
-	w.OnSend("piece:0")
-	w.OnFail("piece:0")
+	w.OnSend(pk("piece", 0))
+	w.OnFail(pk("piece", 0))
 
 	stats = w.Stats()
 	if stats.InSlowStart {
@@ -881,12 +914,27 @@ func TestStats_Fields(t *testing.T) {
 	}
 
 	// Send and ACK a post-cutback piece to exit recovery.
-	w.OnSend("piece:new")
+	w.OnSend(pk("new", 0))
 	clock.Advance(100 * time.Millisecond)
-	w.OnAck("piece:new")
+	w.OnAck(pk("new", 0))
 
 	stats = w.Stats()
 	if stats.InRecovery {
 		t.Error("expected InRecovery=false after post-cutback ACK")
+	}
+}
+
+// BenchmarkSendAckCycle covers the per-piece congestion bookkeeping: every
+// streamed piece pays one TrySend and one OnAck on its stream's window. The
+// keys are built inside the loop because production builds one per piece on
+// each side, so hoisting them out would hide the cost the key type carries.
+func BenchmarkSendAckCycle(b *testing.B) {
+	const hash = "3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c"
+
+	w := NewAdaptiveWindow(DefaultConfig())
+	for i := 0; b.Loop(); i++ {
+		index := i % DefaultInitialWindow
+		w.TrySend(PieceKey{Hash: hash, Index: int32(index)})
+		w.OnAck(PieceKey{Hash: hash, Index: int32(index)})
 	}
 }

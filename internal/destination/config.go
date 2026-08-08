@@ -57,6 +57,12 @@ const (
 	defaultInodeCleanupInterval = 6 * time.Hour // How often to check for stale inode entries
 	inodeRebuildWorkers         = 32            // Concurrent workers for startup inode rebuild from .meta (sized to hide NFS RTT)
 
+	// Concurrent workers for the per-file metadata probing at torrent init
+	// (setupFiles, clearStalePieces). Each file costs several NFS round-trips
+	// before a single piece can stream, and they are pure latency, so size this
+	// to hide RTT the same way inodeRebuildWorkers does.
+	fileSetupConcurrency = 32
+
 	// Default hardlink wait timeout.
 	defaultHardlinkWaitTimeout = 30 * time.Minute // Max time to wait for pending hardlink source
 
@@ -68,7 +74,7 @@ const (
 
 	// Memory management.
 	defaultMaxStreamBufferMB = 512 // Default global memory budget for buffered piece data
-	maxVerifyConcurrency     = 4   // Default concurrent piece reads during finalization (caps transient memory)
+	maxVerifyConcurrency     = 4   // Default concurrent piece reads per verify pass (caps transient memory)
 	// maxVerifyConcurrencyCap bounds the --verify-concurrency knob. Each worker
 	// holds up to one max-size (32 MB) piece buffer: 16 workers = 512 MB
 	// transient worst case, matching the default stream memory budget. Keep in
@@ -76,6 +82,9 @@ const (
 	// verifyConcurrency() clamps defensively in case the two ever drift.
 	maxVerifyConcurrencyCap  = 16
 	parentDirSyncConcurrency = 8 // Concurrent fsyncs of unique parent dirs during finalize (each is a separate NFS commit RTT)
+	// verifyChunkPieces caps the run of consecutive pieces a verify worker
+	// claims per turn - see verifyChunkSize for why runs beat one-at-a-time.
+	verifyChunkPieces = 32
 
 	// verifyIdleTimeout is how long verification can go without verifying a piece
 	// before it is considered stalled. Resets on each successfully verified piece.
@@ -138,7 +147,7 @@ type ServerConfig struct {
 	SavePath           string        // Path as destination qBittorrent sees it (container mount, e.g., "/downloads"). Defaults to BasePath.
 	StateFlushInterval time.Duration // How often to flush dirty state (0 = use default)
 	StreamWorkers      int           // Number of concurrent piece writers (0 = use default)
-	VerifyConcurrency  int           // Concurrent piece-read goroutines during finalize verification (0 = use default 4). Raise on healthy storage to speed finalize; lower if your NFS server can't handle the burst.
+	VerifyConcurrency  int           // Concurrent piece-read goroutines per read-back verify pass - init pre-verify, early finalization, and full finalization alike (0 = use default 4). Raise on healthy storage to speed verification; lower if your NFS server can't handle the burst.
 
 	// Arr configures the Sonarr/Radarr instances consulted by
 	// CheckArrRejections. Zero instances disable the filter, and the server then
@@ -192,6 +201,15 @@ func (c *ServerConfig) GetQBFinalizeConcurrency() int {
 		return 1
 	}
 	return min(c.QBFinalizeConcurrency, maxQBFinalizeConcurrency)
+}
+
+// streamWorkers returns the configured number of concurrent piece writers,
+// falling back to the default when unset.
+func (c *ServerConfig) streamWorkers() int {
+	if c.StreamWorkers <= 0 {
+		return defaultStreamWorkers
+	}
+	return c.StreamWorkers
 }
 
 // Validate validates the server configuration.

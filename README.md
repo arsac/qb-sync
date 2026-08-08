@@ -59,7 +59,7 @@ All flags can be set via environment variables with the prefix `QBSYNC_SOURCE_` 
 | `QBSYNC_SOURCE_RATE_LIMIT` | `--rate-limit` | Max bytes/sec (0 = unlimited) | `0` |
 | `QBSYNC_SOURCE_PIECE_TIMEOUT` | `--piece-timeout` | Timeout for stale in-flight pieces (seconds) | `60` |
 | `QBSYNC_SOURCE_RECONNECT_MAX_DELAY` | `--reconnect-max-delay` | Max reconnect backoff delay (seconds) | `30` |
-| `QBSYNC_SOURCE_NUM_SENDERS` | `--num-senders` | Concurrent sender workers | `4` |
+| `QBSYNC_SOURCE_NUM_SENDERS` | `--num-senders` | Minimum concurrent sender workers; the adaptive stream pool runs one sender per stream, so the active count rises with it | `4` |
 | `QBSYNC_SOURCE_MIN_CONNECTIONS` | `--min-connections` | Minimum TCP connections to destination server | `2` |
 | `QBSYNC_SOURCE_MAX_CONNECTIONS` | `--max-connections` | Maximum TCP connections to destination server | `8` |
 | `QBSYNC_SOURCE_SYNCED_TAG` | `--synced-tag` | Tag for synced torrents (empty to disable) | `synced` |
@@ -89,7 +89,7 @@ All flags can be set via environment variables with the prefix `QBSYNC_SOURCE_` 
 | `QBSYNC_DESTINATION_STREAM_WORKERS` | `--stream-workers` | Concurrent piece writers (0 = auto: 8) | `0` |
 | `QBSYNC_DESTINATION_MAX_STREAM_BUFFER` | `--max-stream-buffer` | Global memory budget for buffered pieces (MB) | `512` |
 | `QBSYNC_DESTINATION_QB_FINALIZE_CONCURRENCY` | `--qb-finalize-concurrency` | Max torrents concurrently in the qB add/recheck stage (0 = default 1, max 8). Raise only on SSD-backed storage | `0` |
-| `QBSYNC_DESTINATION_VERIFY_CONCURRENCY` | `--verify-concurrency` | Concurrent piece-read goroutines during finalize verification (0 = default 4). Raise on healthy storage; lower if your NFS server can't handle the burst | `0` |
+| `QBSYNC_DESTINATION_VERIFY_CONCURRENCY` | `--verify-concurrency` | Concurrent piece-read goroutines per read-back verification pass - at init, early finalization, and full finalization (0 = default 4). Early finalizations run in the background, up to `--stream-workers` at a time, so the burst ceiling is that product. Raise on healthy storage; lower if your NFS server can't handle it | `0` |
 | `QBSYNC_DESTINATION_SYNCED_TAG` | `--synced-tag` | Tag for synced torrents (empty to disable) | `synced` |
 | `QBSYNC_DESTINATION_RADARR_URL` | `--radarr-url` | Radarr URL (empty disables the Radarr filter) | |
 | `QBSYNC_DESTINATION_RADARR_API_KEY` | `--radarr-api-key` | Radarr API key, sent via `X-Api-Key` | |

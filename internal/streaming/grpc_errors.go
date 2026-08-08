@@ -2,9 +2,6 @@ package streaming
 
 import (
 	"errors"
-	"fmt"
-	"strconv"
-	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -41,25 +38,4 @@ func GRPCErrorCode(err error) codes.Code {
 		return provider.GRPCStatus().Code()
 	}
 	return codes.Unknown
-}
-
-// pieceKey creates a unique key for tracking in-flight pieces.
-func pieceKey(hash string, index int32) string {
-	return fmt.Sprintf("%s:%d", hash, index)
-}
-
-// ParsePieceKey extracts the torrent hash and piece index from a piece key.
-func ParsePieceKey(key string) (string, int32, bool) {
-	// Format is "hash:index"
-	lastColon := strings.LastIndexByte(key, ':')
-	if lastColon == -1 {
-		return "", 0, false
-	}
-
-	idx, err := strconv.ParseInt(key[lastColon+1:], 10, 32)
-	if err != nil {
-		return "", 0, false
-	}
-
-	return key[:lastColon], int32(idx), true
 }

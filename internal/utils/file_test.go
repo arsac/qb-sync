@@ -96,9 +96,42 @@ func TestReadPieceFromFilesCached_HonorsContextCancel(t *testing.T) {
 	cancel() // immediately cancelled
 
 	regions := []FileRegion{{Path: path, Offset: 0, Size: 1024}}
-	_, err := ReadPieceFromFilesCached(ctx, cache, regions, 0, 100)
+	err := ReadPieceFromFilesCached(ctx, cache, regions, 0, make([]byte, 100))
 	require.Error(t, err, "cancelled context must surface from the read loop, not silently complete")
 	assert.ErrorIs(t, err, context.Canceled)
+}
+
+// readPieceNaive is the oracle for ReadPieceFromFilesCached: it reads the piece
+// byte by byte, deriving each byte's file from a linear scan, so it shares no
+// boundary arithmetic with ReadPieceInto and catches an off-by-one there.
+func readPieceNaive(t *testing.T, files []FileRegion, pieceOffset, pieceSize int64) ([]byte, error) {
+	t.Helper()
+
+	buf := make([]byte, pieceSize)
+	for i := range buf {
+		at := pieceOffset + int64(i)
+		found := false
+		for _, f := range files {
+			if at < f.Offset || at >= f.Offset+f.Size {
+				continue
+			}
+			fh, err := os.Open(f.Path)
+			if err != nil {
+				return nil, err
+			}
+			_, err = fh.ReadAt(buf[i:i+1], at-f.Offset)
+			fh.Close()
+			if err != nil {
+				return nil, err
+			}
+			found = true
+			break
+		}
+		if !found {
+			return nil, os.ErrNotExist
+		}
+	}
+	return buf, nil
 }
 
 func TestReadPieceFromFilesCached_MatchesUncachedResult(t *testing.T) {
@@ -125,13 +158,13 @@ func TestReadPieceFromFilesCached_MatchesUncachedResult(t *testing.T) {
 		{Path: pathB, Offset: 512, Size: 512},
 	}
 
-	uncached, err := ReadPieceFromFiles(regions, 256, 512) // straddles the boundary
+	uncached, err := readPieceNaive(t, regions, 256, 512) // straddles the boundary
 	require.NoError(t, err)
 
 	cache := NewFdCache()
 	defer cache.Close()
-	cached, err := ReadPieceFromFilesCached(context.Background(), cache, regions, 256, 512)
-	require.NoError(t, err)
+	cached := make([]byte, 512)
+	require.NoError(t, ReadPieceFromFilesCached(context.Background(), cache, regions, 256, cached))
 
 	assert.Equal(t, uncached, cached, "cached read must match uncached for boundary-spanning piece")
 }

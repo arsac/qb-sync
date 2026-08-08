@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"slices"
 	"strconv"
 	"strings"
@@ -387,6 +388,25 @@ func (t *QBTask) findTorrentByHash(hash string) *qbittorrent.Torrent {
 	return nil
 }
 
+// cycleTorrentList returns the source torrent list for the current cycle,
+// fetching it only when the cycle has not already done so. trackNewTorrents
+// fetches the full list at the top of every runOnce, so any later pass in the
+// same cycle that needs it is served from memory.
+//
+// The fetch is the fallback for entry points reached before any cycle has run
+// (the exported test wrappers). Drain runs after the cycle loop has exited and
+// so inherits the last cycle's list, as it did before this was a shared helper.
+//
+// Runs on the runOnce goroutine only - cycleTorrents is unsynchronized, unlike
+// the cycleFiles map, which finalizeTorrent also reaches from listenForRemovals.
+func (t *QBTask) cycleTorrentList(ctx context.Context) ([]qbittorrent.Torrent, error) {
+	if t.cycleTorrents != nil {
+		metrics.CycleCacheHitsTotal.Inc()
+		return t.cycleTorrents, nil
+	}
+	return t.srcClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{})
+}
+
 // cycleFilesFor returns the file-information result for a torrent, fetching
 // from source qB on first miss and caching for the rest of the orchestrator
 // cycle. Eliminates redundant GetFilesInformationCtx round-trips that
@@ -514,17 +534,41 @@ func (t *QBTask) quiesceExcludedCompleted(ctx context.Context, excludedHashes ma
 	}
 }
 
+// allShards makes recheckFileSelections cover every completed torrent instead
+// of the one shard a cycle is responsible for.
+const allShards = -1
+
+// selectionShard returns the recheck shard a torrent belongs to. Derived from
+// the hash alone so a torrent's shard is stable as the completed set churns,
+// which is what makes "once per pruneCycleInterval cycles" hold per torrent
+// rather than per set.
+func selectionShard(hash string) int {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(hash))
+	return int(h.Sum32() % pruneCycleInterval)
+}
+
 // recheckFileSelections compares stored fingerprints against current qBittorrent
 // file priorities. On change: evicts caches, calls InitTorrent with resync=true,
 // and starts tracking for the newly-selected pieces. Torrents tagged with
 // ExcludeSyncTag are skipped — the user has opted out of further sync activity
 // for these, and quiesceExcludedCompleted preserves their completion-cache
 // entry for safe-handoff purposes only.
-func (t *QBTask) recheckFileSelections(ctx context.Context) {
+//
+// shard selects the slice of the completed set to examine, or allShards for all
+// of it. Each torrent costs a GetFilesInformationCtx round-trip on the same
+// single-threaded qBittorrent WebUI the PieceMonitor polls piece states on twice
+// a second, and the completed set is the whole synced library, so covering it in
+// one pass stalled piece discovery for as long as the pass ran.
+func (t *QBTask) recheckFileSelections(ctx context.Context, shard int) {
 	completed := t.store.CompletedSnapshot()
 
 	var changed bool
 	for hash, storedFingerprint := range completed {
+		if shard != allShards && selectionShard(hash) != shard {
+			continue
+		}
+
 		if t.cfg.ExcludeSyncTag != "" {
 			if torrent := t.findTorrentByHash(hash); torrent != nil &&
 				hasTag(torrent.Tags, t.cfg.ExcludeSyncTag) {

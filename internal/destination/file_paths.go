@@ -10,6 +10,12 @@ func targetPath(fi *serverFileInfo) string {
 	return strings.TrimSuffix(fi.path, partialSuffix)
 }
 
+// atFinalPath reports whether the file's data lives at its final path rather
+// than at the .partial that receives writes. Caller must hold state.mu or fileMu.
+func atFinalPath(fi *serverFileInfo) bool {
+	return !strings.HasSuffix(fi.path, partialSuffix)
+}
+
 // checkPathCollisions checks if any selected file's target path is already
 // owned by another active torrent. Caller must hold the map's protecting lock.
 func checkPathCollisions(filePaths map[string]string, hash string, files []*serverFileInfo) error {

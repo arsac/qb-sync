@@ -114,7 +114,7 @@ type SourceConfig struct {
 	PieceTimeout       time.Duration // Timeout for stale in-flight pieces (default: 60s)
 	MaxBytesPerSec     int64
 	ReconnectMaxDelay  time.Duration // Max reconnect backoff delay (default: 30s)
-	NumSenders         int           // Concurrent sender workers for streaming (default: 4)
+	NumSenders         int           // Minimum concurrent sender workers for streaming (default: 4)
 	MinGRPCConnections int           // Minimum TCP connections to destination server (default: 2)
 	MaxGRPCConnections int           // Maximum TCP connections to destination server (default: 8)
 	SourceRemovedTag   string        // Tag applied on destination when torrent is removed from source (empty to disable)
@@ -211,7 +211,7 @@ type DestinationConfig struct {
 	// Streaming tuning
 	StreamWorkers     int // Number of concurrent piece writers (0 = use default 8)
 	MaxStreamBufferMB int // Global memory budget in MB for buffered piece data (default: 512)
-	VerifyConcurrency int // Concurrent piece-read goroutines during finalize verification (0 = use default 4)
+	VerifyConcurrency int // Concurrent piece-read goroutines per read-back verification pass (0 = use default 4)
 
 	// QBFinalizeConcurrency is how many torrents may concurrently occupy the
 	// destination qB add/recheck stage (0 = default 1, max 8).
@@ -301,7 +301,7 @@ func SetupSourceFlags(cmd *cobra.Command) {
 	flags.Int(
 		"num-senders",
 		defaultNumSenders,
-		"Concurrent sender workers for streaming (increase for high-throughput links)",
+		"Minimum concurrent sender workers for streaming; the adaptive stream pool raises this",
 	)
 	flags.Int(
 		"min-connections",
@@ -387,7 +387,7 @@ func SetupDestinationFlags(cmd *cobra.Command) {
 	flags.Int(
 		"verify-concurrency",
 		0,
-		"Concurrent piece-read goroutines during finalize verification (0 = default 4, max 16). Raise on healthy storage to speed finalize; lower if your NFS server can't handle the burst.",
+		"Concurrent piece-read goroutines per read-back verification pass - at init, early finalization, and full finalization alike (0 = default 4, max 16). Raise on healthy storage to speed verification; lower if your NFS server can't handle the burst.",
 	)
 	addArrFlags(flags)
 }

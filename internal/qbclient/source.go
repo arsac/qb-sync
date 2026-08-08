@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/autobrr/go-qbittorrent"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/arsac/qb-sync/internal/metrics"
 	"github.com/arsac/qb-sync/internal/streaming"
@@ -22,6 +23,17 @@ import (
 )
 
 var _ streaming.PieceSource = (*Source)(nil)
+
+// fileIDProbeConcurrency bounds the parallel per-file identity probes in
+// buildFileInfos. Each probe is a single stat, so the caller is latency-bound
+// rather than CPU-bound and the width is chosen to hide NFS round-trip time -
+// the same reasoning as the destination's per-file setup fan-out.
+const fileIDProbeConcurrency = 32
+
+// fileIDProbe reports the device and inode currently backing a path.
+// [utils.GetFileID] in production; a parameter of buildFileInfos so a test can
+// observe how many probes are in flight at once.
+type fileIDProbe func(path string) (uint64, uint64, error)
 
 // fileHandleCache caches open file handles per torrent to avoid repeated
 // open/close syscalls on the source read path. [os.File.ReadAt] maps to pread(2)
@@ -109,8 +121,27 @@ func (c *fileHandleCache) evictPath(hash, path string) {
 
 // cachedMeta holds per-torrent cached metadata for ReadPiece.
 type cachedMeta struct {
-	files      []*pb.FileInfo
-	contentDir string // read directory for this torrent
+	files []*pb.FileInfo
+	// regions mirrors files with paths pre-joined against the torrent's content
+	// directory. ReadPiece runs once per piece (thousands of times per torrent),
+	// so building this per call cost a slice allocation plus one filepath.Join
+	// string allocation per file every time.
+	regions []utils.FileRegion
+}
+
+// newCachedMeta precomputes the per-piece read regions for a torrent. files
+// must be offset-sorted, which GetTorrentMetadata guarantees by assigning
+// offsets as a running sum over index-sorted qBittorrent files.
+func newCachedMeta(files []*pb.FileInfo, contentDir string) *cachedMeta {
+	regions := make([]utils.FileRegion, len(files))
+	for i, f := range files {
+		regions[i] = utils.FileRegion{
+			Path:   filepath.Join(contentDir, f.GetPath()),
+			Offset: f.GetOffset(),
+			Size:   f.GetSize(),
+		}
+	}
+	return &cachedMeta{files: files, regions: regions}
 }
 
 // Source implements streaming.PieceSource using qBittorrent API.
@@ -337,11 +368,29 @@ func (s *Source) GetPieceHashes(ctx context.Context, hash string) ([]string, err
 	return hashes, nil
 }
 
+// torrentGone reports whether err means source qB no longer has the torrent, as
+// opposed to being unreachable. Prefers the library's typed sentinel and falls
+// back to the status text for the methods that wrap a coarser sentinel, the
+// same classification [utils.IsBenignError] applies.
+func torrentGone(err error) bool {
+	if errors.Is(err, qbittorrent.ErrTorrentNotFound) {
+		return true
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "404") || strings.Contains(errStr, "not found")
+}
+
 // GetTorrentMetadata returns metadata needed for streaming.
+// Returns ErrTorrentNotFound if the torrent no longer exists (e.g. was deleted),
+// so callers on the send path can treat it as a removal instead of retrying a
+// read that can never succeed.
 // Uses resilient client with automatic retry for transient errors.
 func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streaming.TorrentMetadata, error) {
 	props, err := s.client.GetTorrentPropertiesCtx(ctx, hash)
 	if err != nil {
+		if torrentGone(err) {
+			return nil, fmt.Errorf("getting torrent properties: %w", streaming.ErrTorrentNotFound)
+		}
 		return nil, fmt.Errorf("getting torrent properties: %w", err)
 	}
 
@@ -352,7 +401,7 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 		return nil, fmt.Errorf("getting torrent info: %w", err)
 	}
 	if len(torrents) == 0 {
-		return nil, fmt.Errorf("torrent not found: %s", hash)
+		return nil, fmt.Errorf("%w: %s", streaming.ErrTorrentNotFound, hash)
 	}
 	torrent := torrents[0]
 
@@ -361,47 +410,16 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 		return nil, fmt.Errorf("getting torrent files: %w", err)
 	}
 
-	// Sort files by Index to ensure correct offset calculation.
-	// qBittorrent may return files in any order, but torrent piece data
-	// is laid out according to the file order in the .torrent metadata.
-	// Note: Using sort.Slice because TorrentFiles has anonymous struct elements.
-	sortedQBFiles := make(qbittorrent.TorrentFiles, len(*qbFiles))
-	copy(sortedQBFiles, *qbFiles)
-	sort.Slice(sortedQBFiles, func(i, j int) bool {
-		return sortedQBFiles[i].Index < sortedQBFiles[j].Index
-	})
+	sortedQBFiles := sortedByIndex(*qbFiles)
 
 	// Must happen after sorting so detectRootFolder sees files in stable order.
 	contentDir := s.resolveContentBase(torrent, sortedQBFiles)
 
-	files := make([]*pb.FileInfo, len(sortedQBFiles))
-	var offset int64
-	for i, f := range sortedQBFiles {
-		files[i] = &pb.FileInfo{
-			Path:     f.Name,
-			Size:     f.Size,
-			Offset:   offset,
-			Selected: f.Priority > 0,
-		}
+	files := buildFileInfos(sortedQBFiles, contentDir, utils.GetFileID)
 
-		filePath := filepath.Join(contentDir, f.Name)
-		if dev, ino, fileIDErr := utils.GetFileID(filePath); fileIDErr == nil {
-			files[i].Inode = ino
-			files[i].Device = dev
-		}
-
-		offset += f.Size
-	}
-
-	pieceSize := int64(props.PieceSize)
-	numPieces := props.PiecesNum
-	if numPieces == 0 && pieceSize > 0 {
-		numPieces = int((torrent.TotalSize + pieceSize - 1) / pieceSize)
-	}
-
-	// Validate piece count fits in int32 (protobuf field type)
-	if numPieces > math.MaxInt32 {
-		return nil, fmt.Errorf("piece count %d exceeds maximum supported value", numPieces)
+	pieceSize, numPieces, err := pieceGeometry(props, torrent.TotalSize)
+	if err != nil {
+		return nil, err
 	}
 
 	torrentFile, err := s.client.ExportTorrentCtx(ctx, hash)
@@ -420,7 +438,7 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 			Name:        torrent.Name,
 			PieceSize:   pieceSize,
 			TotalSize:   torrent.TotalSize,
-			NumPieces:   int32(numPieces),
+			NumPieces:   numPieces,
 			Files:       files,
 			TorrentFile: torrentFile,
 			PieceHashes: pieceHashes,
@@ -428,6 +446,75 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 		},
 		ContentDir: contentDir,
 	}, nil
+}
+
+// pieceGeometry reports the torrent's piece size and piece count, deriving the
+// count from the total size when qBittorrent does not report one, and rejecting
+// a count that would not survive the int32 the protobuf carries it in.
+func pieceGeometry(props qbittorrent.TorrentProperties, totalSize int64) (int64, int32, error) {
+	pieceSize := int64(props.PieceSize)
+	numPieces := props.PiecesNum
+	if numPieces == 0 && pieceSize > 0 {
+		numPieces = int((totalSize + pieceSize - 1) / pieceSize)
+	}
+	if numPieces > math.MaxInt32 {
+		return 0, 0, fmt.Errorf("piece count %d exceeds maximum supported value", numPieces)
+	}
+	return pieceSize, int32(numPieces), nil
+}
+
+// sortedByIndex returns a copy of qbFiles ordered by file index. qBittorrent may
+// return files in any order, but torrent piece data is laid out in index order,
+// so the offsets assigned in buildFileInfos are only correct on a sorted list.
+// Note: [sort.Slice] because TorrentFiles has anonymous struct elements.
+func sortedByIndex(qbFiles qbittorrent.TorrentFiles) qbittorrent.TorrentFiles {
+	sorted := make(qbittorrent.TorrentFiles, len(qbFiles))
+	copy(sorted, qbFiles)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Index < sorted[j].Index
+	})
+	return sorted
+}
+
+// buildFileInfos assigns each file its byte offset in the torrent and stamps it
+// with the identity of the file currently occupying its path, which is what lets
+// the destination hardlink content it already holds instead of streaming it.
+//
+// The identity probes fan out because each is an independent stat - an NFS
+// LOOKUP round-trip on an exported content directory - and nothing here depends
+// on another file's answer. This runs on the torrent-init path ahead of the
+// first streamed piece and again on the sender's ENOENT metadata refresh, so in
+// series a many-file torrent paid one round-trip per file at both.
+//
+// Probing stays best-effort: a file that cannot be stat'd keeps a zero
+// inode/device and is simply not hardlink-eligible, exactly as before.
+func buildFileInfos(qbFiles qbittorrent.TorrentFiles, contentDir string, probe fileIDProbe) []*pb.FileInfo {
+	files := make([]*pb.FileInfo, len(qbFiles))
+	var offset int64
+	for i, f := range qbFiles {
+		files[i] = &pb.FileInfo{
+			Path:     f.Name,
+			Size:     f.Size,
+			Offset:   offset,
+			Selected: f.Priority > 0,
+		}
+		offset += f.Size
+	}
+
+	g := new(errgroup.Group)
+	g.SetLimit(fileIDProbeConcurrency)
+	for i, f := range qbFiles {
+		g.Go(func() error {
+			if dev, ino, fileIDErr := probe(filepath.Join(contentDir, f.Name)); fileIDErr == nil {
+				files[i].Device = dev
+				files[i].Inode = ino
+			}
+			return nil
+		})
+	}
+	_ = g.Wait()
+
+	return files
 }
 
 // ReadPiece reads a piece's data from disk.
@@ -445,7 +532,7 @@ func (s *Source) ReadPiece(ctx context.Context, piece *pb.Piece) ([]byte, error)
 	readStart := time.Now()
 	defer func() { metrics.PieceReadDuration.Observe(time.Since(readStart).Seconds()) }()
 
-	data, readErr := s.readPieceMultiFile(hash, cached.contentDir, cached.files, piece.GetOffset(), piece.GetSize())
+	data, readErr := s.readPieceMultiFile(hash, cached, piece.GetOffset(), piece.GetSize())
 	if readErr == nil || !errors.Is(readErr, os.ErrNotExist) {
 		return data, readErr
 	}
@@ -461,7 +548,7 @@ func (s *Source) ReadPiece(ctx context.Context, piece *pb.Piece) ([]byte, error)
 	if err != nil {
 		return nil, err
 	}
-	return s.readPieceMultiFile(hash, cached.contentDir, cached.files, piece.GetOffset(), piece.GetSize())
+	return s.readPieceMultiFile(hash, cached, piece.GetOffset(), piece.GetSize())
 }
 
 // cachedTorrentMeta returns the cached metadata for a torrent, fetching on first access.
@@ -478,10 +565,7 @@ func (s *Source) cachedTorrentMeta(ctx context.Context, hash string) (*cachedMet
 		return nil, err
 	}
 
-	cm := &cachedMeta{
-		files:      meta.GetFiles(),
-		contentDir: meta.ContentDir,
-	}
+	cm := newCachedMeta(meta.GetFiles(), meta.ContentDir)
 	s.fileCache.Store(hash, cm)
 	return cm, nil
 }
@@ -522,111 +606,24 @@ func (s *Source) readChunkIntoCached(hash, path string, offset int64, buf []byte
 	return nil
 }
 
-// readPieceFromRegions reads piece data spanning multiple files using cached
-// handles. Allocates a single pieceSize buffer and reads each region's
-// contribution directly into the appropriate slice.
-func (s *Source) readPieceFromRegions(
-	hash string,
-	regions []utils.FileRegion,
-	pieceOffset, pieceSize int64,
-) ([]byte, error) {
-	buf := make([]byte, pieceSize)
-	written := int64(0)
-	currentOffset := pieceOffset
-
-	for _, region := range regions {
-		if written >= pieceSize {
-			break
-		}
-
-		fileEnd := region.Offset + region.Size
-		if fileEnd <= currentOffset {
-			continue
-		}
-
-		fileReadOffset := max(currentOffset-region.Offset, 0)
-		availableInFile := region.Size - fileReadOffset
-		toRead := min(pieceSize-written, availableInFile)
-
-		if err := s.readChunkIntoCached(hash, region.Path, fileReadOffset, buf[written:written+toRead]); err != nil {
-			return nil, fmt.Errorf("reading from %s at offset %d: %w", region.Path, fileReadOffset, err)
-		}
-
-		written += toRead
-		currentOffset += toRead
-	}
-
-	if written < pieceSize {
-		return nil, fmt.Errorf("short read: got %d bytes, want %d", written, pieceSize)
-	}
-	return buf, nil
-}
-
-func (s *Source) readPieceMultiFile(
-	hash string,
-	basePath string,
-	files []*pb.FileInfo,
-	offset, size int64,
-) ([]byte, error) {
-	// Check if any deselected file overlaps this piece range.
-	pieceEnd := offset + size
-	hasDeselected := false
-	for _, f := range files {
-		if !f.GetSelected() {
-			fEnd := f.GetOffset() + f.GetSize()
-			if f.GetOffset() < pieceEnd && fEnd > offset {
-				hasDeselected = true
-				break
+func (s *Source) readPieceMultiFile(hash string, cm *cachedMeta, offset, size int64) ([]byte, error) {
+	data := make([]byte, size) // zero-initialized; deselected regions stay zero
+	err := utils.WalkPieceRegions(cm.regions, utils.RegionSpan, offset, data,
+		func(i int, region utils.FileRegion, fileOffset int64, dst []byte) error {
+			if !cm.files[i].GetSelected() {
+				// The file doesn't exist on disk - qBittorrent doesn't create
+				// files with priority 0 - so leave the region zero-filled. The
+				// destination's writePieceData skips deselected files, so only
+				// the selected data (which IS correct here) gets written.
+				return nil
 			}
-		}
-	}
-
-	if !hasDeselected {
-		// Fast path: all overlapping files are selected.
-		regions := make([]utils.FileRegion, len(files))
-		for i, f := range files {
-			regions[i] = utils.FileRegion{
-				Path:   filepath.Join(basePath, f.GetPath()),
-				Offset: f.GetOffset(),
-				Size:   f.GetSize(),
+			if chunkErr := s.readChunkIntoCached(hash, region.Path, fileOffset, dst); chunkErr != nil {
+				return fmt.Errorf("reading from %s at offset %d: %w", region.Path, fileOffset, chunkErr)
 			}
-		}
-		return s.readPieceFromRegions(hash, regions, offset, size)
+			return nil
+		})
+	if err != nil {
+		return nil, err
 	}
-
-	// Boundary piece overlapping a deselected file.
-	// Zero-fill deselected regions — the file doesn't exist on disk because
-	// qBittorrent doesn't create files with priority 0.
-	// Destination's writePieceData skips deselected files, so only the selected
-	// file data (which IS correct here) gets written.
-	data := make([]byte, size) // zero-initialized
-	remaining := size
-	currentOffset := offset
-	for _, f := range files {
-		if remaining <= 0 {
-			break
-		}
-		fEnd := f.GetOffset() + f.GetSize()
-		if fEnd <= currentOffset {
-			continue
-		}
-		fileReadOffset := max(currentOffset-f.GetOffset(), 0)
-		availableInFile := f.GetSize() - fileReadOffset
-		toRead := min(remaining, availableInFile)
-
-		if f.GetSelected() {
-			path := filepath.Join(basePath, f.GetPath())
-			dataOffset := currentOffset - offset
-			dst := data[dataOffset : dataOffset+toRead]
-			if chunkErr := s.readChunkIntoCached(hash, path, fileReadOffset, dst); chunkErr != nil {
-				return nil, fmt.Errorf("reading from %s at offset %d: %w", path, fileReadOffset, chunkErr)
-			}
-		}
-		// Deselected: zeros remain in place
-
-		remaining -= toRead
-		currentOffset += toRead
-	}
-
 	return data, nil
 }

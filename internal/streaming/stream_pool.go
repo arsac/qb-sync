@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
-	"runtime/debug"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -39,6 +38,7 @@ const (
 	defaultPlateauThreshold   = 0.03             // <3% change considered plateau
 	defaultPlateauCount       = 3                // Consecutive plateaus before stopping
 	scalingCooldownPeriod     = 30 * time.Second // Cooldown before resuming scaling (was 2min)
+	probeSettleIntervals      = 2                // Measurement intervals a capacity add gets to prove itself
 
 	// streamDrainTimeout is how long drainAndRemoveStream waits for in-flight
 	// pieces to complete before closing the stream anyway.
@@ -69,7 +69,7 @@ type PooledStream struct {
 
 	// Graceful drain lifecycle
 	draining atomic.Bool // Set true to stop sending new pieces; stream drains in-flight
-	removed  atomic.Bool // Set true when fully drained; forwardAcks exits silently
+	removed  atomic.Bool // Set true when fully drained; its receive loop then ends silently
 
 	// Stats - atomic for lock-free reads
 	bytesSent  atomic.Int64
@@ -97,9 +97,17 @@ type StreamPool struct {
 	// Aggregated channels from all streams. Each ack carries the source
 	// stream so the consumer can update the right window without an external
 	// piece-to-stream lookup.
-	acks     chan AckEnvelope
-	ackReady chan struct{}
-	errs     chan error // Aggregated errors from all streams
+	acks chan AckEnvelope
+	errs chan error // Aggregated errors from all streams
+
+	// capacityWait is closed and replaced every time the pool may have gained
+	// room for another piece. It has its own mutex so publishing never touches
+	// the stream-slice lock, which addStreamLocked already holds.
+	capacityMu   sync.Mutex
+	capacityWait chan struct{}
+
+	// Test-overridable ack delivery timeout. Zero means the package const.
+	ackDeliveryTimeoutOverride time.Duration
 
 	// Adaptive scaling state (protected by mu)
 	adaptive          bool // Whether adaptive scaling is enabled
@@ -108,14 +116,10 @@ type StreamPool struct {
 	lastBytesSent     int64   // Total bytes at last measurement
 	removedBytesSent  int64   // Cumulative bytes from removed streams
 	lastMeasureTime   time.Time
-	plateauCount      int       // Consecutive intervals with <5% change
-	scalingPaused     bool      // Stop scaling after saturation detected
-	scalingPausedTime time.Time // When scaling was paused (for cooldown)
-
-	// Connection-level scaling state (protected by mu)
-	preConnectionThroughput     float64   // Throughput before last connection add
-	connectionAddedTime         time.Time // When last connection was added
-	connectionScaleCheckPending bool      // Awaiting diminishing returns check
+	plateauCount      int         // Consecutive intervals with <5% change
+	scalingPaused     bool        // Stop scaling after saturation detected
+	scalingPausedTime time.Time   // When scaling was paused (for cooldown)
+	probe             *scaleProbe // Capacity unit on trial, nil when none
 
 	// Lifecycle
 	ctx       context.Context
@@ -125,12 +129,33 @@ type StreamPool struct {
 	closeOnce sync.Once
 }
 
-// StreamPoolConfig configures the stream pool.
-type StreamPoolConfig struct {
-	// NumStreams is the initial number of streams (default: 2 if adaptive, 4 otherwise).
-	// Renamed from PoolSize for consistency with BidiQueueConfig.
-	NumStreams int
+// scaleUnit names the kind of capacity a probe added.
+type scaleUnit string
 
+const (
+	unitStream     scaleUnit = "stream"
+	unitConnection scaleUnit = "connection"
+)
+
+// scaleProbe records a capacity unit added on trial. Every add - a stream or a
+// TCP connection - is a probe: the pool keeps the unit only if the throughput
+// measured probeSettleIntervals later beats the throughput measured just before
+// the add, and undoes it otherwise.
+//
+// Without that check an add is a ratchet rather than a decision. The pool adds
+// a stream on any interval measuring more than +5% but only sheds one below
+// -15%, so on a noisy link the asymmetry alone walks the pool to maxStreams
+// whatever the added streams actually carry.
+type scaleProbe struct {
+	unit     scaleUnit
+	baseline float64   // Throughput measured immediately before the add
+	addedAt  time.Time // When the unit was added
+}
+
+// StreamPoolConfig configures the stream pool. The initial stream count is not
+// part of it: [StreamPool.Open] takes that argument directly, so the pool has
+// exactly one place it can come from.
+type StreamPoolConfig struct {
 	// MaxNumStreams is the maximum streams for adaptive scaling (default: 16).
 	// Renamed from MaxPoolSize for consistency with BidiQueueConfig.
 	MaxNumStreams int
@@ -152,7 +177,6 @@ type StreamPoolConfig struct {
 // DefaultStreamPoolConfig returns sensible defaults with adaptive scaling enabled.
 func DefaultStreamPoolConfig() StreamPoolConfig {
 	return StreamPoolConfig{
-		NumStreams:     MinPoolSize, // Start small with adaptive
 		MaxNumStreams:  MaxPoolSize,
 		AckChannelSize: DefaultAckChannelSize,
 		AdaptiveWindow: congestion.DefaultConfig(),
@@ -191,8 +215,8 @@ func NewStreamPool(
 		maxStreams:    maxStreams,
 		streams:       make([]*PooledStream, 0, maxStreams),
 		acks:          make(chan AckEnvelope, ackChannelSize*maxStreams),
-		ackReady:      make(chan struct{}, maxStreams),
 		errs:          make(chan error, maxStreams), // Aggregated error channel
+		capacityWait:  make(chan struct{}),
 		adaptive:      config.Adaptive,
 		scaleInterval: scaleInterval,
 	}
@@ -241,114 +265,110 @@ func (p *StreamPool) Open(ctx context.Context, numStreams int) error {
 	return nil
 }
 
-// forwardAcks reads acks from a single stream and forwards them to the pool's
-// aggregated channels. Also forwards errors from the stream.
-func (p *StreamPool) forwardAcks(ps *PooledStream) { //nolint:gocognit // complexity from panic recovery
-	defer p.wg.Done()
-	defer func() {
-		if r := recover(); r != nil {
-			p.logger.Error("panic in forwardAcks",
-				"streamID", ps.id,
-				"panic", r,
-				"stack", string(debug.Stack()),
-			)
-			select {
-			case p.errs <- fmt.Errorf("panic in forwardAcks (stream %d): %v", ps.id, r):
-			default:
-			}
-		}
-	}()
+// poolAckSink routes one stream's receive loop into the pool's aggregated
+// channels. It owns the delivery timer so the per-ack path allocates nothing.
+type poolAckSink struct {
+	p     *StreamPool
+	ps    *PooledStream
+	timer *time.Timer
+}
 
-	for {
-		select {
-		case <-p.ctx.Done():
-			return
+// newPoolAckSink builds the sink for one stream. The timer starts stopped and
+// is reset per delivery.
+func newPoolAckSink(p *StreamPool, ps *PooledStream) *poolAckSink {
+	timer := time.NewTimer(p.ackDeliveryTimeout())
+	timer.Stop()
+	return &poolAckSink{p: p, ps: ps, timer: timer}
+}
 
-		case <-ps.stream.Done():
-			// Intentionally removed stream — exit silently without error.
-			if ps.removed.Load() {
-				return
-			}
+// deliverAck forwards an ack to the pool's aggregated channel, paired with its
+// source stream so processAck can update the right congestion window without a
+// separate piece-to-stream map.
+//
+// Returning false stops the stream's receive loop. That is the intended
+// response to an ack processor that has stopped draining: blocking here would
+// leave nobody calling Recv, so stream death could never be detected and a
+// Send stuck on HTTP/2 flow control would never be unblocked. ctx is the
+// stream's own context, so closing a drained stream also releases a delivery
+// waiting on a full channel instead of parking it for the whole timeout.
+func (s *poolAckSink) deliverAck(ctx context.Context, ack *pb.PieceAck) bool {
+	timeout := s.p.ackDeliveryTimeout()
+	s.timer.Reset(timeout)
 
-			// Stream ended. Drain any pending error so it gets forwarded
-			// to the pool. Without this, a select race between Done() and
-			// Errors() can silently drop the stream error, leaving the
-			// ack processor unaware that the stream died.
-			select {
-			case err := <-ps.stream.Errors():
-				select {
-				case p.errs <- err:
-				default:
-					p.logger.WarnContext(p.ctx, "error channel full, dropping error on stream close",
-						"streamID", ps.id,
-						"error", err,
-					)
-				}
-			default:
-				// Stream closed without an explicit error (e.g., send timeout
-				// cancelled context). Notify pool so ack processor can trigger
-				// reconnection. Skip during clean shutdown (pool.Close cancels p.ctx).
-				if p.ctx.Err() == nil {
-					select {
-					case p.errs <- fmt.Errorf("stream %d closed unexpectedly", ps.id):
-					case <-p.ctx.Done():
-						// Pool closing between the check and send — no need to report.
-					default:
-						p.logger.WarnContext(
-							p.ctx,
-							"error channel full, dropping synthetic error on silent stream close",
-							"streamID",
-							ps.id,
-						)
-					}
-				}
-			}
-			return
+	select {
+	case s.p.acks <- AckEnvelope{Ack: ack, Stream: s.ps}:
+		// In Go 1.23+, Stop guarantees the channel is drained.
+		s.timer.Stop()
+		return true
 
-		case err, ok := <-ps.stream.Errors():
-			if !ok {
-				continue
-			}
-			// Forward error to aggregated error channel (non-blocking)
-			select {
-			case p.errs <- err:
-			default:
-				// Error channel full, log and continue
-				p.logger.WarnContext(p.ctx, "error channel full, dropping error",
-					"streamID", ps.id,
-					"error", err,
-				)
-			}
+	case <-ctx.Done():
+		metrics.ReceiveAcksExitTotal.WithLabelValues(metrics.ReasonContextCancel).Inc()
+		return false
 
-		case ack, ok := <-ps.stream.Acks():
-			if !ok {
-				return
-			}
+	case <-s.p.ctx.Done():
+		metrics.ReceiveAcksExitTotal.WithLabelValues(metrics.ReasonContextCancel).Inc()
+		return false
 
-			// Forward to pool's aggregated ack channel (blocking with context).
-			// Pair the ack with its source stream so processAck can update the
-			// right window without a separate piece-to-stream map.
-			select {
-			case p.acks <- AckEnvelope{Ack: ack, Stream: ps}:
-				// Signal that an ack is ready (non-blocking)
-				select {
-				case p.ackReady <- struct{}{}:
-				default:
-				}
-			case <-p.ctx.Done():
-				return
-			}
-		}
+	case <-s.timer.C:
+		metrics.ReceiveAcksExitTotal.WithLabelValues(metrics.ReasonAckChannelBlocked).Inc()
+		metrics.AckChannelBlockedTotal.Inc()
+		s.p.logger.WarnContext(s.p.ctx, "ack channel blocked, closing stream",
+			"streamID", s.ps.id,
+			"timeout", timeout,
+		)
+		return false
 	}
 }
 
-// addStreamLocked adds a new stream to the pool. Must hold p.mu write lock.
+// streamEnded publishes the reason a stream's receive loop exited so the ack
+// processor can tear the pool down and reconnect. err is nil when the stream
+// ended without reporting one - a clean EOF, or a context cancelled by the
+// send timeout - and a silent death still has to reach the processor, so it
+// gets a synthetic error. The two cases that are not failures are a stream
+// this pool deliberately drained out and a pool that is shutting down.
+func (s *poolAckSink) streamEnded(err error) {
+	if s.ps.removed.Load() {
+		return
+	}
+	if err == nil {
+		if s.p.ctx.Err() != nil {
+			return
+		}
+		err = fmt.Errorf("stream %d closed unexpectedly", s.ps.id)
+	}
+
+	select {
+	case s.p.errs <- err:
+	default:
+		s.p.logger.WarnContext(s.p.ctx, "error channel full, dropping stream error",
+			"streamID", s.ps.id,
+			"error", err,
+		)
+	}
+}
+
+// ackDeliveryTimeout is how long deliverAck waits for the aggregated ack
+// channel before declaring the stream stuck. Zero means the package default.
+func (p *StreamPool) ackDeliveryTimeout() time.Duration {
+	if p.ackDeliveryTimeoutOverride > 0 {
+		return p.ackDeliveryTimeoutOverride
+	}
+	return ackDeliverTimeout
+}
+
+// addStreamLocked adds a new stream to the pool on the destination's next
+// round-robin connection. Must hold p.mu write lock.
 func (p *StreamPool) addStreamLocked() error {
+	return p.addStreamOnLocked(p.dest.streamConnIdx())
+}
+
+// addStreamOnLocked adds a new stream pinned to connIdx. Must hold p.mu write lock.
+func (p *StreamPool) addStreamOnLocked(connIdx int) error {
 	if len(p.streams) >= p.maxStreams {
 		return errors.New("pool at maximum capacity")
 	}
 
-	stream, err := p.dest.OpenStream(p.ctx, p.logger)
+	stream, err := p.dest.OpenStreamOn(p.ctx, p.logger, connIdx)
 	if err != nil {
 		return fmt.Errorf("opening stream: %w", err)
 	}
@@ -362,9 +382,15 @@ func (p *StreamPool) addStreamLocked() error {
 	p.nextID++
 	p.streams = append(p.streams, ps)
 
-	// Start ack forwarder for this stream
-	p.wg.Add(1)
-	go p.forwardAcks(ps)
+	// Start this stream's ack receive loop, which delivers straight into the
+	// pool's aggregated channels.
+	p.wg.Go(func() {
+		stream.receiveAcks(newPoolAckSink(p, ps))
+	})
+
+	// A fresh stream arrives with an empty window, so senders parked because
+	// every existing stream was full can proceed straight away.
+	p.publishCapacity()
 
 	return nil
 }
@@ -428,13 +454,19 @@ func (p *StreamPool) updateThroughput() {
 		return
 	}
 
+	// The previous interval's throughput is the baseline every scaling decision
+	// compares against, so it has to be read out before the gauge update below
+	// overwrites it - otherwise the measured change is always exactly zero and
+	// the pool can only ever see a plateau.
+	previousThroughput := p.lastThroughput
+
 	// Always update throughput gauge
 	p.lastThroughput = currentThroughput
 	metrics.TransferThroughputBytesPerSecond.Set(currentThroughput)
 
 	// Only make scaling decisions if adaptive
 	if p.adaptive && !p.isInCooldown() {
-		p.applyScalingDecision(currentThroughput)
+		p.applyScalingDecision(currentThroughput, previousThroughput)
 	}
 }
 
@@ -490,41 +522,27 @@ func (p *StreamPool) measureThroughput() (float64, bool) {
 	return currentThroughput, true
 }
 
-// applyScalingDecision applies scaling logic based on throughput change.
+// applyScalingDecision applies scaling logic based on the change from
+// previousThroughput to currentThroughput, both in bytes/sec.
 // Must hold p.mu.
-func (p *StreamPool) applyScalingDecision(currentThroughput float64) {
-	// Check diminishing returns from recent connection add
-	if p.connectionScaleCheckPending && time.Since(p.connectionAddedTime) >= 2*p.scaleInterval {
-		p.connectionScaleCheckPending = false
-		var improvement float64
-		if p.preConnectionThroughput > 0 {
-			improvement = (currentThroughput - p.preConnectionThroughput) / p.preConnectionThroughput
-		}
-		if improvement < defaultScaleUpThreshold {
-			p.logger.InfoContext(p.ctx, "diminishing returns from connection add",
-				"improvementPercent", improvement*percentMultiple,
-				"connections", p.dest.ConnectionCount(),
-			)
-			p.tryConnectionScaleDown()
-			p.pauseScaling("diminishing returns")
-			return
-		}
-		p.logger.InfoContext(p.ctx, "connection add effective",
-			"improvementPercent", improvement*percentMultiple,
-			"connections", p.dest.ConnectionCount(),
-		)
+func (p *StreamPool) applyScalingDecision(currentThroughput, previousThroughput float64) {
+	// A capacity unit on trial owns the pool until its verdict lands: a second
+	// add in the meantime would be measured as part of the first one's payoff.
+	if p.probe != nil {
+		p.evaluateProbe(currentThroughput)
+		return
 	}
 
 	var changeRatio float64
-	if p.lastThroughput > 0 {
-		changeRatio = (currentThroughput - p.lastThroughput) / p.lastThroughput
+	if previousThroughput > 0 {
+		changeRatio = (currentThroughput - previousThroughput) / previousThroughput
 	}
 
 	streamCount := len(p.streams)
 
 	p.logger.DebugContext(p.ctx, "adaptive scaling check",
 		"throughputMBps", currentThroughput/grpcutil.BytesPerMB,
-		"lastThroughputMBps", p.lastThroughput/grpcutil.BytesPerMB,
+		"lastThroughputMBps", previousThroughput/grpcutil.BytesPerMB,
 		"changePercent", changeRatio*percentMultiple,
 		"streams", streamCount,
 		"plateauCount", p.plateauCount,
@@ -532,7 +550,7 @@ func (p *StreamPool) applyScalingDecision(currentThroughput float64) {
 
 	switch {
 	case changeRatio > defaultScaleUpThreshold && streamCount < p.maxStreams:
-		p.tryScaleUp()
+		p.probeStream(currentThroughput)
 
 	case changeRatio < -defaultScaleDownThreshold && streamCount > MinPoolSize:
 		p.tryScaleDown()
@@ -546,19 +564,137 @@ func (p *StreamPool) applyScalingDecision(currentThroughput float64) {
 	}
 }
 
-// tryScaleUp attempts to add a stream. Must hold p.mu.
-func (p *StreamPool) tryScaleUp() {
+// evaluateProbe decides the fate of the capacity unit currently on trial, once
+// it has had probeSettleIntervals to show up in a measurement. A unit that beat
+// its baseline earns another of the same kind - the staircase - and one that did
+// not is removed again. Must hold p.mu.
+func (p *StreamPool) evaluateProbe(currentThroughput float64) {
+	probe := p.probe
+	if time.Since(probe.addedAt) < probeSettleIntervals*p.scaleInterval {
+		return
+	}
+	p.probe = nil
+
+	var improvement float64
+	if probe.baseline > 0 {
+		improvement = (currentThroughput - probe.baseline) / probe.baseline
+	}
+
+	if improvement < defaultScaleUpThreshold {
+		p.logger.InfoContext(p.ctx, "diminishing returns from capacity add",
+			"unit", string(probe.unit),
+			"improvementPercent", improvement*percentMultiple,
+			"streams", len(p.streams),
+			"connections", p.dest.ConnectionCount(),
+		)
+		p.undoProbe(probe.unit)
+		p.pauseScaling("diminishing returns")
+		return
+	}
+
+	p.logger.InfoContext(p.ctx, "capacity add effective",
+		"unit", string(probe.unit),
+		"improvementPercent", improvement*percentMultiple,
+		"streams", len(p.streams),
+		"connections", p.dest.ConnectionCount(),
+	)
+
+	switch probe.unit {
+	case unitStream:
+		p.probeStream(currentThroughput)
+	case unitConnection:
+		p.probeConnection(currentThroughput)
+	}
+}
+
+// undoProbe gives back a capacity unit of the kind the probe added. It sheds
+// the pool's last such unit rather than the exact one, since a stream can die
+// on its own while its probe is pending; the counts are what the next
+// measurement reflects either way, and both floors still apply.
+// Must hold p.mu.
+func (p *StreamPool) undoProbe(unit scaleUnit) {
+	switch unit {
+	case unitStream:
+		if err := p.removeStreamLocked(); err != nil {
+			p.logger.WarnContext(p.ctx, "failed to remove probed stream", "error", err)
+		}
+	case unitConnection:
+		p.tryConnectionScaleDown()
+	}
+}
+
+// probeStream adds a stream on trial, with currentThroughput as its baseline.
+// A pool already at maxStreams simply ends the climb: nothing is armed, so the
+// next measurement scales normally. Must hold p.mu.
+//
+// The publishCapacity inside addStreamLocked is what makes the trial fair: the
+// sender pool runs one worker per stream, so the added stream wakes the sender
+// that was parked for want of one and starts carrying pieces before the verdict.
+func (p *StreamPool) probeStream(currentThroughput float64) {
+	if len(p.streams) >= p.maxStreams {
+		return
+	}
 	if err := p.addStreamLocked(); err != nil {
 		metrics.StreamOpenErrorsTotal.WithLabelValues(metrics.ModeSource).Inc()
 		p.logger.WarnContext(p.ctx, "failed to add stream", "error", err)
 		return
 	}
+	p.probe = &scaleProbe{unit: unitStream, baseline: currentThroughput, addedAt: time.Now()}
 	metrics.StreamPoolSize.Set(float64(len(p.streams)))
 	p.logger.InfoContext(p.ctx, "scaled up",
 		"streams", len(p.streams),
 		"reason", "throughput increased",
 	)
 	p.plateauCount = 0
+}
+
+// probeConnection adds a TCP connection on trial, with currentThroughput as its
+// baseline, and reports whether one was added. Must hold p.mu.
+//
+// The connection is added together with a stream pinned to it. Existing streams
+// keep the connection they were opened on, so a bare connection carries no
+// traffic at all and the probe would measure a flat interval and always undo
+// itself. That also makes the stream ceiling a precondition: with no room for a
+// stream there is nothing to drive the connection, so no probe is armed.
+func (p *StreamPool) probeConnection(currentThroughput float64) bool {
+	if p.dest.ConnectionCount() >= p.dest.MaxConnections() {
+		return false
+	}
+	if len(p.streams) >= p.maxStreams {
+		p.logger.InfoContext(p.ctx, "skipping connection add, no stream slot to drive it",
+			"streams", len(p.streams),
+			"maxStreams", p.maxStreams,
+		)
+		return false
+	}
+
+	connIdx, err := p.dest.AddConnection()
+	if err != nil {
+		p.logger.WarnContext(p.ctx, "failed to add connection", "error", err)
+		return false
+	}
+	if streamErr := p.addStreamOnLocked(connIdx); streamErr != nil {
+		metrics.StreamOpenErrorsTotal.WithLabelValues(metrics.ModeSource).Inc()
+		p.logger.WarnContext(p.ctx, "failed to open stream on new connection, reverting",
+			"error", streamErr,
+		)
+		if removeErr := p.dest.RemoveConnection(connIdx); removeErr != nil {
+			p.logger.WarnContext(p.ctx, "failed to remove unused connection", "error", removeErr)
+		}
+		return false
+	}
+	p.probe = &scaleProbe{unit: unitConnection, baseline: currentThroughput, addedAt: time.Now()}
+
+	connCount := p.dest.ConnectionCount()
+	metrics.GRPCConnectionsActive.Set(float64(connCount))
+	metrics.ConnectionScaleEventsTotal.WithLabelValues(metrics.DirectionUp).Inc()
+	metrics.StreamPoolSize.Set(float64(len(p.streams)))
+	p.logger.InfoContext(p.ctx, "added TCP connection",
+		"connections", connCount,
+		"streams", len(p.streams),
+		"throughputMBps", currentThroughput/grpcutil.BytesPerMB,
+	)
+	return true
 }
 
 // tryScaleDown attempts to remove a stream. If streams are at minimum,
@@ -591,26 +727,15 @@ func (p *StreamPool) handlePlateau(currentThroughput float64) {
 		return
 	}
 
-	// Try connection-level scaling before giving up
+	// Try connection-level scaling before giving up. probeConnection re-checks
+	// the ceiling, but it reports only a bool, so the caller has to know which
+	// side of the ceiling it is on to pick the right pause reason.
 	if p.dest.ConnectionCount() < p.dest.MaxConnections() {
-		if err := p.dest.AddConnection(); err != nil {
-			p.logger.WarnContext(p.ctx, "failed to add connection", "error", err)
+		if !p.probeConnection(currentThroughput) {
 			p.pauseScaling("connection add failed")
 			return
 		}
-
-		p.preConnectionThroughput = currentThroughput
-		p.connectionAddedTime = time.Now()
-		p.connectionScaleCheckPending = true
 		p.plateauCount = 0 // Resume stream scaling on new baseline
-
-		connCount := p.dest.ConnectionCount()
-		metrics.GRPCConnectionsActive.Set(float64(connCount))
-		metrics.ConnectionScaleEventsTotal.WithLabelValues(metrics.DirectionUp).Inc()
-		p.logger.InfoContext(p.ctx, "added TCP connection",
-			"connections", connCount,
-			"throughputMBps", currentThroughput/grpcutil.BytesPerMB,
-		)
 		return
 	}
 
@@ -685,18 +810,32 @@ func (p *StreamPool) removeConnectionStreams(connIdx int) {
 	)
 }
 
-// removeStreamLocked initiates graceful drain of the last stream. Must hold p.mu write lock.
-// The stream stays in the slice during drain (so forwardAcks keeps running and acks flow back)
-// but findLeastLoadedStream skips it. drainAndRemoveStream removes it after drain completes.
+// removeStreamLocked initiates graceful drain of the last stream still carrying
+// traffic. Must hold p.mu write lock. The stream stays in the slice during drain
+// (so its receive loop keeps acks flowing back) but findLeastLoadedStream skips
+// it. drainAndRemoveStream removes it after drain completes.
+//
+// Both the capacity check and the pick skip streams already draining: a drain
+// runs up to streamDrainTimeout, the same order as the cooldown between
+// scale-downs, so counting departing streams would let the usable pool fall
+// under MinPoolSize, and taking the last slot outright would re-target the very
+// stream already on its way out.
 func (p *StreamPool) removeStreamLocked() error {
-	if len(p.streams) <= MinPoolSize {
+	var ps *PooledStream
+	active := 0
+	for _, s := range p.streams {
+		if s.draining.Load() {
+			continue
+		}
+		active++
+		ps = s
+	}
+
+	if active <= MinPoolSize {
 		return errors.New("pool at minimum capacity")
 	}
 
-	lastIdx := len(p.streams) - 1
-	ps := p.streams[lastIdx]
-
-	// Mark as draining before spawning goroutine so SelectStream() skips it
+	// Mark as draining before spawning goroutine so ClaimStream() skips it
 	// immediately when p.mu is released, avoiding a scheduling race.
 	ps.draining.Store(true)
 
@@ -710,6 +849,13 @@ func (p *StreamPool) removeStreamLocked() error {
 
 // drainAndRemoveStream gracefully drains a stream's in-flight pieces, then removes it from the pool.
 // Called as a goroutine by removeStreamLocked and removeConnectionStreams.
+//
+// Idempotent per stream: connection-level scale-down drains every stream on a
+// connection whether or not a stream-level scale-down is already draining one of
+// them, so the same PooledStream can reach here twice. The removed flag claims
+// the retirement exactly once because the bytesSent hand-off below feeds the
+// throughput baseline every scaling decision compares against - counting a
+// departing stream's bytes twice reads as a throughput spike.
 func (p *StreamPool) drainAndRemoveStream(ps *PooledStream) {
 	ps.draining.Store(true) // Idempotent — callers pre-set this under p.mu
 
@@ -736,7 +882,10 @@ func (p *StreamPool) drainAndRemoveStream(ps *PooledStream) {
 
 remove:
 	p.mu.Lock()
-	ps.removed.Store(true)
+	if !ps.removed.CompareAndSwap(false, true) {
+		p.mu.Unlock()
+		return // A concurrent drain already retired this stream.
+	}
 	for i, s := range p.streams {
 		if s == ps {
 			p.streams = append(p.streams[:i], p.streams[i+1:]...)
@@ -759,10 +908,21 @@ func (p *StreamPool) getTotalBytesSentLocked() int64 {
 	return total
 }
 
-// SelectStream returns the best stream for sending a piece.
-// Uses least-loaded selection (fewest in-flight pieces).
-// If no stream can send, returns the least-loaded stream for waiting.
-func (p *StreamPool) SelectStream() (*PooledStream, error) {
+// ClaimStream reserves a congestion-window slot for key on the least-loaded
+// stream that can accept it and returns that stream, or errWindowFull if every
+// stream is at its window limit. The caller owns the slot and must retire it
+// through AckPiece or FailPiece.
+//
+// Selecting and claiming under one lock acquisition is what makes the returned
+// stream usable: draining is only ever set under p.mu's write lock, so a stream
+// claimed here cannot already be on its way out, and its non-zero in-flight
+// count then holds drainAndRemoveStream off until the piece is retired.
+//
+// Losing the last slot on the least-loaded stream is routine with several
+// senders sharing a pool, so the scan retries rather than giving the piece up:
+// the loser's target is full at that point and drops out of the next pass, and
+// a whole pass without a claim means the pool really is saturated.
+func (p *StreamPool) ClaimStream(key congestion.PieceKey) (*PooledStream, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
@@ -770,32 +930,28 @@ func (p *StreamPool) SelectStream() (*PooledStream, error) {
 		return nil, errors.New("no streams available")
 	}
 
-	// First pass: find stream with lowest in-flight count that can send
-	if best := p.findLeastLoadedStream(true); best != nil {
-		return best, nil
+	for range len(p.streams) {
+		best := p.findLeastLoadedStream()
+		if best == nil {
+			break
+		}
+		if best.window.TrySend(key) {
+			return best, nil
+		}
 	}
 
-	// Second pass: no stream can send, return least-loaded for waiting
-	best := p.findLeastLoadedStream(false)
-	if best == nil {
-		// Should never happen if streams is non-empty, but be defensive
-		return nil, errors.New("no streams available")
-	}
-	return best, nil
+	return nil, errWindowFull
 }
 
-// findLeastLoadedStream finds the stream with lowest in-flight count.
-// If requireCanSend is true, only considers streams that can accept new pieces.
+// findLeastLoadedStream finds the non-draining stream with the lowest in-flight
+// count that can accept another piece, or nil if there is none.
 // Must hold p.mu (read or write).
-func (p *StreamPool) findLeastLoadedStream(requireCanSend bool) *PooledStream {
+func (p *StreamPool) findLeastLoadedStream() *PooledStream {
 	var best *PooledStream
 	bestInFlight := math.MaxInt
 
 	for _, ps := range p.streams {
-		if ps.draining.Load() {
-			continue
-		}
-		if requireCanSend && !ps.window.CanSend() {
+		if ps.draining.Load() || !ps.window.CanSend() {
 			continue
 		}
 		inFlight := ps.window.InFlight()
@@ -818,6 +974,25 @@ func (p *StreamPool) CanSend() bool {
 			continue
 		}
 		if ps.window.CanSend() {
+			return true
+		}
+	}
+	return false
+}
+
+// IsInFlight reports whether any stream in the pool already has this piece on
+// the wire. Draining streams count: their pieces are still outstanding and are
+// only requeued once the drain retires them.
+//
+// Advisory, not an exclusion primitive - two senders can both see false for the
+// same key and both claim it, exactly as they can today. It exists to drop the
+// duplicate offers the piece monitor makes, not to make a claim exclusive.
+func (p *StreamPool) IsInFlight(key congestion.PieceKey) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	for _, ps := range p.streams {
+		if ps.window.IsInFlight(key) {
 			return true
 		}
 	}
@@ -849,23 +1024,41 @@ type AckEnvelope struct {
 	Stream *PooledStream
 }
 
-// AckReady returns a channel that signals when acks are available.
-func (p *StreamPool) AckReady() <-chan struct{} {
-	return p.ackReady
+// CapacityWait returns a channel closed the next time the pool may be able to
+// accept another piece. Take it before testing CanSend: a release published in
+// between closes the channel the caller is already holding, so a waiter that
+// then selects on it wakes immediately instead of missing the signal.
+func (p *StreamPool) CapacityWait() <-chan struct{} {
+	p.capacityMu.Lock()
+	defer p.capacityMu.Unlock()
+	return p.capacityWait
 }
 
-// NotifyAckProcessed signals that an ack has been processed and inflight
-// count reduced. This wakes the sender to re-check CanSend().
-//
-// forwardAcks signals ackReady when an ack is enqueued, but the sender
-// checks CanSend() which depends on OnAck having reduced inflight. Without
-// this post-processing signal, the sender can consume the enqueue signal
-// before OnAck fires, see CanSend()=false, and wait forever.
-func (p *StreamPool) NotifyAckProcessed() {
-	select {
-	case p.ackReady <- struct{}{}:
-	default:
-	}
+// publishCapacity wakes every sender parked on CapacityWait. Nothing polls
+// behind it, so every path that releases a congestion-window slot or adds a
+// stream has to call it - which is why AckPiece, FailPiece, ClearAllInflight
+// and addStreamLocked are the only places a window is released or a stream
+// appears.
+func (p *StreamPool) publishCapacity() {
+	p.capacityMu.Lock()
+	defer p.capacityMu.Unlock()
+
+	close(p.capacityWait)
+	p.capacityWait = make(chan struct{})
+}
+
+// AckPiece retires an acknowledged piece from its stream's congestion window,
+// freeing the slot for a waiting sender.
+func (p *StreamPool) AckPiece(ps *PooledStream, key congestion.PieceKey) {
+	ps.window.OnAck(key)
+	p.publishCapacity()
+}
+
+// FailPiece retires a piece that will not be acknowledged - failed, stale, or
+// abandoned before it was sent - from its stream's congestion window.
+func (p *StreamPool) FailPiece(ps *PooledStream, key congestion.PieceKey) {
+	ps.window.OnFail(key)
+	p.publishCapacity()
 }
 
 // Done returns a channel that's closed when any stream fails.
@@ -886,6 +1079,28 @@ func (p *StreamPool) StreamCount() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return len(p.streams)
+}
+
+// SendableStreamCount returns how many streams still accept new pieces, which
+// is how many senders the pool can keep busy: a sender occupies one stream for
+// the whole of its read-then-send, and PieceStream.Send serializes on that
+// stream's own mutex, so two senders on one stream take turns.
+func (p *StreamPool) SendableStreamCount() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	count := 0
+	for _, ps := range p.streams {
+		if !ps.draining.Load() {
+			count++
+		}
+	}
+	return count
+}
+
+// MaxStreams returns the pool's stream ceiling. Fixed at construction.
+func (p *StreamPool) MaxStreams() int {
+	return p.maxStreams
 }
 
 // Stats returns aggregated statistics from all streams.
@@ -933,21 +1148,22 @@ func (p *StreamPool) Stats() StreamPoolStats {
 
 // ClearAllInflight clears in-flight tracking from all streams.
 // Returns all keys that were in-flight.
-func (p *StreamPool) ClearAllInflight() []string {
+func (p *StreamPool) ClearAllInflight() []congestion.PieceKey {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	var allKeys []string
+	var allKeys []congestion.PieceKey
 	for _, ps := range p.streams {
 		keys := ps.window.ClearInflight()
 		allKeys = append(allKeys, keys...)
 	}
+	p.publishCapacity()
 	return allKeys
 }
 
 // StaleKey pairs a stale piece key with the stream whose congestion window owns it.
 type StaleKey struct {
-	Key    string
+	Key    congestion.PieceKey
 	Stream *PooledStream
 }
 
@@ -988,9 +1204,11 @@ func (p *StreamPool) Close() {
 		// This ensures no more sends to channels after this point
 		p.wg.Wait()
 
-		// Now safe to close channels
+		// Now safe to close channels. capacityWait is deliberately left open:
+		// publishCapacity replaces it rather than reusing it, so closing here
+		// would race a late publisher into a double close. Senders leave via
+		// their own context or the stop signal, not via this channel.
 		close(p.acks)
-		close(p.ackReady)
 		close(p.errs)
 	})
 }

@@ -10,6 +10,7 @@ import (
 
 	"github.com/autobrr/go-qbittorrent"
 	"github.com/failsafe-go/failsafe-go"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/arsac/qb-sync/internal/metrics"
 	"github.com/arsac/qb-sync/internal/utils"
@@ -30,7 +31,18 @@ const (
 	idleThreshold  = 5 // consecutive polls with no new pieces before slowing down
 	idleSlowFactor = 5 // poll idle torrents every Nth tick (2.5s instead of 500ms)
 
+	// sourceCompleteRefetchInterval is how long a torrent whose pieces the
+	// source already holds in full may reuse its cached piece states before
+	// asking qBittorrent again. See [torrentState.reusablePieceStates].
+	sourceCompleteRefetchInterval = 30 * time.Second
+
 	queueFullLogInterval = 30 * time.Second // minimum interval between "queue full" warnings
+
+	// pollPieceStatesConcurrency bounds how many torrents have their piece
+	// states fetched at once. High enough to hide the per-call round-trip for a
+	// realistic active set, low enough that a poll tick never puts more than a
+	// handful of concurrent requests on the source qBittorrent's WebUI API.
+	pollPieceStatesConcurrency = 8
 )
 
 // PieceMonitorConfig configures the piece tracker.
@@ -46,32 +58,186 @@ func DefaultPieceMonitorConfig() PieceMonitorConfig {
 }
 
 // torrentState tracks the streaming state for a single torrent.
+//
+// The three per-piece slices are only ever mutated through markStreamed,
+// unmarkStreamed, markFailed and setPieceStates, which keep the derived
+// counts below in step with them. Assigning into them directly silently
+// desynchronises what [PieceMonitor.GetProgress] reports.
 type torrentState struct {
 	meta       *TorrentMetadata
 	hashes     []string // SHA1 hash per piece
 	lastStates []PieceState
 	streamed   []bool // pieces successfully streamed
 	failed     []bool // pieces that failed (for retry logic)
-	idleTicks  int    // consecutive polls with no new pieces completed
+	// queued records pieces currently sitting in the shared completed channel,
+	// set by queueCompletedPieces on a successful send and cleared by
+	// [PieceMonitor.NoteDequeued] when a sender takes the piece off it (and by
+	// unmarkStreamed, which must not leave a re-offer suppressed). It feeds no
+	// derived count, so unlike the slices above it is assigned directly.
+	//
+	// It exists to keep one torrent from crowding the channel every torrent
+	// shares: the scan re-offers every un-streamed piece on every tick for as
+	// long as there is room, so a torrent with fewer pieces than the channel has
+	// slots would otherwise fill it with a dozen-plus copies of each of its own
+	// pieces and leave no slot for anyone else's.
+	queued    []bool
+	idleTicks int // consecutive polls with no new pieces completed
 	// firstUnstreamedScanIdx is the lowest index that *might* still be
 	// un-streamed. queueCompletedPieces uses it to avoid re-scanning the
-	// long prefix of already-streamed pieces on every poll. Pieces complete
-	// monotonically once written, so the cursor only ever moves forward.
-	// Updated under mu (write) by queueCompletedPieces; read by the same.
+	// long prefix of already-streamed pieces on every poll, so nothing below
+	// it is ever offered again: every path that clears a streamed bit must go
+	// through [torrentState.unmarkStreamed] to rewind it. Written under mu by
+	// queueCompletedPieces (forwards) and unmarkStreamed (backwards).
 	firstUnstreamedScanIdx int
+
+	// Counts derived from the slices above, maintained incrementally so
+	// GetProgress is O(1). It runs on every maindata tick (twice a second per
+	// tracked torrent, for the whole transfer and the finalization wait after
+	// it), and rescanning the slices under mu there measured 11us per call on a
+	// 40k-piece torrent - held as a read lock the sender path's MarkStreamed
+	// then has to queue behind.
+	//
+	//	streamedCount   = |{i : streamed[i]}|
+	//	failedCount     = |{i : failed[i]}|, and failed[i] implies !streamed[i]
+	//	availableCount  = |{i : !streamed[i] and the source holds piece i}|
+	streamedCount  int
+	failedCount    int
+	availableCount int
 
 	// lastAdvance is when the streamed count last increased. The orchestrator
 	// uses it, together with the count of downloaded-but-unstreamed pieces, to
 	// tell a stalled torrent from one that is simply waiting on its source.
 	lastAdvance time.Time
 
+	// sourceComplete records that the last fetch found every piece downloaded
+	// at the source, and statesFetchedAt when that fetch happened. Together
+	// they gate the refetch in [torrentState.reusablePieceStates].
+	sourceComplete  bool
+	statesFetchedAt time.Time
+
 	mu sync.RWMutex
+}
+
+// reusablePieceStates returns the cached piece states when refetching them
+// would certainly produce the same array, and nil when the source must be asked.
+//
+// Once the source holds every piece the array is constant, but the poll still
+// needs it on every tick to re-offer pieces the completed queue had no room
+// for. Refetching it there buys nothing and costs a qBittorrent round-trip plus
+// two N-element allocations per torrent per tick - for a 40k-piece torrent, a
+// JSON decode of 40k integers and 640 KB twice a second, for the whole transfer
+// and again for however long finalization takes afterwards. qb-sync syncs
+// torrents the source has already finished, so this is the normal case.
+//
+// The periodic refetch is what keeps pollOneTorrent's 404 removal fallback
+// alive and lets a source that lost its data (a recheck, a deleted file) be
+// noticed rather than offered forever.
+func (s *torrentState) reusablePieceStates(now time.Time) []PieceState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if !s.sourceComplete || now.Sub(s.statesFetchedAt) >= sourceCompleteRefetchInterval {
+		return nil
+	}
+	return s.lastStates
+}
+
+// allDownloaded reports whether the source holds every piece, which is what
+// makes the piece-state array constant from then on.
+func allDownloaded(states []PieceState) bool {
+	if len(states) == 0 {
+		return false
+	}
+	for _, state := range states {
+		if state != PieceStateDownloaded {
+			return false
+		}
+	}
+	return true
 }
 
 // noteAdvance records that a piece became streamed. Caller must hold the write
 // lock.
 func (s *torrentState) noteAdvance() {
 	s.lastAdvance = time.Now()
+}
+
+// sourceHasPiece reports whether the last fetched piece-state array says the
+// source holds piece i. Caller must hold the lock.
+func (s *torrentState) sourceHasPiece(i int) bool {
+	return i < len(s.lastStates) && s.lastStates[i] == PieceStateDownloaded
+}
+
+// markStreamed adds piece i to the streamed set, clearing any failure recorded
+// against it, and reports whether that was a change. Caller must hold the write
+// lock.
+func (s *torrentState) markStreamed(i int) bool {
+	if s.failed[i] {
+		s.failed[i] = false
+		s.failedCount--
+	}
+	if s.streamed[i] {
+		return false
+	}
+	s.streamed[i] = true
+	s.streamedCount++
+	if s.sourceHasPiece(i) {
+		s.availableCount--
+	}
+	return true
+}
+
+// unmarkStreamed returns piece i to the un-streamed set and rewinds the scan
+// cursor so queueCompletedPieces offers it again. Caller must hold the write
+// lock.
+//
+// Clearing the cursor and the queued bit is the whole point: each of them
+// suppresses a re-offer, and without both a piece un-marked here is never
+// offered again, so the torrent silently never completes. Both happen whether or
+// not the piece was actually streamed, so a caller cannot lose them by guessing
+// wrong. Clearing queued can duplicate a piece genuinely still in the channel,
+// which sendPiecePool already drops - far cheaper than stranding one.
+func (s *torrentState) unmarkStreamed(i int) {
+	s.firstUnstreamedScanIdx = min(s.firstUnstreamedScanIdx, i)
+	s.queued[i] = false
+	if !s.streamed[i] {
+		return
+	}
+	s.streamed[i] = false
+	s.streamedCount--
+	if s.sourceHasPiece(i) {
+		s.availableCount++
+	}
+}
+
+// markFailed records that piece i could not be sent. Already-streamed pieces
+// are ignored: the failure set exists to report pieces still owed to the
+// destination, and a streamed piece is not one. Caller must hold the write lock.
+func (s *torrentState) markFailed(i int) {
+	if s.streamed[i] || s.failed[i] {
+		return
+	}
+	s.failed[i] = true
+	s.failedCount++
+}
+
+// setPieceStates installs a freshly fetched piece-state array and recomputes
+// the derived state that depends on it. Caller must hold the write lock.
+//
+// availableCount is the only count that cannot be maintained incrementally
+// here, since every entry may have changed; the rescan is free next to the
+// round-trip and JSON decode that produced the array.
+func (s *torrentState) setPieceStates(states []PieceState, fetchedAt time.Time) {
+	s.lastStates = states
+	s.statesFetchedAt = fetchedAt
+	s.sourceComplete = allDownloaded(states)
+
+	s.availableCount = 0
+	for i := range s.streamed {
+		if !s.streamed[i] && s.sourceHasPiece(i) {
+			s.availableCount++
+		}
+	}
 }
 
 // PieceMonitor monitors piece completion and queues pieces for streaming.
@@ -166,11 +332,34 @@ func (t *PieceMonitor) MarkStreamed(hash string, pieceIndex int) {
 	}
 
 	state.mu.Lock()
-	if !state.streamed[pieceIndex] {
+	if state.markStreamed(pieceIndex) {
 		state.noteAdvance()
 	}
-	state.streamed[pieceIndex] = true
-	state.failed[pieceIndex] = false
+	state.mu.Unlock()
+}
+
+// NoteDequeued records that a sender has taken a piece off the completed
+// channel, so the next poll may offer it again.
+//
+// Clearing at dequeue rather than at ack is what keeps the retry story
+// self-healing: from here on, a piece that never reaches the destination is
+// re-offered by the very next scan, exactly as it was before the queued bit
+// existed. The gap it leaves - a piece dequeued but not yet claimed by a
+// congestion window - is covered by sendPiecePool's own in-flight and streamed
+// checks, which already had to handle duplicates arriving that way.
+func (t *PieceMonitor) NoteDequeued(hash string, pieceIndex int) {
+	t.mu.RLock()
+	state, ok := t.torrents[hash]
+	t.mu.RUnlock()
+
+	if !ok {
+		return
+	}
+
+	state.mu.Lock()
+	if pieceIndex >= 0 && pieceIndex < len(state.queued) {
+		state.queued[pieceIndex] = false
+	}
 	state.mu.Unlock()
 }
 
@@ -192,11 +381,7 @@ func (t *PieceMonitor) MarkStreamedBatch(hash string, written []bool) int {
 	advanced := false
 	for i, isWritten := range written {
 		if isWritten && i < len(state.streamed) {
-			if !state.streamed[i] {
-				advanced = true
-			}
-			state.streamed[i] = true
-			state.failed[i] = false
+			advanced = state.markStreamed(i) || advanced
 			count++
 		}
 	}
@@ -231,11 +416,10 @@ func (t *PieceMonitor) ResyncStreamed(hash string, writtenOnCold []bool) int {
 	for i := range state.streamed {
 		coldHas := i < len(writtenOnCold) && writtenOnCold[i]
 		if coldHas {
-			state.streamed[i] = true
-			state.failed[i] = false
+			state.markStreamed(i)
 		} else if state.streamed[i] {
 			// Was marked streamed but destination doesn't have it — un-mark for re-streaming
-			state.streamed[i] = false
+			state.unmarkStreamed(i)
 			reset++
 		}
 	}
@@ -254,7 +438,7 @@ func (t *PieceMonitor) MarkFailed(hash string, pieceIndex int) {
 	}
 
 	state.mu.Lock()
-	state.failed[pieceIndex] = true
+	state.markFailed(pieceIndex)
 	state.mu.Unlock()
 }
 
@@ -271,32 +455,18 @@ func (t *PieceMonitor) GetProgress(hash string) (StreamProgress, error) {
 	state.mu.RLock()
 	defer state.mu.RUnlock()
 
-	var streamed, failed, available int
-	for i := range state.streamed {
-		if state.streamed[i] {
-			streamed++
-			continue
-		}
-		if state.failed[i] {
-			failed++
-		}
-		// Un-streamed but the source says it has the data: this piece could be
-		// moving and is not.
-		if i < len(state.lastStates) && state.lastStates[i] == PieceStateDownloaded {
-			available++
-		}
-	}
-
 	numPieces := int(state.meta.GetNumPieces())
 
 	return StreamProgress{
 		TorrentHash: hash,
 		TotalPieces: numPieces,
-		Streamed:    streamed,
-		Failed:      failed,
-		Available:   available,
+		Streamed:    state.streamedCount,
+		Failed:      state.failedCount,
+		// Un-streamed but the source says it has the data: these pieces could
+		// be moving and are not.
+		Available:   state.availableCount,
 		LastAdvance: state.lastAdvance,
-		Complete:    streamed == numPieces,
+		Complete:    state.streamedCount == numPieces,
 	}, nil
 }
 
@@ -531,26 +701,28 @@ func (t *PieceMonitor) startTracking(ctx context.Context, hash string, alreadyWr
 	}
 
 	numPieces := int(meta.GetNumPieces())
+	now := time.Now()
 
 	state := &torrentState{
-		meta:       meta,
-		hashes:     hashes,
-		lastStates: states,
-		streamed:   make([]bool, numPieces),
-		failed:     make([]bool, numPieces),
+		meta:     meta,
+		hashes:   hashes,
+		streamed: make([]bool, numPieces),
+		failed:   make([]bool, numPieces),
+		queued:   make([]bool, numPieces),
 		// Start the clock now rather than at the zero time, so a torrent that
 		// never streams a single piece still measures how long it has failed to
 		// advance. That is precisely the stalled case, and leaving this zero
 		// would exclude it from stall detection entirely.
-		lastAdvance: time.Now(),
+		lastAdvance: now,
 	}
+	state.setPieceStates(states, now)
 
 	// Apply already-written pieces BEFORE adding to map and queuing.
 	// This prevents queueCompletedPieces from sending pieces that destination already has.
 	resumedCount := 0
 	for i, written := range alreadyWritten {
 		if written && i < numPieces {
-			state.streamed[i] = true
+			state.markStreamed(i)
 			resumedCount++
 		}
 	}
@@ -563,8 +735,7 @@ func (t *PieceMonitor) startTracking(ctx context.Context, hash string, alreadyWr
 		meta.GetFiles(), meta.GetNumPieces(), meta.GetPieceSize(), meta.GetTotalSize(),
 	); mask != nil {
 		for i, d := range mask {
-			if d && i < numPieces && !state.streamed[i] {
-				state.streamed[i] = true
+			if d && i < numPieces && state.markStreamed(i) {
 				deselectedCount++
 			}
 		}
@@ -590,6 +761,14 @@ func (t *PieceMonitor) startTracking(ctx context.Context, hash string, alreadyWr
 }
 
 // pollActiveTorrents fetches piece states for all tracked torrents.
+//
+// The fetches run concurrently: each is a qBittorrent API round-trip, so run
+// serially they cost the tick N x RTT and a source with dozens of active
+// torrents polls far slower than PollInterval. That interval is also the
+// re-offer latency for any piece a sender declined (window full) or a stale
+// ack requeued, so stretching it directly slows the transfer. Per-torrent
+// state is mutex-guarded and already mutated concurrently by the sender
+// workers, so the fan-out needs no extra synchronization.
 func (t *PieceMonitor) pollActiveTorrents(ctx context.Context) {
 	t.tickCount++
 
@@ -600,25 +779,44 @@ func (t *PieceMonitor) pollActiveTorrents(ctx context.Context) {
 	}
 	t.mu.RUnlock()
 
+	var g errgroup.Group
+	g.SetLimit(pollPieceStatesConcurrency)
+
 	for _, hash := range hashes {
 		if t.shouldSkipIdleTorrent(hash) {
 			metrics.IdlePollSkipsTotal.Inc()
 			continue
 		}
 
-		if err := t.pollTorrentPieces(ctx, hash); err != nil {
-			// If the torrent is no longer found, treat it as removed.
-			// This handles cases where the torrent was deleted between maindata syncs.
-			if errors.Is(err, ErrTorrentNotFound) {
-				t.handleTorrentNotFound(ctx, hash)
-				continue
-			}
-			t.logger.WarnContext(ctx, "failed to poll torrent pieces",
-				"hash", hash,
-				"error", err,
-			)
-		}
+		g.Go(func() error {
+			t.pollOneTorrent(ctx, hash)
+			return nil
+		})
 	}
+
+	_ = g.Wait() // pollOneTorrent handles every failure itself.
+}
+
+// pollOneTorrent fetches and applies one torrent's piece states. Failures are
+// handled here rather than propagated so one unreachable torrent neither
+// aborts the tick nor cancels its siblings' in-flight requests.
+func (t *PieceMonitor) pollOneTorrent(ctx context.Context, hash string) {
+	err := t.pollTorrentPieces(ctx, hash)
+	if err == nil {
+		return
+	}
+
+	// A torrent that is no longer found was deleted between maindata syncs;
+	// treat it as removed.
+	if errors.Is(err, ErrTorrentNotFound) {
+		t.handleTorrentNotFound(ctx, hash)
+		return
+	}
+
+	t.logger.WarnContext(ctx, "failed to poll torrent pieces",
+		"hash", hash,
+		"error", err,
+	)
 }
 
 // shouldSkipIdleTorrent returns true if the torrent has been idle long enough
@@ -649,11 +847,6 @@ func (t *PieceMonitor) handleTorrentNotFound(ctx context.Context, hash string) {
 }
 
 func (t *PieceMonitor) pollTorrentPieces(ctx context.Context, hash string) error {
-	states, err := t.source.GetPieceStates(ctx, hash)
-	if err != nil {
-		return err
-	}
-
 	t.mu.RLock()
 	state, ok := t.torrents[hash]
 	t.mu.RUnlock()
@@ -662,10 +855,23 @@ func (t *PieceMonitor) pollTorrentPieces(ctx context.Context, hash string) error
 		return ErrTorrentNotTracked
 	}
 
+	now := time.Now()
+	states := state.reusablePieceStates(now)
+	fetched := states == nil
+	if fetched {
+		fresh, err := t.source.GetPieceStates(ctx, hash)
+		if err != nil {
+			return err
+		}
+		states = fresh
+	}
+
 	newPieces := t.queueCompletedPieces(ctx, state, states)
 
 	state.mu.Lock()
-	state.lastStates = states
+	if fetched {
+		state.setPieceStates(states, now)
+	}
 	if newPieces > 0 {
 		state.idleTicks = 0
 	} else {
@@ -697,7 +903,8 @@ func (t *PieceMonitor) queueCompletedPieces(ctx context.Context, state *torrentS
 	}
 	state.firstUnstreamedScanIdx = startIdx
 
-	var queued, skipped int
+	var queued int
+	stoppedAt := -1
 	for i := startIdx; i < len(current); i++ {
 		pieceState := current[i]
 		if pieceState != PieceStateDownloaded {
@@ -706,32 +913,48 @@ func (t *PieceMonitor) queueCompletedPieces(ctx context.Context, state *torrentS
 		// Benign TOCTOU: a piece could be marked streamed between this check and
 		// the channel send below. Handled safely downstream — sendPiecePool rechecks
 		// IsPieceStreamed before the actual gRPC send, so duplicates are discarded.
-		if state.streamed[i] {
+		if state.streamed[i] || state.queued[i] {
 			continue
 		}
 
 		piece := t.buildPiece(state, i)
 
-		switch {
-		case t.trySendCompletedNonBlocking(ctx, piece):
+		if t.trySendCompletedNonBlocking(ctx, piece) {
+			state.queued[i] = true
 			queued++
 			t.logger.DebugContext(ctx, "queued piece",
 				"hash", state.meta.GetTorrentHash(),
 				"piece", i,
 			)
-		case ctx.Err() != nil:
-			return queued
-		case !t.closed.Load():
-			skipped++
+			continue
 		}
+		if ctx.Err() != nil || t.closed.Load() {
+			return queued
+		}
+
+		// The queue is full. Everything past this index would be built and
+		// immediately discarded, and the cursor only advances past pieces that
+		// were actually streamed, so the next tick re-offers them anyway -
+		// scanning on produces the same queue contents at the cost of one
+		// *pb.Piece per remaining index. For a fully-downloaded 40k-piece
+		// torrent that was 40k allocations and ~2ms of this state's write lock
+		// every poll interval, contending with the MarkStreamed and
+		// IsPieceStreamed calls the sender workers make on every send and ack.
+		//
+		// Nothing is delayed by stopping: a full queue already holds
+		// completedChannelBufSize pieces, far more work than the senders can
+		// drain in one poll interval.
+		stoppedAt = i
+		break
 	}
 
-	if skipped > 0 {
+	if stoppedAt >= 0 {
 		lastLog := t.queueFullLogNano.Load()
 		if time.Duration(time.Now().UnixNano()-lastLog) >= queueFullLogInterval {
 			t.logger.WarnContext(ctx, "piece queue full, will retry",
 				"hash", state.meta.GetTorrentHash(),
-				"skipped", skipped,
+				"queued", queued,
+				"firstUnqueuedIndex", stoppedAt,
 			)
 			t.queueFullLogNano.Store(time.Now().UnixNano())
 		}
@@ -865,11 +1088,17 @@ func DeselectedPieceMask(files []*pb.FileInfo, numPieces int32, pieceSize, total
 		pieceStart := int64(pieceIdx) * pieceSize
 		pieceEnd := min(pieceStart+pieceSize, totalSize)
 
-		// Piece is deselected if every overlapping file is deselected.
+		// Piece is deselected if every overlapping file is deselected. Only the
+		// files a piece actually spans are visited: the search skips everything
+		// ending at or before pieceStart, and iteration stops at the first file
+		// starting at or after pieceEnd. Scanning all files here cost O(pieces x
+		// files) on a path that runs before the torrent's first piece streams.
 		allDeselected := true
-		for _, f := range files {
-			fEnd := f.GetOffset() + f.GetSize()
-			if f.GetOffset() < pieceEnd && fEnd > pieceStart && f.GetSelected() {
+		for _, f := range files[utils.FirstFileEndingAfter(files, pieceStart, fileInfoEnd):] {
+			if f.GetOffset() >= pieceEnd {
+				break
+			}
+			if f.GetSelected() {
 				allDeselected = false
 				break
 			}
@@ -878,3 +1107,6 @@ func DeselectedPieceMask(files []*pb.FileInfo, numPieces int32, pieceSize, total
 	}
 	return mask
 }
+
+// fileInfoEnd reports a file's exclusive end offset, for [utils.FirstFileEndingAfter].
+func fileInfoEnd(f *pb.FileInfo) int64 { return f.GetOffset() + f.GetSize() }

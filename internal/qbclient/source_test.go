@@ -10,7 +10,6 @@ import (
 
 	"github.com/autobrr/go-qbittorrent"
 
-	"github.com/arsac/qb-sync/internal/utils"
 	pb "github.com/arsac/qb-sync/proto"
 )
 
@@ -585,7 +584,7 @@ func TestReadPiece_ENOENTRetry(t *testing.T) {
 		}
 
 		s := &Source{}
-		s.fileCache.Store("h1", &cachedMeta{files: files, contentDir: dir})
+		s.fileCache.Store("h1", newCachedMeta(files, dir))
 
 		data, err := s.ReadPiece(context.Background(), makePiece("h1"))
 		if err != nil {
@@ -603,7 +602,7 @@ func TestReadPiece_ENOENTRetry(t *testing.T) {
 		emptyDir := t.TempDir()
 
 		s := &Source{}
-		_, err := s.readPieceMultiFile("h3", emptyDir, files, 0, int64(len(content)))
+		_, err := s.readPieceMultiFile("h3", newCachedMeta(files, emptyDir), 0, int64(len(content)))
 		if !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("expected ENOENT, got %v", err)
 		}
@@ -613,50 +612,13 @@ func TestReadPiece_ENOENTRetry(t *testing.T) {
 		// Verifies the cache eviction mechanics that ReadPiece uses when
 		// ENOENT triggers a re-query.
 		s := &Source{}
-		s.fileCache.Store("h4", &cachedMeta{
-			files:      files,
-			contentDir: "/nonexistent/primary",
-		})
+		s.fileCache.Store("h4", newCachedMeta(files, "/nonexistent/primary"))
 
 		s.fileCache.Delete("h4")
 		if _, ok := s.fileCache.Load("h4"); ok {
 			t.Error("cache entry should have been evicted")
 		}
 	})
-}
-
-func TestReadChunkFromFile_Basic(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "data.bin")
-
-	content := []byte("hello world, this is test data!")
-	if err := os.WriteFile(path, content, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	// Read from middle
-	data, err := utils.ReadChunkFromFile(path, 6, 5)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if string(data) != "world" {
-		t.Errorf("got %q, want %q", string(data), "world")
-	}
-
-	// Read from start
-	data, err = utils.ReadChunkFromFile(path, 0, 5)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if string(data) != "hello" {
-		t.Errorf("got %q, want %q", string(data), "hello")
-	}
-
-	// Read past EOF returns an error (short reads are never valid in production)
-	_, err = utils.ReadChunkFromFile(path, int64(len(content)-3), 10)
-	if err == nil {
-		t.Fatal("expected error on short read, got nil")
-	}
 }
 
 func TestReadPieceMultiFile_SingleFile(t *testing.T) {
@@ -676,7 +638,7 @@ func TestReadPieceMultiFile_SingleFile(t *testing.T) {
 	}
 
 	// Read a "piece" from the middle
-	data, err := s.readPieceMultiFile("testhash", dir, files, 4, 8)
+	data, err := s.readPieceMultiFile("testhash", newCachedMeta(files, dir), 4, 8)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -706,7 +668,7 @@ func TestReadPieceMultiFile_MultipleFiles(t *testing.T) {
 	}
 
 	// Read entirely from second file (offset 12, size 4)
-	data, err := s.readPieceMultiFile("testhash", dir, files, 12, 4)
+	data, err := s.readPieceMultiFile("testhash", newCachedMeta(files, dir), 12, 4)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -735,7 +697,7 @@ func TestReadPieceMultiFile_PieceSpansFiles(t *testing.T) {
 	}
 
 	// Read a piece that spans both files: last 2 bytes of a.bin + first 2 bytes of b.bin
-	data, err := s.readPieceMultiFile("testhash", dir, files, 2, 4)
+	data, err := s.readPieceMultiFile("testhash", newCachedMeta(files, dir), 2, 4)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -761,7 +723,7 @@ func TestReadPieceMultiFile_BoundaryPieceZeroFillsDeselected(t *testing.T) {
 	}
 
 	// Read a boundary piece spanning both files: last 2 bytes of a.bin + first 2 of b.bin
-	data, err := s.readPieceMultiFile("testhash", dir, files, 2, 4)
+	data, err := s.readPieceMultiFile("testhash", newCachedMeta(files, dir), 2, 4)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -791,12 +753,35 @@ func TestReadPieceMultiFile_AllSelectedNoZeroFill(t *testing.T) {
 	}
 
 	// When all files are selected, normal read path (no zero-fill)
-	data, err := s.readPieceMultiFile("testhash", dir, files, 2, 4)
+	data, err := s.readPieceMultiFile("testhash", newCachedMeta(files, dir), 2, 4)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if string(data) != "AABB" {
 		t.Errorf("got %q, want %q", string(data), "AABB")
+	}
+}
+
+func TestReadPieceMultiFile_SkipsNonOverlappingDeselected(t *testing.T) {
+	// A deselected file outside the piece range must not push the piece onto the
+	// zero-fill path - ReadPieceInto's narrowing has to land past it, not on it.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "b.bin"), []byte("BBBB"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Source{}
+	files := []*pb.FileInfo{
+		{Path: "a.bin", Size: 4, Offset: 0, Selected: false}, // not on disk
+		{Path: "b.bin", Size: 4, Offset: 4, Selected: true},
+	}
+
+	data, err := s.readPieceMultiFile("testhash", newCachedMeta(files, dir), 4, 4)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(data) != "BBBB" {
+		t.Errorf("got %q, want %q", string(data), "BBBB")
 	}
 }
 
@@ -987,10 +972,9 @@ func TestEvictCache_ClosesHandles(t *testing.T) {
 	}
 
 	s := &Source{}
-	s.fileCache.Store("h1", &cachedMeta{
-		files:      []*pb.FileInfo{{Path: "data.bin", Size: 4, Offset: 0, Selected: true}},
-		contentDir: dir,
-	})
+	s.fileCache.Store("h1", newCachedMeta(
+		[]*pb.FileInfo{{Path: "data.bin", Size: 4, Offset: 0, Selected: true}}, dir,
+	))
 
 	// Open a handle through the cache.
 	f, _ := s.handles.get("h1", path)

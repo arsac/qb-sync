@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -499,5 +500,79 @@ func TestTorrentStore_GetFiltersSentinel(t *testing.T) {
 	state, ok = ts.GetWithSentinel("sentinel")
 	if !ok || state == nil {
 		t.Fatal("GetWithSentinel should return sentinel entries")
+	}
+}
+
+// registerStandInPreVerify attaches a pre-verification pass to state that does
+// not finish instantly once cancelled, standing in for a real pass unwinding
+// its worker queue. A retire path that only cancelled without joining would
+// return with exited still false.
+func registerStandInPreVerify(state *serverTorrentState) *atomic.Bool {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	var exited atomic.Bool
+
+	state.mu.Lock()
+	state.preVerifyCancel = cancel
+	state.preVerifyDone = done
+	state.mu.Unlock()
+
+	go func() {
+		defer close(done)
+		<-ctx.Done()
+		time.Sleep(50 * time.Millisecond)
+		exited.Store(true)
+	}()
+
+	return &exited
+}
+
+// TestTorrentStore_DropRetiresPreVerify pins that every path which drops a
+// torrent's entry also stops its pre-verification pass. Each caller either
+// deletes the torrent's files (abort, orphan reclaim) or re-creates them from
+// scratch (re-sync), so a pass left running reads files that are about to
+// disappear - and holds NFS handles that turn the unlink into a silly-rename.
+func TestTorrentStore_DropRetiresPreVerify(t *testing.T) {
+	t.Parallel()
+
+	drops := map[string]func(*torrentStore, string){
+		"Remove": func(ts *torrentStore, hash string) {
+			ts.Remove(hash)
+		},
+		"Drain": func(ts *torrentStore, _ string) {
+			ts.Drain()
+		},
+		"BeginAbort": func(ts *torrentStore, hash string) {
+			if state, existing := ts.BeginAbort(hash, make(chan struct{})); state == nil || existing != nil {
+				t.Errorf("BeginAbort(%q) did not take the entry", hash)
+			}
+		},
+		"BeginReclaim": func(ts *torrentStore, hash string) {
+			ok := ts.BeginReclaim(hash, make(chan struct{}), func(*serverTorrentState) bool { return true })
+			if !ok {
+				t.Errorf("BeginReclaim(%q) refused the entry", hash)
+			}
+		},
+	}
+
+	for name, drop := range drops {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			ts := newTestStore(t)
+			state := commitTestTorrent(t, ts, "hash", filepath.Join(t.TempDir(), "file.bin"))
+			exited := registerStandInPreVerify(state)
+
+			drop(ts, "hash")
+
+			if !exited.Load() {
+				t.Error("entry dropped while its pre-verification pass was still running")
+			}
+			state.mu.Lock()
+			cancelLeft, doneLeft := state.preVerifyCancel, state.preVerifyDone
+			state.mu.Unlock()
+			if cancelLeft != nil || doneLeft != nil {
+				t.Error("pre-verification pass left registered on a dropped entry")
+			}
+		})
 	}
 }

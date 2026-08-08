@@ -1,6 +1,7 @@
 package destination
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -348,4 +349,110 @@ func TestPersistedMetaToRequest(t *testing.T) {
 		t.Errorf("SaveSubPath: got %q, want %q",
 			req.GetSaveSubPath(), meta.GetSaveSubPath())
 	}
+}
+
+// TestPersistWritten_CheckpointLeavesNothingForTheFlusher pins the contract the
+// four inline checkpoint sites depend on: a successful save goes through the
+// injectable hook and leaves the state clean, so the periodic flusher does not
+// rewrite the identical bitmap on its next tick. A failed save leaves the state
+// dirty so the flusher retries it.
+func TestPersistWritten_CheckpointLeavesNothingForTheFlusher(t *testing.T) {
+	t.Parallel()
+
+	newState := func(dir string) *serverTorrentState {
+		written := bitset.New(8)
+		written.Set(3)
+		return &serverTorrentState{
+			written:          written,
+			dirty:            true,
+			piecesSinceFlush: 7,
+			statePath:        filepath.Join(dir, stateFileName),
+		}
+	}
+
+	t.Run("success clears dirty and the flusher writes nothing", func(t *testing.T) {
+		t.Parallel()
+
+		dir := t.TempDir()
+		logger := testLogger(t)
+		state := newState(dir)
+
+		store := newTorrentStore(dir, logger)
+		store.entries["checkpoint"] = state
+		saves := 0
+		s := &Server{
+			config: ServerConfig{BasePath: dir},
+			logger: logger,
+			store:  store,
+			saveStateFunc: func(_ string, _ *bitset.BitSet) error {
+				saves++
+				return nil
+			},
+		}
+
+		if err := s.persistWritten(state); err != nil {
+			t.Fatalf("persistWritten: %v", err)
+		}
+		if saves != 1 {
+			t.Fatalf("checkpoint did not go through doSaveState: %d saves", saves)
+		}
+		if state.dirty || state.piecesSinceFlush != 0 {
+			t.Fatalf("state still dirty after checkpoint: dirty=%v pending=%d",
+				state.dirty, state.piecesSinceFlush)
+		}
+		if state.flushGen != 1 {
+			t.Fatalf("flushGen = %d, want 1", state.flushGen)
+		}
+
+		s.flushDirtyStates(context.Background())
+		if saves != 1 {
+			t.Fatalf("flusher rewrote the checkpointed bitmap: %d saves total", saves)
+		}
+	})
+
+	t.Run("failure keeps the state dirty", func(t *testing.T) {
+		t.Parallel()
+
+		dir := t.TempDir()
+		state := newState(dir)
+		saveErr := errors.New("nfs is down")
+		s := &Server{
+			config:        ServerConfig{BasePath: dir},
+			logger:        testLogger(t),
+			store:         newTorrentStore(dir, testLogger(t)),
+			saveStateFunc: func(_ string, _ *bitset.BitSet) error { return saveErr },
+		}
+
+		if err := s.persistWritten(state); !errors.Is(err, saveErr) {
+			t.Fatalf("persistWritten error = %v, want %v", err, saveErr)
+		}
+		if !state.dirty || state.piecesSinceFlush != 7 || state.flushGen != 0 {
+			t.Fatalf("bookkeeping advanced on a failed save: dirty=%v pending=%d gen=%d",
+				state.dirty, state.piecesSinceFlush, state.flushGen)
+		}
+	})
+
+	t.Run("no state file is a no-op", func(t *testing.T) {
+		t.Parallel()
+
+		dir := t.TempDir()
+		state := newState(dir)
+		state.statePath = ""
+		s := &Server{
+			config: ServerConfig{BasePath: dir},
+			logger: testLogger(t),
+			store:  newTorrentStore(dir, testLogger(t)),
+			saveStateFunc: func(_ string, _ *bitset.BitSet) error {
+				t.Error("saved a torrent with no state file")
+				return nil
+			},
+		}
+
+		if err := s.persistWritten(state); err != nil {
+			t.Fatalf("persistWritten: %v", err)
+		}
+		if !state.dirty {
+			t.Fatal("cleared dirty without persisting anything")
+		}
+	})
 }

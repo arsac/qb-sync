@@ -3,12 +3,57 @@ package destination
 import (
 	"fmt"
 	"os"
-	"sort"
 
 	"github.com/bits-and-blooms/bitset"
 
+	"github.com/arsac/qb-sync/internal/utils"
 	pb "github.com/arsac/qb-sync/proto"
 )
+
+// declinesWrites reports whether piece data aimed at this file must be dropped
+// rather than written. Caller must hold fileMu.
+//
+// Three reasons, all of which mean the same thing to the write path - there is
+// no .partial for this file to receive bytes:
+//
+//   - unselected, so no .partial was ever created;
+//   - the data is supplied by a hardlink to another torrent's file, which
+//     writing to would corrupt that torrent;
+//   - early-finalized, so its bytes are complete, verified and renamed into
+//     place, and opening f.path would recreate the .partial the rename consumed.
+//
+// A file that has an open write handle can never start declining: hardlink
+// resolution only moves Pending to Complete (both already declining) and
+// selection is immutable, so the only new decliner is early finalization, which
+// takes the handle under the same lock. That is what lets writeIfOpen treat a
+// non-nil handle as permission to write without re-checking here.
+func (f *serverFileInfo) declinesWrites() bool {
+	return f.earlyFinalized || f.skipForWriteData()
+}
+
+// dataCompleteOnDisk reports whether this file's whole content is readable at
+// its final path, which is what makes a piece backed by it verifiable by a
+// read-back. Caller must hold state.mu or fileMu.
+//
+// A zero-length file backs no byte of any piece, so it never holds one back.
+// Everything else needs data on disk (an unselected file has none) at the final
+// path: either hardlinked into place at init, or renamed there by its own early
+// finalization. The path is what distinguishes the second case, not
+// earlyFinalized - that is set when the write handle is taken, several NFS
+// round-trips before the rename lands, and buildWrittenBitmap also sets it for
+// pending hardlinks whose data does not exist yet.
+func (f *serverFileInfo) dataCompleteOnDisk() bool {
+	if f.size <= 0 {
+		return true
+	}
+	if !f.selected {
+		return false
+	}
+	if f.hardlink.state == hlStateComplete {
+		return true
+	}
+	return f.earlyFinalized && atFinalPath(f)
+}
 
 // openForWrite lazily opens the file for writing, creating and pre-allocating it if needed.
 // Protected by fileMu so it can be called outside state.mu for concurrent disk I/O.
@@ -16,7 +61,7 @@ func (f *serverFileInfo) openForWrite() error {
 	f.fileMu.Lock()
 	defer f.fileMu.Unlock()
 
-	if f.file != nil {
+	if f.file != nil || f.declinesWrites() {
 		return nil
 	}
 
@@ -36,77 +81,137 @@ func (f *serverFileInfo) openForWrite() error {
 }
 
 // writeAt ensures the file is open and writes data at the given offset.
-// Holds fileMu.RLock during the write so closeFileHandle (which acquires
-// the exclusive lock) blocks until all in-flight writes complete.
+// Holds fileMu.RLock during the write so closeFileHandle and takeWriteHandle
+// (which acquire the exclusive lock) block until all in-flight writes complete.
+//
+// The already-open case must not touch the exclusive lock. A pending Lock also
+// blocks new RLock acquisitions, so routing every write through openForWrite
+// made each of the stream workers wait out the previous worker's NFS round-trip
+// before its own could start - concurrent writes to one file serialized
+// completely, whatever the worker count.
 func (f *serverFileInfo) writeAt(data []byte, offset int64) error {
-	// Ensure file is open (uses exclusive lock internally for creation).
+	if wrote, err := f.writeIfOpen(data, offset); wrote {
+		return err
+	}
+
 	if openErr := f.openForWrite(); openErr != nil {
 		return openErr
 	}
 
-	// Read-lock for the actual write — concurrent writes to different
-	// offsets are safe (pwrite), while Close waits for all to drain.
+	if wrote, err := f.writeIfOpen(data, offset); wrote {
+		return err
+	}
+	return f.noHandleReason()
+}
+
+// writeIfOpen writes under the read lock when the file already has a handle, so
+// concurrent writes to different offsets overlap (pwrite) while takeWriteHandle
+// and closeFileHandle still wait for them all to drain. Reports false, without
+// writing, when the file has no handle for openForWrite to be given a turn.
+func (f *serverFileInfo) writeIfOpen(data []byte, offset int64) (bool, error) {
 	f.fileMu.RLock()
 	defer f.fileMu.RUnlock()
 
 	if f.file == nil {
-		return fmt.Errorf("file closed during write: %s", f.path)
+		return false, nil
 	}
+	if _, writeErr := f.file.WriteAt(data, offset); writeErr != nil {
+		return true, fmt.Errorf("writing to %s: %w", f.path, writeErr)
+	}
+	return true, nil
+}
 
-	_, writeErr := f.file.WriteAt(data, offset)
-	return writeErr
+// noHandleReason explains why a file still has no write handle after
+// openForWrite returned successfully.
+func (f *serverFileInfo) noHandleReason() error {
+	f.fileMu.RLock()
+	defer f.fileMu.RUnlock()
+
+	if f.declinesWrites() {
+		// Either the file's bytes come from somewhere other than this stream,
+		// or every piece overlapping it was written and read-back verified
+		// before it was renamed - so the only writes that reach here are ones
+		// the file was never going to accept.
+		return nil
+	}
+	return fmt.Errorf("file closed during write: %s", f.path)
+}
+
+// takeWriteHandle closes a completed file to further writes and hands its write
+// handle to an early finalization. Blocks until in-flight writeAt calls drain,
+// so the returned handle is owned exclusively by the caller and safe to sync,
+// read back and close.
+//
+// Caller must hold state.mu: path, file and earlyFinalized are documented as
+// state.mu-guarded but the write path reads them under fileMu alone, so every
+// writer holds both locks and each reader may hold either.
+func (f *serverFileInfo) takeWriteHandle() *os.File {
+	f.fileMu.Lock()
+	defer f.fileMu.Unlock()
+
+	fh := f.file
+	f.file = nil
+	f.earlyFinalized = true
+	return fh
+}
+
+// readmitWrites re-admits writes to a file whose early finalization did not
+// stick, either because it deferred the file back to finalizeFiles or because
+// finalize-time verification failed and its pieces will be re-streamed.
+// Caller must hold state.mu.
+func (f *serverFileInfo) readmitWrites() {
+	f.fileMu.Lock()
+	defer f.fileMu.Unlock()
+
+	f.earlyFinalized = false
+}
+
+// setPath records the file's new location after a rename.
+// Caller must hold state.mu.
+func (f *serverFileInfo) setPath(path string) {
+	f.fileMu.Lock()
+	defer f.fileMu.Unlock()
+
+	f.path = path
+}
+
+// setHardlinkState advances the file's hardlink state machine.
+// Caller must hold state.mu.
+func (f *serverFileInfo) setHardlinkState(hlState hardlinkState) {
+	f.fileMu.Lock()
+	defer f.fileMu.Unlock()
+
+	f.hardlink.state = hlState
 }
 
 // writePieceData writes piece data to the correct file(s) based on offset.
-// A piece may span multiple files in a multi-file torrent.
-// Skips files that are hardlinked, pending hardlink, or unselected.
+// A piece may span multiple files in a multi-file torrent. Files that take no
+// piece data (unselected, hardlinked, early-finalized) drop their share inside
+// writeAt, which is where fileMu makes that decision race-free.
+//
+// No per-piece fsync: data integrity is guaranteed by verifyFilePieces (early
+// finalization) and verifyFinalizedPieces (full finalization), which read back
+// and SHA1-verify pieces before rename. Per-piece fsync would severely degrade
+// write throughput on NFS/spinning disks.
 func (s *serverTorrentState) writePieceData(offset int64, data []byte) error {
-	remaining := data
-	currentOffset := offset
-
-	// Files are constructed sorted by offset (qbclient/source.go assigns
-	// monotonically-increasing offsets). Binary-search past every file whose
-	// end is at or before currentOffset — for many-file torrents (season
-	// packs, archives) this turns the per-piece scan from O(F) into O(log F).
-	startIdx := sort.Search(len(s.files), func(i int) bool {
-		return s.files[i].offset+s.files[i].size > currentOffset
-	})
-
-	for _, fi := range s.files[startIdx:] {
-		if len(remaining) == 0 {
-			break
-		}
-
-		fileEnd := fi.offset + fi.size
-
-		if fileEnd <= currentOffset {
-			continue
-		}
-
-		fileWriteOffset := max(currentOffset-fi.offset, 0)
-		availableInFile := fi.size - fileWriteOffset
-		toProcess := min(int64(len(remaining)), availableInFile)
-
-		if fi.skipForWriteData() {
-			remaining = remaining[toProcess:]
-			currentOffset += toProcess
-			continue
-		}
-
-		// No per-piece fsync: data integrity is guaranteed by verifyFilePieces
-		// (early finalization) and verifyFinalizedPieces (full finalization),
-		// which read back and SHA1-verify pieces before rename.
-		// Per-piece fsync would severely degrade write throughput on NFS/spinning disks.
-		if writeErr := fi.writeAt(remaining[:toProcess], fileWriteOffset); writeErr != nil {
-			return fmt.Errorf("writing to %s: %w", fi.path, writeErr)
-		}
-
-		remaining = remaining[toProcess:]
-		currentOffset += toProcess
-	}
-
-	return nil
+	return utils.WalkPieceRegions(s.files, fileSpan, offset, data,
+		func(_ int, fi *serverFileInfo, fileWriteOffset int64, region []byte) error {
+			return fi.writeAt(region, fileWriteOffset)
+		})
 }
+
+// firstFileEndingAfter narrows a byte range to the files it actually touches.
+// See [utils.FirstFileEndingAfter] for the invariant this relies on.
+func (m *torrentMeta) firstFileEndingAfter(offset int64) int {
+	return utils.FirstFileEndingAfter(m.files, offset, fileEnd)
+}
+
+// fileSpan reports a file's span in the torrent's byte space, for
+// [utils.WalkPieceRegions].
+func fileSpan(f *serverFileInfo) utils.Span { return utils.Span{Offset: f.offset, Size: f.size} }
+
+// fileEnd reports a file's exclusive end offset, for [utils.FirstFileEndingAfter].
+func fileEnd(f *serverFileInfo) int64 { return fileSpan(f).End() }
 
 // buildReadyResponse creates a successful READY response with piece information.
 func (s *serverTorrentState) buildReadyResponse() *pb.InitTorrentResponse {
@@ -164,9 +269,9 @@ func (m *torrentMeta) classifyPiece(pieceIdx int) pieceClass {
 	hasSelected := false
 	hasUnselected := false
 
-	for _, f := range m.files {
-		if f.offset >= pieceEnd || f.offset+f.size <= pieceStart {
-			continue
+	for _, f := range m.files[m.firstFileEndingAfter(pieceStart):] {
+		if f.offset >= pieceEnd {
+			break
 		}
 		if f.selected {
 			hasSelected = true
@@ -182,6 +287,29 @@ func (m *torrentMeta) classifyPiece(pieceIdx int) pieceClass {
 		return pieceNoSelectedOverlap
 	}
 	return pieceFullySelected
+}
+
+// pieceFullyOnDisk reports whether every file backing this piece holds its
+// complete content at its final path, so the piece can be read back and
+// hash-verified. Caller must hold state.mu.
+//
+// Narrows to the overlapping files the same way [torrentMeta.classifyPiece]
+// does; the two answer different questions about the same file range, so they
+// stay separate predicates. This one subsumes the other for unselected files,
+// which never have any content on disk to read.
+func (m *torrentMeta) pieceFullyOnDisk(pieceIdx int) bool {
+	pieceStart := int64(pieceIdx) * m.pieceLength
+	pieceEnd := min(pieceStart+m.pieceLength, m.totalSize)
+
+	for _, f := range m.files[m.firstFileEndingAfter(pieceStart):] {
+		if f.offset >= pieceEnd {
+			break
+		}
+		if !f.dataCompleteOnDisk() {
+			return false
+		}
+	}
+	return true
 }
 
 // calculatePiecesNeeded converts written state to pieces_needed (inverse).

@@ -25,5 +25,6 @@ func (t *PieceMonitor) AddTestState(hash string, numPieces int) {
 		},
 		streamed: make([]bool, numPieces),
 		failed:   make([]bool, numPieces),
+		queued:   make([]bool, numPieces),
 	}
 }

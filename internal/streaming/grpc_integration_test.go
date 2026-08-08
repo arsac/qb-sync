@@ -71,15 +71,16 @@ func startTestGRPCServer(
 	return pb.NewQBSyncServiceClient(conn)
 }
 
-// openStreamWithTimeouts opens a real gRPC bidirectional stream and wraps it
-// in a PieceStream with configurable timeouts for integration testing.
+// openStreamWithTimeouts opens a real gRPC bidirectional stream and wraps it in
+// a PieceStream with configurable timeouts for integration testing. Returns the
+// stream and the sink its receive loop feeds.
 func openStreamWithTimeouts(
 	ctx context.Context,
 	t *testing.T,
 	client pb.QBSyncServiceClient,
 	ackBufSize int,
 	ackTimeout, sndTimeout time.Duration,
-) *PieceStream {
+) (*PieceStream, *chanAckSink) {
 	t.Helper()
 
 	streamCtx, streamCancel := context.WithCancel(ctx)
@@ -89,24 +90,30 @@ func openStreamWithTimeouts(
 		t.Fatalf("failed to open stream: %v", err)
 	}
 
-	ps := &PieceStream{
-		ctx:                     streamCtx,
-		cancel:                  streamCancel,
-		stream:                  stream,
-		logger:                  testLogger,
-		acks:                    make(chan *pb.PieceAck, ackBufSize),
-		ackReady:                make(chan struct{}, 1),
-		done:                    make(chan struct{}),
-		errors:                  make(chan error, 1),
-		sendCh:                  make(chan *sendRequest),
-		stopSend:                make(chan struct{}),
-		sendDone:                make(chan struct{}),
-		ackWriteTimeoutOverride: ackTimeout,
-		sendTimeoutOverride:     sndTimeout,
+	ps := newIntegrationPieceStream(streamCtx, streamCancel, stream, sndTimeout)
+
+	sink := newChanAckSink(ackBufSize, ackTimeout)
+	go ps.receiveAcks(sink)
+	return ps, sink
+}
+
+// newIntegrationPieceStream wraps an open gRPC stream in a PieceStream. The
+// caller starts the receive loop with the sink it wants, which is what decides
+// where acks and stream errors land.
+func newIntegrationPieceStream(
+	streamCtx context.Context,
+	streamCancel context.CancelFunc,
+	stream pb.QBSyncService_StreamPiecesBidiClient,
+	sndTimeout time.Duration,
+) *PieceStream {
+	return &PieceStream{
+		ctx:                 streamCtx,
+		cancel:              streamCancel,
+		stream:              stream,
+		logger:              testLogger,
+		done:                make(chan struct{}),
+		sendTimeoutOverride: sndTimeout,
 	}
-	go ps.receiveAcks()
-	go ps.sendLoop()
-	return ps
 }
 
 // TestIntegration_SendRecvAckRoundtrip verifies the full Send → server Recv →
@@ -137,7 +144,7 @@ func TestIntegration_SendRecvAckRoundtrip(t *testing.T) {
 		}
 	})
 
-	ps := openStreamWithTimeouts(context.Background(), t, client, DefaultAckChannelSize, 0, 0)
+	ps, sink := openStreamWithTimeouts(context.Background(), t, client, DefaultAckChannelSize, 0, 0)
 	defer ps.Close()
 
 	for i := range int32(numPieces) {
@@ -152,7 +159,7 @@ func TestIntegration_SendRecvAckRoundtrip(t *testing.T) {
 
 	for i := range int32(numPieces) {
 		select {
-		case ack := <-ps.Acks():
+		case ack := <-sink.acks:
 			if !ack.GetSuccess() {
 				t.Errorf("ack %d: expected success, got error: %s", ack.GetPieceIndex(), ack.GetError())
 			}
@@ -186,7 +193,7 @@ func TestIntegration_SendTimeoutOnStallServer(t *testing.T) {
 		return stream.Context().Err()
 	})
 
-	ps := openStreamWithTimeouts(context.Background(), t, client, DefaultAckChannelSize, 0, testSendTimeout)
+	ps, _ := openStreamWithTimeouts(context.Background(), t, client, DefaultAckChannelSize, 0, testSendTimeout)
 	defer ps.Close()
 
 	// First send succeeds — server reads it.
@@ -226,12 +233,12 @@ func TestIntegration_SendTimeoutOnStallServer(t *testing.T) {
 }
 
 // TestIntegration_AckChannelBlockedRecovery verifies that when the client
-// doesn't consume acks and the ack channel fills up, receiveAcks exits via
-// the ack write timeout, cancelling the stream context.
+// doesn't consume acks and the sink stops accepting, receiveAcks exits via the
+// delivery timeout, cancelling the stream context.
 //
-// This covers the scenario where forwardAcks is slow → ps.acks fills →
-// receiveAcks can't call Recv → can't detect stream death → deadlock.
-// The ack write timeout breaks this cycle.
+// This covers the scenario where the ack processor is slow → the aggregated
+// channel fills → receiveAcks can't call Recv → can't detect stream death →
+// deadlock. The delivery timeout breaks this cycle.
 func TestIntegration_AckChannelBlockedRecovery(t *testing.T) {
 	t.Parallel()
 
@@ -259,7 +266,7 @@ func TestIntegration_AckChannelBlockedRecovery(t *testing.T) {
 		}
 	})
 
-	ps := openStreamWithTimeouts(context.Background(), t, client, ackBufSize, testAckTimeout, 0)
+	ps, _ := openStreamWithTimeouts(context.Background(), t, client, ackBufSize, testAckTimeout, 0)
 	defer ps.Close()
 
 	// Send several pieces. Server acks them immediately.
@@ -303,7 +310,7 @@ func TestIntegration_ServerErrorDetection(t *testing.T) {
 		return errors.New("server internal error")
 	})
 
-	ps := openStreamWithTimeouts(context.Background(), t, client, DefaultAckChannelSize, 0, 0)
+	ps, sink := openStreamWithTimeouts(context.Background(), t, client, DefaultAckChannelSize, 0, 0)
 	defer ps.Close()
 
 	// Trigger the server's read + error return.
@@ -321,50 +328,65 @@ func TestIntegration_ServerErrorDetection(t *testing.T) {
 		t.Fatal("receiveAcks didn't detect server error")
 	}
 
-	// Verify an error was captured.
+	// Verify the stream end was reported to the sink.
 	select {
-	case err := <-ps.Errors():
+	case err := <-sink.ended:
 		t.Logf("detected server error: %v", err)
 	default:
-		// Error may have been consumed by the context cancel path — acceptable.
+		t.Fatal("stream ended without reporting to the sink")
 	}
 }
 
-// newTestPool creates a minimal StreamPool for integration tests with a real
-// PieceStream wrapped in a PooledStream. It starts the forwardAcks goroutine
-// and returns a cleanup function that cancels the pool context and waits for
-// goroutines to exit.
-func newTestPool(t *testing.T, ps *PieceStream, id int) (*StreamPool, func()) {
+// newPooledTestStream opens a real gRPC stream, wraps it in a minimal StreamPool
+// and runs its receive loop against the pool's own sink - the production wiring.
+// Returns the pool, the stream, and a cleanup that cancels the pool context and
+// waits for the receive loop to exit.
+func newPooledTestStream(
+	t *testing.T,
+	client pb.QBSyncServiceClient,
+	id int,
+	sndTimeout time.Duration,
+) (*StreamPool, *PieceStream, func()) {
 	t.Helper()
 
 	poolCtx, poolCancel := context.WithCancel(context.Background())
 	pool := &StreamPool{
-		ctx:      poolCtx,
-		cancel:   poolCancel,
-		errs:     make(chan error, 10),
-		acks:     make(chan AckEnvelope, 100),
-		ackReady: make(chan struct{}, 10),
-		logger:   slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ctx:          poolCtx,
+		cancel:       poolCancel,
+		errs:         make(chan error, 10),
+		acks:         make(chan AckEnvelope, 100),
+		capacityWait: make(chan struct{}),
+		logger:       slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
 
+	streamCtx, streamCancel := context.WithCancel(context.Background())
+	stream, err := client.StreamPiecesBidi(streamCtx)
+	if err != nil {
+		streamCancel()
+		poolCancel()
+		t.Fatalf("failed to open stream: %v", err)
+	}
+
+	ps := newIntegrationPieceStream(streamCtx, streamCancel, stream, sndTimeout)
 	pooled := &PooledStream{stream: ps, id: id}
-	pool.wg.Add(1)
-	go pool.forwardAcks(pooled)
+	pool.wg.Go(func() {
+		ps.receiveAcks(newPoolAckSink(pool, pooled))
+	})
 
 	cleanup := func() {
+		ps.Close()
 		poolCancel()
 		pool.wg.Wait()
 	}
-	return pool, cleanup
+	return pool, ps, cleanup
 }
 
 // TestIntegration_PoolErrorPropagation verifies that a stream error from a
 // crashing server propagates through the full path: real gRPC → receiveAcks
-// detects error → writes to ps.errors → closes ps.done → forwardAcks drains
-// and forwards to pool.errs.
+// detects the error → hands it to the pool's sink → pool.errs.
 //
-// This exercises the error drain in forwardAcks (lines 250-261 of stream_pool.go)
-// with a real gRPC transport, ensuring the pool always learns about stream death.
+// This exercises poolAckSink.streamEnded with a real gRPC transport, ensuring
+// the pool always learns about stream death.
 func TestIntegration_PoolErrorPropagation(t *testing.T) {
 	t.Parallel()
 
@@ -376,10 +398,7 @@ func TestIntegration_PoolErrorPropagation(t *testing.T) {
 		return errors.New("server crash")
 	})
 
-	ps := openStreamWithTimeouts(context.Background(), t, client, DefaultAckChannelSize, 0, 0)
-	defer ps.Close()
-
-	pool, cleanup := newTestPool(t, ps, 1)
+	pool, ps, cleanup := newPooledTestStream(t, client, 1, 0)
 	defer cleanup()
 
 	// Trigger the server's read + error return.
@@ -391,7 +410,7 @@ func TestIntegration_PoolErrorPropagation(t *testing.T) {
 		t.Fatalf("Send failed: %v", err)
 	}
 
-	// The error should propagate through forwardAcks to pool.errs.
+	// The error should propagate through the pool's sink to pool.errs.
 	select {
 	case err := <-pool.errs:
 		t.Logf("pool received error: %v", err)
@@ -399,12 +418,10 @@ func TestIntegration_PoolErrorPropagation(t *testing.T) {
 		t.Fatal("timed out waiting for error to propagate to pool")
 	}
 
-	// Stream's Done channel should be closed.
-	//
-	// This must wait rather than poll once. Done() is closed by receiveAcks
-	// while the error is published by forwardAcks - different goroutines with
-	// no ordering between them - so a non-blocking check asserts a sequence the
-	// code never promises and fails under scheduler pressure.
+	// Stream's Done channel should be closed. The sink is notified before
+	// done closes, so by the time the error lands this is all but settled -
+	// still wait rather than poll once, since nothing forces the scheduler to
+	// have run the remaining defers.
 	select {
 	case <-ps.Done():
 		// Correct — receiveAcks exited.
@@ -414,14 +431,13 @@ func TestIntegration_PoolErrorPropagation(t *testing.T) {
 }
 
 // TestIntegration_SendTimeoutErrorReachesPool verifies the full deadlock
-// detection chain end-to-end: destination stops consuming → HTTP/2 flow control fills
-// → Send timeout fires → stream context cancelled → receiveAcks exits →
-// forwardAcks detects stream death via Done() → synthetic error reaches pool.
+// detection chain end-to-end: destination stops consuming → HTTP/2 flow control
+// fills → Send timeout fires → stream context cancelled → receiveAcks exits →
+// reports a stream that ended with no error of its own → synthetic error
+// reaches pool.
 //
 // This is the production deadlock scenario. Without the send timeout, Send
-// blocks forever. The send timeout cancels the stream context, which causes
-// receiveAcks to exit (closing Done()), which causes forwardAcks to detect
-// silent stream death and send a synthetic error to pool.errs.
+// blocks forever.
 func TestIntegration_SendTimeoutErrorReachesPool(t *testing.T) {
 	t.Parallel()
 
@@ -440,10 +456,7 @@ func TestIntegration_SendTimeoutErrorReachesPool(t *testing.T) {
 		return stream.Context().Err()
 	})
 
-	ps := openStreamWithTimeouts(context.Background(), t, client, DefaultAckChannelSize, 0, testSendTimeout)
-	defer ps.Close()
-
-	pool, cleanup := newTestPool(t, ps, 1)
+	pool, ps, cleanup := newPooledTestStream(t, client, 1, testSendTimeout)
 	defer cleanup()
 
 	// First send succeeds — server reads it.
@@ -479,14 +492,14 @@ func TestIntegration_SendTimeoutErrorReachesPool(t *testing.T) {
 		t.Fatal("stream Done() not closed — send timeout didn't break the deadlock")
 	}
 
-	// With the silent-death fix, forwardAcks now sends a synthetic error
-	// when the stream closes without an explicit error. This must arrive
-	// reliably — it's what triggers the ack processor to reconnect.
+	// The sink synthesises an error when the stream closes without one of its
+	// own. This must arrive reliably — it's what triggers the ack processor to
+	// reconnect.
 	select {
 	case err := <-pool.errs:
 		t.Logf("pool received error: %v", err)
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for error on pool.errs — forwardAcks silent-death fix not working")
+		t.Fatal("timed out waiting for error on pool.errs — silent stream death went unreported")
 	}
 }
 
@@ -612,7 +625,7 @@ func TestIntegration_AddConnection_Success(t *testing.T) {
 		t.Fatalf("initial ConnectionCount = %d, want 1", d.ConnectionCount())
 	}
 
-	if addErr := d.AddConnection(); addErr != nil {
+	if _, addErr := d.AddConnection(); addErr != nil {
 		t.Fatalf("AddConnection: %v", addErr)
 	}
 
@@ -644,7 +657,7 @@ func TestIntegration_AddConnection_AtMax(t *testing.T) {
 	}
 	defer d.Close()
 
-	addErr := d.AddConnection()
+	_, addErr := d.AddConnection()
 	if addErr == nil {
 		t.Fatal("expected error when adding connection at max, got nil")
 	}
@@ -671,7 +684,7 @@ func TestIntegration_RemoveConnection_Success(t *testing.T) {
 	defer d.Close()
 
 	// Add a connection first so we can remove it
-	if addErr := d.AddConnection(); addErr != nil {
+	if _, addErr := d.AddConnection(); addErr != nil {
 		t.Fatalf("AddConnection: %v", addErr)
 	}
 	if d.ConnectionCount() != 2 {
@@ -732,10 +745,10 @@ func TestIntegration_RemoveConnection_IndexMismatch(t *testing.T) {
 	defer d.Close()
 
 	// Add two connections (total: 3)
-	if addErr := d.AddConnection(); addErr != nil {
+	if _, addErr := d.AddConnection(); addErr != nil {
 		t.Fatalf("AddConnection 1: %v", addErr)
 	}
-	if addErr := d.AddConnection(); addErr != nil {
+	if _, addErr := d.AddConnection(); addErr != nil {
 		t.Fatalf("AddConnection 2: %v", addErr)
 	}
 
@@ -779,7 +792,7 @@ func TestIntegration_AddRemoveConnection_Concurrent(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 5 {
 		wg.Go(func() {
-			_ = d.AddConnection()
+			_, _ = d.AddConnection()
 		})
 	}
 	wg.Wait()
@@ -863,11 +876,15 @@ func TestIntegration_OpenStream_DistributesAcrossConns(t *testing.T) {
 
 	const numStreams = 4
 	streams := make([]*PieceStream, numStreams)
+	sinks := make([]*chanAckSink, numStreams)
 	for i := range numStreams {
 		s, openErr := d.OpenStream(context.Background(), logger)
 		if openErr != nil {
 			t.Fatalf("OpenStream(%d): %v", i, openErr)
 		}
+		// OpenStream starts only the send side; the caller owns the receive loop.
+		sinks[i] = newChanAckSink(DefaultAckChannelSize, 0)
+		go s.receiveAcks(sinks[i])
 		streams[i] = s
 	}
 
@@ -889,7 +906,7 @@ func TestIntegration_OpenStream_DistributesAcrossConns(t *testing.T) {
 			}
 
 			select {
-			case ack := <-ps.Acks():
+			case ack := <-sinks[idx].acks:
 				if !ack.GetSuccess() {
 					t.Errorf("stream %d ack: not success", idx)
 				}

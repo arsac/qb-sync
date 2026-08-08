@@ -1336,3 +1336,461 @@ func TestVerifyConcurrency_HonorsConfigAndClamps(t *testing.T) {
 		})
 	}
 }
+
+// TestFinalizeFiles_ParallelSyncAndRename pins the phase-2 fan-out: every
+// non-hardlinked file must end up synced, closed, and renamed to its own final
+// path, with fi.path updated to match, while hardlink-complete files are left
+// untouched. Each file carries index-specific content and a distinct name, so a
+// cross-wired task (renaming file i onto file j's target) fails loudly rather
+// than passing on a shuffled-but-complete result set.
+func TestFinalizeFiles_ParallelSyncAndRename(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+	ctx := context.Background()
+
+	// More files than either concurrency limit so tasks genuinely overlap.
+	const numFiles = 96
+
+	dir := filepath.Join(tmpDir, "torrent")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	const (
+		shapeClosedPartial = iota // .partial on disk, no open handle
+		shapeOpenPartial          // .partial on disk with a live write handle
+		shapeHardlinked           // hardlink-complete: must not be renamed
+		shapeAlreadyFinal         // early-finalized: path already has no suffix
+		numShapes
+	)
+
+	type expectation struct {
+		fi        *serverFileInfo
+		shape     int
+		finalPath string
+		content   []byte
+	}
+
+	files := make([]*serverFileInfo, numFiles)
+	expected := make([]expectation, numFiles)
+	for i := range numFiles {
+		shape := i % numShapes
+		finalPath := filepath.Join(dir, fmt.Sprintf("file%03d.mkv", i))
+		content := fmt.Appendf(nil, "content-of-file-%03d", i)
+
+		onDisk := finalPath
+		if shape != shapeAlreadyFinal {
+			onDisk = finalPath + partialSuffix
+		}
+		if err := os.WriteFile(onDisk, content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		fi := &serverFileInfo{
+			path:     onDisk,
+			offset:   int64(i) * int64(len(content)),
+			size:     int64(len(content)),
+			selected: true,
+		}
+		if shape == shapeHardlinked {
+			fi.hardlink.state = hlStateComplete
+		}
+		if shape == shapeOpenPartial {
+			if err := fi.openForWrite(); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		files[i] = fi
+		expected[i] = expectation{fi: fi, shape: shape, finalPath: finalPath, content: content}
+	}
+
+	state := &serverTorrentState{
+		torrentMeta: torrentMeta{pieceLength: 16, totalSize: 16, files: files},
+		written:     bitset.New(1).Set(0),
+		statePath:   filepath.Join(tmpDir, ".state"),
+	}
+
+	if err := s.finalizeFiles(ctx, "testHash", state); err != nil {
+		t.Fatalf("finalizeFiles: %v", err)
+	}
+
+	for i, exp := range expected {
+		if exp.shape == shapeHardlinked {
+			// Skipped entirely: still .partial, in memory and on disk.
+			if exp.fi.path != exp.finalPath+partialSuffix {
+				t.Errorf("file %d (hardlinked): path = %q, want unchanged %q",
+					i, exp.fi.path, exp.finalPath+partialSuffix)
+			}
+			if _, err := os.Stat(exp.finalPath + partialSuffix); err != nil {
+				t.Errorf("file %d (hardlinked): .partial should still exist: %v", i, err)
+			}
+			continue
+		}
+
+		if exp.fi.path != exp.finalPath {
+			t.Errorf("file %d: path = %q, want %q", i, exp.fi.path, exp.finalPath)
+		}
+		if exp.fi.file != nil {
+			t.Errorf("file %d: handle should be closed after finalize", i)
+		}
+		got, err := os.ReadFile(exp.finalPath)
+		if err != nil {
+			t.Errorf("file %d: reading final path: %v", i, err)
+			continue
+		}
+		if string(got) != string(exp.content) {
+			t.Errorf("file %d: final path holds %q, want %q", i, got, exp.content)
+		}
+	}
+}
+
+// TestRunDiskStage_StopsPreVerify pins that the disk stage retires the
+// init-time pre-verification pass before it starts reading pieces back itself.
+// Left running, that pass reads the same bytes off NFS a second time,
+// concurrently, and can still be setting verified bits while the finalize
+// read-back queue is being built from them.
+func TestRunDiskStage_StopsPreVerify(t *testing.T) {
+	t.Parallel()
+
+	s, tmpDir := newTestDestServer(t)
+
+	hash := "stops-preverify"
+	state := newTwoStageTestState(t, tmpDir, hash, 2)
+
+	s.store.mu.Lock()
+	s.store.entries[hash] = state
+	s.store.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	passDone := make(chan struct{})
+	var exited atomic.Bool
+	state.mu.Lock()
+	state.preVerifyCancel = cancel
+	state.preVerifyDone = passDone
+	state.mu.Unlock()
+
+	go func() {
+		defer close(passDone)
+		<-ctx.Done()
+		time.Sleep(50 * time.Millisecond) // stand-in for the pass unwinding
+		exited.Store(true)
+	}()
+
+	done := make(chan struct{})
+	s.runBackgroundFinalization(hash, state, &pb.FinalizeTorrentRequest{TorrentHash: hash}, time.Now(), done)
+
+	if !exited.Load() {
+		t.Error("disk stage ran with the pre-verification pass still going")
+	}
+	state.mu.Lock()
+	cancelLeft, doneLeft := state.preVerifyCancel, state.preVerifyDone
+	state.mu.Unlock()
+	if cancelLeft != nil || doneLeft != nil {
+		t.Error("disk stage left the pre-verification pass registered")
+	}
+}
+
+// newPendingHardlinkState builds a torrent whose files are all pending on
+// another torrent's data. Each file gets its own already-written source file
+// (distinct content and size) plus its own doneCh, so a task that resolves the
+// wrong file's hardlink is visible in the linked content rather than hidden by
+// a uniform fixture. Returns the state, the per-file doneCh channels, the
+// target paths and the expected contents, all index-aligned.
+func newPendingHardlinkState(
+	t *testing.T,
+	tmpDir string,
+	numFiles int,
+) (*serverTorrentState, []chan struct{}, []string, [][]byte) {
+	t.Helper()
+
+	srcDir := filepath.Join(tmpDir, "source")
+	dstDir := filepath.Join(tmpDir, "target")
+	for _, d := range []string{srcDir, dstDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	files := make([]*serverFileInfo, numFiles)
+	dones := make([]chan struct{}, numFiles)
+	targets := make([]string, numFiles)
+	contents := make([][]byte, numFiles)
+
+	var offset int64
+	for i := range numFiles {
+		// Distinct length per index so a cross-wired link also trips the
+		// size check, not just the content comparison.
+		content := fmt.Appendf(nil, "pending-source-%03d%s", i, strings.Repeat("x", i))
+		rel := filepath.Join("source", fmt.Sprintf("src%03d.bin", i))
+		if err := os.WriteFile(filepath.Join(tmpDir, rel), content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		target := filepath.Join(dstDir, fmt.Sprintf("file%03d.bin", i))
+		done := make(chan struct{})
+		files[i] = &serverFileInfo{
+			path:     target,
+			size:     int64(len(content)),
+			offset:   offset,
+			selected: true,
+			hardlink: hardlinkInfo{
+				state:      hlStatePending,
+				sourcePath: rel,
+				doneCh:     done,
+			},
+		}
+		dones[i] = done
+		targets[i] = target
+		contents[i] = content
+		offset += int64(len(content))
+	}
+
+	state := &serverTorrentState{
+		torrentMeta: torrentMeta{pieceLength: 16, totalSize: offset, files: files},
+		written:     bitset.New(1).Set(0),
+		statePath:   filepath.Join(tmpDir, ".state"),
+	}
+	return state, dones, targets, contents
+}
+
+// TestResolvePendingHardlinks_WaitsConcurrently pins that a torrent's pending
+// hardlinks are waited on in parallel. Serially, file i's source torrent could
+// not even be looked at until file i-1's had finalized, so a torrent pending on
+// several sources paid one full defaultHardlinkWaitTimeout per file before
+// reporting the first source that never showed up.
+//
+// The last file's source is released first: with a serial pass every worker is
+// still parked on file 0's channel, so its link never appears and the watchdog
+// below fires. With the fan-out it lands immediately.
+func TestResolvePendingHardlinks_WaitsConcurrently(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+
+	// More files than fileSetupConcurrency so the last one is only reachable
+	// if earlier waits release their slots, i.e. genuinely concurrently.
+	const numFiles = 40
+	state, dones, targets, contents := newPendingHardlinkState(t, tmpDir, numFiles)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.resolvePendingHardlinks(context.Background(), "pending", state) }()
+
+	last := numFiles - 1
+	close(dones[last])
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(targets[last]); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("last file's hardlink never appeared: waits are serialized behind file 0")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	for i := range last {
+		close(dones[i])
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("resolvePendingHardlinks: %v", err)
+	}
+
+	for i := range numFiles {
+		got, err := os.ReadFile(targets[i])
+		if err != nil {
+			t.Errorf("file %d: reading target: %v", i, err)
+			continue
+		}
+		if string(got) != string(contents[i]) {
+			t.Errorf("file %d: linked content %q, want %q", i, got, contents[i])
+		}
+		if state.files[i].hardlink.state != hlStateComplete {
+			t.Errorf("file %d: hardlink state = %v, want complete", i, state.files[i].hardlink.state)
+		}
+	}
+}
+
+// TestResolvePendingHardlinks_ConcurrentWriteIsRaceFree pins that the write
+// path and hardlink resolution agree on a lock for fi.hardlink.state.
+// writePieceData consults every spanned file's hardlink state to decide whether
+// the file takes piece data, and it runs outside state.mu; a duplicate piece the
+// source re-sent after a stale ack can still be in there when FinalizeTorrent
+// starts resolving this torrent's pending hardlinks. The assertion is the race
+// detector.
+func TestResolvePendingHardlinks_ConcurrentWriteIsRaceFree(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+
+	const numFiles = 16
+	state, dones, _, _ := newPendingHardlinkState(t, tmpDir, numFiles)
+
+	data := make([]byte, state.totalSize)
+	stop := make(chan struct{})
+	var writers sync.WaitGroup
+	for range 4 {
+		writers.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if err := state.writePieceData(0, data); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		})
+	}
+
+	for _, done := range dones {
+		close(done)
+	}
+	if err := s.resolvePendingHardlinks(context.Background(), "pending", state); err != nil {
+		t.Fatal(err)
+	}
+
+	close(stop)
+	writers.Wait()
+
+	for _, fi := range state.files {
+		if fi.hardlink.state != hlStateComplete {
+			t.Fatalf("file %s: hardlink state = %v, want complete", fi.path, fi.hardlink.state)
+		}
+	}
+}
+
+// TestResolvePendingHardlinks_FirstFailureCancelsWaits pins that one file's
+// failure stops the siblings still parked on their doneCh. Without a shared
+// cancellation the group would sit on them until defaultHardlinkWaitTimeout
+// (30 minutes) even though the torrent's finalization is already doomed.
+func TestResolvePendingHardlinks_FirstFailureCancelsWaits(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+
+	const numFiles = 8
+	state, dones, _, _ := newPendingHardlinkState(t, tmpDir, numFiles)
+
+	// File 0's source finalizes at the wrong size (stale FileID), which is a
+	// hard finalize failure. Every other file's source stays pending forever.
+	if err := os.Truncate(filepath.Join(tmpDir, state.files[0].hardlink.sourcePath), 1); err != nil {
+		t.Fatal(err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.resolvePendingHardlinks(context.Background(), "pending", state) }()
+	close(dones[0])
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected an error for the missing hardlink source")
+		}
+		if !strings.Contains(err.Error(), "pending hardlink source") {
+			t.Fatalf("error = %v, want the missing-source failure", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("resolvePendingHardlinks did not return: siblings still waiting on their timeout")
+	}
+}
+
+// TestVerifyChunkSize pins the work-run sizing: every worker gets a run, the
+// run is capped once there are enough of them to keep the cursor balancing, and
+// it never drops to the one-piece-per-claim stride the runs exist to replace.
+func TestVerifyChunkSize(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		pieces, workers, want int
+	}{
+		{pieces: 0, workers: 0, want: 1},    // empty set: no division by zero
+		{pieces: 3, workers: 3, want: 1},    // one piece each is all there is
+		{pieces: 7, workers: 3, want: 2},    // below the cap: one run per worker
+		{pieces: 100, workers: 4, want: 25}, // below the cap: one run per worker
+		{pieces: 130, workers: 4, want: verifyChunkPieces},
+		{pieces: 40000, workers: 4, want: verifyChunkPieces},
+		{pieces: 1000, workers: 1, want: verifyChunkPieces},
+	}
+
+	for _, tc := range cases {
+		if got := verifyChunkSize(tc.pieces, tc.workers); got != tc.want {
+			t.Errorf("verifyChunkSize(%d, %d) = %d, want %d", tc.pieces, tc.workers, got, tc.want)
+		}
+	}
+}
+
+// TestVerifyPieceSet_ChunkedClaimsCoverEveryPieceExactlyOnce pins the run
+// arithmetic against the two ways it can go wrong: a claim that skips or
+// repeats pieces at a run boundary, and a final short run that overruns the
+// slice. Piece counts are chosen so the last run is partial in every case.
+func TestVerifyPieceSet_ChunkedClaimsCoverEveryPieceExactlyOnce(t *testing.T) {
+	t.Parallel()
+
+	const pieceLength = 16
+
+	cases := []struct{ pieces, workers int }{
+		{pieces: 3, workers: 16},  // fewer pieces than workers
+		{pieces: 7, workers: 3},   // run of 2, last run short
+		{pieces: 130, workers: 4}, // capped run, last run short
+		{pieces: 200, workers: 4}, // capped run, several runs per worker
+	}
+
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("pieces=%d/workers=%d", tc.pieces, tc.workers), func(t *testing.T) {
+			t.Parallel()
+
+			totalSize := int64(tc.pieces * pieceLength)
+			full := make([]byte, totalSize)
+			for i := range full {
+				full[i] = byte(i * 31)
+			}
+			hashes := make([]string, tc.pieces)
+			for p := range tc.pieces {
+				hashes[p] = utils.ComputeSHA1(full[p*pieceLength : (p+1)*pieceLength])
+			}
+
+			// Corrupt a scattered set so more than one run has to report, and
+			// so a run that silently skips pieces loses a known failure.
+			var want []int
+			onDisk := append([]byte(nil), full...)
+			for p := range tc.pieces {
+				if p%7 == 3 {
+					onDisk[p*pieceLength] ^= 0xff
+					want = append(want, p)
+				}
+			}
+
+			path := filepath.Join(t.TempDir(), "chunked.bin")
+			if err := os.WriteFile(path, onDisk, 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			state := &serverTorrentState{torrentMeta: torrentMeta{
+				pieceHashes: hashes,
+				pieceLength: pieceLength,
+				totalSize:   totalSize,
+			}}
+			regions := []utils.FileRegion{{Path: path, Offset: 0, Size: totalSize}}
+			pieces := make([]int, tc.pieces)
+			for i := range pieces {
+				pieces[i] = i
+			}
+
+			s, _ := newTestDestServer(t)
+			s.config.VerifyConcurrency = tc.workers
+
+			var disposed atomic.Int64
+			got := s.verifyPieceSet(t.Context(), "h", state, regions, pieces, func() {
+				disposed.Add(1)
+			})
+
+			if fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Errorf("failed pieces = %v, want %v", got, want)
+			}
+			if n := disposed.Load(); n != int64(tc.pieces) {
+				t.Errorf("pieces disposed of = %d, want %d", n, tc.pieces)
+			}
+		})
+	}
+}

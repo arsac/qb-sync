@@ -1,6 +1,8 @@
 package streaming
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -9,10 +11,6 @@ import (
 
 func TestStreamPoolConfig_Defaults(t *testing.T) {
 	config := DefaultStreamPoolConfig()
-
-	if config.NumStreams != MinPoolSize {
-		t.Errorf("expected NumStreams %d, got %d", MinPoolSize, config.NumStreams)
-	}
 
 	if config.MaxNumStreams != MaxPoolSize {
 		t.Errorf("expected MaxNumStreams %d, got %d", MaxPoolSize, config.MaxNumStreams)
@@ -214,115 +212,113 @@ func TestStreamingConstants(t *testing.T) {
 	}
 }
 
-func TestPieceKey(t *testing.T) {
-	tests := []struct {
-		hash     string
-		index    int32
-		expected string
-	}{
-		{"abc123", 0, "abc123:0"},
-		{"abc123", 1, "abc123:1"},
-		{"abc123", 100, "abc123:100"},
-		{"", 0, ":0"},
+// newClaimTestStream builds a PooledStream whose window holds exactly `window`
+// slots, `filled` of them already occupied by another sender's pieces.
+func newClaimTestStream(id, window, filled int) *PooledStream {
+	w := congestion.NewAdaptiveWindow(congestion.Config{
+		MinWindow:     window,
+		MaxWindow:     window,
+		InitialWindow: window,
+		PieceTimeout:  time.Minute,
+	})
+	for i := range filled {
+		w.OnSend(congestion.PieceKey{Hash: "occupant", Index: int32(i)})
 	}
-
-	for _, tt := range tests {
-		result := pieceKey(tt.hash, tt.index)
-		if result != tt.expected {
-			t.Errorf("pieceKey(%q, %d) = %q, want %q", tt.hash, tt.index, result, tt.expected)
-		}
-	}
+	return &PooledStream{window: w, id: id}
 }
 
-func TestParsePieceKey(t *testing.T) {
-	tests := []struct {
-		key           string
-		expectedHash  string
-		expectedIndex int32
-		expectedOK    bool
-	}{
-		{"abc123:0", "abc123", 0, true},
-		{"abc123:1", "abc123", 1, true},
-		{"abc123:100", "abc123", 100, true},
-		{":0", "", 0, true},
-		{"abc123", "", 0, false},     // No colon
-		{"abc123:", "", 0, false},    // No index
-		{"abc123:abc", "", 0, false}, // Invalid index
-		{"", "", 0, false},           // Empty string
-		{"a:b:c", "a", 0, false},     // Multiple colons (b:c is not a valid int)
-	}
+// TestClaimStream_SelectsAndClaimsUnderOneLock pins the contract that replaced
+// the old select-then-TrySend pair: the returned stream already holds the
+// caller's slot (which is what keeps drainAndRemoveStream off it), saturated and
+// draining streams are never returned, and a pool with nothing to give reports
+// errWindowFull instead of a stream the caller would immediately fail on.
+func TestClaimStream_SelectsAndClaimsUnderOneLock(t *testing.T) {
+	t.Parallel()
 
-	for _, tt := range tests {
-		hash, index, ok := ParsePieceKey(tt.key)
-		if ok != tt.expectedOK {
-			t.Errorf("ParsePieceKey(%q) ok = %v, want %v", tt.key, ok, tt.expectedOK)
-			continue
+	key := congestion.PieceKey{Hash: "abc", Index: 7}
+
+	t.Run("claims the slot on the stream it returns", func(t *testing.T) {
+		t.Parallel()
+
+		ps := newClaimTestStream(0, 4, 0)
+		pool := &StreamPool{streams: []*PooledStream{ps}, logger: testLogger}
+
+		got, err := pool.ClaimStream(key)
+		if err != nil {
+			t.Fatalf("ClaimStream: %v", err)
 		}
-		if ok {
-			if hash != tt.expectedHash {
-				t.Errorf("ParsePieceKey(%q) hash = %q, want %q", tt.key, hash, tt.expectedHash)
-			}
-			if index != tt.expectedIndex {
-				t.Errorf("ParsePieceKey(%q) index = %d, want %d", tt.key, index, tt.expectedIndex)
-			}
+		if got != ps {
+			t.Fatalf("returned stream id %d, want 0", got.id)
 		}
-	}
-}
-
-func TestPieceKeyRoundTrip(t *testing.T) {
-	// Test that pieceKey and ParsePieceKey are inverses
-	testCases := []struct {
-		hash  string
-		index int32
-	}{
-		{"abc123def456", 0},
-		{"abc123def456", 42},
-		{"abc123def456", 12345},
-		{"", 0},
-	}
-
-	for _, tc := range testCases {
-		key := pieceKey(tc.hash, tc.index)
-		hash, index, ok := ParsePieceKey(key)
-		if !ok {
-			t.Errorf("ParsePieceKey(pieceKey(%q, %d)) failed", tc.hash, tc.index)
-			continue
+		if inFlight := ps.window.InFlight(); inFlight != 1 {
+			t.Fatalf("in-flight after claim = %d, want 1 (the slot must already be taken)", inFlight)
 		}
-		if hash != tc.hash || index != tc.index {
-			t.Errorf("Round trip failed: (%q, %d) -> %q -> (%q, %d)",
-				tc.hash, tc.index, key, hash, index)
+		if claimed := ps.window.ClearInflight(); len(claimed) != 1 || claimed[0] != key {
+			t.Errorf("claimed keys = %v, want exactly [%v]", claimed, key)
 		}
-	}
-}
+	})
 
-// TestFindLeastLoadedStreamLogic tests the selection logic conceptually.
-// Since we can't easily create a pool without a GRPCDestination,
-// we test the AdaptiveWindow behavior that underlies the selection.
-func TestFindLeastLoadedStreamLogic(t *testing.T) {
-	// Create two windows with different in-flight counts
-	config := congestion.DefaultConfig()
-	w1 := congestion.NewAdaptiveWindow(config)
-	w2 := congestion.NewAdaptiveWindow(config)
+	t.Run("prefers the least loaded stream that can send", func(t *testing.T) {
+		t.Parallel()
 
-	// w1 has 2 in-flight, w2 has 1 in-flight
-	w1.OnSend("piece:0")
-	w1.OnSend("piece:1")
-	w2.OnSend("piece:2")
+		// Stream 0 is the least loaded by in-flight count but is saturated,
+		// so the claim has to fall through to stream 2.
+		saturated := newClaimTestStream(0, 1, 1)
+		busy := newClaimTestStream(1, 8, 5)
+		best := newClaimTestStream(2, 8, 3)
+		pool := &StreamPool{streams: []*PooledStream{saturated, busy, best}, logger: testLogger}
 
-	// Selection should prefer w2 (lower in-flight)
-	if w1.InFlight() <= w2.InFlight() {
-		t.Errorf("Test setup wrong: w1.InFlight()=%d should be > w2.InFlight()=%d",
-			w1.InFlight(), w2.InFlight())
-	}
+		got, err := pool.ClaimStream(key)
+		if err != nil {
+			t.Fatalf("ClaimStream: %v", err)
+		}
+		if got != best {
+			t.Fatalf("returned stream id %d, want 2", got.id)
+		}
+		if inFlight := saturated.window.InFlight(); inFlight != 1 {
+			t.Errorf("saturated stream in-flight = %d, want 1 (untouched)", inFlight)
+		}
+	})
 
-	// Verify CanSend works correctly
-	// With default window of 10, both should be able to send
-	if !w1.CanSend() {
-		t.Error("w1 should be able to send")
-	}
-	if !w2.CanSend() {
-		t.Error("w2 should be able to send")
-	}
+	t.Run("never claims a draining stream", func(t *testing.T) {
+		t.Parallel()
+
+		draining := newClaimTestStream(0, 8, 0)
+		draining.draining.Store(true)
+		live := newClaimTestStream(1, 8, 6)
+		pool := &StreamPool{streams: []*PooledStream{draining, live}, logger: testLogger}
+
+		got, err := pool.ClaimStream(key)
+		if err != nil {
+			t.Fatalf("ClaimStream: %v", err)
+		}
+		if got != live {
+			t.Fatalf("returned stream id %d, want 1", got.id)
+		}
+		if inFlight := draining.window.InFlight(); inFlight != 0 {
+			t.Errorf("draining stream in-flight = %d, want 0 (a claim would hold up its drain)", inFlight)
+		}
+	})
+
+	t.Run("reports errWindowFull without claiming anything", func(t *testing.T) {
+		t.Parallel()
+
+		a := newClaimTestStream(0, 2, 2)
+		b := newClaimTestStream(1, 3, 3)
+		pool := &StreamPool{streams: []*PooledStream{a, b}, logger: testLogger}
+
+		got, err := pool.ClaimStream(key)
+		if !errors.Is(err, errWindowFull) {
+			t.Fatalf("ClaimStream error = %v, want errWindowFull", err)
+		}
+		if got != nil {
+			t.Errorf("returned stream id %d, want nil", got.id)
+		}
+		if a.window.InFlight() != 2 || b.window.InFlight() != 3 {
+			t.Errorf("in-flight counts changed: %d, %d; want 2, 3",
+				a.window.InFlight(), b.window.InFlight())
+		}
+	})
 }
 
 // TestScalingDecisionThresholds tests the threshold logic for scaling decisions.
@@ -404,5 +400,111 @@ func TestCooldownPeriod(t *testing.T) {
 	}
 	if scalingCooldownPeriod > 10*time.Minute {
 		t.Errorf("scalingCooldownPeriod (%v) seems too long", scalingCooldownPeriod)
+	}
+}
+
+// newScaleDownTestPool builds a pool holding n real-enough streams, so
+// removeStreamLocked's background drain can Close() what it picks.
+func newScaleDownTestPool(t *testing.T, n int) *StreamPool {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	streams := make([]*PooledStream, n)
+	for i := range streams {
+		streams[i] = newDrainTestStream(ctx, i)
+	}
+	return &StreamPool{
+		ctx:     ctx,
+		cancel:  cancel,
+		streams: streams,
+		logger:  testLogger,
+		errs:    make(chan error, 10),
+		acks:    make(chan AckEnvelope, 10),
+	}
+}
+
+// TestRemoveStreamLocked_IgnoresDrainingStreams pins that a scale-down landing
+// while an earlier drain is still in flight neither re-targets the departing
+// stream nor lets the pool's usable width fall below MinPoolSize. A drain runs
+// up to streamDrainTimeout, which is the same order as the cooldown between
+// scale-downs, so the overlap is reachable.
+func TestRemoveStreamLocked_IgnoresDrainingStreams(t *testing.T) {
+	t.Parallel()
+
+	t.Run("picks the last stream still carrying traffic", func(t *testing.T) {
+		t.Parallel()
+
+		pool := newScaleDownTestPool(t, MinPoolSize+2)
+
+		last := len(pool.streams) - 1
+		pool.streams[last].draining.Store(true) // Already on its way out.
+		wantPick := pool.streams[last-1]
+
+		pool.mu.Lock()
+		err := pool.removeStreamLocked()
+		pool.mu.Unlock()
+		if err != nil {
+			t.Fatalf("removeStreamLocked: %v", err)
+		}
+
+		if !wantPick.draining.Load() {
+			t.Errorf("stream %d (last non-draining) was not picked for removal", wantPick.id)
+		}
+	})
+
+	t.Run("refuses when only MinPoolSize streams still carry traffic", func(t *testing.T) {
+		t.Parallel()
+
+		// Length is MinPoolSize+1, but one of those is already leaving, so
+		// removing another would drop the usable pool to MinPoolSize-1.
+		pool := newScaleDownTestPool(t, MinPoolSize+1)
+
+		pool.streams[len(pool.streams)-1].draining.Store(true)
+
+		pool.mu.Lock()
+		err := pool.removeStreamLocked()
+		pool.mu.Unlock()
+
+		if err == nil {
+			t.Fatal("expected removeStreamLocked to refuse, got nil error")
+		}
+		for _, ps := range pool.streams[:len(pool.streams)-1] {
+			if ps.draining.Load() {
+				t.Errorf("stream %d was marked draining despite the refusal", ps.id)
+			}
+		}
+	})
+}
+
+// TestDrainAndRemoveStream_RetiresOnce pins that a stream reaching
+// drainAndRemoveStream twice - which connection-level scale-down does whenever
+// one of the connection's streams is already being drained by a stream-level
+// scale-down - is accounted exactly once. Double-counting its bytes into
+// removedBytesSent reads as a throughput spike on the next measurement
+// interval, which is the input every scaling decision compares against.
+func TestDrainAndRemoveStream_RetiresOnce(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ps := newDrainTestStream(ctx, 1)
+	ps.bytesSent.Store(4096)
+
+	pool := newDrainTestPool(ctx, cancel, ps)
+
+	pool.drainAndRemoveStream(ps)
+	pool.drainAndRemoveStream(ps) // e.g. the connection this stream sits on is now going away too
+
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+
+	if len(pool.streams) != 0 {
+		t.Fatalf("expected the stream removed, got %d streams", len(pool.streams))
+	}
+	if pool.removedBytesSent != 4096 {
+		t.Errorf("removedBytesSent = %d, want 4096 (counted once)", pool.removedBytesSent)
 	}
 }
