@@ -39,6 +39,12 @@ const (
 	maxPieceHashMismatches        = 5                // Per-piece hash mismatch limit before forcing finalization
 )
 
+// errWindowFull reports that another sender took the last congestion-window
+// slot between this sender's capacity check and its send. It is contention,
+// not a fault: the piece was never read or transmitted, so the sender keeps it
+// and retries rather than counting a failure.
+var errWindowFull = errors.New("window full")
+
 // BidiQueueConfig configures the bidirectional streaming work queue.
 type BidiQueueConfig struct {
 	MaxBytesPerSec int64         // Rate limit in bytes per second (0 = unlimited)
@@ -344,22 +350,8 @@ func (q *BidiQueue) runSenderPool(ctx context.Context, pool *StreamPool, stopSen
 // senderWorker is the per-piece send loop run by each sender goroutine.
 func (q *BidiQueue) senderWorker(ctx context.Context, pool *StreamPool, stopSender <-chan struct{}, id int) {
 	for {
-		// Wait for any stream to have capacity.
-		if !pool.CanSend() {
-			metrics.WindowFullTotal.Inc()
-			for !pool.CanSend() {
-				select {
-				case <-ctx.Done():
-					return
-				case <-stopSender:
-					return
-				case <-pool.AckReady():
-					// Fast path: woken by ack arrival.
-				case <-time.After(senderRetryBackoff):
-					// Safety net: recheck capacity periodically.
-					// Handles missed AckReady signals and stale-cleanup capacity changes.
-				}
-			}
+		if !q.awaitCapacity(ctx, pool, stopSender) {
+			return
 		}
 
 		select {
@@ -371,16 +363,72 @@ func (q *BidiQueue) senderWorker(ctx context.Context, pool *StreamPool, stopSend
 			if !ok {
 				return
 			}
-			if err := q.sendPiecePool(ctx, pool, piece); err != nil {
-				q.logger.ErrorContext(ctx, "failed to send piece",
-					"hash", piece.GetTorrentHash(),
-					"piece", piece.GetIndex(),
-					"sender", id,
-					"error", err,
-				)
-				q.tracker.MarkFailed(piece.GetTorrentHash(), int(piece.GetIndex()))
-				q.piecesFail.Add(1)
+			if !q.deliverPiece(ctx, pool, stopSender, piece, id) {
+				return
 			}
+		}
+	}
+}
+
+// awaitCapacity blocks until some stream in the pool can accept a piece.
+// Returns false when the worker should exit.
+func (q *BidiQueue) awaitCapacity(ctx context.Context, pool *StreamPool, stopSender <-chan struct{}) bool {
+	if pool.CanSend() {
+		return true
+	}
+
+	metrics.WindowFullTotal.Inc()
+	for !pool.CanSend() {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-stopSender:
+			return false
+		case <-pool.AckReady():
+			// Fast path: woken by ack arrival.
+		case <-time.After(senderRetryBackoff):
+			// Safety net: recheck capacity periodically.
+			// Handles missed AckReady signals and stale-cleanup capacity changes.
+		}
+	}
+	return true
+}
+
+// deliverPiece sends one dequeued piece, re-attempting for as long as the only
+// thing stopping it is a full congestion window. Returns false when the worker
+// should exit.
+//
+// Senders check pool capacity before dequeuing but claim a window slot inside
+// sendPiecePool, so with several senders sharing one window the loser of that
+// race is routine - a saturated window is the steady state congestion control
+// aims for, not a fault. Handing the piece back to the tracker cost it a full
+// PollInterval, since queueCompletedPieces only re-offers pieces on the next
+// tick, and inflated the failure counters with contention.
+func (q *BidiQueue) deliverPiece(
+	ctx context.Context,
+	pool *StreamPool,
+	stopSender <-chan struct{},
+	piece *pb.Piece,
+	id int,
+) bool {
+	for {
+		sendErr := q.sendPiecePool(ctx, pool, piece)
+		if sendErr == nil {
+			return true
+		}
+		if !errors.Is(sendErr, errWindowFull) {
+			q.logger.ErrorContext(ctx, "failed to send piece",
+				"hash", piece.GetTorrentHash(),
+				"piece", piece.GetIndex(),
+				"sender", id,
+				"error", sendErr,
+			)
+			q.tracker.MarkFailed(piece.GetTorrentHash(), int(piece.GetIndex()))
+			q.piecesFail.Add(1)
+			return true
+		}
+		if !q.awaitCapacity(ctx, pool, stopSender) {
+			return false
 		}
 	}
 }
@@ -469,7 +517,7 @@ func (q *BidiQueue) sendPiecePool(ctx context.Context, pool *StreamPool, piece *
 			"piece", index,
 			"stream", ps.id,
 		)
-		return errors.New("window full")
+		return errWindowFull
 	}
 
 	data, err := q.source.ReadPiece(ctx, piece)

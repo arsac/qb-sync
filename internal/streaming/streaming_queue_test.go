@@ -3,6 +3,8 @@ package streaming
 import (
 	"context"
 	"errors"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -291,6 +293,144 @@ func TestSenderWorkersConcurrency(t *testing.T) {
 	// Each failed piece increments piecesFail.
 	if got := q.piecesFail.Load(); got != numPieces {
 		t.Errorf("expected %d piecesFail, got %d", numPieces, got)
+	}
+}
+
+// indexRecordingSource is a mock PieceSource that records the index of every
+// piece it is asked to read, then fails the read so the test never needs a
+// real gRPC stream.
+type indexRecordingSource struct {
+	mu      sync.Mutex
+	indices []int32
+}
+
+func (s *indexRecordingSource) ReadPiece(_ context.Context, p *pb.Piece) ([]byte, error) {
+	s.mu.Lock()
+	s.indices = append(s.indices, p.GetIndex())
+	s.mu.Unlock()
+	return nil, errors.New("mock read error")
+}
+
+func (s *indexRecordingSource) read() []int32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.indices)
+}
+
+func (s *indexRecordingSource) GetPieceStates(context.Context, string) ([]PieceState, error) {
+	return nil, nil
+}
+
+func (s *indexRecordingSource) GetPieceHashes(context.Context, string) ([]string, error) {
+	return nil, nil
+}
+
+func (s *indexRecordingSource) GetTorrentMetadata(context.Context, string) (*TorrentMetadata, error) {
+	return nil, nil
+}
+
+// TestDeliverPiece_RetriesAfterLosingWindowSlot pins that a piece rejected
+// because the congestion window was full is kept by the sender and sent once
+// capacity frees, rather than handed back to the tracker - which would delay it
+// by a full poll interval and count it as a failure.
+//
+// Deterministic: the window is sized to one slot and pre-filled by the test, so
+// the first attempt is guaranteed to lose the race, and the slot is only
+// released after the assertion that no read has happened yet.
+func TestDeliverPiece_RetriesAfterLosingWindowSlot(t *testing.T) {
+	const (
+		hash       = "testhash"
+		pieceIndex = int32(7)
+		numPieces  = 16
+	)
+
+	source := &indexRecordingSource{}
+	dest := &GRPCDestination{
+		initResults: map[string]*InitTorrentResult{hash: {}},
+	}
+	tracker := NewPieceMonitor(nil, nil, testLogger, DefaultPieceMonitorConfig())
+	tracker.torrents[hash] = &torrentState{
+		streamed: make([]bool, numPieces),
+		failed:   make([]bool, numPieces),
+	}
+
+	q := &BidiQueue{
+		source:              source,
+		dest:                dest,
+		tracker:             tracker,
+		logger:              testLogger,
+		config:              DefaultBidiQueueConfig(),
+		pieceHashMismatches: make(map[string]int),
+	}
+
+	// One stream with a single-slot window, already occupied by another
+	// sender's piece: TrySend must fail on the first attempt.
+	pool := NewStreamPool(nil, testLogger, StreamPoolConfig{MaxNumStreams: 1, AckChannelSize: 10})
+	pool.ctx, pool.cancel = context.WithCancel(context.Background())
+	defer pool.cancel()
+
+	window := congestion.NewAdaptiveWindow(congestion.Config{
+		MinWindow:     1,
+		MaxWindow:     1,
+		InitialWindow: 1,
+		PieceTimeout:  time.Minute,
+	})
+	const occupant = "otherhash:0"
+	window.OnSend(occupant)
+	ps := &PooledStream{window: window, id: 0}
+	pool.mu.Lock()
+	pool.streams = append(pool.streams, ps)
+	pool.mu.Unlock()
+
+	if pool.CanSend() {
+		t.Fatal("pool should be at window capacity before the test starts")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stopSender := make(chan struct{})
+	defer close(stopSender)
+
+	piece := &pb.Piece{TorrentHash: hash, Index: pieceIndex}
+	returned := make(chan bool, 1)
+	go func() { returned <- q.deliverPiece(ctx, pool, stopSender, piece, 0) }()
+
+	// While the window stays full the piece must be held, not read and not
+	// counted as failed. Several backoff cycles is long enough for a
+	// drop-and-return regression to have finished the call.
+	time.Sleep(5 * senderRetryBackoff)
+	if got := source.read(); len(got) != 0 {
+		t.Fatalf("read the piece while the window was full: %v", got)
+	}
+	if got := q.piecesFail.Load(); got != 0 {
+		t.Fatalf("counted a window-full rejection as a failure: piecesFail=%d", got)
+	}
+	select {
+	case <-returned:
+		t.Fatal("deliverPiece gave up the piece instead of waiting for window capacity")
+	default:
+	}
+
+	// Free the slot: the retry should now claim it and read the same piece.
+	window.OnAck(occupant)
+	pool.NotifyAckProcessed()
+
+	select {
+	case ok := <-returned:
+		if !ok {
+			t.Fatal("deliverPiece reported worker exit, want the piece delivered")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("deliverPiece did not retry after window capacity freed")
+	}
+
+	if got := source.read(); !slices.Equal(got, []int32{pieceIndex}) {
+		t.Errorf("read indices = %v, want exactly [%d]", got, pieceIndex)
+	}
+	// The retry's read failure - not the window-full rejection - is the one
+	// failure this piece is allowed to record.
+	if got := q.piecesFail.Load(); got != 1 {
+		t.Errorf("piecesFail = %d, want 1 (the read error only)", got)
 	}
 }
 
