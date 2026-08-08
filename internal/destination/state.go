@@ -3,10 +3,10 @@ package destination
 import (
 	"fmt"
 	"os"
-	"sort"
 
 	"github.com/bits-and-blooms/bitset"
 
+	"github.com/arsac/qb-sync/internal/utils"
 	pb "github.com/arsac/qb-sync/proto"
 )
 
@@ -146,9 +146,7 @@ func (s *serverTorrentState) writePieceData(offset int64, data []byte) error {
 			break
 		}
 
-		fileEnd := fi.offset + fi.size
-
-		if fileEnd <= currentOffset {
+		if fileEnd(fi) <= currentOffset {
 			continue
 		}
 
@@ -171,19 +169,14 @@ func (s *serverTorrentState) writePieceData(offset int64, data []byte) error {
 	return nil
 }
 
-// firstFileEndingAfter returns the index of the first file whose data extends
-// past offset, so callers can iterate only the files a byte range actually
-// touches instead of scanning the whole torrent.
-//
-// Valid because files are constructed sorted by offset and contiguous
-// (qbclient/source.go assigns offsets as a running sum), which makes each
-// file's end offset monotonically non-decreasing. For many-file torrents
-// (season packs, archives) this turns per-piece work from O(F) into O(log F).
+// firstFileEndingAfter narrows a byte range to the files it actually touches.
+// See [utils.FirstFileEndingAfter] for the invariant this relies on.
 func (m *torrentMeta) firstFileEndingAfter(offset int64) int {
-	return sort.Search(len(m.files), func(i int) bool {
-		return m.files[i].offset+m.files[i].size > offset
-	})
+	return utils.FirstFileEndingAfter(m.files, offset, fileEnd)
 }
+
+// fileEnd reports a file's exclusive end offset, for [utils.FirstFileEndingAfter].
+func fileEnd(f *serverFileInfo) int64 { return f.offset + f.size }
 
 // buildReadyResponse creates a successful READY response with piece information.
 func (s *serverTorrentState) buildReadyResponse() *pb.InitTorrentResponse {

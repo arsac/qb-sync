@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -635,6 +636,78 @@ func TestDeselectedPieceMask(t *testing.T) {
 			}
 		}
 	})
+}
+
+// deselectedPieceMaskFullScan is the pre-narrowing implementation, kept as an
+// oracle: it visits every file for every piece, so it cannot drop the first or
+// last overlapping file the way a mis-stated binary search can.
+func deselectedPieceMaskFullScan(files []*pb.FileInfo, numPieces int32, pieceSize, totalSize int64) []bool {
+	mask := make([]bool, numPieces)
+	for pieceIdx := range numPieces {
+		pieceStart := int64(pieceIdx) * pieceSize
+		pieceEnd := min(pieceStart+pieceSize, totalSize)
+		allDeselected := true
+		for _, f := range files {
+			fEnd := f.GetOffset() + f.GetSize()
+			if f.GetOffset() < pieceEnd && fEnd > pieceStart && f.GetSelected() {
+				allDeselected = false
+				break
+			}
+		}
+		mask[pieceIdx] = allDeselected
+	}
+	return mask
+}
+
+// mixedSelectionLayout builds an offset-sorted, contiguous file list mixing the
+// shapes that distinguish a correct narrowing from a subtly wrong one: files
+// smaller than a piece, files that end exactly on a piece boundary, files
+// spanning several pieces, and zero-length files wedged at file boundaries
+// (which end exactly where the next file starts).
+func mixedSelectionLayout(pieceSize int64) ([]*pb.FileInfo, int32, int64) {
+	sizes := []int64{
+		pieceSize / 3, 0, pieceSize, pieceSize * 3, 1, 0,
+		pieceSize*2 + 1, pieceSize - 1, 0, pieceSize / 2,
+	}
+	var files []*pb.FileInfo
+	var offset int64
+	for i := range 40 {
+		size := sizes[i%len(sizes)]
+		files = append(files, &pb.FileInfo{
+			Path:     fmt.Sprintf("f%02d.bin", i),
+			Size:     size,
+			Offset:   offset,
+			Selected: i%3 != 0,
+		})
+		offset += size
+	}
+	return files, int32((offset + pieceSize - 1) / pieceSize), offset
+}
+
+func TestDeselectedPieceMask_MatchesFullScan(t *testing.T) {
+	for _, pieceSize := range []int64{16, 100, 4096} {
+		files, numPieces, totalSize := mixedSelectionLayout(pieceSize)
+
+		got := DeselectedPieceMask(files, numPieces, pieceSize, totalSize)
+		want := deselectedPieceMaskFullScan(files, numPieces, pieceSize, totalSize)
+		if !slices.Equal(got, want) {
+			t.Fatalf("pieceSize %d: narrowed mask differs from full scan\ngot  %v\nwant %v",
+				pieceSize, got, want)
+		}
+		// Guard against a layout that makes the comparison vacuous.
+		if !slices.Contains(want, true) || !slices.Contains(want, false) {
+			t.Fatalf("pieceSize %d: layout produced a uniform mask, test proves nothing", pieceSize)
+		}
+	}
+}
+
+func BenchmarkDeselectedPieceMask(b *testing.B) {
+	const pieceSize = 4096
+	files, numPieces, totalSize := mixedSelectionLayout(pieceSize)
+	b.ResetTimer()
+	for b.Loop() {
+		DeselectedPieceMask(files, numPieces, pieceSize, totalSize)
+	}
 }
 
 func TestPieceMonitor_RemovalNotification_Integration(t *testing.T) {

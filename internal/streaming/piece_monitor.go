@@ -899,11 +899,17 @@ func DeselectedPieceMask(files []*pb.FileInfo, numPieces int32, pieceSize, total
 		pieceStart := int64(pieceIdx) * pieceSize
 		pieceEnd := min(pieceStart+pieceSize, totalSize)
 
-		// Piece is deselected if every overlapping file is deselected.
+		// Piece is deselected if every overlapping file is deselected. Only the
+		// files a piece actually spans are visited: the search skips everything
+		// ending at or before pieceStart, and iteration stops at the first file
+		// starting at or after pieceEnd. Scanning all files here cost O(pieces x
+		// files) on a path that runs before the torrent's first piece streams.
 		allDeselected := true
-		for _, f := range files {
-			fEnd := f.GetOffset() + f.GetSize()
-			if f.GetOffset() < pieceEnd && fEnd > pieceStart && f.GetSelected() {
+		for _, f := range files[utils.FirstFileEndingAfter(files, pieceStart, fileInfoEnd):] {
+			if f.GetOffset() >= pieceEnd {
+				break
+			}
+			if f.GetSelected() {
 				allDeselected = false
 				break
 			}
@@ -912,3 +918,6 @@ func DeselectedPieceMask(files []*pb.FileInfo, numPieces int32, pieceSize, total
 	}
 	return mask
 }
+
+// fileInfoEnd reports a file's exclusive end offset, for [utils.FirstFileEndingAfter].
+func fileInfoEnd(f *pb.FileInfo) int64 { return f.GetOffset() + f.GetSize() }

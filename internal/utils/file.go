@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"syscall"
 )
 
@@ -20,13 +21,35 @@ type FileRegion struct {
 	Size   int64  // Total size of this file
 }
 
+// FirstFileEndingAfter returns the index of the first file whose data extends
+// past offset, where end reports a file's exclusive end offset in the torrent's
+// byte space. Everything before that index is irrelevant to a byte range
+// starting at offset, so callers iterate only the files the range actually
+// touches instead of scanning the whole torrent - O(log F) instead of O(F) per
+// piece, which is the difference between millions and thousands of iterations
+// for a many-file torrent's per-piece passes.
+//
+// Valid because a torrent's files are offset-sorted and contiguous (each
+// offset is a running sum over the index-sorted file list), which makes end
+// offsets monotonically non-decreasing. The predicate must be strictly greater:
+// a zero-length file wedged at a file boundary ends exactly at offset and
+// contributes nothing to a range starting there.
+func FirstFileEndingAfter[T any](files []T, offset int64, end func(T) int64) int {
+	return sort.Search(len(files), func(i int) bool {
+		return end(files[i]) > offset
+	})
+}
+
+// regionEnd reports a region's exclusive end offset, for [FirstFileEndingAfter].
+func regionEnd(f FileRegion) int64 { return f.Offset + f.Size }
+
 // ReadPieceInto fills buf with the piece starting at pieceOffset in the
 // torrent's byte space, delegating each file's contribution to read. files must
-// be offset-sorted; only the ones overlapping the piece are visited, and read
-// receives their index in files, the offset to start at inside that file, and
-// the sub-slice of buf that region backs. A region left untouched by read keeps
-// whatever buf already held, which is how callers zero-fill files that don't
-// exist on disk.
+// be offset-sorted and contiguous; only the ones overlapping the piece are
+// visited, and read receives their index in files, the offset to start at
+// inside that file, and the sub-slice of buf that region backs. A region left
+// untouched by read keeps whatever buf already held, which is how callers
+// zero-fill files that don't exist on disk.
 //
 // Every piece read in the codebase walks the same file/piece geometry, so this
 // is the one place the boundary arithmetic and the full-coverage requirement are
@@ -41,13 +64,15 @@ func ReadPieceInto(
 	written := int64(0)
 	currentOffset := pieceOffset
 
-	for i, f := range files {
+	for i := FirstFileEndingAfter(files, pieceOffset, regionEnd); i < len(files); i++ {
+		f := files[i]
 		if written >= pieceSize {
 			break
 		}
 
-		fileEnd := f.Offset + f.Size
-		if fileEnd <= currentOffset {
+		// Zero-length files sit at a boundary the walk has already passed, so
+		// they survive the search above without contributing anything.
+		if regionEnd(f) <= currentOffset {
 			continue
 		}
 

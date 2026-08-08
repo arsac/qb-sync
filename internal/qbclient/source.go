@@ -132,17 +132,6 @@ func newCachedMeta(files []*pb.FileInfo, contentDir string) *cachedMeta {
 	return &cachedMeta{files: files, regions: regions}
 }
 
-// firstFileAt returns the index of the first file whose data extends past
-// offset. Files are offset-sorted and contiguous, so everything before this
-// index is irrelevant to a piece starting at offset; binary searching keeps
-// per-piece work proportional to the files a piece actually spans instead of
-// the torrent's total file count.
-func firstFileAt(files []*pb.FileInfo, offset int64) int {
-	return sort.Search(len(files), func(i int) bool {
-		return files[i].GetOffset()+files[i].GetSize() > offset
-	})
-}
-
 // Source implements streaming.PieceSource using qBittorrent API.
 type Source struct {
 	client            *ResilientClient
@@ -550,14 +539,10 @@ func (s *Source) readChunkIntoCached(hash, path string, offset int64, buf []byte
 }
 
 func (s *Source) readPieceMultiFile(hash string, cm *cachedMeta, offset, size int64) ([]byte, error) {
-	// Only files overlapping [offset, offset+size) matter, and they are
-	// contiguous in the slice starting at first.
-	first := firstFileAt(cm.files, offset)
-
 	data := make([]byte, size) // zero-initialized; deselected regions stay zero
-	err := utils.ReadPieceInto(cm.regions[first:], offset, data,
+	err := utils.ReadPieceInto(cm.regions, offset, data,
 		func(i int, region utils.FileRegion, fileOffset int64, dst []byte) error {
-			if !cm.files[first+i].GetSelected() {
+			if !cm.files[i].GetSelected() {
 				// The file doesn't exist on disk - qBittorrent doesn't create
 				// files with priority 0 - so leave the region zero-filled. The
 				// destination's writePieceData skips deselected files, so only

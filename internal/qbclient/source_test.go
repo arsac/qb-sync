@@ -764,7 +764,7 @@ func TestReadPieceMultiFile_AllSelectedNoZeroFill(t *testing.T) {
 
 func TestReadPieceMultiFile_SkipsNonOverlappingDeselected(t *testing.T) {
 	// A deselected file outside the piece range must not push the piece onto the
-	// zero-fill path — firstFileAt has to land past it, not on it.
+	// zero-fill path - ReadPieceInto's narrowing has to land past it, not on it.
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "b.bin"), []byte("BBBB"), 0o644); err != nil {
 		t.Fatal(err)
