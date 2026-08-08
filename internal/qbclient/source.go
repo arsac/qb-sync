@@ -540,7 +540,7 @@ func (s *Source) readChunkIntoCached(hash, path string, offset int64, buf []byte
 
 func (s *Source) readPieceMultiFile(hash string, cm *cachedMeta, offset, size int64) ([]byte, error) {
 	data := make([]byte, size) // zero-initialized; deselected regions stay zero
-	err := utils.ReadPieceInto(cm.regions, offset, data,
+	err := utils.WalkPieceRegions(cm.regions, utils.RegionSpan, offset, data,
 		func(i int, region utils.FileRegion, fileOffset int64, dst []byte) error {
 			if !cm.files[i].GetSelected() {
 				// The file doesn't exist on disk - qBittorrent doesn't create

@@ -3,6 +3,7 @@ package destination
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -203,5 +204,22 @@ func TestWritePieceData_BinarySearchBoundaries(t *testing.T) {
 		}
 		assertRange(t, state.files[2].path, 100, 50, data[:50])
 		assertRange(t, state.files[3].path, 0, 50, data[50:])
+	})
+
+	t.Run("data running past the last file is rejected, not half-written", func(t *testing.T) {
+		t.Parallel()
+		state := newState(t)
+
+		// 100 bytes at offset 250 with totalSize 300: the files can back only
+		// half of it. Silently writing the covered prefix and reporting success
+		// would let writePiece mark the piece written and ack it.
+		data := pattern(100, 31)
+		err := state.writePieceData(250, data)
+		if err == nil {
+			t.Fatal("writePieceData accepted data the files cannot cover")
+		}
+		if !strings.Contains(err.Error(), "cover only 50 of 100") {
+			t.Fatalf("error %q does not report the covered byte count", err)
+		}
 	})
 }

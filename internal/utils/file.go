@@ -40,56 +40,74 @@ func FirstFileEndingAfter[T any](files []T, offset int64, end func(T) int64) int
 	})
 }
 
-// regionEnd reports a region's exclusive end offset, for [FirstFileEndingAfter].
-func regionEnd(f FileRegion) int64 { return f.Offset + f.Size }
+// Span is a file's placement in a torrent's byte space, the only thing
+// [WalkPieceRegions] needs to know about a caller's file type.
+type Span struct {
+	Offset int64
+	Size   int64
+}
 
-// ReadPieceInto fills buf with the piece starting at pieceOffset in the
-// torrent's byte space, delegating each file's contribution to read. files must
-// be offset-sorted and contiguous; only the ones overlapping the piece are
-// visited, and read receives their index in files, the offset to start at
-// inside that file, and the sub-slice of buf that region backs. A region left
-// untouched by read keeps whatever buf already held, which is how callers
-// zero-fill files that don't exist on disk.
+// End reports the span's exclusive end offset.
+func (s Span) End() int64 { return s.Offset + s.Size }
+
+// RegionSpan reports a region's span, for [WalkPieceRegions].
+func RegionSpan(f FileRegion) Span { return Span{Offset: f.Offset, Size: f.Size} }
+
+// WalkPieceRegions maps the piece of len(buf) bytes starting at pieceOffset onto
+// the files backing it and hands each file's contribution to visit. files must
+// be offset-sorted and contiguous, with span reporting each one's placement in
+// the torrent's byte space; only the files overlapping the piece are visited,
+// and visit receives their index in files, the offset to start at inside that
+// file, and the sub-slice of buf that region backs.
 //
-// Every piece read in the codebase walks the same file/piece geometry, so this
-// is the one place the boundary arithmetic and the full-coverage requirement are
-// stated.
-func ReadPieceInto(
-	files []FileRegion,
+// A region left untouched by visit keeps whatever buf already held, which is how
+// the source zero-fills files that don't exist on disk and how the destination
+// drops the share of files that take no data. The walk still apportions those
+// regions, so declining one never shifts the bytes that follow it.
+//
+// Every per-piece transfer in the codebase - source read, destination write,
+// finalize read-back - walks the same file/piece geometry, so this is the one
+// place the boundary arithmetic and the full-coverage requirement are stated.
+func WalkPieceRegions[T any](
+	files []T,
+	span func(T) Span,
 	pieceOffset int64,
 	buf []byte,
-	read func(i int, f FileRegion, fileOffset int64, dst []byte) error,
+	visit func(i int, f T, fileOffset int64, region []byte) error,
 ) error {
+	end := func(f T) int64 { return span(f).End() }
+
 	pieceSize := int64(len(buf))
-	written := int64(0)
+	covered := int64(0)
 	currentOffset := pieceOffset
 
-	for i := FirstFileEndingAfter(files, pieceOffset, regionEnd); i < len(files); i++ {
+	for i := FirstFileEndingAfter(files, pieceOffset, end); i < len(files); i++ {
 		f := files[i]
-		if written >= pieceSize {
+		if covered >= pieceSize {
 			break
 		}
 
+		s := span(f)
+
 		// Zero-length files sit at a boundary the walk has already passed, so
 		// they survive the search above without contributing anything.
-		if regionEnd(f) <= currentOffset {
+		if s.End() <= currentOffset {
 			continue
 		}
 
-		fileReadOffset := max(currentOffset-f.Offset, 0)
-		availableInFile := f.Size - fileReadOffset
-		toRead := min(pieceSize-written, availableInFile)
+		regionOffset := max(currentOffset-s.Offset, 0)
+		toProcess := min(pieceSize-covered, s.Size-regionOffset)
 
-		if err := read(i, f, fileReadOffset, buf[written:written+toRead]); err != nil {
+		if err := visit(i, f, regionOffset, buf[covered:covered+toProcess]); err != nil {
 			return err
 		}
 
-		written += toRead
-		currentOffset += toRead
+		covered += toProcess
+		currentOffset += toProcess
 	}
 
-	if written < pieceSize {
-		return fmt.Errorf("short read: got %d bytes, want %d", written, pieceSize)
+	if covered < pieceSize {
+		return fmt.Errorf("piece at offset %d: files cover only %d of %d bytes", pieceOffset, covered, pieceSize)
 	}
 	return nil
 }
@@ -168,7 +186,7 @@ func (c *FdCache) Close() {
 func ReadPieceFromFilesCached(
 	ctx context.Context, cache *FdCache, files []FileRegion, pieceOffset int64, buf []byte,
 ) error {
-	return ReadPieceInto(files, pieceOffset, buf,
+	return WalkPieceRegions(files, RegionSpan, pieceOffset, buf,
 		func(_ int, f FileRegion, fileOffset int64, dst []byte) error {
 			if err := ctx.Err(); err != nil {
 				return err

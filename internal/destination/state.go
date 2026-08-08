@@ -164,36 +164,16 @@ func (f *serverFileInfo) setHardlinkState(hlState hardlinkState) {
 // A piece may span multiple files in a multi-file torrent. Files that take no
 // piece data (unselected, hardlinked, early-finalized) drop their share inside
 // writeAt, which is where fileMu makes that decision race-free.
+//
+// No per-piece fsync: data integrity is guaranteed by verifyFilePieces (early
+// finalization) and verifyFinalizedPieces (full finalization), which read back
+// and SHA1-verify pieces before rename. Per-piece fsync would severely degrade
+// write throughput on NFS/spinning disks.
 func (s *serverTorrentState) writePieceData(offset int64, data []byte) error {
-	remaining := data
-	currentOffset := offset
-
-	for _, fi := range s.files[s.firstFileEndingAfter(currentOffset):] {
-		if len(remaining) == 0 {
-			break
-		}
-
-		if fileEnd(fi) <= currentOffset {
-			continue
-		}
-
-		fileWriteOffset := max(currentOffset-fi.offset, 0)
-		availableInFile := fi.size - fileWriteOffset
-		toProcess := min(int64(len(remaining)), availableInFile)
-
-		// No per-piece fsync: data integrity is guaranteed by verifyFilePieces
-		// (early finalization) and verifyFinalizedPieces (full finalization),
-		// which read back and SHA1-verify pieces before rename.
-		// Per-piece fsync would severely degrade write throughput on NFS/spinning disks.
-		if writeErr := fi.writeAt(remaining[:toProcess], fileWriteOffset); writeErr != nil {
-			return writeErr
-		}
-
-		remaining = remaining[toProcess:]
-		currentOffset += toProcess
-	}
-
-	return nil
+	return utils.WalkPieceRegions(s.files, fileSpan, offset, data,
+		func(_ int, fi *serverFileInfo, fileWriteOffset int64, region []byte) error {
+			return fi.writeAt(region, fileWriteOffset)
+		})
 }
 
 // firstFileEndingAfter narrows a byte range to the files it actually touches.
@@ -202,8 +182,12 @@ func (m *torrentMeta) firstFileEndingAfter(offset int64) int {
 	return utils.FirstFileEndingAfter(m.files, offset, fileEnd)
 }
 
+// fileSpan reports a file's span in the torrent's byte space, for
+// [utils.WalkPieceRegions].
+func fileSpan(f *serverFileInfo) utils.Span { return utils.Span{Offset: f.offset, Size: f.size} }
+
 // fileEnd reports a file's exclusive end offset, for [utils.FirstFileEndingAfter].
-func fileEnd(f *serverFileInfo) int64 { return f.offset + f.size }
+func fileEnd(f *serverFileInfo) int64 { return fileSpan(f).End() }
 
 // buildReadyResponse creates a successful READY response with piece information.
 func (s *serverTorrentState) buildReadyResponse() *pb.InitTorrentResponse {

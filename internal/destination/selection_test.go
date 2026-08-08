@@ -349,6 +349,60 @@ func TestWritePieceData_SkipsUnselectedFiles(t *testing.T) {
 	}
 }
 
+// TestWritePieceData_UnselectedFileStillConsumesItsShare pins that a file which
+// takes no data does not shift the bytes behind it. The walk apportions every
+// overlapping file's range and writeAt drops the ones that decline, so a
+// declining file in the MIDDLE of a piece is the case where treating "skipped"
+// as "contributed nothing" would silently write the wrong bytes to the next
+// file. The existing coverage only ever declines the last file of a piece.
+func TestWritePieceData_UnselectedFileStillConsumesItsShare(t *testing.T) {
+	t.Parallel()
+	_, tmpDir := newTestDestServer(t)
+
+	head := filepath.Join(tmpDir, "head.bin.partial")
+	tail := filepath.Join(tmpDir, "tail.bin.partial")
+	state := &serverTorrentState{
+		torrentMeta: torrentMeta{
+			pieceLength: 150,
+			totalSize:   150,
+			files: []*serverFileInfo{
+				{path: head, size: 50, offset: 0, selected: true},
+				{path: filepath.Join(tmpDir, "middle.bin"), size: 50, offset: 50, selected: false},
+				{path: tail, size: 50, offset: 100, selected: true},
+			},
+		},
+	}
+	for _, path := range []string{head, tail} {
+		if err := os.WriteFile(path, make([]byte, 50), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	data := make([]byte, 150)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	if err := state.writePieceData(0, data); err != nil {
+		t.Fatalf("writePieceData: %v", err)
+	}
+
+	for _, tc := range []struct {
+		path string
+		want []byte
+	}{
+		{head, data[0:50]},
+		{tail, data[100:150]},
+	} {
+		content, err := os.ReadFile(tc.path)
+		if err != nil {
+			t.Fatalf("reading %s: %v", tc.path, err)
+		}
+		if !bytes.Equal(content, tc.want) {
+			t.Errorf("%s = %v, want %v", filepath.Base(tc.path), content[:8], tc.want[:8])
+		}
+	}
+}
+
 // TestWritePieceData_LeavesHardlinkedFilesUntouched pins that a file whose data
 // arrived by hardlink takes no piece data. The hardlink shares its inode with
 // another torrent's file, so a write lands in that torrent's data too - and the
