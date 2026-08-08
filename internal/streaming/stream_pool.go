@@ -132,12 +132,10 @@ type StreamPool struct {
 	closeOnce sync.Once
 }
 
-// StreamPoolConfig configures the stream pool.
+// StreamPoolConfig configures the stream pool. The initial stream count is not
+// part of it: [StreamPool.Open] takes that argument directly, so the pool has
+// exactly one place it can come from.
 type StreamPoolConfig struct {
-	// NumStreams is the initial number of streams (default: 2 if adaptive, 4 otherwise).
-	// Renamed from PoolSize for consistency with BidiQueueConfig.
-	NumStreams int
-
 	// MaxNumStreams is the maximum streams for adaptive scaling (default: 16).
 	// Renamed from MaxPoolSize for consistency with BidiQueueConfig.
 	MaxNumStreams int
@@ -159,7 +157,6 @@ type StreamPoolConfig struct {
 // DefaultStreamPoolConfig returns sensible defaults with adaptive scaling enabled.
 func DefaultStreamPoolConfig() StreamPoolConfig {
 	return StreamPoolConfig{
-		NumStreams:     MinPoolSize, // Start small with adaptive
 		MaxNumStreams:  MaxPoolSize,
 		AckChannelSize: DefaultAckChannelSize,
 		AdaptiveWindow: congestion.DefaultConfig(),
@@ -695,16 +692,30 @@ func (p *StreamPool) removeConnectionStreams(connIdx int) {
 	)
 }
 
-// removeStreamLocked initiates graceful drain of the last stream. Must hold p.mu write lock.
-// The stream stays in the slice during drain (so its receive loop keeps acks flowing back)
-// but findLeastLoadedStream skips it. drainAndRemoveStream removes it after drain completes.
+// removeStreamLocked initiates graceful drain of the last stream still carrying
+// traffic. Must hold p.mu write lock. The stream stays in the slice during drain
+// (so its receive loop keeps acks flowing back) but findLeastLoadedStream skips
+// it. drainAndRemoveStream removes it after drain completes.
+//
+// Both the capacity check and the pick skip streams already draining: a drain
+// runs up to streamDrainTimeout, the same order as the cooldown between
+// scale-downs, so counting departing streams would let the usable pool fall
+// under MinPoolSize, and taking the last slot outright would re-target the very
+// stream already on its way out.
 func (p *StreamPool) removeStreamLocked() error {
-	if len(p.streams) <= MinPoolSize {
-		return errors.New("pool at minimum capacity")
+	var ps *PooledStream
+	active := 0
+	for _, s := range p.streams {
+		if s.draining.Load() {
+			continue
+		}
+		active++
+		ps = s
 	}
 
-	lastIdx := len(p.streams) - 1
-	ps := p.streams[lastIdx]
+	if active <= MinPoolSize {
+		return errors.New("pool at minimum capacity")
+	}
 
 	// Mark as draining before spawning goroutine so ClaimStream() skips it
 	// immediately when p.mu is released, avoiding a scheduling race.
@@ -720,6 +731,13 @@ func (p *StreamPool) removeStreamLocked() error {
 
 // drainAndRemoveStream gracefully drains a stream's in-flight pieces, then removes it from the pool.
 // Called as a goroutine by removeStreamLocked and removeConnectionStreams.
+//
+// Idempotent per stream: connection-level scale-down drains every stream on a
+// connection whether or not a stream-level scale-down is already draining one of
+// them, so the same PooledStream can reach here twice. The removed flag claims
+// the retirement exactly once because the bytesSent hand-off below feeds the
+// throughput baseline every scaling decision compares against - counting a
+// departing stream's bytes twice reads as a throughput spike.
 func (p *StreamPool) drainAndRemoveStream(ps *PooledStream) {
 	ps.draining.Store(true) // Idempotent — callers pre-set this under p.mu
 
@@ -746,7 +764,10 @@ func (p *StreamPool) drainAndRemoveStream(ps *PooledStream) {
 
 remove:
 	p.mu.Lock()
-	ps.removed.Store(true)
+	if !ps.removed.CompareAndSwap(false, true) {
+		p.mu.Unlock()
+		return // A concurrent drain already retired this stream.
+	}
 	for i, s := range p.streams {
 		if s == ps {
 			p.streams = append(p.streams[:i], p.streams[i+1:]...)

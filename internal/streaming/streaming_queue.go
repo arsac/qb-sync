@@ -251,7 +251,6 @@ func (q *BidiQueue) runStream(ctx context.Context) error {
 	q.dest.ClearInitCache()
 
 	poolConfig := StreamPoolConfig{
-		NumStreams:     q.config.NumStreams,
 		MaxNumStreams:  q.config.MaxNumStreams,
 		AdaptiveWindow: q.config.AdaptiveWindow,
 		Adaptive:       q.config.AdaptivePool,

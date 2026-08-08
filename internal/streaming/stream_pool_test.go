@@ -1,6 +1,7 @@
 package streaming
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -10,10 +11,6 @@ import (
 
 func TestStreamPoolConfig_Defaults(t *testing.T) {
 	config := DefaultStreamPoolConfig()
-
-	if config.NumStreams != MinPoolSize {
-		t.Errorf("expected NumStreams %d, got %d", MinPoolSize, config.NumStreams)
-	}
 
 	if config.MaxNumStreams != MaxPoolSize {
 		t.Errorf("expected MaxNumStreams %d, got %d", MaxPoolSize, config.MaxNumStreams)
@@ -403,5 +400,111 @@ func TestCooldownPeriod(t *testing.T) {
 	}
 	if scalingCooldownPeriod > 10*time.Minute {
 		t.Errorf("scalingCooldownPeriod (%v) seems too long", scalingCooldownPeriod)
+	}
+}
+
+// newScaleDownTestPool builds a pool holding n real-enough streams, so
+// removeStreamLocked's background drain can Close() what it picks.
+func newScaleDownTestPool(t *testing.T, n int) *StreamPool {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	streams := make([]*PooledStream, n)
+	for i := range streams {
+		streams[i] = newDrainTestStream(ctx, i)
+	}
+	return &StreamPool{
+		ctx:     ctx,
+		cancel:  cancel,
+		streams: streams,
+		logger:  testLogger,
+		errs:    make(chan error, 10),
+		acks:    make(chan AckEnvelope, 10),
+	}
+}
+
+// TestRemoveStreamLocked_IgnoresDrainingStreams pins that a scale-down landing
+// while an earlier drain is still in flight neither re-targets the departing
+// stream nor lets the pool's usable width fall below MinPoolSize. A drain runs
+// up to streamDrainTimeout, which is the same order as the cooldown between
+// scale-downs, so the overlap is reachable.
+func TestRemoveStreamLocked_IgnoresDrainingStreams(t *testing.T) {
+	t.Parallel()
+
+	t.Run("picks the last stream still carrying traffic", func(t *testing.T) {
+		t.Parallel()
+
+		pool := newScaleDownTestPool(t, MinPoolSize+2)
+
+		last := len(pool.streams) - 1
+		pool.streams[last].draining.Store(true) // Already on its way out.
+		wantPick := pool.streams[last-1]
+
+		pool.mu.Lock()
+		err := pool.removeStreamLocked()
+		pool.mu.Unlock()
+		if err != nil {
+			t.Fatalf("removeStreamLocked: %v", err)
+		}
+
+		if !wantPick.draining.Load() {
+			t.Errorf("stream %d (last non-draining) was not picked for removal", wantPick.id)
+		}
+	})
+
+	t.Run("refuses when only MinPoolSize streams still carry traffic", func(t *testing.T) {
+		t.Parallel()
+
+		// Length is MinPoolSize+1, but one of those is already leaving, so
+		// removing another would drop the usable pool to MinPoolSize-1.
+		pool := newScaleDownTestPool(t, MinPoolSize+1)
+
+		pool.streams[len(pool.streams)-1].draining.Store(true)
+
+		pool.mu.Lock()
+		err := pool.removeStreamLocked()
+		pool.mu.Unlock()
+
+		if err == nil {
+			t.Fatal("expected removeStreamLocked to refuse, got nil error")
+		}
+		for _, ps := range pool.streams[:len(pool.streams)-1] {
+			if ps.draining.Load() {
+				t.Errorf("stream %d was marked draining despite the refusal", ps.id)
+			}
+		}
+	})
+}
+
+// TestDrainAndRemoveStream_RetiresOnce pins that a stream reaching
+// drainAndRemoveStream twice - which connection-level scale-down does whenever
+// one of the connection's streams is already being drained by a stream-level
+// scale-down - is accounted exactly once. Double-counting its bytes into
+// removedBytesSent reads as a throughput spike on the next measurement
+// interval, which is the input every scaling decision compares against.
+func TestDrainAndRemoveStream_RetiresOnce(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ps := newDrainTestStream(ctx, 1)
+	ps.bytesSent.Store(4096)
+
+	pool := newDrainTestPool(ctx, cancel, ps)
+
+	pool.drainAndRemoveStream(ps)
+	pool.drainAndRemoveStream(ps) // e.g. the connection this stream sits on is now going away too
+
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+
+	if len(pool.streams) != 0 {
+		t.Fatalf("expected the stream removed, got %d streams", len(pool.streams))
+	}
+	if pool.removedBytesSent != 4096 {
+		t.Errorf("removedBytesSent = %d, want 4096 (counted once)", pool.removedBytesSent)
 	}
 }
