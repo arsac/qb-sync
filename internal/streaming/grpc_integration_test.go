@@ -97,28 +97,23 @@ func openStreamWithTimeouts(
 	return ps, sink
 }
 
-// newIntegrationPieceStream wraps an open gRPC stream in a PieceStream with the
-// send loop running. The caller starts the receive loop with the sink it wants,
-// which is what decides where acks and stream errors land.
+// newIntegrationPieceStream wraps an open gRPC stream in a PieceStream. The
+// caller starts the receive loop with the sink it wants, which is what decides
+// where acks and stream errors land.
 func newIntegrationPieceStream(
 	streamCtx context.Context,
 	streamCancel context.CancelFunc,
 	stream pb.QBSyncService_StreamPiecesBidiClient,
 	sndTimeout time.Duration,
 ) *PieceStream {
-	ps := &PieceStream{
+	return &PieceStream{
 		ctx:                 streamCtx,
 		cancel:              streamCancel,
 		stream:              stream,
 		logger:              testLogger,
 		done:                make(chan struct{}),
-		sendCh:              make(chan *sendRequest),
-		stopSend:            make(chan struct{}),
-		sendDone:            make(chan struct{}),
 		sendTimeoutOverride: sndTimeout,
 	}
-	go ps.sendLoop()
-	return ps
 }
 
 // TestIntegration_SendRecvAckRoundtrip verifies the full Send → server Recv →

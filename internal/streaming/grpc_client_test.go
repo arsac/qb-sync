@@ -174,15 +174,11 @@ func newTestPieceStreamWithOptions(
 		stream:              mock,
 		logger:              testLogger,
 		done:                make(chan struct{}),
-		sendCh:              make(chan *sendRequest),
-		stopSend:            make(chan struct{}),
-		sendDone:            make(chan struct{}),
 		sendTimeoutOverride: sndTimeout,
 	}
 
 	sink := newChanAckSink(ackBufSize, ackTimeout)
 	go ps.receiveAcks(sink)
-	go ps.sendLoop()
 	return ps, sink
 }
 
@@ -222,9 +218,64 @@ func TestSend_StreamErrorPropagates(t *testing.T) {
 	}
 }
 
+// TestSend_SerializesConcurrentSenders verifies that concurrent Send callers
+// never overlap inside stream.Send. gRPC allows only one sender goroutine per
+// stream, and the sender pool routinely has several workers on one stream.
+func TestSend_SerializesConcurrentSenders(t *testing.T) {
+	t.Parallel()
+
+	const (
+		senders       = 8
+		sendsPerActor = 25
+	)
+
+	var inFlight, maxInFlight atomic.Int32
+	mock := &mockBidiStream{
+		sendFunc: func(*pb.WritePieceRequest) error {
+			now := inFlight.Add(1)
+			for {
+				peak := maxInFlight.Load()
+				if now <= peak || maxInFlight.CompareAndSwap(peak, now) {
+					break
+				}
+			}
+			// Widen the overlap window so an unserialized send is caught by
+			// the counter, not just by the race detector.
+			time.Sleep(50 * time.Microsecond)
+			inFlight.Add(-1)
+			return nil
+		},
+	}
+
+	ps, _ := newTestPieceStream(context.Background(), mock)
+	defer ps.Close()
+
+	var sendErrs atomic.Int32
+	done := make(chan struct{})
+	for range senders {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			for range sendsPerActor {
+				if err := ps.Send(&pb.WritePieceRequest{TorrentHash: "test"}); err != nil {
+					sendErrs.Add(1)
+				}
+			}
+		}()
+	}
+	for range senders {
+		<-done
+	}
+
+	if peak := maxInFlight.Load(); peak != 1 {
+		t.Fatalf("concurrent stream.Send calls: peak in-flight = %d, want 1", peak)
+	}
+	if n := sendErrs.Load(); n != 0 {
+		t.Fatalf("expected no send errors, got %d", n)
+	}
+}
+
 // TestSend_AfterCloseSendReturnsError verifies that calling Send after CloseSend
-// returns an error instead of panicking. Before the stopSend fix, this would
-// panic with "send on closed channel" because CloseSend closed sendCh directly.
+// returns an error rather than pushing a piece onto a half-closed stream.
 func TestSend_AfterCloseSendReturnsError(t *testing.T) {
 	t.Parallel()
 
@@ -1039,11 +1090,8 @@ func newStubPooledStreams(n int) []*PooledStream {
 	for i := range n {
 		streams[i] = &PooledStream{
 			stream: &PieceStream{
-				connIdx:  0,
-				done:     make(chan struct{}),
-				sendCh:   make(chan *sendRequest),
-				stopSend: make(chan struct{}),
-				sendDone: make(chan struct{}),
+				connIdx: 0,
+				done:    make(chan struct{}),
 			},
 			window: congestion.NewAdaptiveWindow(congestion.DefaultConfig()),
 			id:     i,

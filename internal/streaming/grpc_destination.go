@@ -53,8 +53,8 @@ const (
 
 	// sendTimeout is how long Send waits for the gRPC stream.Send to complete.
 	// gRPC Send() blocks on HTTP/2 flow control when the receiver stops consuming.
-	// Since Send doesn't accept a context, the caller-side timer cancels the stream
-	// context if the sendLoop's stream.Send doesn't return in time.
+	// Since Send doesn't accept a context, a timer armed around the call cancels
+	// the stream context if stream.Send doesn't return in time.
 	sendTimeout = 30 * time.Second
 
 	// gRPC connect backoff parameters.
@@ -340,9 +340,9 @@ func (d *GRPCDestination) CheckTorrentStatus(ctx context.Context, hash string) (
 // Each stream gets its own cancellable context so a stuck Send() can be
 // unblocked without tearing down the entire pool.
 //
-// Only the send side is started here. The caller must run receiveAcks with a
-// sink of its own - it is what detects stream death, and Close waits on the
-// done channel it closes.
+// No goroutine is started here. The caller must run receiveAcks with a sink of
+// its own - it is what detects stream death, and Close waits on the done channel
+// it closes.
 func (d *GRPCDestination) OpenStream(ctx context.Context, logger *slog.Logger) (*PieceStream, error) {
 	connIdx := d.streamConnIdx()
 
@@ -357,21 +357,14 @@ func (d *GRPCDestination) OpenStream(ctx context.Context, logger *slog.Logger) (
 		return nil, fmt.Errorf("failed to open stream: %w", err)
 	}
 
-	ps := &PieceStream{
-		connIdx:  connIdx,
-		ctx:      streamCtx,
-		cancel:   streamCancel,
-		stream:   stream,
-		logger:   logger,
-		done:     make(chan struct{}),
-		sendCh:   make(chan *sendRequest), // unbuffered: natural backpressure
-		stopSend: make(chan struct{}),
-		sendDone: make(chan struct{}),
-	}
-
-	go ps.sendLoop()
-
-	return ps, nil
+	return &PieceStream{
+		connIdx: connIdx,
+		ctx:     streamCtx,
+		cancel:  streamCancel,
+		stream:  stream,
+		logger:  logger,
+		done:    make(chan struct{}),
+	}, nil
 }
 
 // FinalizeTorrent requests the destination server to finalize a torrent:
