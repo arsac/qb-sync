@@ -424,12 +424,13 @@ var (
 		},
 	)
 
-	// CycleCacheHitsTotal counts times fetchTorrentsCompletedOnDest reused the per-cycle cache.
+	// CycleCacheHitsTotal counts times an orchestrator pass reused the cycle's
+	// source torrent list instead of refetching it from qBittorrent.
 	CycleCacheHitsTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "cycle_cache_hits_total",
-			Help:      "Total times the per-cycle completed torrents cache was reused",
+			Help:      "Total times the per-cycle source torrent list was reused",
 		},
 	)
 

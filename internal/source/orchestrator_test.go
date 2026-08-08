@@ -51,7 +51,8 @@ type mockQBClient struct {
 	getTorrentsResult []qbittorrent.Torrent
 	getTorrentsErr    error
 
-	getFilesCalls atomic.Int64
+	getTorrentsCalls atomic.Int64
+	getFilesCalls    atomic.Int64
 
 	freeSpaceOnDisk int64
 	freeSpaceErr    error
@@ -71,6 +72,7 @@ func (m *mockQBClient) GetTorrentsCtx(
 	_ context.Context,
 	_ qbittorrent.TorrentFilterOptions,
 ) ([]qbittorrent.Torrent, error) {
+	m.getTorrentsCalls.Add(1)
 	return m.getTorrentsResult, m.getTorrentsErr
 }
 
@@ -376,10 +378,22 @@ func TestConstants(t *testing.T) {
 }
 
 // mockDest implements Destination for testing.
+// finalizeCall records one FinalizeTorrent invocation. The scalar finalize*
+// fields below only survive the last call, which cannot show that a multi-
+// torrent pass sent each torrent its own record.
+type finalizeCall struct {
+	hash        string
+	savePath    string
+	category    string
+	tags        string
+	saveSubPath string
+}
+
 type mockDest struct {
 	checkStatusResults map[string]*streaming.InitTorrentResult
 	checkStatusErr     error
 
+	finalizeCalls       []finalizeCall
 	finalizeCalled      bool
 	finalizeHash        string
 	finalizeSavePath    string
@@ -424,6 +438,13 @@ func (m *mockDest) FinalizeTorrent(_ context.Context, hash, savePath, category, 
 	m.finalizeCategory = category
 	m.finalizeTags = tags
 	m.finalizeSaveSubPath = saveSubPath
+	m.finalizeCalls = append(m.finalizeCalls, finalizeCall{
+		hash:        hash,
+		savePath:    savePath,
+		category:    category,
+		tags:        tags,
+		saveSubPath: saveSubPath,
+	})
 	return m.finalizeErr
 }
 
@@ -3608,4 +3629,113 @@ func TestCycleFilesFor_ConcurrentAccessIsRaceSafe(t *testing.T) {
 	})
 
 	wg.Wait()
+}
+
+// TestFinalizeCompletedStreams_ServedFromTheCycleTorrentList pins that a
+// finalize attempt reuses the torrent record trackNewTorrents already fetched
+// for this cycle instead of asking qBittorrent again for each torrent.
+//
+// The waste this removes is a steady state, not an edge case: the destination
+// finalizes one torrent at a time, so every other completed torrent is
+// re-offered on every cycle and answered with BUSY or VERIFYING - and each one
+// was paying a torrents/info round-trip first, on the same WebUI the
+// PieceMonitor polls piece states on for the torrents still streaming.
+func TestFinalizeCompletedStreams_ServedFromTheCycleTorrentList(t *testing.T) {
+	newTask := func(t *testing.T, client *mockQBClient, dest *mockDest) *QBTask {
+		t.Helper()
+		logger := testLogger(t)
+		return &QBTask{
+			cfg:       &config.SourceConfig{},
+			logger:    logger,
+			srcClient: client,
+			grpcDest:  dest,
+			source:    qbclient.NewSource(nil, ""),
+			// Only reached if a finalize unexpectedly succeeds, which is what a
+			// broken fallback looks like - present so that fails on an assertion
+			// rather than a nil-tracker panic.
+			tracker: streaming.NewPieceMonitor(
+				nil, &mockPieceSource{numPieces: 1}, logger, streaming.DefaultPieceMonitorConfig(),
+			),
+			store: newTorrentStore(filepath.Join(t.TempDir(), "completed.json"), time.Hour, logger),
+		}
+	}
+
+	// Complete on the source side, so finalizeCompletedStreams attempts every
+	// one of them. VERIFYING keeps the pass on its polling path (no sync
+	// bookkeeping), which is exactly the repeated-cycle case under test.
+	completed := func(hashes ...string) map[string]streaming.StreamProgress {
+		progress := make(map[string]streaming.StreamProgress, len(hashes))
+		for _, h := range hashes {
+			progress[h] = streaming.StreamProgress{Complete: true}
+		}
+		return progress
+	}
+	tracked := func(hashes ...string) map[string]TrackedTorrent {
+		m := make(map[string]TrackedTorrent, len(hashes))
+		for _, h := range hashes {
+			m[h] = TrackedTorrent{}
+		}
+		return m
+	}
+
+	t.Run("cached torrents finalize with their own record and no round-trip", func(t *testing.T) {
+		client := &mockQBClient{}
+		dest := &mockDest{finalizeErr: streaming.ErrFinalizeVerifying}
+		task := newTask(t, client, dest)
+		task.cycleTorrents = []qbittorrent.Torrent{
+			{Hash: "aaa", SavePath: "/data/a", Category: "movies", Tags: "hd"},
+			{Hash: "unrelated", SavePath: "/data/x", Category: "junk", Tags: "no"},
+			{Hash: "bbb", SavePath: "/data/b", Category: "tv", Tags: "sd"},
+		}
+
+		if err := task.finalizeCompletedStreams(
+			context.Background(), tracked("aaa", "bbb"), completed("aaa", "bbb"),
+		); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if got := client.getTorrentsCalls.Load(); got != 0 {
+			t.Errorf("expected 0 GetTorrentsCtx round-trips, got %d", got)
+		}
+
+		byHash := make(map[string]finalizeCall, len(dest.finalizeCalls))
+		for _, c := range dest.finalizeCalls {
+			byHash[c.hash] = c
+		}
+		if len(byHash) != 2 {
+			t.Fatalf("expected 2 distinct torrents finalized, got %d (%v)", len(byHash), dest.finalizeCalls)
+		}
+		for _, want := range []finalizeCall{
+			{hash: "aaa", savePath: "/data/a", category: "movies", tags: "hd"},
+			{hash: "bbb", savePath: "/data/b", category: "tv", tags: "sd"},
+		} {
+			got := byHash[want.hash]
+			if got.savePath != want.savePath || got.category != want.category || got.tags != want.tags {
+				t.Errorf("hash %s finalized with %+v, want %+v", want.hash, got, want)
+			}
+		}
+	})
+
+	t.Run("a torrent missing from the cycle list still falls back to a fetch", func(t *testing.T) {
+		// A tracked torrent absent from the cycle list has left the source. The
+		// fetch is what turns that into the "torrent not found" error the
+		// removal-time path relies on, so the fallback must survive.
+		client := &mockQBClient{getTorrentsResult: nil}
+		dest := &mockDest{finalizeErr: streaming.ErrFinalizeVerifying}
+		task := newTask(t, client, dest)
+		task.cycleTorrents = []qbittorrent.Torrent{{Hash: "other"}}
+
+		if err := task.finalizeCompletedStreams(
+			context.Background(), tracked("gone"), completed("gone"),
+		); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if got := client.getTorrentsCalls.Load(); got != 1 {
+			t.Errorf("expected 1 fallback GetTorrentsCtx round-trip, got %d", got)
+		}
+		if dest.finalizeCalled {
+			t.Error("FinalizeTorrent should not be called for a torrent gone from the source")
+		}
+	})
 }

@@ -387,6 +387,25 @@ func (t *QBTask) findTorrentByHash(hash string) *qbittorrent.Torrent {
 	return nil
 }
 
+// cycleTorrentList returns the source torrent list for the current cycle,
+// fetching it only when the cycle has not already done so. trackNewTorrents
+// fetches the full list at the top of every runOnce, so any later pass in the
+// same cycle that needs it is served from memory.
+//
+// The fetch is the fallback for entry points reached before any cycle has run
+// (the exported test wrappers). Drain runs after the cycle loop has exited and
+// so inherits the last cycle's list, as it did before this was a shared helper.
+//
+// Runs on the runOnce goroutine only - cycleTorrents is unsynchronized, unlike
+// the cycleFiles map, which finalizeTorrent also reaches from listenForRemovals.
+func (t *QBTask) cycleTorrentList(ctx context.Context) ([]qbittorrent.Torrent, error) {
+	if t.cycleTorrents != nil {
+		metrics.CycleCacheHitsTotal.Inc()
+		return t.cycleTorrents, nil
+	}
+	return t.srcClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{})
+}
+
 // cycleFilesFor returns the file-information result for a torrent, fetching
 // from source qB on first miss and caching for the rest of the orchestrator
 // cycle. Eliminates redundant GetFilesInformationCtx round-trips that

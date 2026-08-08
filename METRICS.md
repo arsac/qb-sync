@@ -52,7 +52,7 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_cleanup_groups_total` | `result` | Hardlink groups processed during source cleanup |
 | `qbsync_cleanup_torrents_handed_off_total` | | Torrents handed off from source to destination |
 | `qbsync_idle_poll_skips_total` | | Piece poll skips due to idle torrent detection |
-| `qbsync_cycle_cache_hits_total` | | Per-cycle completed-torrents cache reuses |
+| `qbsync_cycle_cache_hits_total` | | Per-cycle source torrent list reuses |
 | `qbsync_health_check_cache_total` | `result` | Health check cache hits/misses |
 | `qbsync_file_handle_cache_total` | `result` | File handle cache lookups (hit/miss) on source |
 | `qbsync_file_handle_evictions_total` | | File handle evictions (stale retry, fallback, or full evict) |

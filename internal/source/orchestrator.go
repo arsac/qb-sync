@@ -96,8 +96,10 @@ type QBTask struct {
 	pruneCycleCount int
 
 	// Per-cycle cache of torrents to avoid redundant GetTorrentsCtx calls.
-	// Set by trackNewTorrents, consumed by fetchTorrentsCompletedOnDest, reset each cycle.
-	// nil means not yet fetched this cycle; non-nil (even empty) means cached.
+	// Set by trackNewTorrents, read through cycleTorrentList and
+	// findTorrentByHash, reset each cycle. nil means not yet fetched this
+	// cycle; non-nil (even empty) means cached. Unsynchronized: only the
+	// runOnce goroutine may touch it, unlike cycleFiles below.
 	cycleTorrents []qbittorrent.Torrent
 
 	// Per-cycle cache of file-information results to avoid redundant
@@ -338,7 +340,7 @@ func (t *QBTask) RecheckFileSelections(ctx context.Context) {
 // On handoff failure the cache entry is left in place so the next cycle
 // retries; on success (or in dry-run) the entry is pruned to bound cache size.
 func (t *QBTask) pruneCompletedOnDest(ctx context.Context) {
-	torrents, err := t.srcClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{})
+	torrents, err := t.cycleTorrentList(ctx)
 	if err != nil {
 		t.logger.WarnContext(ctx, "failed to fetch torrents for cache pruning", "error", err)
 		return

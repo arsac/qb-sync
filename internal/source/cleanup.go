@@ -207,15 +207,9 @@ func hasTag(tags, target string) bool {
 
 // fetchTorrentsCompletedOnDest returns source torrents that are known to be complete on destination.
 func (t *QBTask) fetchTorrentsCompletedOnDest(ctx context.Context) ([]qbittorrent.Torrent, error) {
-	allTorrents := t.cycleTorrents
-	if allTorrents != nil {
-		metrics.CycleCacheHitsTotal.Inc()
-	} else {
-		var err error
-		allTorrents, err = t.srcClient.GetTorrentsCtx(ctx, qbittorrent.TorrentFilterOptions{})
-		if err != nil {
-			return nil, err
-		}
+	allTorrents, err := t.cycleTorrentList(ctx)
+	if err != nil {
+		return nil, err
 	}
 
 	completedSnapshot := t.store.CompletedSnapshot()
