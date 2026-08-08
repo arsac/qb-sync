@@ -975,6 +975,90 @@ func newStubPooledStreams(n int) []*PooledStream {
 	return streams
 }
 
+// measureInterval drives one throughput measurement: it attributes totalBytes
+// cumulative bytes to the pool's first stream and backdates the measurement
+// baseline by two seconds, so updateThroughput sees a full interval.
+func measureInterval(pool *StreamPool, totalBytes int64) {
+	pool.mu.Lock()
+	pool.streams[0].bytesSent.Store(totalBytes)
+	pool.lastMeasureTime = time.Now().Add(-2 * time.Second)
+	pool.mu.Unlock()
+
+	pool.updateThroughput()
+}
+
+// TestUpdateThroughput_ScalesOnMeasuredChange pins the wiring between the
+// throughput measurement and the scaling decision: the decision has to compare
+// a new measurement against the PREVIOUS interval's, so a caller that publishes
+// the new value as lastThroughput first leaves every change ratio at zero and
+// the pool permanently stuck on the plateau path. The applyScalingDecision
+// tests seed lastThroughput by hand and so cannot see that.
+func TestUpdateThroughput_ScalesOnMeasuredChange(t *testing.T) {
+	t.Parallel()
+
+	addr := startTestGRPCServerAddr(t, func(stream pb.QBSyncService_StreamPiecesBidiServer) error {
+		<-stream.Context().Done()
+		return stream.Context().Err()
+	})
+
+	t.Run("increase scales up", func(t *testing.T) {
+		t.Parallel()
+
+		dest, err := NewGRPCDestination(addr, 1, 4)
+		if err != nil {
+			t.Fatalf("NewGRPCDestination: %v", err)
+		}
+		defer dest.Close()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		pool := newAdaptiveScalingTestPool(ctx, cancel, dest, newStubPooledStreams(MinPoolSize))
+
+		measureInterval(pool, 10<<20) // baseline: 5 MB/s
+		measureInterval(pool, 30<<20) // 10 MB/s, +100%
+
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+		if got := len(pool.streams); got != MinPoolSize+1 {
+			t.Errorf("streams = %d, want %d: a doubling of throughput did not scale the pool up", got, MinPoolSize+1)
+		}
+	})
+
+	t.Run("decrease scales down", func(t *testing.T) {
+		t.Parallel()
+
+		dest, err := NewGRPCDestination(addr, 1, 4)
+		if err != nil {
+			t.Fatalf("NewGRPCDestination: %v", err)
+		}
+		defer dest.Close()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		streams := make([]*PooledStream, MinPoolSize+1)
+		for i := range streams {
+			streams[i] = newDrainTestStream(ctx, i)
+		}
+		pool := newAdaptiveScalingTestPool(ctx, cancel, dest, streams)
+
+		measureInterval(pool, 30<<20) // baseline: 15 MB/s
+		measureInterval(pool, 40<<20) // 5 MB/s, -67%
+
+		pool.wg.Wait() // drainAndRemoveStream
+
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+		if got := len(pool.streams); got != MinPoolSize {
+			t.Errorf("streams = %d, want %d: a collapse in throughput did not scale the pool down", got, MinPoolSize)
+		}
+		if !pool.scalingPaused {
+			t.Error("scaling should be paused after a scale-down")
+		}
+	})
+}
+
 // TestHandlePlateau_FullSaturationPauses verifies that when at max connections
 // and max streams, handlePlateau pauses scaling unconditionally.
 func TestHandlePlateau_FullSaturationPauses(t *testing.T) {
@@ -1040,10 +1124,10 @@ func TestDiminishingReturns_TriggersScaleDown(t *testing.T) {
 	pool.connectionScaleCheckPending = true
 	pool.preConnectionThroughput = 100.0
 	pool.connectionAddedTime = time.Now().Add(-3 * defaultScaleInterval) // Past check window
-	pool.lastThroughput = 102.0                                          // Only 2% improvement
 
-	// Current throughput: 102 MB/s (2% improvement < 5% threshold)
-	pool.applyScalingDecision(102.0)
+	// Current throughput: 102 MB/s, only 2% above preConnectionThroughput,
+	// below the 5% threshold that would call the connection add effective.
+	pool.applyScalingDecision(102.0, 102.0)
 
 	if !pool.scalingPaused {
 		t.Error("scaling should be paused after diminishing returns")
@@ -1089,9 +1173,8 @@ func TestDiminishingReturns_GoodImprovement(t *testing.T) {
 	pool.connectionScaleCheckPending = true
 	pool.preConnectionThroughput = 100.0
 	pool.connectionAddedTime = time.Now().Add(-3 * defaultScaleInterval)
-	pool.lastThroughput = 110.0
 
-	pool.applyScalingDecision(110.0)
+	pool.applyScalingDecision(110.0, 110.0)
 
 	if pool.scalingPaused {
 		t.Error("scaling should NOT be paused after good improvement")

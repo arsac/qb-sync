@@ -431,13 +431,19 @@ func (p *StreamPool) updateThroughput() {
 		return
 	}
 
+	// The previous interval's throughput is the baseline every scaling decision
+	// compares against, so it has to be read out before the gauge update below
+	// overwrites it - otherwise the measured change is always exactly zero and
+	// the pool can only ever see a plateau.
+	previousThroughput := p.lastThroughput
+
 	// Always update throughput gauge
 	p.lastThroughput = currentThroughput
 	metrics.TransferThroughputBytesPerSecond.Set(currentThroughput)
 
 	// Only make scaling decisions if adaptive
 	if p.adaptive && !p.isInCooldown() {
-		p.applyScalingDecision(currentThroughput)
+		p.applyScalingDecision(currentThroughput, previousThroughput)
 	}
 }
 
@@ -493,9 +499,10 @@ func (p *StreamPool) measureThroughput() (float64, bool) {
 	return currentThroughput, true
 }
 
-// applyScalingDecision applies scaling logic based on throughput change.
+// applyScalingDecision applies scaling logic based on the change from
+// previousThroughput to currentThroughput, both in bytes/sec.
 // Must hold p.mu.
-func (p *StreamPool) applyScalingDecision(currentThroughput float64) {
+func (p *StreamPool) applyScalingDecision(currentThroughput, previousThroughput float64) {
 	// Check diminishing returns from recent connection add
 	if p.connectionScaleCheckPending && time.Since(p.connectionAddedTime) >= 2*p.scaleInterval {
 		p.connectionScaleCheckPending = false
@@ -519,15 +526,15 @@ func (p *StreamPool) applyScalingDecision(currentThroughput float64) {
 	}
 
 	var changeRatio float64
-	if p.lastThroughput > 0 {
-		changeRatio = (currentThroughput - p.lastThroughput) / p.lastThroughput
+	if previousThroughput > 0 {
+		changeRatio = (currentThroughput - previousThroughput) / previousThroughput
 	}
 
 	streamCount := len(p.streams)
 
 	p.logger.DebugContext(p.ctx, "adaptive scaling check",
 		"throughputMBps", currentThroughput/grpcutil.BytesPerMB,
-		"lastThroughputMBps", p.lastThroughput/grpcutil.BytesPerMB,
+		"lastThroughputMBps", previousThroughput/grpcutil.BytesPerMB,
 		"changePercent", changeRatio*percentMultiple,
 		"streams", streamCount,
 		"plateauCount", p.plateauCount,
