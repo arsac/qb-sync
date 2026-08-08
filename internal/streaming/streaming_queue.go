@@ -530,52 +530,17 @@ func (q *BidiQueue) ensureTorrentInitialized(ctx context.Context, hash string) e
 // sendPiecePool reads piece data and sends it over the best available stream.
 func (q *BidiQueue) sendPiecePool(ctx context.Context, pool *StreamPool, piece *pb.Piece) error {
 	sendStart := time.Now()
-	hash := piece.GetTorrentHash()
-	index := piece.GetIndex()
-	key := congestion.PieceKey{Hash: hash, Index: index}
+	key := congestion.PieceKey{Hash: piece.GetTorrentHash(), Index: piece.GetIndex()}
 
-	// Drop pieces whose torrent was untracked between queue time and now.
-	// queueCompletedPieces enqueues with a snapshot of the torrent state, so
-	// a concurrent Untrack (e.g., torrent removed from source mid-stream)
-	// can leave stale pieces in the channel. Sending them would re-init the
-	// torrent on destination and produce PIECE_ERROR_NOT_INITIALIZED noise.
-	if !q.tracker.IsTracked(hash) {
-		q.logger.DebugContext(ctx, "dropping queued piece for untracked torrent",
-			"hash", hash, "piece", index,
-		)
-		return nil
+	reason, prepErr := q.prepareSend(ctx, pool, key)
+	if prepErr != nil {
+		return prepErr
 	}
-
-	if err := q.ensureTorrentInitialized(ctx, hash); err != nil {
-		return err
-	}
-
-	// Skip pieces already covered (e.g. hardlinked on destination before this piece was dequeued)
-	if q.tracker.IsPieceStreamed(hash, int(index)) {
-		q.logger.DebugContext(ctx, "skipping piece covered by hardlink",
-			"hash", hash,
-			"piece", index,
-		)
-		return nil
-	}
-
-	// Skip a piece another sender already has on the wire. The monitor clears a
-	// piece's queued bit the moment a sender dequeues it (NoteDequeued), which is
-	// what keeps the scan a self-healing retry, so every poll tick from then until
-	// the ack lands offers the piece again. Sending it again costs a full piece
-	// read off NFS plus a second copy over the link, and puts two copies under a
-	// single congestion-window key, which the first ack then retires. The
-	// duplicates that arrive after the ack are caught by the IsPieceStreamed check
-	// above; this is the window before it.
-	//
-	// Safe as a drop rather than a deferral: a piece that never gets acked is
-	// retired from the window by the stale sweep or by stream teardown, both of
-	// which requeue it through MarkFailed, so nothing here is the last chance to
-	// send it.
-	if pool.IsInFlight(key) {
-		q.logger.DebugContext(ctx, "skipping piece already in flight",
-			"hash", hash,
-			"piece", index,
+	if reason != "" {
+		q.logger.DebugContext(ctx, "skipping queued piece",
+			"hash", key.Hash,
+			"piece", key.Index,
+			"reason", reason,
 		)
 		return nil
 	}
@@ -585,8 +550,8 @@ func (q *BidiQueue) sendPiecePool(ctx context.Context, pool *StreamPool, piece *
 	ps, claimErr := pool.ClaimStream(key)
 	if errors.Is(claimErr, errWindowFull) {
 		q.logger.DebugContext(ctx, "window full, skipping disk read",
-			"hash", hash,
-			"piece", index,
+			"hash", key.Hash,
+			"piece", key.Index,
 		)
 		return errWindowFull
 	}
@@ -594,6 +559,64 @@ func (q *BidiQueue) sendPiecePool(ctx context.Context, pool *StreamPool, piece *
 		return fmt.Errorf("claiming stream: %w", claimErr)
 	}
 
+	return q.sendClaimedPiece(ctx, pool, ps, piece, key, sendStart)
+}
+
+// prepareSend runs the pre-send gate for one piece: it lazily initializes the
+// piece's torrent on the destination and reports why the piece need not be sent,
+// or "" when it should be. The three drop conditions all cost nothing to detect
+// and all avoid a full piece read off NFS plus a copy over the link.
+//
+// The initialization sits between the first check and the rest deliberately.
+// Sending a piece for an untracked torrent would re-init a torrent the source
+// has already dropped, so that check has to precede it; and InitTorrent is what
+// marks the pieces the destination already holds as streamed, so the streamed
+// check has to follow it to catch a first piece the destination hardlinked.
+func (q *BidiQueue) prepareSend(ctx context.Context, pool *StreamPool, key congestion.PieceKey) (string, error) {
+	// queueCompletedPieces enqueues with a snapshot of the torrent state, so a
+	// concurrent Untrack (e.g. torrent removed from source mid-stream) can leave
+	// stale pieces in the channel.
+	if !q.tracker.IsTracked(key.Hash) {
+		return "torrent untracked", nil
+	}
+
+	if err := q.ensureTorrentInitialized(ctx, key.Hash); err != nil {
+		return "", err
+	}
+
+	// Already covered, e.g. hardlinked on the destination before this piece was
+	// dequeued, or acked from an earlier send of the same piece.
+	if q.tracker.IsPieceStreamed(key.Hash, int(key.Index)) {
+		return "already streamed", nil
+	}
+
+	// Another sender already has this piece on the wire. The monitor clears a
+	// piece's queued bit the moment a sender dequeues it (NoteDequeued), which is
+	// what keeps the scan a self-healing retry, so every poll tick from then until
+	// the ack lands offers the piece again. Sending it again would put two copies
+	// under a single congestion-window key, which the first ack then retires.
+	//
+	// Safe as a drop rather than a deferral: a piece that never gets acked is
+	// retired from the window by the stale sweep or by stream teardown, both of
+	// which requeue it through MarkFailed, so nothing here is the last chance to
+	// send it.
+	if pool.IsInFlight(key) {
+		return "already in flight", nil
+	}
+
+	return "", nil
+}
+
+// sendClaimedPiece reads and transmits a piece that already holds a congestion
+// window slot, releasing the slot on any failure so the piece is requeued.
+func (q *BidiQueue) sendClaimedPiece(
+	ctx context.Context,
+	pool *StreamPool,
+	ps *PooledStream,
+	piece *pb.Piece,
+	key congestion.PieceKey,
+	sendStart time.Time,
+) error {
 	data, err := q.source.ReadPiece(ctx, piece)
 	if err != nil {
 		pool.FailPiece(ps, key)
@@ -608,8 +631,8 @@ func (q *BidiQueue) sendPiecePool(ctx context.Context, pool *StreamPool, piece *
 	}
 
 	req := &pb.WritePieceRequest{
-		TorrentHash: hash,
-		PieceIndex:  index,
+		TorrentHash: key.Hash,
+		PieceIndex:  key.Index,
 		Offset:      piece.GetOffset(),
 		Size:        piece.GetSize(),
 		Data:        data,
@@ -628,8 +651,8 @@ func (q *BidiQueue) sendPiecePool(ctx context.Context, pool *StreamPool, piece *
 	ps.bytesSent.Add(int64(len(data)))
 
 	q.logger.DebugContext(ctx, "sent piece",
-		"hash", hash,
-		"piece", index,
+		"hash", key.Hash,
+		"piece", key.Index,
 		"size", len(data),
 		"stream", ps.id,
 		"window", ps.window.Window(),

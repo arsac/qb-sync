@@ -433,14 +433,20 @@ func TestDeliverPiece_RetriesAfterLosingWindowSlot(t *testing.T) {
 	}
 }
 
-// newInFlightSkipFixture builds the minimum a sendPiecePool call needs: a
-// tracked torrent, an initialized destination, and a pool of one stream whose
-// window the test drives directly.
-func newInFlightSkipFixture(t *testing.T, hash string, numPieces int) (
+// sendGateHash is the torrent newSendGateFixture builds.
+const sendGateHash = "testhash"
+
+// newSendGateFixture builds the minimum a sendPiecePool call needs: a tracked
+// torrent, an initialized destination, and a pool of one stream whose window the
+// test drives directly.
+func newSendGateFixture(t *testing.T) (
 	*BidiQueue, *StreamPool, *PooledStream, *indexRecordingSource,
 ) {
 	t.Helper()
 
+	const numPieces = 16
+
+	hash := sendGateHash
 	source := &indexRecordingSource{}
 	tracker := NewPieceMonitor(nil, nil, testLogger, DefaultPieceMonitorConfig())
 	tracker.torrents[hash] = &torrentState{
@@ -481,14 +487,13 @@ func newInFlightSkipFixture(t *testing.T, hash string, numPieces int) (
 // torrent re-sends its in-flight pieces once per poll interval.
 func TestSendPiecePool_SkipsPieceAlreadyInFlight(t *testing.T) {
 	const (
-		hash       = "testhash"
+		hash       = sendGateHash
 		pieceIndex = int32(3)
-		numPieces  = 16
 	)
 	key := congestion.PieceKey{Hash: hash, Index: pieceIndex}
 
 	t.Run("in flight is skipped without a read or a second claim", func(t *testing.T) {
-		q, pool, ps, source := newInFlightSkipFixture(t, hash, numPieces)
+		q, pool, ps, source := newSendGateFixture(t)
 		ps.window.OnSend(key)
 
 		piece := &pb.Piece{TorrentHash: hash, Index: pieceIndex}
@@ -504,7 +509,7 @@ func TestSendPiecePool_SkipsPieceAlreadyInFlight(t *testing.T) {
 	})
 
 	t.Run("a draining stream still counts as in flight", func(t *testing.T) {
-		q, pool, ps, source := newInFlightSkipFixture(t, hash, numPieces)
+		q, pool, ps, source := newSendGateFixture(t)
 		ps.window.OnSend(key)
 		ps.draining.Store(true)
 
@@ -518,7 +523,7 @@ func TestSendPiecePool_SkipsPieceAlreadyInFlight(t *testing.T) {
 	})
 
 	t.Run("a retired piece is sent", func(t *testing.T) {
-		q, pool, ps, source := newInFlightSkipFixture(t, hash, numPieces)
+		q, pool, ps, source := newSendGateFixture(t)
 		ps.window.OnSend(key)
 		pool.FailPiece(ps, key)
 
@@ -529,6 +534,47 @@ func TestSendPiecePool_SkipsPieceAlreadyInFlight(t *testing.T) {
 		}
 		if got := source.read(); !slices.Equal(got, []int32{pieceIndex}) {
 			t.Errorf("read indices = %v, want exactly [%d]", got, pieceIndex)
+		}
+	})
+}
+
+// TestPrepareSend_DropsPiecesThatNeedNoSend pins the two pre-send drop reasons
+// the in-flight test does not cover, plus the ordering the gate depends on: the
+// untracked check has to run before the destination is initialized, or a piece
+// left in the channel by a concurrent Untrack re-inits a torrent the source has
+// already dropped.
+func TestPrepareSend_DropsPiecesThatNeedNoSend(t *testing.T) {
+	const (
+		hash       = sendGateHash
+		pieceIndex = int32(3)
+	)
+
+	t.Run("an untracked torrent is dropped before initialization", func(t *testing.T) {
+		q, pool, _, source := newSendGateFixture(t)
+		// Untracking also removes the metadata ensureTorrentInitialized needs, so
+		// a gate that initializes first surfaces as an error rather than a nil.
+		q.tracker.Untrack(hash)
+		q.dest = &GRPCDestination{initResults: map[string]*InitTorrentResult{}}
+
+		piece := &pb.Piece{TorrentHash: hash, Index: pieceIndex}
+		if err := q.sendPiecePool(t.Context(), pool, piece); err != nil {
+			t.Fatalf("sendPiecePool returned %v, want nil for an untracked torrent", err)
+		}
+		if got := source.read(); len(got) != 0 {
+			t.Errorf("read a piece for an untracked torrent: %v", got)
+		}
+	})
+
+	t.Run("an already streamed piece is dropped", func(t *testing.T) {
+		q, pool, _, source := newSendGateFixture(t)
+		q.tracker.MarkStreamed(hash, int(pieceIndex))
+
+		piece := &pb.Piece{TorrentHash: hash, Index: pieceIndex}
+		if err := q.sendPiecePool(t.Context(), pool, piece); err != nil {
+			t.Fatalf("sendPiecePool returned %v, want nil for a streamed piece", err)
+		}
+		if got := source.read(); len(got) != 0 {
+			t.Errorf("read a piece already marked streamed: %v", got)
 		}
 	})
 }
