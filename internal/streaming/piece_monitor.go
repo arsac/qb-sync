@@ -31,6 +31,11 @@ const (
 	idleThreshold  = 5 // consecutive polls with no new pieces before slowing down
 	idleSlowFactor = 5 // poll idle torrents every Nth tick (2.5s instead of 500ms)
 
+	// sourceCompleteRefetchInterval is how long a torrent whose pieces the
+	// source already holds in full may reuse its cached piece states before
+	// asking qBittorrent again. See [torrentState.reusablePieceStates].
+	sourceCompleteRefetchInterval = 30 * time.Second
+
 	queueFullLogInterval = 30 * time.Second // minimum interval between "queue full" warnings
 
 	// pollPieceStatesConcurrency bounds how many torrents have their piece
@@ -72,7 +77,51 @@ type torrentState struct {
 	// tell a stalled torrent from one that is simply waiting on its source.
 	lastAdvance time.Time
 
+	// sourceComplete records that the last fetch found every piece downloaded
+	// at the source, and statesFetchedAt when that fetch happened. Together
+	// they gate the refetch in [torrentState.reusablePieceStates].
+	sourceComplete  bool
+	statesFetchedAt time.Time
+
 	mu sync.RWMutex
+}
+
+// reusablePieceStates returns the cached piece states when refetching them
+// would certainly produce the same array, and nil when the source must be asked.
+//
+// Once the source holds every piece the array is constant, but the poll still
+// needs it on every tick to re-offer pieces the completed queue had no room
+// for. Refetching it there buys nothing and costs a qBittorrent round-trip plus
+// two N-element allocations per torrent per tick - for a 40k-piece torrent, a
+// JSON decode of 40k integers and 640 KB twice a second, for the whole transfer
+// and again for however long finalization takes afterwards. qb-sync syncs
+// torrents the source has already finished, so this is the normal case.
+//
+// The periodic refetch is what keeps pollOneTorrent's 404 removal fallback
+// alive and lets a source that lost its data (a recheck, a deleted file) be
+// noticed rather than offered forever.
+func (s *torrentState) reusablePieceStates(now time.Time) []PieceState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if !s.sourceComplete || now.Sub(s.statesFetchedAt) >= sourceCompleteRefetchInterval {
+		return nil
+	}
+	return s.lastStates
+}
+
+// allDownloaded reports whether the source holds every piece, which is what
+// makes the piece-state array constant from then on.
+func allDownloaded(states []PieceState) bool {
+	if len(states) == 0 {
+		return false
+	}
+	for _, state := range states {
+		if state != PieceStateDownloaded {
+			return false
+		}
+	}
+	return true
 }
 
 // noteAdvance records that a piece became streamed. Caller must hold the write
@@ -540,11 +589,13 @@ func (t *PieceMonitor) startTracking(ctx context.Context, hash string, alreadyWr
 	numPieces := int(meta.GetNumPieces())
 
 	state := &torrentState{
-		meta:       meta,
-		hashes:     hashes,
-		lastStates: states,
-		streamed:   make([]bool, numPieces),
-		failed:     make([]bool, numPieces),
+		meta:            meta,
+		hashes:          hashes,
+		lastStates:      states,
+		statesFetchedAt: time.Now(),
+		sourceComplete:  allDownloaded(states),
+		streamed:        make([]bool, numPieces),
+		failed:          make([]bool, numPieces),
 		// Start the clock now rather than at the zero time, so a torrent that
 		// never streams a single piece still measures how long it has failed to
 		// advance. That is precisely the stalled case, and leaving this zero
@@ -683,11 +734,6 @@ func (t *PieceMonitor) handleTorrentNotFound(ctx context.Context, hash string) {
 }
 
 func (t *PieceMonitor) pollTorrentPieces(ctx context.Context, hash string) error {
-	states, err := t.source.GetPieceStates(ctx, hash)
-	if err != nil {
-		return err
-	}
-
 	t.mu.RLock()
 	state, ok := t.torrents[hash]
 	t.mu.RUnlock()
@@ -696,10 +742,25 @@ func (t *PieceMonitor) pollTorrentPieces(ctx context.Context, hash string) error
 		return ErrTorrentNotTracked
 	}
 
+	now := time.Now()
+	states := state.reusablePieceStates(now)
+	fetched := states == nil
+	if fetched {
+		fresh, err := t.source.GetPieceStates(ctx, hash)
+		if err != nil {
+			return err
+		}
+		states = fresh
+	}
+
 	newPieces := t.queueCompletedPieces(ctx, state, states)
 
 	state.mu.Lock()
-	state.lastStates = states
+	if fetched {
+		state.lastStates = states
+		state.statesFetchedAt = now
+		state.sourceComplete = allDownloaded(states)
+	}
 	if newPieces > 0 {
 		state.idleTicks = 0
 	} else {

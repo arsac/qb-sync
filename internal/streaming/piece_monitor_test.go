@@ -1072,3 +1072,142 @@ func TestQueueCompletedPieces_StopsWhenTheQueueIsFull(t *testing.T) {
 		}
 	})
 }
+
+// countingStateSource records every GetPieceStates call and reports every piece
+// downloaded except the indices in missing.
+type countingStateSource struct {
+	numPieces int
+	missing   map[int]bool
+
+	calls atomic.Int64
+}
+
+func (s *countingStateSource) GetPieceStates(context.Context, string) ([]PieceState, error) {
+	s.calls.Add(1)
+	states := make([]PieceState, s.numPieces)
+	for i := range states {
+		if s.missing[i] {
+			states[i] = PieceStateNotDownloaded
+			continue
+		}
+		states[i] = PieceStateDownloaded
+	}
+	return states, nil
+}
+
+func (s *countingStateSource) GetPieceHashes(context.Context, string) ([]string, error) {
+	return make([]string, s.numPieces), nil
+}
+
+func (s *countingStateSource) GetTorrentMetadata(context.Context, string) (*TorrentMetadata, error) {
+	return &TorrentMetadata{InitTorrentRequest: &pb.InitTorrentRequest{
+		TorrentHash: "h1",
+		NumPieces:   int32(s.numPieces),
+		PieceSize:   1,
+		TotalSize:   int64(s.numPieces),
+	}}, nil
+}
+
+func (s *countingStateSource) ReadPiece(context.Context, *pb.Piece) ([]byte, error) {
+	return nil, errors.New("not used")
+}
+
+// drainCompleted empties the completed channel and returns how many pieces it held.
+func drainCompleted(monitor *PieceMonitor) int {
+	n := 0
+	for {
+		select {
+		case <-monitor.completed:
+			n++
+		default:
+			return n
+		}
+	}
+}
+
+// TestPollTorrentPieces_ReusesStatesTheSourceCannotChange pins the refetch gate.
+//
+// The scan must still run every tick - it is what re-offers pieces the queue had
+// no room for - but once the source holds every piece the array it scans is
+// constant, and refetching it costs a round-trip plus two N-element allocations
+// per torrent per tick for the whole transfer and the finalization wait after it.
+func TestPollTorrentPieces_ReusesStatesTheSourceCannotChange(t *testing.T) {
+	t.Parallel()
+
+	const numPieces = 8
+
+	setup := func(t *testing.T, missing map[int]bool) (*PieceMonitor, *countingStateSource) {
+		t.Helper()
+		source := &countingStateSource{numPieces: numPieces, missing: missing}
+		monitor := newTestMonitor()
+		monitor.source = source
+		if err := monitor.startTracking(context.Background(), "h1", nil); err != nil {
+			t.Fatalf("startTracking: %v", err)
+		}
+		if got := source.calls.Load(); got != 1 {
+			t.Fatalf("GetPieceStates calls after startTracking = %d, want 1", got)
+		}
+		return monitor, source
+	}
+
+	t.Run("a source that holds every piece is asked once", func(t *testing.T) {
+		t.Parallel()
+		monitor, source := setup(t, nil)
+
+		for tick := range 3 {
+			if got := drainCompleted(monitor); got != numPieces {
+				t.Fatalf("tick %d queued %d pieces, want %d: the scan must run from the cache too",
+					tick, got, numPieces)
+			}
+			if err := monitor.pollTorrentPieces(context.Background(), "h1"); err != nil {
+				t.Fatalf("pollTorrentPieces: %v", err)
+			}
+		}
+
+		if got := source.calls.Load(); got != 1 {
+			t.Errorf("GetPieceStates calls = %d, want 1: a constant piece-state array was refetched", got)
+		}
+	})
+
+	t.Run("a piece the source is still missing forces a refetch", func(t *testing.T) {
+		t.Parallel()
+		monitor, source := setup(t, map[int]bool{numPieces - 1: true})
+
+		for range 2 {
+			if err := monitor.pollTorrentPieces(context.Background(), "h1"); err != nil {
+				t.Fatalf("pollTorrentPieces: %v", err)
+			}
+		}
+
+		if got := source.calls.Load(); got != 3 {
+			t.Errorf("GetPieceStates calls = %d, want 3: an incomplete source must be re-asked every tick", got)
+		}
+	})
+
+	t.Run("the cache expires so a lost source is noticed", func(t *testing.T) {
+		t.Parallel()
+		monitor, source := setup(t, nil)
+
+		if err := monitor.pollTorrentPieces(context.Background(), "h1"); err != nil {
+			t.Fatalf("pollTorrentPieces: %v", err)
+		}
+		if got := source.calls.Load(); got != 1 {
+			t.Fatalf("GetPieceStates calls = %d, want 1 before the cache expires", got)
+		}
+
+		state, ok := monitor.torrents["h1"]
+		if !ok {
+			t.Fatal("torrent not tracked")
+		}
+		state.mu.Lock()
+		state.statesFetchedAt = state.statesFetchedAt.Add(-sourceCompleteRefetchInterval)
+		state.mu.Unlock()
+
+		if err := monitor.pollTorrentPieces(context.Background(), "h1"); err != nil {
+			t.Fatalf("pollTorrentPieces: %v", err)
+		}
+		if got := source.calls.Load(); got != 2 {
+			t.Errorf("GetPieceStates calls = %d, want 2: the cache must expire", got)
+		}
+	})
+}
