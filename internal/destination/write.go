@@ -98,11 +98,12 @@ func (s *Server) writePiece(ctx context.Context, req *pb.WritePieceRequest) writ
 	}
 
 	// Disk I/O outside state.mu: writePieceData reads immutable metadata (files
-	// slice, offsets) directly, and reaches each file's path and handle through
-	// writeAt, which holds fileMu. That covers the one overlap state.mu would
-	// otherwise be needed for: a duplicate the source re-sent can still be here
-	// when another worker's write completes the file and hands it to an early
-	// finalization that renames it.
+	// slice, offsets) directly, and reaches every mutable field it needs - path,
+	// handle, early-finalized and hardlink state - through writeAt, which holds
+	// fileMu. That covers the overlaps state.mu would otherwise be needed for: a
+	// duplicate the source re-sent can still be here when another worker's write
+	// completes the file and hands it to an early finalization that renames it,
+	// or when finalization resolves a neighbouring file's pending hardlink.
 	if writeErr := state.writePieceData(req.GetOffset(), data); writeErr != nil {
 		metrics.PieceWriteErrorsTotal.WithLabelValues(metrics.ModeDestination).Inc()
 		return writePieceError(fmt.Sprintf("write failed: %v", writeErr), pb.PieceErrorCode_PIECE_ERROR_IO)

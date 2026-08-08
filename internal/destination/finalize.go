@@ -517,8 +517,10 @@ func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTo
 //
 // Runs without state.mu: a wait can block for up to defaultHardlinkWaitTimeout
 // and holding the lock would stall every WritePiece for that long. Safe because
-// the files slice is immutable after init, finalization.active keeps writers
-// out, and each task owns exactly one file.
+// the files slice is immutable after init and each task owns exactly one file;
+// the one shared field a task mutates, fi.hardlink.state, is published under
+// state.mu because a WritePiece that entered writePieceData before finalization
+// became active is still reading it.
 //
 // The waits run concurrently. Serially, a torrent with files pending on several
 // different source torrents burned one full timeout per file before reporting
@@ -538,7 +540,7 @@ func (s *Server) resolvePendingHardlinks(ctx context.Context, hash string, state
 		if fi.hardlink.state != hlStatePending {
 			continue
 		}
-		g.Go(func() error { return s.resolvePendingHardlink(gctx, hash, linkSlots, fi) })
+		g.Go(func() error { return s.resolvePendingHardlink(gctx, hash, state, linkSlots, fi) })
 	}
 	return g.Wait()
 }
@@ -548,6 +550,7 @@ func (s *Server) resolvePendingHardlinks(ctx context.Context, hash string, state
 func (s *Server) resolvePendingHardlink(
 	ctx context.Context,
 	hash string,
+	state *serverTorrentState,
 	linkSlots *semaphore.Weighted,
 	fi *serverFileInfo,
 ) error {
@@ -620,7 +623,9 @@ func (s *Server) resolvePendingHardlink(
 		)
 	}
 
-	fi.hardlink.markComplete()
+	state.mu.Lock()
+	fi.setHardlinkState(hlStateComplete)
+	state.mu.Unlock()
 	return nil
 }
 
@@ -1092,7 +1097,7 @@ func (s *Server) recoverAffectedFile(
 				"hash", hash, "path", fi.path, "error", removeErr)
 		}
 
-		fi.hardlink.state = hlStateNone
+		fi.setHardlinkState(hlStateNone)
 		fi.setPath(targetPath(fi) + partialSuffix)
 		return
 	}

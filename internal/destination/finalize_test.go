@@ -1611,6 +1611,56 @@ func TestResolvePendingHardlinks_WaitsConcurrently(t *testing.T) {
 	}
 }
 
+// TestResolvePendingHardlinks_ConcurrentWriteIsRaceFree pins that the write
+// path and hardlink resolution agree on a lock for fi.hardlink.state.
+// writePieceData consults every spanned file's hardlink state to decide whether
+// the file takes piece data, and it runs outside state.mu; a duplicate piece the
+// source re-sent after a stale ack can still be in there when FinalizeTorrent
+// starts resolving this torrent's pending hardlinks. The assertion is the race
+// detector.
+func TestResolvePendingHardlinks_ConcurrentWriteIsRaceFree(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+
+	const numFiles = 16
+	state, dones, _, _ := newPendingHardlinkState(t, tmpDir, numFiles)
+
+	data := make([]byte, state.totalSize)
+	stop := make(chan struct{})
+	var writers sync.WaitGroup
+	for range 4 {
+		writers.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if err := state.writePieceData(0, data); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		})
+	}
+
+	for _, done := range dones {
+		close(done)
+	}
+	if err := s.resolvePendingHardlinks(context.Background(), "pending", state); err != nil {
+		t.Fatal(err)
+	}
+
+	close(stop)
+	writers.Wait()
+
+	for _, fi := range state.files {
+		if fi.hardlink.state != hlStateComplete {
+			t.Fatalf("file %s: hardlink state = %v, want complete", fi.path, fi.hardlink.state)
+		}
+	}
+}
+
 // TestResolvePendingHardlinks_FirstFailureCancelsWaits pins that one file's
 // failure stops the siblings still parked on their doneCh. Without a shared
 // cancellation the group would sit on them until defaultHardlinkWaitTimeout

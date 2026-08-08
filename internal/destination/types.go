@@ -68,8 +68,9 @@ func (i *inProgressInode) close() {
 //	file, path, earlyFinalized, piecesWritten,
 //	hardlink.state (transitions through hardlink state machine during finalization)
 //
-// file, path and earlyFinalized are also read under fileMu by the write path,
-// so they are mutated only through the serverFileInfo methods that hold both.
+// file, path, earlyFinalized and hardlink.state are also read under fileMu by
+// the write path, so they are mutated only through the serverFileInfo methods
+// that hold both.
 type torrentMeta struct {
 	pieceHashes []string          // SHA1 hashes per piece for verification
 	pieceLength int64             // Size of each piece (last piece may be smaller)
@@ -289,8 +290,9 @@ type finalizeResult struct {
 // State machine: None -> InProgress (first writer) or Pending (wait for another) -> Complete.
 //
 // sourceFileID, sourcePath, and doneCh are immutable after init.
-// state is mutable and requires the parent serverTorrentState.mu.
-// Use applyOutcome() during init and markComplete() during finalization.
+// state is mutable: applyOutcome() sets it during init, before the torrent is
+// reachable by any other goroutine, after which it may only be changed through
+// serverFileInfo.setHardlinkState.
 type hardlinkInfo struct {
 	state        hardlinkState // Current state in the hardlink state machine
 	sourceFileID FileID        // Source file ID for registration (immutable after init)
@@ -308,13 +310,6 @@ func (h *hardlinkInfo) applyOutcome(outcome hardlinkOutcome) {
 	}
 }
 
-// markComplete transitions the hardlink state to Complete.
-// Called during finalization after a pending hardlink is resolved.
-// Caller must hold state.mu.
-func (h *hardlinkInfo) markComplete() {
-	h.state = hlStateComplete
-}
-
 // serverFileInfo holds information about a file in a torrent.
 //
 // Immutable fields (set during init, safe to read without state.mu):
@@ -327,9 +322,10 @@ func (h *hardlinkInfo) markComplete() {
 //	path, earlyFinalized, piecesWritten, hardlink.state
 //
 // The write path (openForWrite/writeAt) runs outside state.mu for concurrent
-// disk I/O and reads path, file and earlyFinalized under fileMu, so those three
-// are written under both locks and read under either. See takeWriteHandle,
-// readmitWrites and setPath, which are the only ways to mutate them.
+// disk I/O and reads path, file, earlyFinalized and hardlink.state under fileMu,
+// so those four are written under both locks and read under either. See
+// takeWriteHandle, readmitWrites, setPath and setHardlinkState, which are the
+// only ways to mutate them.
 type serverFileInfo struct {
 	path   string       // Full path on disk (mutable: renamed during early finalize)
 	size   int64        // File size
@@ -353,6 +349,7 @@ type serverFileInfo struct {
 
 // skipForWriteData reports whether this file should be skipped during piece write.
 // True for unselected files, or files that are hardlinked/pending hardlink.
+// Caller must hold state.mu or fileMu; the write path reaches it via declinesWrites.
 func (f *serverFileInfo) skipForWriteData() bool {
 	return !f.selected || f.hardlink.state == hlStateComplete || f.hardlink.state == hlStatePending
 }

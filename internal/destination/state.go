@@ -10,17 +10,33 @@ import (
 	pb "github.com/arsac/qb-sync/proto"
 )
 
+// declinesWrites reports whether piece data aimed at this file must be dropped
+// rather than written. Caller must hold fileMu.
+//
+// Three reasons, all of which mean the same thing to the write path - there is
+// no .partial for this file to receive bytes:
+//
+//   - unselected, so no .partial was ever created;
+//   - the data is supplied by a hardlink to another torrent's file, which
+//     writing to would corrupt that torrent;
+//   - early-finalized, so its bytes are complete, verified and renamed into
+//     place, and opening f.path would recreate the .partial the rename consumed.
+//
+// A file that has an open write handle can never start declining: hardlink
+// resolution only moves Pending to Complete (both already declining) and
+// selection is immutable, so the only new decliner is early finalization, which
+// takes the handle under the same lock.
+func (f *serverFileInfo) declinesWrites() bool {
+	return f.earlyFinalized || f.skipForWriteData()
+}
+
 // openForWrite lazily opens the file for writing, creating and pre-allocating it if needed.
 // Protected by fileMu so it can be called outside state.mu for concurrent disk I/O.
-//
-// Declines to open an early-finalized file: its data is complete, verified and
-// renamed into place, so opening f.path would recreate the .partial the rename
-// consumed. writeAt turns that into a dropped write.
 func (f *serverFileInfo) openForWrite() error {
 	f.fileMu.Lock()
 	defer f.fileMu.Unlock()
 
-	if f.file != nil || f.earlyFinalized {
+	if f.file != nil || f.declinesWrites() {
 		return nil
 	}
 
@@ -54,17 +70,20 @@ func (f *serverFileInfo) writeAt(data []byte, offset int64) error {
 	defer f.fileMu.RUnlock()
 
 	if f.file == nil {
-		if f.earlyFinalized {
-			// Every piece overlapping this file was written and read-back
-			// verified before it was renamed, so the only writes that reach
-			// here are duplicates the source re-sent after a stale ack.
+		if f.declinesWrites() {
+			// Either the file's bytes come from somewhere other than this
+			// stream, or every piece overlapping it was written and read-back
+			// verified before it was renamed - so the only writes that reach
+			// here are ones the file was never going to accept.
 			return nil
 		}
 		return fmt.Errorf("file closed during write: %s", f.path)
 	}
 
-	_, writeErr := f.file.WriteAt(data, offset)
-	return writeErr
+	if _, writeErr := f.file.WriteAt(data, offset); writeErr != nil {
+		return fmt.Errorf("writing to %s: %w", f.path, writeErr)
+	}
+	return nil
 }
 
 // takeWriteHandle closes a completed file to further writes and hands its write
@@ -105,9 +124,19 @@ func (f *serverFileInfo) setPath(path string) {
 	f.path = path
 }
 
+// setHardlinkState advances the file's hardlink state machine.
+// Caller must hold state.mu.
+func (f *serverFileInfo) setHardlinkState(hlState hardlinkState) {
+	f.fileMu.Lock()
+	defer f.fileMu.Unlock()
+
+	f.hardlink.state = hlState
+}
+
 // writePieceData writes piece data to the correct file(s) based on offset.
-// A piece may span multiple files in a multi-file torrent.
-// Skips files that are hardlinked, pending hardlink, or unselected.
+// A piece may span multiple files in a multi-file torrent. Files that take no
+// piece data (unselected, hardlinked, early-finalized) drop their share inside
+// writeAt, which is where fileMu makes that decision race-free.
 func (s *serverTorrentState) writePieceData(offset int64, data []byte) error {
 	remaining := data
 	currentOffset := offset
@@ -127,18 +156,12 @@ func (s *serverTorrentState) writePieceData(offset int64, data []byte) error {
 		availableInFile := fi.size - fileWriteOffset
 		toProcess := min(int64(len(remaining)), availableInFile)
 
-		if fi.skipForWriteData() {
-			remaining = remaining[toProcess:]
-			currentOffset += toProcess
-			continue
-		}
-
 		// No per-piece fsync: data integrity is guaranteed by verifyFilePieces
 		// (early finalization) and verifyFinalizedPieces (full finalization),
 		// which read back and SHA1-verify pieces before rename.
 		// Per-piece fsync would severely degrade write throughput on NFS/spinning disks.
 		if writeErr := fi.writeAt(remaining[:toProcess], fileWriteOffset); writeErr != nil {
-			return fmt.Errorf("writing to %s: %w", fi.path, writeErr)
+			return writeErr
 		}
 
 		remaining = remaining[toProcess:]

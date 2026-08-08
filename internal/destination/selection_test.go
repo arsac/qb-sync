@@ -1,6 +1,7 @@
 package destination
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -345,6 +346,66 @@ func TestWritePieceData_SkipsUnselectedFiles(t *testing.T) {
 	// Verify unselected file was NOT created
 	if _, statErr := os.Stat(state.files[1].path); !os.IsNotExist(statErr) {
 		t.Error("unselected file should not exist on disk")
+	}
+}
+
+// TestWritePieceData_LeavesHardlinkedFilesUntouched pins that a file whose data
+// arrived by hardlink takes no piece data. The hardlink shares its inode with
+// another torrent's file, so a write lands in that torrent's data too - and the
+// source streams these pieces whenever a boundary piece also covers a file this
+// torrent really is writing.
+func TestWritePieceData_LeavesHardlinkedFilesUntouched(t *testing.T) {
+	t.Parallel()
+	_, tmpDir := newTestDestServer(t)
+
+	original := []byte("data owned by the source torrent")
+	streamedPath := filepath.Join(tmpDir, "streamed.bin.partial")
+	if err := os.WriteFile(streamedPath, make([]byte, len(original)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		hlState hardlinkState
+	}{
+		{"complete", hlStateComplete},
+		{"pending", hlStatePending},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			linkedPath := filepath.Join(tmpDir, tc.name+".bin")
+			if err := os.WriteFile(linkedPath, original, 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			size := int64(len(original))
+			state := &serverTorrentState{
+				torrentMeta: torrentMeta{
+					pieceLength: 2 * size,
+					totalSize:   2 * size,
+					files: []*serverFileInfo{
+						{path: streamedPath, size: size, offset: 0, selected: true},
+						{
+							path: linkedPath, size: size, offset: size, selected: true,
+							hardlink: hardlinkInfo{state: tc.hlState},
+						},
+					},
+				},
+			}
+
+			data := bytes.Repeat([]byte{0xAA}, int(2*size))
+			if err := state.writePieceData(0, data); err != nil {
+				t.Fatalf("writePieceData: %v", err)
+			}
+
+			got, err := os.ReadFile(linkedPath)
+			if err != nil {
+				t.Fatalf("reading hardlinked file: %v", err)
+			}
+			if !bytes.Equal(got, original) {
+				t.Errorf("hardlinked file = %q, want it untouched (%q)", got, original)
+			}
+		})
 	}
 }
 
