@@ -249,6 +249,12 @@ func (s *Server) runDiskStage(
 	ctx, cancel := context.WithTimeout(s.bgCtx, computeDiskStageTimeout(state.totalSize))
 	defer cancel()
 
+	// The init-time pre-verification pass exists to get read-back work done
+	// while the transfer is still running. That window has closed, and it reads
+	// the same pieces this stage is about to read, so let it go rather than
+	// have two passes competing for the same NFS reads.
+	state.stopPreVerify()
+
 	// Sync parent directories before verification to ensure NFS has flushed
 	// file data and renames to the server. Without this, verification can
 	// read stale data from the NFS client cache, causing false hash mismatches.

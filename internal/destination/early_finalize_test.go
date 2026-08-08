@@ -7,7 +7,9 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/bits-and-blooms/bitset"
 
@@ -1046,5 +1048,183 @@ func TestPreVerifyCompleteFiles(t *testing.T) {
 	}
 	if state.written.Count() != numPieces {
 		t.Errorf("written pieces = %d, want %d (pass must not clear bits)", state.written.Count(), numPieces)
+	}
+}
+
+// TestStopPreVerify_WaitsForPassToExit pins the ordering finalization depends
+// on: once stopPreVerify returns, the pre-verification pass has stopped
+// touching state.verified, so the finalize read-back queue it is about to build
+// is a stable snapshot. A stopPreVerify that only cancelled would return while
+// the pass was still running.
+func TestStopPreVerify_WaitsForPassToExit(t *testing.T) {
+	t.Parallel()
+
+	t.Run("no pass registered", func(t *testing.T) {
+		t.Parallel()
+		(&serverTorrentState{}).stopPreVerify() // must not block or panic
+	})
+
+	t.Run("waits then clears", func(t *testing.T) {
+		t.Parallel()
+
+		state := &serverTorrentState{}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		var exited atomic.Bool
+
+		state.mu.Lock()
+		state.preVerifyCancel = cancel
+		state.preVerifyDone = done
+		state.mu.Unlock()
+
+		go func() {
+			defer close(done)
+			<-ctx.Done()
+			// Unwinding a real pass (draining its worker queue, taking
+			// state.mu for the last file) is not instantaneous. Stand in for
+			// that so a stopPreVerify that skipped the join fails here rather
+			// than passing on a lucky schedule.
+			time.Sleep(50 * time.Millisecond)
+			exited.Store(true)
+		}()
+
+		state.stopPreVerify()
+
+		if !exited.Load() {
+			t.Error("stopPreVerify returned before the pass exited")
+		}
+
+		state.mu.Lock()
+		cancelLeft, doneLeft := state.preVerifyCancel, state.preVerifyDone
+		state.mu.Unlock()
+		if cancelLeft != nil || doneLeft != nil {
+			t.Error("stopPreVerify left the pass registered")
+		}
+
+		state.stopPreVerify() // idempotent: must not block on the closed handle
+	})
+}
+
+// TestStartPreVerify_StoppablePass pins that the pass started at init is the one
+// finalization can stop, and that stopping it keeps the pass's core invariant:
+// a bit in state.verified means that piece was read back off disk and matched.
+// Cancellation must never widen the set - a corrupt file's pieces stay unmarked
+// however far the pass got.
+func TestStartPreVerify_StoppablePass(t *testing.T) {
+	t.Parallel()
+
+	const (
+		pieceLength = 16
+		numPieces   = 32
+		perFile     = int64(pieceLength * 2)
+	)
+	totalSize := int64(pieceLength * numPieces)
+
+	full := make([]byte, totalSize)
+	for i := range full {
+		full[i] = byte(i * 11)
+	}
+	hashes := make([]string, numPieces)
+	for p := range numPieces {
+		hashes[p] = utils.ComputeSHA1(full[p*pieceLength : (p+1)*pieceLength])
+	}
+
+	dir := t.TempDir()
+	// Every file is a two-piece hlStateComplete candidate. The last one is
+	// corrupt, so whichever files the pass reaches, its pieces must stay out of
+	// state.verified.
+	const corruptFile = numPieces/2 - 1
+	files := make([]*serverFileInfo, 0, numPieces/2)
+	for i := range numPieces / 2 {
+		offset := int64(i) * perFile
+		content := slices.Clone(full[offset : offset+perFile])
+		if i == corruptFile {
+			content[0] ^= 0xff
+		}
+		path := filepath.Join(dir, fmt.Sprintf("f%02d.bin", i))
+		if err := os.WriteFile(path, content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, &serverFileInfo{
+			path: path, offset: offset, size: perFile, selected: true,
+			hardlink: hardlinkInfo{state: hlStateComplete},
+		})
+	}
+
+	meta := torrentMeta{
+		pieceHashes: hashes,
+		pieceLength: pieceLength,
+		totalSize:   totalSize,
+		files:       files,
+	}
+	meta.computeFilePieceRanges()
+
+	written := bitset.New(numPieces)
+	written.FlipRange(0, numPieces)
+	state := &serverTorrentState{
+		torrentMeta: meta,
+		written:     written,
+		verified:    bitset.New(numPieces),
+	}
+
+	s, _ := newTestDestServer(t)
+	s.startPreVerify("hash", state)
+
+	state.mu.Lock()
+	registered := state.preVerifyCancel != nil && state.preVerifyDone != nil
+	state.mu.Unlock()
+	if !registered {
+		t.Fatal("startPreVerify did not register a stoppable pass")
+	}
+
+	state.stopPreVerify()
+
+	// Post-stop the pass is gone, so verified can be read without the lock.
+	for p := range numPieces {
+		if !state.verified.Test(uint(p)) {
+			continue
+		}
+		if p/2 == corruptFile {
+			t.Errorf("piece %d of the corrupt file was marked verified", p)
+			continue
+		}
+		got, readErr := os.ReadFile(files[p/2].path)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		at := int64(p)*pieceLength - files[p/2].offset
+		if utils.ComputeSHA1(got[at:at+pieceLength]) != hashes[p] {
+			t.Errorf("piece %d marked verified but does not match on disk", p)
+		}
+	}
+	if state.written.Count() != numPieces {
+		t.Errorf("written pieces = %d, want %d (pass must not clear bits)", state.written.Count(), numPieces)
+	}
+}
+
+// TestStartPreVerify_NoCandidates pins that a torrent with nothing already on
+// disk registers no pass at all, so stopPreVerify stays free on the finalize
+// path for the common fresh-transfer case.
+func TestStartPreVerify_NoCandidates(t *testing.T) {
+	t.Parallel()
+
+	state := &serverTorrentState{
+		torrentMeta: torrentMeta{
+			pieceHashes: []string{"a"},
+			pieceLength: 16,
+			totalSize:   16,
+			files:       []*serverFileInfo{{path: "x", offset: 0, size: 16, selected: true}},
+		},
+		written:  bitset.New(1),
+		verified: bitset.New(1),
+	}
+
+	s, _ := newTestDestServer(t)
+	s.startPreVerify("hash", state)
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.preVerifyCancel != nil || state.preVerifyDone != nil {
+		t.Error("startPreVerify registered a pass with no candidate files")
 	}
 }

@@ -275,6 +275,9 @@ func (s *Server) initNewTorrent(
 // stall. Nothing downstream depends on it finishing: it only ever adds skips for
 // verifyFinalizedPieces, so a cancelled or never-launched pass just leaves the
 // pre-change amount of work at finalize.
+//
+// The pass gets its own context, registered on the state, so finalization can
+// stop it once it starts reading the same bytes back itself - see stopPreVerify.
 func (s *Server) startPreVerify(hash string, state *serverTorrentState) {
 	if s.config.DryRun || len(state.pieceHashes) == 0 || len(preVerifyCandidates(state)) == 0 {
 		return
@@ -282,8 +285,19 @@ func (s *Server) startPreVerify(hash string, state *serverTorrentState) {
 	if s.bgCtx.Err() != nil {
 		return
 	}
+
+	ctx, cancel := context.WithCancel(s.bgCtx)
+	done := make(chan struct{})
+
+	state.mu.Lock()
+	state.preVerifyCancel = cancel
+	state.preVerifyDone = done
+	state.mu.Unlock()
+
 	s.bgWg.Go(func() {
-		s.preVerifyCompleteFiles(s.bgCtx, hash, state)
+		defer close(done)
+		defer cancel()
+		s.preVerifyCompleteFiles(ctx, hash, state)
 	})
 }
 

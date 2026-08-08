@@ -1444,3 +1444,49 @@ func TestFinalizeFiles_ParallelSyncAndRename(t *testing.T) {
 		}
 	}
 }
+
+// TestRunDiskStage_StopsPreVerify pins that the disk stage retires the
+// init-time pre-verification pass before it starts reading pieces back itself.
+// Left running, that pass reads the same bytes off NFS a second time,
+// concurrently, and can still be setting verified bits while the finalize
+// read-back queue is being built from them.
+func TestRunDiskStage_StopsPreVerify(t *testing.T) {
+	t.Parallel()
+
+	s, tmpDir := newTestDestServer(t)
+
+	hash := "stops-preverify"
+	state := newTwoStageTestState(t, tmpDir, hash, 2)
+
+	s.store.mu.Lock()
+	s.store.entries[hash] = state
+	s.store.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	passDone := make(chan struct{})
+	var exited atomic.Bool
+	state.mu.Lock()
+	state.preVerifyCancel = cancel
+	state.preVerifyDone = passDone
+	state.mu.Unlock()
+
+	go func() {
+		defer close(passDone)
+		<-ctx.Done()
+		time.Sleep(50 * time.Millisecond) // stand-in for the pass unwinding
+		exited.Store(true)
+	}()
+
+	done := make(chan struct{})
+	s.runBackgroundFinalization(hash, state, &pb.FinalizeTorrentRequest{TorrentHash: hash}, time.Now(), done)
+
+	if !exited.Load() {
+		t.Error("disk stage ran with the pre-verification pass still going")
+	}
+	state.mu.Lock()
+	cancelLeft, doneLeft := state.preVerifyCancel, state.preVerifyDone
+	state.mu.Unlock()
+	if cancelLeft != nil || doneLeft != nil {
+		t.Error("disk stage left the pre-verification pass registered")
+	}
+}

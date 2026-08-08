@@ -1,6 +1,7 @@
 package destination
 
 import (
+	"context"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -174,8 +175,36 @@ type serverTorrentState struct {
 	// count at zero.
 	earlyFinalizing int
 
+	// preVerifyCancel stops the init-time pre-verification pass and
+	// preVerifyDone is closed when it has exited. Both are nil once the pass
+	// has been stopped or was never started. See stopPreVerify.
+	preVerifyCancel context.CancelFunc
+	preVerifyDone   chan struct{}
+
 	// Cached for re-initialization (hardlink info for logging)
 	hardlinkResults []*pb.HardlinkResult
+}
+
+// stopPreVerify cancels the init-time pre-verification pass and waits for it to
+// exit. Idempotent, and a no-op when no pass was started.
+//
+// The pass reads back exactly the pieces verifyFinalizedPieces is about to read,
+// so once finalization's disk stage starts, leaving it running would read the
+// same bytes off NFS twice, concurrently. Everything it already marked verified
+// still counts; the rest is picked up by the finalize pass, which reads the
+// whole torrent's outstanding pieces at full verify concurrency rather than one
+// file at a time.
+func (s *serverTorrentState) stopPreVerify() {
+	s.mu.Lock()
+	cancel, done := s.preVerifyCancel, s.preVerifyDone
+	s.preVerifyCancel, s.preVerifyDone = nil, nil
+	s.mu.Unlock()
+
+	if cancel == nil {
+		return
+	}
+	cancel()
+	<-done
 }
 
 // finishEarlyFinalize retires one background early finalization.

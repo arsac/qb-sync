@@ -322,9 +322,10 @@ func (s *Server) preVerifyCompleteFiles(ctx context.Context, hash string, state 
 	start := time.Now()
 	pieces := 0
 
+	done := 0
 	for _, fi := range files {
 		if ctx.Err() != nil {
-			return
+			break
 		}
 		failed, _ := s.verifyFilePieces(ctx, state, fi, nil)
 
@@ -333,11 +334,13 @@ func (s *Server) preVerifyCompleteFiles(ctx context.Context, hash string, state 
 		markInteriorVerified(state, fi, failed)
 		pieces += int(state.verified.Count() - before)
 		state.mu.Unlock()
+		done++
 	}
 
 	s.logger.InfoContext(ctx, "pre-verified pieces already on disk at init",
 		"hash", hash,
-		"files", len(files),
+		"files", done,
+		"candidates", len(files),
 		"pieces", pieces,
 		"duration", time.Since(start).Round(time.Millisecond),
 	)
