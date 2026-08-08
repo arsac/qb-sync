@@ -549,99 +549,28 @@ func (s *Source) readChunkIntoCached(hash, path string, offset int64, buf []byte
 	return nil
 }
 
-// readPieceFromRegions reads piece data spanning multiple files using cached
-// handles. Allocates a single pieceSize buffer and reads each region's
-// contribution directly into the appropriate slice.
-func (s *Source) readPieceFromRegions(
-	hash string,
-	regions []utils.FileRegion,
-	pieceOffset, pieceSize int64,
-) ([]byte, error) {
-	buf := make([]byte, pieceSize)
-	written := int64(0)
-	currentOffset := pieceOffset
-
-	for _, region := range regions {
-		if written >= pieceSize {
-			break
-		}
-
-		fileEnd := region.Offset + region.Size
-		if fileEnd <= currentOffset {
-			continue
-		}
-
-		fileReadOffset := max(currentOffset-region.Offset, 0)
-		availableInFile := region.Size - fileReadOffset
-		toRead := min(pieceSize-written, availableInFile)
-
-		if err := s.readChunkIntoCached(hash, region.Path, fileReadOffset, buf[written:written+toRead]); err != nil {
-			return nil, fmt.Errorf("reading from %s at offset %d: %w", region.Path, fileReadOffset, err)
-		}
-
-		written += toRead
-		currentOffset += toRead
-	}
-
-	if written < pieceSize {
-		return nil, fmt.Errorf("short read: got %d bytes, want %d", written, pieceSize)
-	}
-	return buf, nil
-}
-
 func (s *Source) readPieceMultiFile(hash string, cm *cachedMeta, offset, size int64) ([]byte, error) {
-	// Only files overlapping [offset, pieceEnd) matter, and they are contiguous
-	// in the slice starting at first.
-	pieceEnd := offset + size
+	// Only files overlapping [offset, offset+size) matter, and they are
+	// contiguous in the slice starting at first.
 	first := firstFileAt(cm.files, offset)
 
-	hasDeselected := false
-	for i := first; i < len(cm.files) && cm.files[i].GetOffset() < pieceEnd; i++ {
-		if !cm.files[i].GetSelected() {
-			hasDeselected = true
-			break
-		}
-	}
-
-	if !hasDeselected {
-		// Fast path: all overlapping files are selected.
-		return s.readPieceFromRegions(hash, cm.regions[first:], offset, size)
-	}
-
-	// Boundary piece overlapping a deselected file.
-	// Zero-fill deselected regions — the file doesn't exist on disk because
-	// qBittorrent doesn't create files with priority 0.
-	// Destination's writePieceData skips deselected files, so only the selected
-	// file data (which IS correct here) gets written.
-	data := make([]byte, size) // zero-initialized
-	remaining := size
-	currentOffset := offset
-	for i := first; i < len(cm.files); i++ {
-		if remaining <= 0 {
-			break
-		}
-		f := cm.files[i]
-		fEnd := f.GetOffset() + f.GetSize()
-		if fEnd <= currentOffset {
-			continue
-		}
-		fileReadOffset := max(currentOffset-f.GetOffset(), 0)
-		availableInFile := f.GetSize() - fileReadOffset
-		toRead := min(remaining, availableInFile)
-
-		if f.GetSelected() {
-			path := cm.regions[i].Path
-			dataOffset := currentOffset - offset
-			dst := data[dataOffset : dataOffset+toRead]
-			if chunkErr := s.readChunkIntoCached(hash, path, fileReadOffset, dst); chunkErr != nil {
-				return nil, fmt.Errorf("reading from %s at offset %d: %w", path, fileReadOffset, chunkErr)
+	data := make([]byte, size) // zero-initialized; deselected regions stay zero
+	err := utils.ReadPieceInto(cm.regions[first:], offset, data,
+		func(i int, region utils.FileRegion, fileOffset int64, dst []byte) error {
+			if !cm.files[first+i].GetSelected() {
+				// The file doesn't exist on disk - qBittorrent doesn't create
+				// files with priority 0 - so leave the region zero-filled. The
+				// destination's writePieceData skips deselected files, so only
+				// the selected data (which IS correct here) gets written.
+				return nil
 			}
-		}
-		// Deselected: zeros remain in place
-
-		remaining -= toRead
-		currentOffset += toRead
+			if chunkErr := s.readChunkIntoCached(hash, region.Path, fileOffset, dst); chunkErr != nil {
+				return fmt.Errorf("reading from %s at offset %d: %w", region.Path, fileOffset, chunkErr)
+			}
+			return nil
+		})
+	if err != nil {
+		return nil, err
 	}
-
 	return data, nil
 }

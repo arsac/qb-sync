@@ -101,6 +101,39 @@ func TestReadPieceFromFilesCached_HonorsContextCancel(t *testing.T) {
 	assert.ErrorIs(t, err, context.Canceled)
 }
 
+// readPieceNaive is the oracle for ReadPieceFromFilesCached: it reads the piece
+// byte by byte, deriving each byte's file from a linear scan, so it shares no
+// boundary arithmetic with ReadPieceInto and catches an off-by-one there.
+func readPieceNaive(t *testing.T, files []FileRegion, pieceOffset, pieceSize int64) ([]byte, error) {
+	t.Helper()
+
+	buf := make([]byte, pieceSize)
+	for i := range buf {
+		at := pieceOffset + int64(i)
+		found := false
+		for _, f := range files {
+			if at < f.Offset || at >= f.Offset+f.Size {
+				continue
+			}
+			fh, err := os.Open(f.Path)
+			if err != nil {
+				return nil, err
+			}
+			_, err = fh.ReadAt(buf[i:i+1], at-f.Offset)
+			fh.Close()
+			if err != nil {
+				return nil, err
+			}
+			found = true
+			break
+		}
+		if !found {
+			return nil, os.ErrNotExist
+		}
+	}
+	return buf, nil
+}
+
 func TestReadPieceFromFilesCached_MatchesUncachedResult(t *testing.T) {
 	t.Parallel()
 
@@ -125,7 +158,7 @@ func TestReadPieceFromFilesCached_MatchesUncachedResult(t *testing.T) {
 		{Path: pathB, Offset: 512, Size: 512},
 	}
 
-	uncached, err := ReadPieceFromFiles(regions, 256, 512) // straddles the boundary
+	uncached, err := readPieceNaive(t, regions, 256, 512) // straddles the boundary
 	require.NoError(t, err)
 
 	cache := NewFdCache()

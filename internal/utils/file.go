@@ -20,16 +20,28 @@ type FileRegion struct {
 	Size   int64  // Total size of this file
 }
 
-// ReadPieceFromFiles reads piece data that may span multiple files.
-// Files must be ordered by offset. Allocates one buffer of pieceSize bytes
-// and reads each file's contribution into the appropriate slice — no per-chunk
-// allocation or append/copy.
-func ReadPieceFromFiles(files []FileRegion, pieceOffset, pieceSize int64) ([]byte, error) {
-	buf := make([]byte, pieceSize)
+// ReadPieceInto fills buf with the piece starting at pieceOffset in the
+// torrent's byte space, delegating each file's contribution to read. files must
+// be offset-sorted; only the ones overlapping the piece are visited, and read
+// receives their index in files, the offset to start at inside that file, and
+// the sub-slice of buf that region backs. A region left untouched by read keeps
+// whatever buf already held, which is how callers zero-fill files that don't
+// exist on disk.
+//
+// Every piece read in the codebase walks the same file/piece geometry, so this
+// is the one place the boundary arithmetic and the full-coverage requirement are
+// stated.
+func ReadPieceInto(
+	files []FileRegion,
+	pieceOffset int64,
+	buf []byte,
+	read func(i int, f FileRegion, fileOffset int64, dst []byte) error,
+) error {
+	pieceSize := int64(len(buf))
 	written := int64(0)
 	currentOffset := pieceOffset
 
-	for _, f := range files {
+	for i, f := range files {
 		if written >= pieceSize {
 			break
 		}
@@ -43,8 +55,8 @@ func ReadPieceFromFiles(files []FileRegion, pieceOffset, pieceSize int64) ([]byt
 		availableInFile := f.Size - fileReadOffset
 		toRead := min(pieceSize-written, availableInFile)
 
-		if err := readChunkInto(f.Path, fileReadOffset, buf[written:written+toRead]); err != nil {
-			return nil, fmt.Errorf("reading from %s at offset %d: %w", f.Path, fileReadOffset, err)
+		if err := read(i, f, fileReadOffset, buf[written:written+toRead]); err != nil {
+			return err
 		}
 
 		written += toRead
@@ -52,21 +64,9 @@ func ReadPieceFromFiles(files []FileRegion, pieceOffset, pieceSize int64) ([]byt
 	}
 
 	if written < pieceSize {
-		return nil, fmt.Errorf("short read: got %d bytes, want %d", written, pieceSize)
+		return fmt.Errorf("short read: got %d bytes, want %d", written, pieceSize)
 	}
-	return buf, nil
-}
-
-// readChunkInto reads len(buf) bytes from path starting at offset directly
-// into buf. Returns an error on short read or any error other than [io.EOF]
-// at the end of the read.
-func readChunkInto(path string, offset int64, buf []byte) error {
-	file, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	return readAtFull(file, buf, offset, path)
+	return nil
 }
 
 // readAtFull issues a single ReadAt and treats short reads as errors. EOF is
@@ -131,10 +131,10 @@ func (c *FdCache) Close() {
 	c.fds = nil
 }
 
-// ReadPieceFromFilesCached is the cached variant of ReadPieceFromFiles. It
-// fills the caller-supplied buf (its length is the piece size) so a verify
-// worker can reuse one buffer across every piece it processes instead of
-// allocating a piece-sized buffer per read.
+// ReadPieceFromFilesCached fills the caller-supplied buf (its length is the
+// piece size) through cached file handles, so a verify worker can reuse one
+// buffer across every piece it processes instead of allocating a piece-sized
+// buffer per read.
 //
 // The caller-supplied FdCache must be used by exactly one goroutine. Honors ctx
 // cancellation between file regions (regular-file ReadAt on Unix can't be
@@ -143,43 +143,20 @@ func (c *FdCache) Close() {
 func ReadPieceFromFilesCached(
 	ctx context.Context, cache *FdCache, files []FileRegion, pieceOffset int64, buf []byte,
 ) error {
-	pieceSize := int64(len(buf))
-	written := int64(0)
-	currentOffset := pieceOffset
-
-	for _, f := range files {
-		if written >= pieceSize {
-			break
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
-		fileEnd := f.Offset + f.Size
-		if fileEnd <= currentOffset {
-			continue
-		}
-
-		fileReadOffset := max(currentOffset-f.Offset, 0)
-		availableInFile := f.Size - fileReadOffset
-		toRead := min(pieceSize-written, availableInFile)
-
-		fd, openErr := cache.Open(f.Path)
-		if openErr != nil {
-			return fmt.Errorf("opening %s: %w", f.Path, openErr)
-		}
-		if err := readAtFull(fd, buf[written:written+toRead], fileReadOffset, f.Path); err != nil {
-			return fmt.Errorf("reading from %s at offset %d: %w", f.Path, fileReadOffset, err)
-		}
-
-		written += toRead
-		currentOffset += toRead
-	}
-
-	if written < pieceSize {
-		return fmt.Errorf("short read: got %d bytes, want %d", written, pieceSize)
-	}
-	return nil
+	return ReadPieceInto(files, pieceOffset, buf,
+		func(_ int, f FileRegion, fileOffset int64, dst []byte) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			fd, openErr := cache.Open(f.Path)
+			if openErr != nil {
+				return fmt.Errorf("opening %s: %w", f.Path, openErr)
+			}
+			if err := readAtFull(fd, dst, fileOffset, f.Path); err != nil {
+				return fmt.Errorf("reading from %s at offset %d: %w", f.Path, fileOffset, err)
+			}
+			return nil
+		})
 }
 
 // AreHardlinked reports whether two paths refer to the same underlying file (i.e., share an inode).
