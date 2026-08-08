@@ -792,6 +792,63 @@ func TestSenderWorkers_TrackTheStreamCount(t *testing.T) {
 	}
 }
 
+// TestSenderWorker_NotesTheDequeue pins the sender's half of the monitor's
+// queued bit. The monitor stops offering a piece for as long as it believes the
+// piece is still sitting in the completed channel, so a sender that takes one
+// without saying so strands it: the failed bitmap only feeds progress reporting,
+// and the scan consults nothing but streamed and queued.
+func TestSenderWorker_NotesTheDequeue(t *testing.T) {
+	const (
+		hash      = "testhash"
+		numPieces = 1
+	)
+
+	source := &indexRecordingSource{}
+	dest := &GRPCDestination{
+		initResults: map[string]*InitTorrentResult{hash: {}},
+	}
+	tracker := NewPieceMonitor(nil, nil, testLogger, DefaultPieceMonitorConfig())
+	st := newTestState(numPieces)
+	st.meta.InitTorrentRequest.TorrentHash = hash
+	st.meta.InitTorrentRequest.PieceSize = 1 << 20
+	st.meta.InitTorrentRequest.TotalSize = 1 << 20
+	tracker.torrents[hash] = st
+
+	q := &BidiQueue{
+		source:              source,
+		dest:                dest,
+		tracker:             tracker,
+		logger:              testLogger,
+		config:              DefaultBidiQueueConfig(),
+		pieceHashMismatches: make(map[congestion.PieceKey]int),
+	}
+
+	pool := makeTestPoolWithInflight(t, nil)
+	defer pool.cancel()
+
+	// Exactly the state queueCompletedPieces leaves behind: the piece is on the
+	// channel and recorded as queued.
+	states := []PieceState{PieceStateDownloaded}
+	if n := tracker.queueCompletedPieces(t.Context(), st, states); n != numPieces {
+		t.Fatalf("queued %d pieces, want %d", n, numPieces)
+	}
+
+	stopSender := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() { q.senderWorker(t.Context(), pool, stopSender, 0) })
+
+	waitFor(t, "the sender to attempt the piece", func() bool {
+		return len(source.read()) > 0
+	})
+	close(stopSender)
+	wg.Wait()
+
+	// The send failed, so the next scan is the piece's only way back.
+	if n := tracker.queueCompletedPieces(t.Context(), st, states); n != numPieces {
+		t.Errorf("re-queued %d pieces after a failed send, want %d: the piece is stranded", n, numPieces)
+	}
+}
+
 // waitFor polls cond until it holds or the deadline passes.
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()

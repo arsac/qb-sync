@@ -371,6 +371,7 @@ func (q *BidiQueue) senderWorker(ctx context.Context, pool *StreamPool, stopSend
 			if !ok {
 				return
 			}
+			q.tracker.NoteDequeued(piece.GetTorrentHash(), int(piece.GetIndex()))
 			if !q.deliverPiece(ctx, pool, stopSender, piece, id) {
 				return
 			}
@@ -558,14 +559,14 @@ func (q *BidiQueue) sendPiecePool(ctx context.Context, pool *StreamPool, piece *
 		return nil
 	}
 
-	// Skip a piece another sender already has on the wire. queueCompletedPieces
-	// tracks streamed, not queued, so every poll tick re-offers every un-streamed
-	// piece for as long as the completed queue has room - including the ones a
-	// sender has already dequeued and is waiting on an ack for. Sending such a
-	// piece again costs a full piece read off NFS plus a second copy over the
-	// link, and puts two copies under a single congestion-window key, which the
-	// first ack then retires. The duplicates that arrive after the ack are caught
-	// by the IsPieceStreamed check above; this is the window before it.
+	// Skip a piece another sender already has on the wire. The monitor clears a
+	// piece's queued bit the moment a sender dequeues it (NoteDequeued), which is
+	// what keeps the scan a self-healing retry, so every poll tick from then until
+	// the ack lands offers the piece again. Sending it again costs a full piece
+	// read off NFS plus a second copy over the link, and puts two copies under a
+	// single congestion-window key, which the first ack then retires. The
+	// duplicates that arrive after the ack are caught by the IsPieceStreamed check
+	// above; this is the window before it.
 	//
 	// Safe as a drop rather than a deferral: a piece that never gets acked is
 	// retired from the window by the stale sweep or by stream teardown, both of

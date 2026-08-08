@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -26,8 +27,8 @@ func newTestMonitor() *PieceMonitor {
 	}
 }
 
-// newTestState builds a torrentState with empty streamed/failed slices.
-// numPieces sets both slice lengths and the meta NumPieces field.
+// newTestState builds a torrentState with empty streamed/failed/queued slices.
+// numPieces sets every slice length and the meta NumPieces field.
 func newTestState(numPieces int) *torrentState {
 	return &torrentState{
 		meta: &TorrentMetadata{
@@ -37,6 +38,7 @@ func newTestState(numPieces int) *torrentState {
 		},
 		streamed: make([]bool, numPieces),
 		failed:   make([]bool, numPieces),
+		queued:   make([]bool, numPieces),
 	}
 }
 
@@ -1012,6 +1014,47 @@ func newBacklogState(numPieces int) (*torrentState, []PieceState) {
 	return st, current
 }
 
+// TestQueueCompletedPieces_LeavesRoomForOtherTorrents pins why the queued bit
+// exists. Every tracked torrent shares one completed channel, and the scan
+// re-offers every un-streamed piece for as long as there is room, so a torrent
+// with fewer pieces than the channel has slots used to fill it with repeat copies
+// of its own pieces and starve every other torrent of a slot entirely.
+func TestQueueCompletedPieces_LeavesRoomForOtherTorrents(t *testing.T) {
+	ctx := context.Background()
+
+	const (
+		queueSlots     = 8
+		piecesPerToken = 3
+		ticks          = 3
+	)
+
+	monitor := newTestMonitor()
+	monitor.completed = make(chan *pb.Piece, queueSlots)
+	monitor.queueFullLogNano.Store(time.Now().UnixNano()) // suppress the rate-limited warn
+
+	busy, busyStates := newBacklogState(piecesPerToken)
+	quiet, quietStates := newBacklogState(piecesPerToken)
+	quiet.meta.InitTorrentRequest.TorrentHash = "quiet"
+
+	// The busy torrent is polled repeatedly while no sender dequeues anything.
+	for range ticks {
+		monitor.queueCompletedPieces(ctx, busy, busyStates)
+	}
+	if got := monitor.queueCompletedPieces(ctx, quiet, quietStates); got != piecesPerToken {
+		t.Fatalf("second torrent queued %d of %d pieces after %d ticks of the first; "+
+			"repeat offers crowded it out", got, piecesPerToken, ticks)
+	}
+
+	perHash := map[string]int{}
+	for len(monitor.completed) > 0 {
+		perHash[(<-monitor.completed).GetTorrentHash()]++
+	}
+	want := map[string]int{"backlog": piecesPerToken, "quiet": piecesPerToken}
+	if !maps.Equal(perHash, want) {
+		t.Errorf("queue holds %v, want %v (one copy of each torrent's pieces)", perHash, want)
+	}
+}
+
 func TestQueueCompletedPieces_StopsWhenTheQueueIsFull(t *testing.T) {
 	ctx := context.Background()
 
@@ -1050,15 +1093,17 @@ func TestQueueCompletedPieces_StopsWhenTheQueueIsFull(t *testing.T) {
 		}
 	})
 
-	// Re-offering is the only retry mechanism the scan has: it tracks streamed,
-	// not queued, so a piece a sender already dequeued but whose ack has not
-	// landed is offered again on the next tick. That is what makes the sender's
-	// in-flight skip (see TestSendPiecePool_SkipsPieceAlreadyInFlight) load
-	// bearing rather than defensive - without it those offers become a second
-	// disk read and a second copy over the link.
-	t.Run("re-offers a dequeued piece whose ack has not landed", func(t *testing.T) {
+	// Re-offering is the only retry mechanism the scan has, and the queued bit is
+	// what keeps it from re-offering pieces still sitting in the channel: only
+	// the piece a sender actually took comes back. That single re-offer is what
+	// makes the sender's in-flight skip (see
+	// TestSendPiecePool_SkipsPieceAlreadyInFlight) load bearing rather than
+	// defensive - without it, it becomes a second disk read and a second copy
+	// over the link for every piece on the wire.
+	t.Run("re-offers only the dequeued piece, not the ones still queued", func(t *testing.T) {
 		monitor := newTestMonitor()
 		st, current := newBacklogState(4)
+		monitor.torrents["backlog"] = st
 
 		if got := monitor.queueCompletedPieces(ctx, st, current); got != 4 {
 			t.Fatalf("queued %d pieces, want 4", got)
@@ -1067,18 +1112,17 @@ func TestQueueCompletedPieces_StopsWhenTheQueueIsFull(t *testing.T) {
 		if idx := (<-monitor.completed).GetIndex(); idx != 0 {
 			t.Fatalf("dequeued piece %d, want 0", idx)
 		}
+		monitor.NoteDequeued("backlog", 0)
 
-		// Every un-streamed piece is offered again: the three still sitting in
-		// the queue and the one on the wire.
-		if got := monitor.queueCompletedPieces(ctx, st, current); got != 4 {
-			t.Fatalf("re-queued %d pieces on the next tick, want 4", got)
+		if got := monitor.queueCompletedPieces(ctx, st, current); got != 1 {
+			t.Fatalf("re-queued %d pieces on the next tick, want 1", got)
 		}
 		var queued []int32
 		for len(monitor.completed) > 0 {
 			queued = append(queued, (<-monitor.completed).GetIndex())
 		}
-		if !slices.Equal(queued, []int32{1, 2, 3, 0, 1, 2, 3}) {
-			t.Errorf("queue contents %v, want [1 2 3 0 1 2 3] (every un-streamed piece offered twice)", queued)
+		if !slices.Equal(queued, []int32{1, 2, 3, 0}) {
+			t.Errorf("queue contents %v, want [1 2 3 0] (only the dequeued piece re-offered)", queued)
 		}
 	})
 
@@ -1144,12 +1188,15 @@ func (s *countingStateSource) ReadPiece(context.Context, *pb.Piece) ([]byte, err
 	return nil, errors.New("not used")
 }
 
-// drainCompleted empties the completed channel and returns how many pieces it held.
+// drainCompleted empties the completed channel and returns how many pieces it
+// held, noting each dequeue the way a sender worker does so the next scan is
+// free to offer the piece again.
 func drainCompleted(monitor *PieceMonitor) int {
 	n := 0
 	for {
 		select {
-		case <-monitor.completed:
+		case piece := <-monitor.completed:
+			monitor.NoteDequeued(piece.GetTorrentHash(), int(piece.GetIndex()))
 			n++
 		default:
 			return n

@@ -69,7 +69,19 @@ type torrentState struct {
 	lastStates []PieceState
 	streamed   []bool // pieces successfully streamed
 	failed     []bool // pieces that failed (for retry logic)
-	idleTicks  int    // consecutive polls with no new pieces completed
+	// queued records pieces currently sitting in the shared completed channel,
+	// set by queueCompletedPieces on a successful send and cleared by
+	// [PieceMonitor.NoteDequeued] when a sender takes the piece off it (and by
+	// unmarkStreamed, which must not leave a re-offer suppressed). It feeds no
+	// derived count, so unlike the slices above it is assigned directly.
+	//
+	// It exists to keep one torrent from crowding the channel every torrent
+	// shares: the scan re-offers every un-streamed piece on every tick for as
+	// long as there is room, so a torrent with fewer pieces than the channel has
+	// slots would otherwise fill it with a dozen-plus copies of each of its own
+	// pieces and leave no slot for anyone else's.
+	queued    []bool
+	idleTicks int // consecutive polls with no new pieces completed
 	// firstUnstreamedScanIdx is the lowest index that *might* still be
 	// un-streamed. queueCompletedPieces uses it to avoid re-scanning the
 	// long prefix of already-streamed pieces on every poll, so nothing below
@@ -179,12 +191,15 @@ func (s *torrentState) markStreamed(i int) bool {
 // cursor so queueCompletedPieces offers it again. Caller must hold the write
 // lock.
 //
-// The rewind is the whole point: the cursor is what makes the per-tick scan
-// cheap, and without it a piece un-marked below the cursor is never re-offered,
-// so the torrent silently never completes. It happens whether or not the piece
-// was actually streamed, so a caller cannot lose the rewind by guessing wrong.
+// Clearing the cursor and the queued bit is the whole point: each of them
+// suppresses a re-offer, and without both a piece un-marked here is never
+// offered again, so the torrent silently never completes. Both happen whether or
+// not the piece was actually streamed, so a caller cannot lose them by guessing
+// wrong. Clearing queued can duplicate a piece genuinely still in the channel,
+// which sendPiecePool already drops - far cheaper than stranding one.
 func (s *torrentState) unmarkStreamed(i int) {
 	s.firstUnstreamedScanIdx = min(s.firstUnstreamedScanIdx, i)
+	s.queued[i] = false
 	if !s.streamed[i] {
 		return
 	}
@@ -319,6 +334,31 @@ func (t *PieceMonitor) MarkStreamed(hash string, pieceIndex int) {
 	state.mu.Lock()
 	if state.markStreamed(pieceIndex) {
 		state.noteAdvance()
+	}
+	state.mu.Unlock()
+}
+
+// NoteDequeued records that a sender has taken a piece off the completed
+// channel, so the next poll may offer it again.
+//
+// Clearing at dequeue rather than at ack is what keeps the retry story
+// self-healing: from here on, a piece that never reaches the destination is
+// re-offered by the very next scan, exactly as it was before the queued bit
+// existed. The gap it leaves - a piece dequeued but not yet claimed by a
+// congestion window - is covered by sendPiecePool's own in-flight and streamed
+// checks, which already had to handle duplicates arriving that way.
+func (t *PieceMonitor) NoteDequeued(hash string, pieceIndex int) {
+	t.mu.RLock()
+	state, ok := t.torrents[hash]
+	t.mu.RUnlock()
+
+	if !ok {
+		return
+	}
+
+	state.mu.Lock()
+	if pieceIndex >= 0 && pieceIndex < len(state.queued) {
+		state.queued[pieceIndex] = false
 	}
 	state.mu.Unlock()
 }
@@ -668,6 +708,7 @@ func (t *PieceMonitor) startTracking(ctx context.Context, hash string, alreadyWr
 		hashes:   hashes,
 		streamed: make([]bool, numPieces),
 		failed:   make([]bool, numPieces),
+		queued:   make([]bool, numPieces),
 		// Start the clock now rather than at the zero time, so a torrent that
 		// never streams a single piece still measures how long it has failed to
 		// advance. That is precisely the stalled case, and leaving this zero
@@ -872,13 +913,14 @@ func (t *PieceMonitor) queueCompletedPieces(ctx context.Context, state *torrentS
 		// Benign TOCTOU: a piece could be marked streamed between this check and
 		// the channel send below. Handled safely downstream — sendPiecePool rechecks
 		// IsPieceStreamed before the actual gRPC send, so duplicates are discarded.
-		if state.streamed[i] {
+		if state.streamed[i] || state.queued[i] {
 			continue
 		}
 
 		piece := t.buildPiece(state, i)
 
 		if t.trySendCompletedNonBlocking(ctx, piece) {
+			state.queued[i] = true
 			queued++
 			t.logger.DebugContext(ctx, "queued piece",
 				"hash", state.meta.GetTorrentHash(),
