@@ -6,8 +6,6 @@ import (
 	"os"
 	"slices"
 	"sort"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/arsac/qb-sync/internal/metrics"
@@ -141,22 +139,24 @@ func (s *Server) writePiece(ctx context.Context, req *pb.WritePieceRequest) writ
 	return writePieceOK()
 }
 
-// verifyFilePieces reads back interior pieces from a synced .partial file and
-// verifies their hashes. Returns indices of pieces that failed verification,
-// ascending, and whether ctx cancellation cut the pass short. Boundary pieces
-// (spanning adjacent files) are skipped - they are deferred to
-// verifyFinalizedPieces.
+// verifyFilePieces reads back interior pieces from a file and verifies their
+// hashes through the shared verifyPieceSet worker pool. Returns indices of
+// pieces that failed verification, ascending, and whether ctx cancellation cut
+// the pass short. Boundary pieces (spanning adjacent files) are skipped - they
+// are deferred to verifyFinalizedPieces.
 //
-// If fh is non-nil, reads go through it directly (saves NFS open round-trips
-// per piece). If fh is nil, opens fi.path for the duration of the verify pass.
+// Interior pieces lie entirely within fi, so a single region describes every
+// read the pass makes. Each worker opens its own handle on it via the pool's
+// per-goroutine FdCache; a file that can't be opened at all fails every piece,
+// which is what makes the caller re-stream it.
 //
 // Safe to call without state.mu: all accessed fields (pieceHashes, pieceLength,
 // totalSize, fi geometry) are immutable after initialization.
 func (s *Server) verifyFilePieces(
 	ctx context.Context,
+	hash string,
 	state *serverTorrentState,
 	fi *serverFileInfo,
-	fh *os.File,
 ) ([]int, bool) {
 	if len(state.pieceHashes) == 0 {
 		return nil, false
@@ -170,102 +170,8 @@ func (s *Server) verifyFilePieces(
 		return nil, false
 	}
 
-	if fh == nil {
-		f, openErr := os.Open(fi.path)
-		if openErr != nil {
-			// Can't read anything - treat every interior piece as failed so
-			// the caller re-streams them. Boundary pieces are deferred to
-			// verifyFinalizedPieces regardless.
-			return pieces, false
-		}
-		defer f.Close()
-		fh = f
-	}
-
-	return s.verifyPiecesParallel(ctx, state, fi, fh, pieces), ctx.Err() != nil
-}
-
-// verifyPiecesParallel read-back-verifies pieces with the same worker-pool
-// shape verifyFinalizedPieces uses. A serial pass leaves an NFS export with
-// one outstanding read at a time and hashes on a single core, so a completed
-// multi-GB file stalls its stream worker for the whole read-back while the
-// remaining workers keep writing - overlapping reads and SHA1 across workers
-// removes that stall from the transfer's critical path.
-//
-// Each worker owns a pieceLength buffer (never escapes, VerifyPieceHash only
-// hashes it) and, past the first, its own read fd: the per-file open cost is
-// paid once, not per piece, and mirrors the per-goroutine FdCache rule that
-// verify workers never share a handle.
-//
-// Cancelling ctx stops the reads but the pass still drains the queue, reporting
-// every piece it never got to as failed. Callers act on "not in the failed set"
-// as proof a piece was read back and matched, so an interrupted pass has to fail
-// closed rather than silently shrink its coverage.
-func (s *Server) verifyPiecesParallel(
-	ctx context.Context,
-	state *serverTorrentState,
-	fi *serverFileInfo,
-	fh *os.File,
-	pieces []int,
-) []int {
-	workers := min(s.verifyConcurrency(), len(pieces))
-
-	var (
-		next     atomic.Int64
-		failedMu sync.Mutex
-		failed   []int
-		wg       sync.WaitGroup
-	)
-
-	for w := range workers {
-		wg.Go(func() {
-			rf := fh
-			if w > 0 {
-				if own, openErr := os.Open(fi.path); openErr == nil {
-					defer own.Close()
-					rf = own
-				}
-			}
-			buf := make([]byte, state.pieceLength)
-			for {
-				i := int(next.Add(1)) - 1
-				if i >= len(pieces) {
-					return
-				}
-				p := pieces[i]
-				if ctx.Err() == nil && verifyOneFilePiece(state, fi, rf, buf, p) {
-					continue
-				}
-				failedMu.Lock()
-				failed = append(failed, p)
-				failedMu.Unlock()
-			}
-		})
-	}
-	wg.Wait()
-
-	sort.Ints(failed)
-	return failed
-}
-
-// verifyOneFilePiece reads interior piece p of fi through rf into buf and
-// reports whether its hash matches. Pieces with no known hash pass trivially.
-func verifyOneFilePiece(state *serverTorrentState, fi *serverFileInfo, rf *os.File, buf []byte, p int) bool {
-	if state.pieceHashes[p] == "" {
-		return true
-	}
-
-	pieceStart := int64(p) * state.pieceLength
-	pieceEnd := min(pieceStart+state.pieceLength, state.totalSize)
-	pieceSize := pieceEnd - pieceStart
-
-	pieceBuf := buf[:pieceSize]
-	n, readErr := rf.ReadAt(pieceBuf, pieceStart-fi.offset)
-	if readErr != nil || int64(n) != pieceSize {
-		return false
-	}
-
-	return utils.VerifyPieceHash(pieceBuf, state.pieceHashes[p]) == nil
+	regions := []utils.FileRegion{{Path: fi.path, Offset: fi.offset, Size: fi.size}}
+	return s.verifyPieceSet(ctx, hash, state, regions, pieces, nil), ctx.Err() != nil
 }
 
 // markInteriorVerified marks every interior piece of fi as verified post-flush
@@ -330,7 +236,7 @@ func (s *Server) preVerifyCompleteFiles(ctx context.Context, hash string, state 
 		if ctx.Err() != nil {
 			break
 		}
-		failed, _ := s.verifyFilePieces(ctx, state, fi, nil)
+		failed, _ := s.verifyFilePieces(ctx, hash, state, fi)
 
 		state.mu.Lock()
 		before := state.verified.Count()
@@ -441,9 +347,9 @@ func (s *Server) startEarlyFinalize(
 // concurrent WritePiece will touch fi, and FinalizeTorrent defers while the
 // early finalization is counted in flight.
 //
-// fh is the write handle snapshotted by startEarlyFinalize. Verifying through
-// it skips re-opening the file per piece, which on NFS saves two round-trips
-// (LOOKUP + OPEN) per piece.
+// fh is the write handle snapshotted by startEarlyFinalize, which this
+// goroutine owns: syncVerifyClose syncs it, verifies the file's contents and
+// closes it.
 func (s *Server) earlyFinalizeFile(
 	ctx context.Context,
 	hash string,
@@ -530,10 +436,8 @@ func (s *Server) earlyFinalizeFile(
 // sync error. Returns the first sync/close error and the list of failed
 // piece indices (only meaningful when the returned error is nil).
 //
-// When fh is non-nil, the verify reads use it directly, which saves NFS
-// LOOKUP+OPEN round-trips per piece compared to verifyFilePieces opening
-// fresh. When fh is nil (e.g., test setup that bypasses openForWrite),
-// verifyFilePieces opens fi.path itself.
+// The sync must land before the verify: the read-back opens its own handles,
+// so it sees the file's contents on the server, not this handle's dirty pages.
 func (s *Server) syncVerifyClose(
 	ctx context.Context,
 	hash string,
@@ -555,7 +459,7 @@ func (s *Server) syncVerifyClose(
 
 	if firstErr == nil {
 		var interrupted bool
-		failedPieces, interrupted = s.verifyFilePieces(ctx, state, fi, fh)
+		failedPieces, interrupted = s.verifyFilePieces(ctx, hash, state, fi)
 		if interrupted {
 			// An interrupted pass reports the pieces it never read as failed,
 			// which is the right answer for a caller that only adds skips but

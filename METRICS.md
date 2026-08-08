@@ -45,7 +45,7 @@ All metrics use the `qbsync_` namespace and are exposed via Prometheus at `/metr
 | `qbsync_piece_write_errors_total` | `mode` | Piece write failures (file open/truncate/write) |
 | `qbsync_state_save_errors_total` | `mode` | Failures saving torrent state to disk |
 | `qbsync_file_sync_errors_total` | `mode` | File sync/close failures before finalization rename |
-| `qbsync_verification_errors_total` | `mode` | Piece verification failures during finalization |
+| `qbsync_verification_errors_total` | `mode` | Piece read-back verification failures (early finalization, init-time pre-verify, full finalization) |
 | `qbsync_hardlink_errors_total` | `mode` | Hardlink creation failures |
 | `qbsync_stale_inode_evictions_total` | | Inode registry entries evicted due to recycled source inodes |
 | `qbsync_stream_open_errors_total` | `mode` | Stream open or poll failures |

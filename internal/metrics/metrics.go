@@ -344,7 +344,9 @@ var (
 		[]string{LabelMode},
 	)
 
-	// VerificationErrorsTotal counts piece verification failures during finalization.
+	// VerificationErrorsTotal counts per-piece read-back verification failures,
+	// across all three passes that read pieces back: early finalization, the
+	// init-time pre-verify pass, and full finalization.
 	VerificationErrorsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: namespace,

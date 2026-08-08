@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -810,8 +811,6 @@ func (s *Server) registerFinalizedInodes(ctx context.Context, hash string, state
 //   - (nil, nil) — all pieces verified OK
 //   - (failedPieces, nil) — piece-level corruption, recovery needed
 //   - (nil, err) — system error (context cancel, idle timeout)
-//
-//nolint:gocognit
 func (s *Server) verifyFinalizedPieces(
 	ctx context.Context,
 	hash string,
@@ -828,79 +827,44 @@ func (s *Server) verifyFinalizedPieces(
 		)
 	}
 
-	pieceSize := state.pieceLength
-	totalSize := state.totalSize
 	numPieces := len(state.pieceHashes)
 
 	s.logger.InfoContext(ctx, "verifying finalized pieces",
 		"hash", hash,
 		"pieces", numPieces,
-		"pieceSize", pieceSize,
+		"pieceSize", state.pieceLength,
 	)
 
 	// Create a context with progress-based idle timeout.
 	// The cancel func is called by the idle watchdog if no progress is made.
+	// The pass reads through idleCtx, not ctx, so a hung NFS read cannot
+	// outlive the watchdog.
 	idleCtx, idleCancel := context.WithCancel(ctx)
 	defer idleCancel()
-
-	// Verify pieces in parallel — all accessed state fields (pieceHashes,
-	// pieceLength, totalSize, files) are immutable at this point (finalizing=true).
-	//
-	// Worker-pool pattern (rather than one goroutine per piece) so each worker
-	// holds a per-goroutine FdCache that reuses file handles across all the
-	// pieces it processes. Reusing fds removes one open+close (LOOKUP+OPEN+
-	// CLOSE) RTT per piece per file region — the dominant verify cost on NFS
-	// for multi-file torrents.
-	g, gCtx := errgroup.WithContext(idleCtx)
 
 	var verified atomic.Int64
 	var lastProgress atomic.Value // stores time.Time of last verified piece
 	lastProgress.Store(time.Now())
 
-	var failedMu sync.Mutex
-	var failedPieces []int
+	go s.verifyIdleWatchdog(ctx, idleCtx, hash, numPieces, &verified, &lastProgress, idleCancel)
 
-	go s.verifyIdleWatchdog(ctx, gCtx, hash, numPieces, &verified, &lastProgress, idleCancel)
-
-	regions := finalizedRegions(state)
-	pieceCh := queuePiecesNeedingReadBack(state, &verified, &lastProgress)
-
-	for range s.verifyConcurrency() {
-		g.Go(func() error {
-			cache := utils.NewFdCache()
-			defer cache.Close()
-			// One buffer per worker, resliced per piece: the final piece is the
-			// only short one, so a pieceSize buffer covers every read.
-			buf := make([]byte, pieceSize)
-			for i := range pieceCh {
-				if err := gCtx.Err(); err != nil {
-					return err
-				}
-				offset := int64(i) * pieceSize
-				size := pieceSize
-				if offset+size > totalSize {
-					size = totalSize - offset
-				}
-				// gCtx (not ctx): the idle watchdog cancels gCtx, and
-				// ReadPieceFromFilesCached checks it between file regions —
-				// using ctx would let a hung NFS read outlive the watchdog.
-				if !s.verifyOnePiece(gCtx, cache, hash, regions, i, offset, buf[:size], state.pieceHashes[i]) {
-					failedMu.Lock()
-					failedPieces = append(failedPieces, i)
-					failedMu.Unlock()
-				}
-				lastProgress.Store(time.Now())
-				if count := verified.Add(1); count%50 == 0 || count == int64(numPieces) {
-					s.logger.DebugContext(ctx, "verification progress",
-						"hash", hash, "verified", count, "total", numPieces,
-					)
-				}
+	// All state fields the pass reads (pieceHashes, pieceLength, totalSize,
+	// files) are immutable at this point (finalizing=true).
+	failedPieces := s.verifyPieceSet(idleCtx, hash, state, finalizedRegions(state),
+		piecesNeedingReadBack(state, &verified, &lastProgress),
+		func() {
+			lastProgress.Store(time.Now())
+			if count := verified.Add(1); count%50 == 0 || count == int64(numPieces) {
+				s.logger.DebugContext(ctx, "verification progress",
+					"hash", hash, "verified", count, "total", numPieces,
+				)
 			}
-			return nil
 		})
-	}
 
-	if err := g.Wait(); err != nil {
+	// An interrupted pass reports every piece it never read as failed. That is
+	// the right answer for callers that only add skips, but here it would
+	// re-stream an intact torrent, so a cancelled pass is a system error.
+	if err := idleCtx.Err(); err != nil {
 		return nil, err
 	}
 
@@ -917,32 +881,99 @@ func (s *Server) verifyFinalizedPieces(
 	return nil, nil
 }
 
-// verifyOnePiece reads a single piece from finalized files into data (whose
-// length sets the read size) and verifies its hash. Returns true if the piece
-// is valid, false if it's corrupted or unreadable. The cache and data buffer
-// are reused across the pieces processed by one worker goroutine — both must
-// be that worker's own, not shared.
+// verifyPieceSet read-back-verifies pieces by reading each one through regions
+// and comparing its SHA1, returning the indices that failed, ascending. This is
+// the one read-back verify implementation: full finalization runs it over the
+// whole torrent's files, early finalization and the init-time pre-verify pass
+// run it over a single file's region.
+//
+// Worker-pool pattern (rather than one goroutine per piece) so each worker holds
+// a per-goroutine FdCache that reuses file handles across all the pieces it
+// processes, plus one pieceLength buffer resliced per piece. Reusing fds removes
+// an open+close (LOOKUP+OPEN+CLOSE) RTT per piece per file region - the dominant
+// verify cost on NFS for multi-file torrents.
+//
+// Fails closed on cancellation: the pass stops reading but still reports every
+// piece it never got to as failed, so "absent from the result" always means
+// "read back and hashed correctly". onVerified, when non-nil, is called once per
+// piece disposed of, from arbitrary worker goroutines.
+func (s *Server) verifyPieceSet(
+	ctx context.Context,
+	hash string,
+	state *serverTorrentState,
+	regions []utils.FileRegion,
+	pieces []int,
+	onVerified func(),
+) []int {
+	var (
+		next     atomic.Int64
+		failedMu sync.Mutex
+		failed   []int
+		wg       sync.WaitGroup
+	)
+
+	for range min(s.verifyConcurrency(), len(pieces)) {
+		wg.Go(func() {
+			cache := utils.NewFdCache()
+			defer cache.Close()
+			buf := make([]byte, state.pieceLength)
+			for {
+				i := int(next.Add(1)) - 1
+				if i >= len(pieces) {
+					return
+				}
+				if !s.verifyOnePiece(ctx, cache, hash, state, regions, buf, pieces[i]) {
+					failedMu.Lock()
+					failed = append(failed, pieces[i])
+					failedMu.Unlock()
+				}
+				if onVerified != nil {
+					onVerified()
+				}
+			}
+		})
+	}
+	wg.Wait()
+
+	sort.Ints(failed)
+	return failed
+}
+
+// verifyOnePiece reads piece p through regions into buf (resliced to the piece's
+// size - the final piece is the only short one) and reports whether its hash
+// matches. Pieces with no known hash pass trivially. The cache and buffer are
+// reused across the pieces processed by one worker goroutine, so both must be
+// that worker's own, not shared.
 func (s *Server) verifyOnePiece(
 	ctx context.Context,
 	cache *utils.FdCache,
 	hash string,
+	state *serverTorrentState,
 	regions []utils.FileRegion,
-	pieceIdx int,
-	offset int64,
-	data []byte,
-	expectedHash string,
+	buf []byte,
+	p int,
 ) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	if state.pieceHashes[p] == "" {
+		return true
+	}
+
+	offset := int64(p) * state.pieceLength
+	data := buf[:min(state.pieceLength, state.totalSize-offset)]
+
 	if readErr := utils.ReadPieceFromFilesCached(ctx, cache, regions, offset, data); readErr != nil {
 		metrics.VerificationErrorsTotal.WithLabelValues(metrics.ModeDestination).Inc()
 		s.logger.WarnContext(ctx, "piece read failed during verification",
-			"hash", hash, "piece", pieceIdx, "error", readErr,
+			"hash", hash, "piece", p, "error", readErr,
 		)
 		return false
 	}
-	if hashErr := utils.VerifyPieceHash(data, expectedHash); hashErr != nil {
+	if hashErr := utils.VerifyPieceHash(data, state.pieceHashes[p]); hashErr != nil {
 		metrics.VerificationErrorsTotal.WithLabelValues(metrics.ModeDestination).Inc()
 		s.logger.WarnContext(ctx, "piece hash mismatch during verification",
-			"hash", hash, "piece", pieceIdx, "error", hashErr,
+			"hash", hash, "piece", p, "error", hashErr,
 		)
 		return false
 	}
@@ -1160,14 +1191,14 @@ func (s *Server) handleExistingFinalization(
 	}, nil
 }
 
-// queuePiecesNeedingReadBack returns a closed, fully-buffered channel of the
-// piece indices that still need a finalize-time read-back. Pieces skipped
-// because they were already verified count as progress immediately, so the
-// idle watchdog doesn't fire on a torrent that needs few or no re-reads.
-func queuePiecesNeedingReadBack(
+// piecesNeedingReadBack returns the piece indices that still need a
+// finalize-time read-back. Pieces skipped because they were already verified
+// count as progress immediately, so the idle watchdog doesn't fire on a torrent
+// that needs few or no re-reads.
+func piecesNeedingReadBack(
 	state *serverTorrentState, verified *atomic.Int64, lastProgress *atomic.Value,
-) chan int {
-	pieceCh := make(chan int, len(state.pieceHashes))
+) []int {
+	pieces := make([]int, 0, len(state.pieceHashes))
 	for i, expectedHash := range state.pieceHashes {
 		if expectedHash == "" {
 			continue
@@ -1187,10 +1218,9 @@ func queuePiecesNeedingReadBack(
 			lastProgress.Store(time.Now())
 			continue
 		}
-		pieceCh <- i
+		pieces = append(pieces, i)
 	}
-	close(pieceCh)
-	return pieceCh
+	return pieces
 }
 
 // finalizedRegions maps a torrent's files to their finalized (non-.partial)

@@ -931,18 +931,8 @@ func TestVerifyFilePieces_ScatteredCorruption(t *testing.T) {
 			s, _ := newTestDestServer(t)
 			s.config.VerifyConcurrency = workers
 
-			fh, openErr := os.Open(path)
-			if openErr != nil {
-				t.Fatal(openErr)
-			}
-			defer fh.Close()
-
-			if got, _ := s.verifyFilePieces(t.Context(), state, fi, fh); !slices.Equal(got, want) {
-				t.Errorf("shared handle: failed pieces = %v, want %v", got, want)
-			}
-			// nil handle exercises the self-open path for every worker.
-			if got, _ := s.verifyFilePieces(t.Context(), state, fi, nil); !slices.Equal(got, want) {
-				t.Errorf("self-opened: failed pieces = %v, want %v", got, want)
+			if got, _ := s.verifyFilePieces(t.Context(), "h", state, fi); !slices.Equal(got, want) {
+				t.Errorf("failed pieces = %v, want %v", got, want)
 			}
 
 			// A cancelled pass must fail closed: callers read "not in the
@@ -951,7 +941,7 @@ func TestVerifyFilePieces_ScatteredCorruption(t *testing.T) {
 			// coverage silently.
 			ctx, cancel := context.WithCancel(t.Context())
 			cancel()
-			got, interrupted := s.verifyFilePieces(ctx, state, fi, fh)
+			got, interrupted := s.verifyFilePieces(ctx, "h", state, fi)
 			if !interrupted {
 				t.Error("cancelled pass reported interrupted = false")
 			}
@@ -960,6 +950,82 @@ func TestVerifyFilePieces_ScatteredCorruption(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestVerifyFilePieces_ShortTailAndMissingFile pins the two cases the shared
+// verifyPieceSet pool has to reproduce without the single-file read path that
+// used to state them explicitly: the final piece is short (its read size comes
+// from totalSize, not pieceLength) and an unopenable file fails every interior
+// piece rather than passing them by default.
+func TestVerifyFilePieces_ShortTailAndMissingFile(t *testing.T) {
+	t.Parallel()
+
+	const pieceLength = 16
+	// 3 pieces where the last holds 5 bytes, so a full-length read overruns.
+	totalSize := int64(2*pieceLength + 5)
+
+	full := make([]byte, totalSize)
+	for i := range full {
+		full[i] = byte(i * 7)
+	}
+	hashes := []string{
+		utils.ComputeSHA1(full[0:pieceLength]),
+		utils.ComputeSHA1(full[pieceLength : 2*pieceLength]),
+		utils.ComputeSHA1(full[2*pieceLength:]),
+	}
+
+	newState := func(t *testing.T, contents []byte, name string) (*serverTorrentState, *serverFileInfo) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), name)
+		if contents != nil {
+			if err := os.WriteFile(path, contents, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		fi := &serverFileInfo{
+			path: path, offset: 0, size: totalSize,
+			firstPiece: 0, lastPiece: len(hashes) - 1, selected: true,
+		}
+		return &serverTorrentState{torrentMeta: torrentMeta{
+			pieceHashes: hashes,
+			pieceLength: pieceLength,
+			totalSize:   totalSize,
+			files:       []*serverFileInfo{fi},
+		}}, fi
+	}
+
+	t.Run("intact short tail", func(t *testing.T) {
+		t.Parallel()
+		s, _ := newTestDestServer(t)
+		state, fi := newState(t, full, "tail.bin.partial")
+		if got, _ := s.verifyFilePieces(t.Context(), "h", state, fi); len(got) != 0 {
+			t.Errorf("failed pieces = %v, want none", got)
+		}
+	})
+
+	t.Run("corrupt short tail", func(t *testing.T) {
+		t.Parallel()
+		s, _ := newTestDestServer(t)
+		onDisk := slices.Clone(full)
+		onDisk[len(onDisk)-1] ^= 0xff
+		state, fi := newState(t, onDisk, "tail.bin.partial")
+		if got, _ := s.verifyFilePieces(t.Context(), "h", state, fi); !slices.Equal(got, []int{2}) {
+			t.Errorf("failed pieces = %v, want [2]", got)
+		}
+	})
+
+	t.Run("missing file", func(t *testing.T) {
+		t.Parallel()
+		s, _ := newTestDestServer(t)
+		state, fi := newState(t, nil, "absent.bin.partial")
+		got, interrupted := s.verifyFilePieces(t.Context(), "h", state, fi)
+		if interrupted {
+			t.Error("interrupted = true without cancellation")
+		}
+		if !slices.Equal(got, []int{0, 1, 2}) {
+			t.Errorf("failed pieces = %v, want every interior piece", got)
+		}
+	})
 }
 
 // TestPreVerifyCompleteFiles pins the init-time read-back pass to exactly the
