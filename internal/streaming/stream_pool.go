@@ -699,7 +699,7 @@ func (p *StreamPool) removeStreamLocked() error {
 	lastIdx := len(p.streams) - 1
 	ps := p.streams[lastIdx]
 
-	// Mark as draining before spawning goroutine so SelectStream() skips it
+	// Mark as draining before spawning goroutine so ClaimStream() skips it
 	// immediately when p.mu is released, avoiding a scheduling race.
 	ps.draining.Store(true)
 
@@ -762,10 +762,21 @@ func (p *StreamPool) getTotalBytesSentLocked() int64 {
 	return total
 }
 
-// SelectStream returns the best stream for sending a piece.
-// Uses least-loaded selection (fewest in-flight pieces).
-// If no stream can send, returns the least-loaded stream for waiting.
-func (p *StreamPool) SelectStream() (*PooledStream, error) {
+// ClaimStream reserves a congestion-window slot for key on the least-loaded
+// stream that can accept it and returns that stream, or errWindowFull if every
+// stream is at its window limit. The caller owns the slot and must retire it
+// through AckPiece or FailPiece.
+//
+// Selecting and claiming under one lock acquisition is what makes the returned
+// stream usable: draining is only ever set under p.mu's write lock, so a stream
+// claimed here cannot already be on its way out, and its non-zero in-flight
+// count then holds drainAndRemoveStream off until the piece is retired.
+//
+// Losing the last slot on the least-loaded stream is routine with several
+// senders sharing a pool, so the scan retries rather than giving the piece up:
+// the loser's target is full at that point and drops out of the next pass, and
+// a whole pass without a claim means the pool really is saturated.
+func (p *StreamPool) ClaimStream(key congestion.PieceKey) (*PooledStream, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
@@ -773,32 +784,28 @@ func (p *StreamPool) SelectStream() (*PooledStream, error) {
 		return nil, errors.New("no streams available")
 	}
 
-	// First pass: find stream with lowest in-flight count that can send
-	if best := p.findLeastLoadedStream(true); best != nil {
-		return best, nil
+	for range len(p.streams) {
+		best := p.findLeastLoadedStream()
+		if best == nil {
+			break
+		}
+		if best.window.TrySend(key) {
+			return best, nil
+		}
 	}
 
-	// Second pass: no stream can send, return least-loaded for waiting
-	best := p.findLeastLoadedStream(false)
-	if best == nil {
-		// Should never happen if streams is non-empty, but be defensive
-		return nil, errors.New("no streams available")
-	}
-	return best, nil
+	return nil, errWindowFull
 }
 
-// findLeastLoadedStream finds the stream with lowest in-flight count.
-// If requireCanSend is true, only considers streams that can accept new pieces.
+// findLeastLoadedStream finds the non-draining stream with the lowest in-flight
+// count that can accept another piece, or nil if there is none.
 // Must hold p.mu (read or write).
-func (p *StreamPool) findLeastLoadedStream(requireCanSend bool) *PooledStream {
+func (p *StreamPool) findLeastLoadedStream() *PooledStream {
 	var best *PooledStream
 	bestInFlight := math.MaxInt
 
 	for _, ps := range p.streams {
-		if ps.draining.Load() {
-			continue
-		}
-		if requireCanSend && !ps.window.CanSend() {
+		if ps.draining.Load() || !ps.window.CanSend() {
 			continue
 		}
 		inFlight := ps.window.InFlight()

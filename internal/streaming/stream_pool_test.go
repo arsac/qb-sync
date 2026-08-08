@@ -1,6 +1,7 @@
 package streaming
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -214,34 +215,113 @@ func TestStreamingConstants(t *testing.T) {
 	}
 }
 
-// TestFindLeastLoadedStreamLogic tests the selection logic conceptually.
-// Since we can't easily create a pool without a GRPCDestination,
-// we test the AdaptiveWindow behavior that underlies the selection.
-func TestFindLeastLoadedStreamLogic(t *testing.T) {
-	// Create two windows with different in-flight counts
-	config := congestion.DefaultConfig()
-	w1 := congestion.NewAdaptiveWindow(config)
-	w2 := congestion.NewAdaptiveWindow(config)
-
-	// w1 has 2 in-flight, w2 has 1 in-flight
-	w1.OnSend(congestion.PieceKey{Hash: "hash", Index: 0})
-	w1.OnSend(congestion.PieceKey{Hash: "hash", Index: 1})
-	w2.OnSend(congestion.PieceKey{Hash: "hash", Index: 2})
-
-	// Selection should prefer w2 (lower in-flight)
-	if w1.InFlight() <= w2.InFlight() {
-		t.Errorf("Test setup wrong: w1.InFlight()=%d should be > w2.InFlight()=%d",
-			w1.InFlight(), w2.InFlight())
+// newClaimTestStream builds a PooledStream whose window holds exactly `window`
+// slots, `filled` of them already occupied by another sender's pieces.
+func newClaimTestStream(id, window, filled int) *PooledStream {
+	w := congestion.NewAdaptiveWindow(congestion.Config{
+		MinWindow:     window,
+		MaxWindow:     window,
+		InitialWindow: window,
+		PieceTimeout:  time.Minute,
+	})
+	for i := range filled {
+		w.OnSend(congestion.PieceKey{Hash: "occupant", Index: int32(i)})
 	}
+	return &PooledStream{window: w, id: id}
+}
 
-	// Verify CanSend works correctly
-	// With default window of 10, both should be able to send
-	if !w1.CanSend() {
-		t.Error("w1 should be able to send")
-	}
-	if !w2.CanSend() {
-		t.Error("w2 should be able to send")
-	}
+// TestClaimStream_SelectsAndClaimsUnderOneLock pins the contract that replaced
+// the old select-then-TrySend pair: the returned stream already holds the
+// caller's slot (which is what keeps drainAndRemoveStream off it), saturated and
+// draining streams are never returned, and a pool with nothing to give reports
+// errWindowFull instead of a stream the caller would immediately fail on.
+func TestClaimStream_SelectsAndClaimsUnderOneLock(t *testing.T) {
+	t.Parallel()
+
+	key := congestion.PieceKey{Hash: "abc", Index: 7}
+
+	t.Run("claims the slot on the stream it returns", func(t *testing.T) {
+		t.Parallel()
+
+		ps := newClaimTestStream(0, 4, 0)
+		pool := &StreamPool{streams: []*PooledStream{ps}, logger: testLogger}
+
+		got, err := pool.ClaimStream(key)
+		if err != nil {
+			t.Fatalf("ClaimStream: %v", err)
+		}
+		if got != ps {
+			t.Fatalf("returned stream id %d, want 0", got.id)
+		}
+		if inFlight := ps.window.InFlight(); inFlight != 1 {
+			t.Fatalf("in-flight after claim = %d, want 1 (the slot must already be taken)", inFlight)
+		}
+		if claimed := ps.window.ClearInflight(); len(claimed) != 1 || claimed[0] != key {
+			t.Errorf("claimed keys = %v, want exactly [%v]", claimed, key)
+		}
+	})
+
+	t.Run("prefers the least loaded stream that can send", func(t *testing.T) {
+		t.Parallel()
+
+		// Stream 0 is the least loaded by in-flight count but is saturated,
+		// so the claim has to fall through to stream 2.
+		saturated := newClaimTestStream(0, 1, 1)
+		busy := newClaimTestStream(1, 8, 5)
+		best := newClaimTestStream(2, 8, 3)
+		pool := &StreamPool{streams: []*PooledStream{saturated, busy, best}, logger: testLogger}
+
+		got, err := pool.ClaimStream(key)
+		if err != nil {
+			t.Fatalf("ClaimStream: %v", err)
+		}
+		if got != best {
+			t.Fatalf("returned stream id %d, want 2", got.id)
+		}
+		if inFlight := saturated.window.InFlight(); inFlight != 1 {
+			t.Errorf("saturated stream in-flight = %d, want 1 (untouched)", inFlight)
+		}
+	})
+
+	t.Run("never claims a draining stream", func(t *testing.T) {
+		t.Parallel()
+
+		draining := newClaimTestStream(0, 8, 0)
+		draining.draining.Store(true)
+		live := newClaimTestStream(1, 8, 6)
+		pool := &StreamPool{streams: []*PooledStream{draining, live}, logger: testLogger}
+
+		got, err := pool.ClaimStream(key)
+		if err != nil {
+			t.Fatalf("ClaimStream: %v", err)
+		}
+		if got != live {
+			t.Fatalf("returned stream id %d, want 1", got.id)
+		}
+		if inFlight := draining.window.InFlight(); inFlight != 0 {
+			t.Errorf("draining stream in-flight = %d, want 0 (a claim would hold up its drain)", inFlight)
+		}
+	})
+
+	t.Run("reports errWindowFull without claiming anything", func(t *testing.T) {
+		t.Parallel()
+
+		a := newClaimTestStream(0, 2, 2)
+		b := newClaimTestStream(1, 3, 3)
+		pool := &StreamPool{streams: []*PooledStream{a, b}, logger: testLogger}
+
+		got, err := pool.ClaimStream(key)
+		if !errors.Is(err, errWindowFull) {
+			t.Fatalf("ClaimStream error = %v, want errWindowFull", err)
+		}
+		if got != nil {
+			t.Errorf("returned stream id %d, want nil", got.id)
+		}
+		if a.window.InFlight() != 2 || b.window.InFlight() != 3 {
+			t.Errorf("in-flight counts changed: %d, %d; want 2, 3",
+				a.window.InFlight(), b.window.InFlight())
+		}
+	})
 }
 
 // TestScalingDecisionThresholds tests the threshold logic for scaling decisions.

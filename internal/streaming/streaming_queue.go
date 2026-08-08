@@ -35,10 +35,10 @@ const (
 	maxPieceHashMismatches        = 5                // Per-piece hash mismatch limit before forcing finalization
 )
 
-// errWindowFull reports that another sender took the last congestion-window
-// slot between this sender's capacity check and its send. It is contention,
-// not a fault: the piece was never read or transmitted, so the sender keeps it
-// and retries rather than counting a failure.
+// errWindowFull reports that every stream in the pool was at its congestion
+// window limit when the sender tried to claim a slot. It is contention, not a
+// fault: the piece was never read or transmitted, so the sender keeps it and
+// retries rather than counting a failure.
 var errWindowFull = errors.New("window full")
 
 // BidiQueueConfig configures the bidirectional streaming work queue.
@@ -399,9 +399,9 @@ func (q *BidiQueue) awaitCapacity(ctx context.Context, pool *StreamPool, stopSen
 // should exit.
 //
 // Senders check pool capacity before dequeuing but claim a window slot inside
-// sendPiecePool, so with several senders sharing one window the loser of that
-// race is routine - a saturated window is the steady state congestion control
-// aims for, not a fault. Handing the piece back to the tracker cost it a full
+// sendPiecePool, so a piece can still arrive at a pool that filled up in
+// between - a saturated window is the steady state congestion control aims for,
+// not a fault. Handing the piece back to the tracker cost it a full
 // PollInterval, since queueCompletedPieces only re-offers pieces on the next
 // tick, and inflated the failure counters with contention.
 func (q *BidiQueue) deliverPiece(
@@ -504,20 +504,18 @@ func (q *BidiQueue) sendPiecePool(ctx context.Context, pool *StreamPool, piece *
 		return nil
 	}
 
-	// Acquire window slot BEFORE the disk read so we fail fast when the
+	// Claim the window slot BEFORE the disk read so we fail fast when the
 	// window is full, avoiding a wasted NFS I/O round-trip.
-	ps, selectErr := pool.SelectStream()
-	if selectErr != nil {
-		return fmt.Errorf("selecting stream: %w", selectErr)
-	}
-
-	if !ps.window.TrySend(key) {
+	ps, claimErr := pool.ClaimStream(key)
+	if errors.Is(claimErr, errWindowFull) {
 		q.logger.DebugContext(ctx, "window full, skipping disk read",
 			"hash", hash,
 			"piece", index,
-			"stream", ps.id,
 		)
 		return errWindowFull
+	}
+	if claimErr != nil {
+		return fmt.Errorf("claiming stream: %w", claimErr)
 	}
 
 	data, err := q.source.ReadPiece(ctx, piece)
