@@ -489,77 +489,8 @@ func (s *Server) relocateForSubPathChange(
 // finalizeFiles syncs all file handles, closes them, and renames from .partial to final.
 // Also resolves pending hardlinks by waiting for source files to complete.
 func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTorrentState) error {
-	// Phase 1: Resolve pending hardlinks without holding state.mu.
-	// Waiting on hardlink channels can block for up to defaultHardlinkWaitTimeout,
-	// and holding the lock would block all WritePiece calls for that duration.
-	// Safe because: files slice is immutable after init, and finalizing=true prevents writes.
-	for _, fi := range state.files {
-		if fi.hardlink.state != hlStatePending {
-			continue
-		}
-
-		s.logger.DebugContext(ctx, "waiting for pending hardlink source",
-			"hash", hash,
-			"target", fi.path,
-			"source", fi.hardlink.sourcePath,
-		)
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(defaultHardlinkWaitTimeout):
-			return fmt.Errorf("timeout waiting for pending hardlink source %s (waited %v)",
-				fi.hardlink.sourcePath, defaultHardlinkWaitTimeout)
-		case <-fi.hardlink.doneCh:
-			// Source is ready
-		}
-
-		sourcePath := filepath.Join(s.config.BasePath, fi.hardlink.sourcePath)
-		// Defense in depth: tryHardlinkFromInProgress already screens for
-		// cross-filesystem cases at init time, but if BasePath layout changed
-		// between init and finalize (rare: bind-mount swap, filesystem remount)
-		// the os.Link below would fail with EXDEV. Detect upfront for a
-		// clearer error.
-		if !sameFilesystem(sourcePath, filepath.Dir(fi.path)) {
-			return fmt.Errorf("pending hardlink %s -> %s spans filesystems (source removed or remounted?)",
-				sourcePath, fi.path)
-		}
-		// Validate the source's final size matches what THIS torrent's metadata
-		// expects before linking. tryHardlinkFromRegistered does the same check
-		// against its on-disk view; the in-progress path has historically relied
-		// on the assumption that two torrents sharing a (Dev, Ino) share the
-		// same file size. That assumption breaks under inode recycling or stale
-		// in-progress entries from a crashed prior run, and a wrong-sized link
-		// makes destination qB reject the torrent at AddTorrent with
-		// "mismatching file size", with no way to recover short of manual
-		// cleanup. Fail finalize so the source re-streams instead.
-		if sourceInfo, statErr := os.Stat(sourcePath); statErr != nil {
-			return fmt.Errorf("stat'ing pending hardlink source %s: %w", sourcePath, statErr)
-		} else if sourceInfo.Size() != fi.size {
-			return fmt.Errorf("pending hardlink source %s has size %d, expected %d "+
-				"(stale FileID or source-torrent metadata divergence)",
-				sourcePath, sourceInfo.Size(), fi.size)
-		}
-		if linkErr := os.Link(sourcePath, fi.path); linkErr != nil {
-			if os.IsExist(linkErr) {
-				s.logger.DebugContext(ctx, "pending hardlink target already exists",
-					"hash", hash,
-					"target", fi.path,
-				)
-			} else {
-				return fmt.Errorf("creating pending hardlink %s -> %s: %w",
-					sourcePath, fi.path, linkErr)
-			}
-		} else {
-			metrics.HardlinksCreatedTotal.Inc()
-			s.logger.InfoContext(ctx, "created pending hardlink",
-				"hash", hash,
-				"source", sourcePath,
-				"target", fi.path,
-			)
-		}
-
-		fi.hardlink.markComplete()
+	if err := s.resolvePendingHardlinks(ctx, hash, state); err != nil {
+		return err
 	}
 
 	// Phase 2: Sync, close, and rename under lock.
@@ -578,6 +509,118 @@ func (s *Server) finalizeFiles(ctx context.Context, hash string, state *serverTo
 	}
 
 	s.flushWrittenState(ctx, hash, state)
+	return nil
+}
+
+// resolvePendingHardlinks waits for every file whose data another torrent is
+// still writing and links it into place once that torrent finalizes.
+//
+// Runs without state.mu: a wait can block for up to defaultHardlinkWaitTimeout
+// and holding the lock would stall every WritePiece for that long. Safe because
+// the files slice is immutable after init, finalization.active keeps writers
+// out, and each task owns exactly one file.
+//
+// The waits run concurrently. Serially, a torrent with files pending on several
+// different source torrents burned one full timeout per file before reporting
+// the first source that never arrived, and every resolved file paid its
+// stat/link round-trips in front of the next file's wait. The group carries a
+// context so the first failure cancels the siblings still parked on a timeout
+// whose outcome no longer matters.
+//
+// The waits themselves are deliberately uncapped - a capped group would park
+// later files behind earlier ones, reintroducing exactly the serialization this
+// fan-out removes - so the bound is applied to the link work each wait unblocks,
+// at the same width as the other per-file metadata passes.
+func (s *Server) resolvePendingHardlinks(ctx context.Context, hash string, state *serverTorrentState) error {
+	linkSlots := semaphore.NewWeighted(fileSetupConcurrency)
+	g, gctx := errgroup.WithContext(ctx)
+	for _, fi := range state.files {
+		if fi.hardlink.state != hlStatePending {
+			continue
+		}
+		g.Go(func() error { return s.resolvePendingHardlink(gctx, hash, linkSlots, fi) })
+	}
+	return g.Wait()
+}
+
+// resolvePendingHardlink waits for one file's source torrent to finish writing
+// it, then hardlinks it into place under a linkSlots slot.
+func (s *Server) resolvePendingHardlink(
+	ctx context.Context,
+	hash string,
+	linkSlots *semaphore.Weighted,
+	fi *serverFileInfo,
+) error {
+	s.logger.DebugContext(ctx, "waiting for pending hardlink source",
+		"hash", hash,
+		"target", fi.path,
+		"source", fi.hardlink.sourcePath,
+	)
+
+	timer := time.NewTimer(defaultHardlinkWaitTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return fmt.Errorf("timeout waiting for pending hardlink source %s (waited %v)",
+			fi.hardlink.sourcePath, defaultHardlinkWaitTimeout)
+	case <-fi.hardlink.doneCh:
+		// Source is ready
+	}
+
+	if acqErr := linkSlots.Acquire(ctx, 1); acqErr != nil {
+		return acqErr
+	}
+	defer linkSlots.Release(1)
+
+	sourcePath := filepath.Join(s.config.BasePath, fi.hardlink.sourcePath)
+	// Defense in depth: tryHardlinkFromInProgress already screens for
+	// cross-filesystem cases at init time, but if BasePath layout changed
+	// between init and finalize (rare: bind-mount swap, filesystem remount)
+	// the os.Link below would fail with EXDEV. Detect upfront for a
+	// clearer error.
+	if !sameFilesystem(sourcePath, filepath.Dir(fi.path)) {
+		return fmt.Errorf("pending hardlink %s -> %s spans filesystems (source removed or remounted?)",
+			sourcePath, fi.path)
+	}
+	// Validate the source's final size matches what THIS torrent's metadata
+	// expects before linking. tryHardlinkFromRegistered does the same check
+	// against its on-disk view; the in-progress path has historically relied
+	// on the assumption that two torrents sharing a (Dev, Ino) share the
+	// same file size. That assumption breaks under inode recycling or stale
+	// in-progress entries from a crashed prior run, and a wrong-sized link
+	// makes destination qB reject the torrent at AddTorrent with
+	// "mismatching file size", with no way to recover short of manual
+	// cleanup. Fail finalize so the source re-streams instead.
+	if sourceInfo, statErr := os.Stat(sourcePath); statErr != nil {
+		return fmt.Errorf("stat'ing pending hardlink source %s: %w", sourcePath, statErr)
+	} else if sourceInfo.Size() != fi.size {
+		return fmt.Errorf("pending hardlink source %s has size %d, expected %d "+
+			"(stale FileID or source-torrent metadata divergence)",
+			sourcePath, sourceInfo.Size(), fi.size)
+	}
+	if linkErr := os.Link(sourcePath, fi.path); linkErr != nil {
+		if os.IsExist(linkErr) {
+			s.logger.DebugContext(ctx, "pending hardlink target already exists",
+				"hash", hash,
+				"target", fi.path,
+			)
+		} else {
+			return fmt.Errorf("creating pending hardlink %s -> %s: %w",
+				sourcePath, fi.path, linkErr)
+		}
+	} else {
+		metrics.HardlinksCreatedTotal.Inc()
+		s.logger.InfoContext(ctx, "created pending hardlink",
+			"hash", hash,
+			"source", sourcePath,
+			"target", fi.path,
+		)
+	}
+
+	fi.hardlink.markComplete()
 	return nil
 }
 

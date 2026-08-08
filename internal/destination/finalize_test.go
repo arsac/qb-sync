@@ -1490,3 +1490,157 @@ func TestRunDiskStage_StopsPreVerify(t *testing.T) {
 		t.Error("disk stage left the pre-verification pass registered")
 	}
 }
+
+// newPendingHardlinkState builds a torrent whose files are all pending on
+// another torrent's data. Each file gets its own already-written source file
+// (distinct content and size) plus its own doneCh, so a task that resolves the
+// wrong file's hardlink is visible in the linked content rather than hidden by
+// a uniform fixture. Returns the state, the per-file doneCh channels, the
+// target paths and the expected contents, all index-aligned.
+func newPendingHardlinkState(
+	t *testing.T,
+	tmpDir string,
+	numFiles int,
+) (*serverTorrentState, []chan struct{}, []string, [][]byte) {
+	t.Helper()
+
+	srcDir := filepath.Join(tmpDir, "source")
+	dstDir := filepath.Join(tmpDir, "target")
+	for _, d := range []string{srcDir, dstDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	files := make([]*serverFileInfo, numFiles)
+	dones := make([]chan struct{}, numFiles)
+	targets := make([]string, numFiles)
+	contents := make([][]byte, numFiles)
+
+	var offset int64
+	for i := range numFiles {
+		// Distinct length per index so a cross-wired link also trips the
+		// size check, not just the content comparison.
+		content := fmt.Appendf(nil, "pending-source-%03d%s", i, strings.Repeat("x", i))
+		rel := filepath.Join("source", fmt.Sprintf("src%03d.bin", i))
+		if err := os.WriteFile(filepath.Join(tmpDir, rel), content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		target := filepath.Join(dstDir, fmt.Sprintf("file%03d.bin", i))
+		done := make(chan struct{})
+		files[i] = &serverFileInfo{
+			path:     target,
+			size:     int64(len(content)),
+			offset:   offset,
+			selected: true,
+			hardlink: hardlinkInfo{
+				state:      hlStatePending,
+				sourcePath: rel,
+				doneCh:     done,
+			},
+		}
+		dones[i] = done
+		targets[i] = target
+		contents[i] = content
+		offset += int64(len(content))
+	}
+
+	state := &serverTorrentState{
+		torrentMeta: torrentMeta{pieceLength: 16, totalSize: offset, files: files},
+		written:     bitset.New(1).Set(0),
+		statePath:   filepath.Join(tmpDir, ".state"),
+	}
+	return state, dones, targets, contents
+}
+
+// TestResolvePendingHardlinks_WaitsConcurrently pins that a torrent's pending
+// hardlinks are waited on in parallel. Serially, file i's source torrent could
+// not even be looked at until file i-1's had finalized, so a torrent pending on
+// several sources paid one full defaultHardlinkWaitTimeout per file before
+// reporting the first source that never showed up.
+//
+// The last file's source is released first: with a serial pass every worker is
+// still parked on file 0's channel, so its link never appears and the watchdog
+// below fires. With the fan-out it lands immediately.
+func TestResolvePendingHardlinks_WaitsConcurrently(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+
+	// More files than fileSetupConcurrency so the last one is only reachable
+	// if earlier waits release their slots, i.e. genuinely concurrently.
+	const numFiles = 40
+	state, dones, targets, contents := newPendingHardlinkState(t, tmpDir, numFiles)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.resolvePendingHardlinks(context.Background(), "pending", state) }()
+
+	last := numFiles - 1
+	close(dones[last])
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(targets[last]); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("last file's hardlink never appeared: waits are serialized behind file 0")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	for i := range last {
+		close(dones[i])
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("resolvePendingHardlinks: %v", err)
+	}
+
+	for i := range numFiles {
+		got, err := os.ReadFile(targets[i])
+		if err != nil {
+			t.Errorf("file %d: reading target: %v", i, err)
+			continue
+		}
+		if string(got) != string(contents[i]) {
+			t.Errorf("file %d: linked content %q, want %q", i, got, contents[i])
+		}
+		if state.files[i].hardlink.state != hlStateComplete {
+			t.Errorf("file %d: hardlink state = %v, want complete", i, state.files[i].hardlink.state)
+		}
+	}
+}
+
+// TestResolvePendingHardlinks_FirstFailureCancelsWaits pins that one file's
+// failure stops the siblings still parked on their doneCh. Without a shared
+// cancellation the group would sit on them until defaultHardlinkWaitTimeout
+// (30 minutes) even though the torrent's finalization is already doomed.
+func TestResolvePendingHardlinks_FirstFailureCancelsWaits(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+
+	const numFiles = 8
+	state, dones, _, _ := newPendingHardlinkState(t, tmpDir, numFiles)
+
+	// File 0's source finalizes at the wrong size (stale FileID), which is a
+	// hard finalize failure. Every other file's source stays pending forever.
+	if err := os.Truncate(filepath.Join(tmpDir, state.files[0].hardlink.sourcePath), 1); err != nil {
+		t.Fatal(err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.resolvePendingHardlinks(context.Background(), "pending", state) }()
+	close(dones[0])
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected an error for the missing hardlink source")
+		}
+		if !strings.Contains(err.Error(), "pending hardlink source") {
+			t.Fatalf("error = %v, want the missing-source failure", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("resolvePendingHardlinks did not return: siblings still waiting on their timeout")
+	}
+}
