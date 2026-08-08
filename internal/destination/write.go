@@ -64,35 +64,14 @@ func (s *Server) writePiece(ctx context.Context, req *pb.WritePieceRequest) writ
 	}
 	data := req.GetData()
 
-	// Early check with lock (optimization to skip hash verification in common cases).
-	// This is NOT the correctness check - see double-check below after hash verification.
-	state.mu.Lock()
-	alreadyWritten := uint(pieceIndex) < state.written.Len() && state.written.Test(uint(pieceIndex))
-	isFinalizing := state.finalization.active
-	state.mu.Unlock()
-
-	if alreadyWritten {
-		return writePieceOK()
+	if res, done := admitPiece(state, pieceIndex); done {
+		return res
 	}
 
-	// Early rejection during finalization (optimization to skip expensive hash verification)
-	if isFinalizing {
-		return writePieceError("torrent is being finalized", pb.PieceErrorCode_PIECE_ERROR_FINALIZING)
-	}
-
-	// Verify piece hash outside lock (pieceHashes is immutable after init).
-	// This is CPU-intensive so we don't hold the lock during verification.
-	// Skip verification for boundary pieces overlapping deselected files:
-	// source zero-fills the deselected region (file doesn't exist on disk),
-	// changing the hash. writePieceData skips deselected files, so only
-	// the selected file data is actually written.
 	writeStart := time.Now()
-	if state.classifyPiece(int(pieceIndex)) == pieceFullySelected &&
-		int(pieceIndex) < len(state.pieceHashes) && state.pieceHashes[pieceIndex] != "" {
-		if hashErr := utils.VerifyPieceHash(data, state.pieceHashes[pieceIndex]); hashErr != nil {
-			metrics.PieceWriteDuration.Observe(time.Since(writeStart).Seconds())
-			return writePieceError(hashErr.Error(), pb.PieceErrorCode_PIECE_ERROR_HASH_MISMATCH)
-		}
+	if hashErr := verifyIncomingPiece(state, pieceIndex, data); hashErr != nil {
+		metrics.PieceWriteDuration.Observe(time.Since(writeStart).Seconds())
+		return writePieceError(hashErr.Error(), pb.PieceErrorCode_PIECE_ERROR_HASH_MISMATCH)
 	}
 
 	// Disk I/O outside state.mu: writePieceData reads immutable metadata (files
@@ -107,32 +86,95 @@ func (s *Server) writePiece(ctx context.Context, req *pb.WritePieceRequest) writ
 		return writePieceError(fmt.Sprintf("write failed: %v", writeErr), pb.PieceErrorCode_PIECE_ERROR_IO)
 	}
 
+	return s.commitPiece(ctx, torrentHash, state, pieceIndex, len(data), writeStart)
+}
+
+// admitPiece runs the pre-write checks: a piece already on disk needs no work,
+// and one arriving during finalization must be refused. Reports whether
+// writePiece should return the result instead of writing.
+//
+// Neither answer is load-bearing - commitPiece re-tests both under the lock it
+// records the piece with. This pass exists only to skip the hash verification
+// and the NFS write in the common cases.
+func admitPiece(state *serverTorrentState, pieceIndex int32) (writeResult, bool) {
 	state.mu.Lock()
-	defer state.mu.Unlock()
+	alreadyWritten := uint(pieceIndex) < state.written.Len() && state.written.Test(uint(pieceIndex))
+	isFinalizing := state.finalization.active
+	state.mu.Unlock()
+
+	switch {
+	case alreadyWritten:
+		return writePieceOK(), true
+	case isFinalizing:
+		return writePieceError("torrent is being finalized", pb.PieceErrorCode_PIECE_ERROR_FINALIZING), true
+	default:
+		return writeResult{}, false
+	}
+}
+
+// verifyIncomingPiece SHA1-checks a piece against the torrent's own hash before
+// it reaches disk. Runs outside state.mu: it is CPU-intensive and pieceHashes
+// is immutable after init.
+//
+// Boundary pieces overlapping deselected files are skipped - the source
+// zero-fills the deselected region (that file does not exist on disk), which
+// changes the hash. writePieceData drops those regions, so only the selected
+// file data is actually written.
+func verifyIncomingPiece(state *serverTorrentState, pieceIndex int32, data []byte) error {
+	if int(pieceIndex) >= len(state.pieceHashes) || state.pieceHashes[pieceIndex] == "" {
+		return nil
+	}
+	if state.classifyPiece(int(pieceIndex)) != pieceFullySelected {
+		return nil
+	}
+	return utils.VerifyPieceHash(data, state.pieceHashes[pieceIndex])
+}
+
+// commitPiece records a piece whose data is now on disk: it re-tests the two
+// conditions admitPiece checked without holding the lock across the write,
+// marks the piece and lets checkFileCompletions hand any now-complete file to
+// an early finalization.
+//
+// The reporting runs after the unlock. Neither the three Prometheus operations
+// nor the progress line reads torrent state - the two bitmap counts are
+// snapshotted under the lock - and every stream worker takes state.mu once per
+// piece, so there is nothing to gain from holding it over them.
+func (s *Server) commitPiece(
+	ctx context.Context,
+	hash string,
+	state *serverTorrentState,
+	pieceIndex int32,
+	dataLen int,
+	writeStart time.Time,
+) writeResult {
+	state.mu.Lock()
 
 	// CORRECTNESS CHECK: Re-verify finalizing flag under lock.
 	// Even if finalization started between the early check and now, this prevents the write.
 	if state.finalization.active {
+		state.mu.Unlock()
 		return writePieceError("torrent is being finalized", pb.PieceErrorCode_PIECE_ERROR_FINALIZING)
 	}
 
 	// Re-check under lock: a concurrent writer may have marked this piece.
 	if uint(pieceIndex) < state.written.Len() && state.written.Test(uint(pieceIndex)) {
+		state.mu.Unlock()
 		return writePieceOK()
 	}
 
 	markPieceWritten(state, pieceIndex)
-	s.checkFileCompletions(torrentHash, state, pieceIndex)
+	s.checkFileCompletions(hash, state, pieceIndex)
+	count, total := state.written.Count(), state.written.Len()
+	state.mu.Unlock()
+
 	metrics.PieceWriteDuration.Observe(time.Since(writeStart).Seconds())
-
 	metrics.PiecesReceivedTotal.Inc()
-	metrics.BytesReceivedTotal.Add(float64(len(data)))
+	metrics.BytesReceivedTotal.Add(float64(dataLen))
 
-	count := state.written.Count()
-	if count%50 == 0 || count == state.written.Len() {
+	if count%50 == 0 || count == total {
 		s.logger.DebugContext(ctx, "write progress",
-			"hash", torrentHash,
-			"progress", fmt.Sprintf("%d/%d", int(count), int(state.written.Len())),
+			"hash", hash,
+			"progress", fmt.Sprintf("%d/%d", int(count), int(total)),
 		)
 	}
 
