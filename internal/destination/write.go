@@ -369,6 +369,29 @@ func (s *Server) earlyFinalizeFile(
 
 	failedPieces, syncCloseErr := s.syncVerifyClose(ctx, hash, state, fi, fh)
 
+	if !s.recordEarlyFinalize(ctx, hash, state, fi, fileIndex, failedPieces, syncCloseErr) {
+		return
+	}
+
+	// The rename just published this file's content at its final path, which can
+	// be the last thing a piece spanning it and its neighbours was waiting for.
+	s.verifyPiecesNowReadable(ctx, hash, state, fi)
+}
+
+// recordEarlyFinalize applies the outcome of one file's sync-verify-close under
+// state.mu, renaming the file into place on success. Reports whether the file
+// ended up finalized at its final path; every other outcome leaves it as a
+// .partial for finalizeFiles to retry, with writes re-admitted so a re-streamed
+// piece still reaches disk.
+func (s *Server) recordEarlyFinalize(
+	ctx context.Context,
+	hash string,
+	state *serverTorrentState,
+	fi *serverFileInfo,
+	fileIndex int,
+	failedPieces []int,
+	syncCloseErr error,
+) bool {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 
@@ -382,7 +405,7 @@ func (s *Server) earlyFinalizeFile(
 		}
 		s.logger.WarnContext(ctx, "early finalization sync failed, deferring to finalizeFiles",
 			"hash", hash, "file", fi.path, "error", syncCloseErr)
-		return
+		return false
 	}
 
 	if len(failedPieces) > 0 {
@@ -399,7 +422,7 @@ func (s *Server) earlyFinalizeFile(
 		metrics.EarlyFinalizeVerifyFailuresTotal.Inc()
 		s.logger.WarnContext(ctx, "early verify failed, pieces will be re-streamed",
 			"hash", hash, "file", fi.path, "failedPieces", len(failedPieces))
-		return // File stays as .partial
+		return false // File stays as .partial
 	}
 
 	if err := s.renamePartialFile(ctx, hash, fi); err != nil {
@@ -414,7 +437,7 @@ func (s *Server) earlyFinalizeFile(
 		}
 		s.logger.WarnContext(ctx, "early finalization rename failed, deferring",
 			"hash", hash, "file", fi.path, "error", err)
-		return
+		return false
 	}
 
 	markInteriorVerified(state, fi, nil)
@@ -423,6 +446,90 @@ func (s *Server) earlyFinalizeFile(
 	metrics.FilesEarlyFinalizedTotal.Inc()
 	s.logger.InfoContext(ctx, "file early-finalized",
 		"hash", hash, "file", fi.path, "fileIndex", fileIndex)
+	return true
+}
+
+// verifyPiecesNowReadable read-back-verifies the pieces fi's early finalization
+// just made readable and marks the ones that pass, so verifyFinalizedPieces can
+// skip them.
+//
+// verifyFilePieces only covers the pieces lying wholly inside one file, so every
+// piece straddling a file boundary is left for the finalize read-back - the one
+// that runs inside the stall the source polls on, one torrent at a time. Such a
+// piece can only be read once every file backing it is complete at its final
+// path, which makes the file whose rename lands last the natural place to check:
+// one file boundary is one piece for a torrent of large files, and every piece
+// it has for a torrent whose files are smaller than a piece.
+//
+// Purely additive, like preVerifyCompleteFiles: a bit is set only for a piece
+// that read back and hashed correctly, and a failure is left for
+// verifyFinalizedPieces to act on. It has to be - the files backing these pieces
+// are already renamed into place, so clearing their written bits here would ask
+// the source to re-stream data writePieceData now drops.
+//
+// Two files whose renames land together can both queue the piece they share and
+// read it twice. Harmless (the second read finds the same bytes and sets a bit
+// already set) and not worth a reservation protocol for one extra piece read.
+func (s *Server) verifyPiecesNowReadable(
+	ctx context.Context,
+	hash string,
+	state *serverTorrentState,
+	fi *serverFileInfo,
+) {
+	state.mu.Lock()
+	pieces := piecesNowReadable(state, fi)
+	regions := finalizedRegions(state)
+	state.mu.Unlock()
+
+	if len(pieces) == 0 {
+		return
+	}
+
+	failed := s.verifyPieceSet(ctx, hash, state, regions, pieces, nil)
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	marked := 0
+	for _, p := range pieces {
+		if _, bad := slices.BinarySearch(failed, p); bad {
+			continue
+		}
+		state.verified.Set(uint(p))
+		marked++
+	}
+
+	s.logger.DebugContext(ctx, "verified pieces spanning a completed file",
+		"hash", hash, "file", fi.path, "verified", marked, "candidates", len(pieces))
+}
+
+// piecesNowReadable returns the pieces overlapping fi that still need a
+// finalize-time read-back and can have one now. Caller must hold state.mu.
+//
+// It skips the same pieces piecesNeedingReadBack does: one with no known hash,
+// one already verified, and one sharing space with an unselected file - the last
+// of those falls out of pieceFullyOnDisk, since an unselected file's bytes were
+// never written to disk at all. What it adds is the readability requirement,
+// which only this path has to test, finalization running with every file in
+// place by construction.
+func piecesNowReadable(state *serverTorrentState, fi *serverFileInfo) []int {
+	if state.verified == nil || fi.size <= 0 {
+		return nil
+	}
+
+	var pieces []int
+	for p := fi.firstPiece; p <= fi.lastPiece; p++ {
+		if p >= len(state.pieceHashes) || state.pieceHashes[p] == "" {
+			continue
+		}
+		if state.verified.Test(uint(p)) {
+			continue
+		}
+		if !state.pieceFullyOnDisk(p) {
+			continue
+		}
+		pieces = append(pieces, p)
+	}
+	return pieces
 }
 
 // syncVerifyClose syncs the supplied handle (if any), verifies the file's

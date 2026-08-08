@@ -31,6 +31,30 @@ func (f *serverFileInfo) declinesWrites() bool {
 	return f.earlyFinalized || f.skipForWriteData()
 }
 
+// dataCompleteOnDisk reports whether this file's whole content is readable at
+// its final path, which is what makes a piece backed by it verifiable by a
+// read-back. Caller must hold state.mu or fileMu.
+//
+// A zero-length file backs no byte of any piece, so it never holds one back.
+// Everything else needs data on disk (an unselected file has none) at the final
+// path: either hardlinked into place at init, or renamed there by its own early
+// finalization. The path is what distinguishes the second case, not
+// earlyFinalized - that is set when the write handle is taken, several NFS
+// round-trips before the rename lands, and buildWrittenBitmap also sets it for
+// pending hardlinks whose data does not exist yet.
+func (f *serverFileInfo) dataCompleteOnDisk() bool {
+	if f.size <= 0 {
+		return true
+	}
+	if !f.selected {
+		return false
+	}
+	if f.hardlink.state == hlStateComplete {
+		return true
+	}
+	return f.earlyFinalized && atFinalPath(f)
+}
+
 // openForWrite lazily opens the file for writing, creating and pre-allocating it if needed.
 // Protected by fileMu so it can be called outside state.mu for concurrent disk I/O.
 func (f *serverFileInfo) openForWrite() error {
@@ -263,6 +287,29 @@ func (m *torrentMeta) classifyPiece(pieceIdx int) pieceClass {
 		return pieceNoSelectedOverlap
 	}
 	return pieceFullySelected
+}
+
+// pieceFullyOnDisk reports whether every file backing this piece holds its
+// complete content at its final path, so the piece can be read back and
+// hash-verified. Caller must hold state.mu.
+//
+// Narrows to the overlapping files the same way [torrentMeta.classifyPiece]
+// does; the two answer different questions about the same file range, so they
+// stay separate predicates. This one subsumes the other for unselected files,
+// which never have any content on disk to read.
+func (m *torrentMeta) pieceFullyOnDisk(pieceIdx int) bool {
+	pieceStart := int64(pieceIdx) * m.pieceLength
+	pieceEnd := min(pieceStart+m.pieceLength, m.totalSize)
+
+	for _, f := range m.files[m.firstFileEndingAfter(pieceStart):] {
+		if f.offset >= pieceEnd {
+			break
+		}
+		if !f.dataCompleteOnDisk() {
+			return false
+		}
+	}
+	return true
 }
 
 // calculatePiecesNeeded converts written state to pieces_needed (inverse).

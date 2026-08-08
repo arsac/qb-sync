@@ -1454,3 +1454,239 @@ func TestEarlyFinalize_WriteHandoffIsExclusive(t *testing.T) {
 		}
 	})
 }
+
+// newBoundaryPieceState builds a two-file torrent whose file boundary falls in
+// the middle of piece 1, so piece 0 is interior to file A, piece 2 is interior
+// to file B, and piece 1 can only be read once BOTH files are at their final
+// path. corruptAt (-1 for none) flips one byte on disk.
+func newBoundaryPieceState(t *testing.T, dir string, corruptAt int) *serverTorrentState {
+	t.Helper()
+
+	const (
+		pieceLength = 16
+		numPieces   = 3
+	)
+	totalSize := pieceLength * numPieces
+
+	full := make([]byte, totalSize)
+	for i := range full {
+		full[i] = byte(i*11 + 3)
+	}
+	hashes := make([]string, numPieces)
+	for p := range numPieces {
+		hashes[p] = utils.ComputeSHA1(full[p*pieceLength : (p+1)*pieceLength])
+	}
+
+	write := func(name string, offset, size int) string {
+		path := filepath.Join(dir, name+partialSuffix)
+		content := slices.Clone(full[offset : offset+size])
+		if corruptAt >= offset && corruptAt < offset+size {
+			content[corruptAt-offset] ^= 0xff
+		}
+		if err := os.WriteFile(path, content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	files := []*serverFileInfo{
+		// A: bytes 0-23. Piece 0 interior, piece 1 straddles into B.
+		{path: write("a.bin", 0, 24), offset: 0, size: 24, selected: true},
+		// B: bytes 24-47. Piece 1 straddles from A, piece 2 interior.
+		{path: write("b.bin", 24, 24), offset: 24, size: 24, selected: true},
+	}
+	meta := torrentMeta{
+		pieceHashes: hashes,
+		pieceLength: pieceLength,
+		totalSize:   int64(totalSize),
+		files:       files,
+	}
+	meta.computeFilePieceRanges()
+
+	written := bitset.New(numPieces)
+	written.FlipRange(0, numPieces)
+	return &serverTorrentState{
+		torrentMeta: meta,
+		written:     written,
+		verified:    bitset.New(numPieces),
+	}
+}
+
+func verifiedPieces(state *serverTorrentState) []int {
+	var got []int
+	for p := range int(state.verified.Len()) {
+		if state.verified.Test(uint(p)) {
+			got = append(got, p)
+		}
+	}
+	return got
+}
+
+// completeFile drives one file's early finalization to completion by claiming
+// its last outstanding piece, then waits for the background pass to land.
+func completeFile(t *testing.T, s *Server, state *serverTorrentState, fi *serverFileInfo, piece int32) {
+	t.Helper()
+	state.mu.Lock()
+	fi.piecesWritten = fi.piecesTotal - 1
+	s.checkFileCompletions("hash", state, piece)
+	state.mu.Unlock()
+	waitEarlyFinalize(t, state)
+}
+
+// TestVerifyPiecesNowReadable_BoundaryPieceLeavesTheFinalizeStall pins that a
+// piece straddling two files is read back and marked as soon as the second of
+// them is renamed into place, instead of waiting for verifyFinalizedPieces to
+// read it inside the finalize stall the source polls on. One such piece exists
+// per file boundary, which for a torrent of sub-piece files is every piece.
+func TestVerifyPiecesNowReadable_BoundaryPieceLeavesTheFinalizeStall(t *testing.T) {
+	t.Parallel()
+
+	t.Run("verified once both files land", func(t *testing.T) {
+		t.Parallel()
+		s, tmpDir := newTestDestServer(t)
+		state := newBoundaryPieceState(t, tmpDir, -1)
+		files := state.files
+
+		completeFile(t, s, state, files[0], 0)
+		if got := verifiedPieces(state); !slices.Equal(got, []int{0}) {
+			t.Fatalf("after file A: verified = %v, want [0] (piece 1 needs file B on disk)", got)
+		}
+
+		completeFile(t, s, state, files[1], 2)
+		if got := verifiedPieces(state); !slices.Equal(got, []int{0, 1, 2}) {
+			t.Errorf("after file B: verified = %v, want [0 1 2]", got)
+		}
+
+		var count atomic.Int64
+		var progress atomic.Value
+		progress.Store(time.Now())
+		if left := piecesNeedingReadBack(state, &count, &progress); len(left) != 0 {
+			t.Errorf("finalize read-back still has %v to do, want nothing left", left)
+		}
+	})
+
+	t.Run("a corrupt boundary piece is left for finalization", func(t *testing.T) {
+		t.Parallel()
+		s, tmpDir := newTestDestServer(t)
+		// Byte 20 lies in file A but only in piece 1, so A's own interior
+		// verify (piece 0) still passes and A finalizes normally.
+		state := newBoundaryPieceState(t, tmpDir, 20)
+		files := state.files
+
+		completeFile(t, s, state, files[0], 0)
+		completeFile(t, s, state, files[1], 2)
+
+		if got := verifiedPieces(state); !slices.Equal(got, []int{0, 2}) {
+			t.Errorf("verified = %v, want [0 2] (the corrupt boundary piece must stay unverified)", got)
+		}
+		// The pass may not act on the failure: both files are already renamed,
+		// so a cleared written bit would ask for data writePieceData drops.
+		if state.written.Count() != 3 {
+			t.Errorf("written = %d, want 3 (the pass must not clear bits)", state.written.Count())
+		}
+		for i, fi := range files {
+			if !fi.earlyFinalized || !atFinalPath(fi) {
+				t.Errorf("file %d: earlyFinalized=%v path=%q, want finalized at its final path",
+					i, fi.earlyFinalized, fi.path)
+			}
+		}
+	})
+}
+
+// TestPiecesNowReadable_RequiresEveryBackingFileInPlace pins the selection the
+// additive marking rests on: a piece may only be queued when every file behind
+// it holds its whole content at its final path. Getting this wrong marks a piece
+// verified that nothing ever read back, which silently disables the only
+// integrity gate the destination has.
+func TestPiecesNowReadable_RequiresEveryBackingFileInPlace(t *testing.T) {
+	t.Parallel()
+
+	// Two files sharing piece 1; A is finalized in place, B varies per case.
+	// Pieces 0 and 2 are interior to A and B and pre-marked verified the way
+	// their own early finalizations would, so only piece 1 is ever a candidate
+	// and every case reduces to "is B readable?".
+	newState := func(t *testing.T, b *serverFileInfo) *serverTorrentState {
+		t.Helper()
+		state := newBoundaryPieceState(t, t.TempDir(), -1)
+		state.files[0].path = targetPath(state.files[0])
+		state.files[0].earlyFinalized = true
+		state.verified.Set(0)
+		state.verified.Set(2)
+
+		b.offset, b.size = state.files[1].offset, state.files[1].size
+		b.firstPiece, b.lastPiece = state.files[1].firstPiece, state.files[1].lastPiece
+		if b.path == "" {
+			b.path = targetPath(state.files[1])
+		}
+		state.files[1] = b
+		return state
+	}
+
+	tests := []struct {
+		name string
+		b    *serverFileInfo
+		want []int
+	}{
+		{"renamed into place", &serverFileInfo{selected: true, earlyFinalized: true}, []int{1}},
+		{"hardlinked at init", &serverFileInfo{
+			selected: true, hardlink: hardlinkInfo{state: hlStateComplete},
+		}, []int{1}},
+		{"still receiving writes", &serverFileInfo{selected: true}, nil},
+		{"early-finalized but not yet renamed", &serverFileInfo{
+			selected: true, earlyFinalized: true, path: "b.bin" + partialSuffix,
+		}, nil},
+		{"pending hardlink, data not created yet", &serverFileInfo{
+			selected: true, earlyFinalized: true, hardlink: hardlinkInfo{state: hlStatePending},
+			path: "b.bin" + partialSuffix,
+		}, nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			state := newState(t, tc.b)
+			if got := piecesNowReadable(state, state.files[1]); !slices.Equal(got, tc.want) {
+				t.Errorf("piecesNowReadable = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("skips an already verified piece", func(t *testing.T) {
+		t.Parallel()
+		state := newState(t, &serverFileInfo{selected: true, earlyFinalized: true})
+		state.verified.Set(1)
+		if got := piecesNowReadable(state, state.files[1]); got != nil {
+			t.Errorf("piecesNowReadable = %v, want nil", got)
+		}
+	})
+
+	t.Run("skips a piece with no known hash", func(t *testing.T) {
+		t.Parallel()
+		state := newState(t, &serverFileInfo{selected: true, earlyFinalized: true})
+		state.pieceHashes[1] = ""
+		if got := piecesNowReadable(state, state.files[1]); got != nil {
+			t.Errorf("piecesNowReadable = %v, want nil", got)
+		}
+	})
+
+	t.Run("skips a piece sharing space with an unselected file", func(t *testing.T) {
+		t.Parallel()
+		state := newState(t, &serverFileInfo{selected: true, earlyFinalized: true})
+		state.files[0].selected = false
+		if got := piecesNowReadable(state, state.files[1]); got != nil {
+			t.Errorf("piecesNowReadable = %v, want nil", got)
+		}
+	})
+
+	// A zero-length file backs no byte of the piece it sits inside, and nothing
+	// ever early-finalizes it (checkFileCompletions skips size<=0), so treating
+	// it as data still to come would strand its neighbours' shared piece.
+	t.Run("a zero-length neighbour holds nothing back", func(t *testing.T) {
+		t.Parallel()
+		state := newState(t, &serverFileInfo{selected: true, earlyFinalized: true})
+		empty := &serverFileInfo{path: "empty.bin", offset: state.files[1].offset, selected: true}
+		state.files = []*serverFileInfo{state.files[0], empty, state.files[1]}
+		if got := piecesNowReadable(state, state.files[2]); !slices.Equal(got, []int{1}) {
+			t.Errorf("piecesNowReadable = %v, want [1]", got)
+		}
+	})
+}

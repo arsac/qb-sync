@@ -1181,7 +1181,7 @@ func (s *Server) recoverAffectedFile(
 	// Normal (streamed) files: rename back to .partial (skip if already .partial).
 	// Even if rename fails, the deferred cleanup keeps earlyFinalized and
 	// piecesWritten consistent with state.written.
-	if strings.HasSuffix(fi.path, partialSuffix) {
+	if !atFinalPath(fi) {
 		return
 	}
 	partialPath := fi.path + partialSuffix
