@@ -169,6 +169,15 @@ func (w *AdaptiveWindow) InFlight() int {
 	return len(w.inflight)
 }
 
+// IsInFlight reports whether the piece has been sent and not yet retired by an
+// ack, a failure or the stale sweep.
+func (w *AdaptiveWindow) IsInFlight(key PieceKey) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	_, ok := w.inflight[key]
+	return ok
+}
+
 // CanSend returns true if we can send another piece without exceeding the window.
 func (w *AdaptiveWindow) CanSend() bool {
 	w.mu.Lock()

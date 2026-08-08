@@ -558,6 +558,27 @@ func (q *BidiQueue) sendPiecePool(ctx context.Context, pool *StreamPool, piece *
 		return nil
 	}
 
+	// Skip a piece another sender already has on the wire. queueCompletedPieces
+	// tracks streamed, not queued, so every poll tick re-offers every un-streamed
+	// piece for as long as the completed queue has room - including the ones a
+	// sender has already dequeued and is waiting on an ack for. Sending such a
+	// piece again costs a full piece read off NFS plus a second copy over the
+	// link, and puts two copies under a single congestion-window key, which the
+	// first ack then retires. The duplicates that arrive after the ack are caught
+	// by the IsPieceStreamed check above; this is the window before it.
+	//
+	// Safe as a drop rather than a deferral: a piece that never gets acked is
+	// retired from the window by the stale sweep or by stream teardown, both of
+	// which requeue it through MarkFailed, so nothing here is the last chance to
+	// send it.
+	if pool.IsInFlight(key) {
+		q.logger.DebugContext(ctx, "skipping piece already in flight",
+			"hash", hash,
+			"piece", index,
+		)
+		return nil
+	}
+
 	// Claim the window slot BEFORE the disk read so we fail fast when the
 	// window is full, avoiding a wasted NFS I/O round-trip.
 	ps, claimErr := pool.ClaimStream(key)

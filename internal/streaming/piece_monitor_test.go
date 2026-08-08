@@ -1050,6 +1050,38 @@ func TestQueueCompletedPieces_StopsWhenTheQueueIsFull(t *testing.T) {
 		}
 	})
 
+	// Re-offering is the only retry mechanism the scan has: it tracks streamed,
+	// not queued, so a piece a sender already dequeued but whose ack has not
+	// landed is offered again on the next tick. That is what makes the sender's
+	// in-flight skip (see TestSendPiecePool_SkipsPieceAlreadyInFlight) load
+	// bearing rather than defensive - without it those offers become a second
+	// disk read and a second copy over the link.
+	t.Run("re-offers a dequeued piece whose ack has not landed", func(t *testing.T) {
+		monitor := newTestMonitor()
+		st, current := newBacklogState(4)
+
+		if got := monitor.queueCompletedPieces(ctx, st, current); got != 4 {
+			t.Fatalf("queued %d pieces, want 4", got)
+		}
+		// A sender takes piece 0 off the queue and is still waiting on its ack.
+		if idx := (<-monitor.completed).GetIndex(); idx != 0 {
+			t.Fatalf("dequeued piece %d, want 0", idx)
+		}
+
+		// Every un-streamed piece is offered again: the three still sitting in
+		// the queue and the one on the wire.
+		if got := monitor.queueCompletedPieces(ctx, st, current); got != 4 {
+			t.Fatalf("re-queued %d pieces on the next tick, want 4", got)
+		}
+		var queued []int32
+		for len(monitor.completed) > 0 {
+			queued = append(queued, (<-monitor.completed).GetIndex())
+		}
+		if !slices.Equal(queued, []int32{1, 2, 3, 0, 1, 2, 3}) {
+			t.Errorf("queue contents %v, want [1 2 3 0 1 2 3] (every un-streamed piece offered twice)", queued)
+		}
+	})
+
 	// The scan is what holds the torrent's write lock, which every send and ack
 	// contends on, so a full queue has to cost O(1) rather than one discarded
 	// *pb.Piece per remaining index.

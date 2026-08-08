@@ -980,6 +980,25 @@ func (p *StreamPool) CanSend() bool {
 	return false
 }
 
+// IsInFlight reports whether any stream in the pool already has this piece on
+// the wire. Draining streams count: their pieces are still outstanding and are
+// only requeued once the drain retires them.
+//
+// Advisory, not an exclusion primitive - two senders can both see false for the
+// same key and both claim it, exactly as they can today. It exists to drop the
+// duplicate offers the piece monitor makes, not to make a claim exclusive.
+func (p *StreamPool) IsInFlight(key congestion.PieceKey) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	for _, ps := range p.streams {
+		if ps.window.IsInFlight(key) {
+			return true
+		}
+	}
+	return false
+}
+
 // TotalInFlight returns the total in-flight pieces across all streams.
 func (p *StreamPool) TotalInFlight() int {
 	p.mu.RLock()

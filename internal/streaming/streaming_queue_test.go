@@ -433,6 +433,106 @@ func TestDeliverPiece_RetriesAfterLosingWindowSlot(t *testing.T) {
 	}
 }
 
+// newInFlightSkipFixture builds the minimum a sendPiecePool call needs: a
+// tracked torrent, an initialized destination, and a pool of one stream whose
+// window the test drives directly.
+func newInFlightSkipFixture(t *testing.T, hash string, numPieces int) (
+	*BidiQueue, *StreamPool, *PooledStream, *indexRecordingSource,
+) {
+	t.Helper()
+
+	source := &indexRecordingSource{}
+	tracker := NewPieceMonitor(nil, nil, testLogger, DefaultPieceMonitorConfig())
+	tracker.torrents[hash] = &torrentState{
+		streamed: make([]bool, numPieces),
+		failed:   make([]bool, numPieces),
+	}
+
+	q := &BidiQueue{
+		source:              source,
+		dest:                &GRPCDestination{initResults: map[string]*InitTorrentResult{hash: {}}},
+		tracker:             tracker,
+		logger:              testLogger,
+		config:              DefaultBidiQueueConfig(),
+		pieceHashMismatches: make(map[congestion.PieceKey]int),
+	}
+
+	pool := NewStreamPool(nil, testLogger, StreamPoolConfig{MaxNumStreams: 1, AckChannelSize: 10})
+	pool.ctx, pool.cancel = context.WithCancel(context.Background())
+	t.Cleanup(pool.cancel)
+
+	ps := &PooledStream{id: 0, window: congestion.NewAdaptiveWindow(congestion.Config{
+		MinWindow:     1,
+		MaxWindow:     4,
+		InitialWindow: 4,
+		PieceTimeout:  time.Minute,
+	})}
+	pool.mu.Lock()
+	pool.streams = append(pool.streams, ps)
+	pool.mu.Unlock()
+
+	return q, pool, ps, source
+}
+
+// TestSendPiecePool_SkipsPieceAlreadyInFlight pins that a piece the pool already
+// has on the wire is dropped instead of read off disk and sent a second time.
+// The piece monitor re-offers every un-streamed piece on each poll tick, and a
+// piece is only streamed once its ack lands, so without this the tail of every
+// torrent re-sends its in-flight pieces once per poll interval.
+func TestSendPiecePool_SkipsPieceAlreadyInFlight(t *testing.T) {
+	const (
+		hash       = "testhash"
+		pieceIndex = int32(3)
+		numPieces  = 16
+	)
+	key := congestion.PieceKey{Hash: hash, Index: pieceIndex}
+
+	t.Run("in flight is skipped without a read or a second claim", func(t *testing.T) {
+		q, pool, ps, source := newInFlightSkipFixture(t, hash, numPieces)
+		ps.window.OnSend(key)
+
+		piece := &pb.Piece{TorrentHash: hash, Index: pieceIndex}
+		if err := q.sendPiecePool(t.Context(), pool, piece); err != nil {
+			t.Fatalf("sendPiecePool returned %v, want nil for an in-flight piece", err)
+		}
+		if got := source.read(); len(got) != 0 {
+			t.Errorf("read a piece that was already in flight: %v", got)
+		}
+		if got := ps.window.InFlight(); got != 1 {
+			t.Errorf("inFlight = %d, want 1 (no second claim for the same piece)", got)
+		}
+	})
+
+	t.Run("a draining stream still counts as in flight", func(t *testing.T) {
+		q, pool, ps, source := newInFlightSkipFixture(t, hash, numPieces)
+		ps.window.OnSend(key)
+		ps.draining.Store(true)
+
+		piece := &pb.Piece{TorrentHash: hash, Index: pieceIndex}
+		if err := q.sendPiecePool(t.Context(), pool, piece); err != nil {
+			t.Fatalf("sendPiecePool returned %v, want nil for an in-flight piece", err)
+		}
+		if got := source.read(); len(got) != 0 {
+			t.Errorf("read a piece still outstanding on a draining stream: %v", got)
+		}
+	})
+
+	t.Run("a retired piece is sent", func(t *testing.T) {
+		q, pool, ps, source := newInFlightSkipFixture(t, hash, numPieces)
+		ps.window.OnSend(key)
+		pool.FailPiece(ps, key)
+
+		piece := &pb.Piece{TorrentHash: hash, Index: pieceIndex}
+		// The mock source fails every read, so reaching it is the assertion.
+		if err := q.sendPiecePool(t.Context(), pool, piece); err == nil {
+			t.Fatal("sendPiecePool returned nil, want the mock read error")
+		}
+		if got := source.read(); !slices.Equal(got, []int32{pieceIndex}) {
+			t.Errorf("read indices = %v, want exactly [%d]", got, pieceIndex)
+		}
+	})
+}
+
 // makeTestPoolWithStaleKeys creates a StreamPool with the given number of
 // streams, each with pieces that become stale after a short sleep.
 func makeTestPoolWithStaleKeys(t *testing.T, streamKeys [][]congestion.PieceKey) (*StreamPool, []*PooledStream) {
