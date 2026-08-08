@@ -3,8 +3,100 @@ package destination
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 )
+
+// TestWriteAt_OpenFileWritesWithoutExclusiveLock pins that a write to a file
+// that already has a handle never reaches for fileMu's exclusive lock. It is
+// the property the stream workers' concurrency rests on: a pending Lock blocks
+// new RLock acquisitions, so one write taking it forces every other worker to
+// wait out the in-flight NFS round-trip before starting its own.
+//
+// A held RLock stands in for that in-flight write. The exclusive-lock shape
+// blocks on it forever; the read-lock shape completes straight through.
+func TestWriteAt_OpenFileWritesWithoutExclusiveLock(t *testing.T) {
+	t.Parallel()
+
+	fi := &serverFileInfo{
+		path:     filepath.Join(t.TempDir(), "f.partial"),
+		size:     64,
+		selected: true,
+	}
+	if err := fi.openForWrite(); err != nil {
+		t.Fatalf("openForWrite: %v", err)
+	}
+
+	fi.fileMu.RLock()
+	defer fi.fileMu.RUnlock()
+
+	done := make(chan error, 1)
+	go func() { done <- fi.writeAt([]byte("concurrent"), 0) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("writeAt: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("writeAt blocked while another write held fileMu.RLock: " +
+			"it is taking the exclusive lock, which serializes the stream workers")
+	}
+
+	content, err := os.ReadFile(fi.path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(content[:len("concurrent")]) != "concurrent" {
+		t.Fatalf("file holds %q, want the concurrent write", content[:len("concurrent")])
+	}
+}
+
+// TestWriteAt_ConcurrentFirstWritesAllLand covers the other side of the split:
+// several workers racing on a file nobody has opened yet must all end up
+// writing, with exactly one of them creating and pre-allocating the handle.
+func TestWriteAt_ConcurrentFirstWritesAllLand(t *testing.T) {
+	t.Parallel()
+
+	const workers = 8
+	fi := &serverFileInfo{
+		path:     filepath.Join(t.TempDir(), "f.partial"),
+		size:     workers,
+		selected: true,
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, workers)
+	start := make(chan struct{})
+	for i := range workers {
+		wg.Go(func() {
+			<-start
+			errs[i] = fi.writeAt([]byte{byte('a' + i)}, int64(i))
+		})
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("worker %d: %v", i, err)
+		}
+	}
+
+	content, err := os.ReadFile(fi.path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if len(content) != workers {
+		t.Fatalf("file is %d bytes, want %d (pre-allocation lost)", len(content), workers)
+	}
+	for i := range workers {
+		if content[i] != byte('a'+i) {
+			t.Fatalf("byte %d = %q, want %q", i, content[i], byte('a'+i))
+		}
+	}
+}
 
 // TestWritePieceData_BinarySearchBoundaries pins the [sort.Search] file-skip
 // optimization in writePieceData. A wrong predicate (e.g. >= instead of >)

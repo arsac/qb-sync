@@ -25,7 +25,8 @@ import (
 // A file that has an open write handle can never start declining: hardlink
 // resolution only moves Pending to Complete (both already declining) and
 // selection is immutable, so the only new decliner is early finalization, which
-// takes the handle under the same lock.
+// takes the handle under the same lock. That is what lets writeIfOpen treat a
+// non-nil handle as permission to write without re-checking here.
 func (f *serverFileInfo) declinesWrites() bool {
 	return f.earlyFinalized || f.skipForWriteData()
 }
@@ -58,32 +59,58 @@ func (f *serverFileInfo) openForWrite() error {
 // writeAt ensures the file is open and writes data at the given offset.
 // Holds fileMu.RLock during the write so closeFileHandle and takeWriteHandle
 // (which acquire the exclusive lock) block until all in-flight writes complete.
+//
+// The already-open case must not touch the exclusive lock. A pending Lock also
+// blocks new RLock acquisitions, so routing every write through openForWrite
+// made each of the stream workers wait out the previous worker's NFS round-trip
+// before its own could start - concurrent writes to one file serialized
+// completely, whatever the worker count.
 func (f *serverFileInfo) writeAt(data []byte, offset int64) error {
-	// Ensure file is open (uses exclusive lock internally for creation).
+	if wrote, err := f.writeIfOpen(data, offset); wrote {
+		return err
+	}
+
 	if openErr := f.openForWrite(); openErr != nil {
 		return openErr
 	}
 
-	// Read-lock for the actual write - concurrent writes to different
-	// offsets are safe (pwrite), while Close waits for all to drain.
+	if wrote, err := f.writeIfOpen(data, offset); wrote {
+		return err
+	}
+	return f.noHandleReason()
+}
+
+// writeIfOpen writes under the read lock when the file already has a handle, so
+// concurrent writes to different offsets overlap (pwrite) while takeWriteHandle
+// and closeFileHandle still wait for them all to drain. Reports false, without
+// writing, when the file has no handle for openForWrite to be given a turn.
+func (f *serverFileInfo) writeIfOpen(data []byte, offset int64) (bool, error) {
 	f.fileMu.RLock()
 	defer f.fileMu.RUnlock()
 
 	if f.file == nil {
-		if f.declinesWrites() {
-			// Either the file's bytes come from somewhere other than this
-			// stream, or every piece overlapping it was written and read-back
-			// verified before it was renamed - so the only writes that reach
-			// here are ones the file was never going to accept.
-			return nil
-		}
-		return fmt.Errorf("file closed during write: %s", f.path)
+		return false, nil
 	}
-
 	if _, writeErr := f.file.WriteAt(data, offset); writeErr != nil {
-		return fmt.Errorf("writing to %s: %w", f.path, writeErr)
+		return true, fmt.Errorf("writing to %s: %w", f.path, writeErr)
 	}
-	return nil
+	return true, nil
+}
+
+// noHandleReason explains why a file still has no write handle after
+// openForWrite returned successfully.
+func (f *serverFileInfo) noHandleReason() error {
+	f.fileMu.RLock()
+	defer f.fileMu.RUnlock()
+
+	if f.declinesWrites() {
+		// Either the file's bytes come from somewhere other than this stream,
+		// or every piece overlapping it was written and read-back verified
+		// before it was renamed - so the only writes that reach here are ones
+		// the file was never going to accept.
+		return nil
+	}
+	return fmt.Errorf("file closed during write: %s", f.path)
 }
 
 // takeWriteHandle closes a completed file to further writes and hands its write
