@@ -487,7 +487,7 @@ var (
 	)
 
 	// AckChannelBlockedTotal counts times the ack channel was full for longer than the write timeout,
-	// forcing receiveAcks to exit. Indicates forwardAcks is too slow draining acks.
+	// forcing receiveAcks to exit. Indicates the ack processor is too slow draining acks.
 	AckChannelBlockedTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: namespace,

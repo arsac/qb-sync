@@ -49,33 +49,55 @@ func (m *mockBidiStream) RecvMsg(any) error            { return nil }
 
 var testLogger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 
-// newClosedDonePooledStream builds a PooledStream whose underlying PieceStream
-// has its done channel pre-closed. Used by forwardAcks tests that simulate a
-// stream that has already exited. errs is the error channel given to the
-// inner PieceStream (caller decides whether to seed it with an error).
-func newClosedDonePooledStream(id int, errs chan error) *PooledStream {
-	streamDone := make(chan struct{})
-	close(streamDone)
-	return &PooledStream{
-		stream: &PieceStream{
-			done:     streamDone,
-			errors:   errs,
-			acks:     make(chan *pb.PieceAck, 10),
-			ackReady: make(chan struct{}, 1),
-		},
-		id: id,
-	}
-}
-
-// newForwardAcksTestPool returns a minimal StreamPool wired up for forwardAcks
+// newAckSinkTestPool returns a minimal StreamPool wired up for poolAckSink
 // tests with channel buffers sized for "small but non-blocking" use.
-func newForwardAcksTestPool(ctx context.Context) *StreamPool {
+func newAckSinkTestPool(ctx context.Context) *StreamPool {
 	return &StreamPool{
 		ctx:      ctx,
 		errs:     make(chan error, 10),
 		acks:     make(chan AckEnvelope, 10),
 		ackReady: make(chan struct{}, 10),
 		logger:   testLogger,
+	}
+}
+
+// chanAckSink stands in for the pool in PieceStream receive-loop tests: it
+// collects acks and records the stream-end error. deliverAck gives up after
+// timeout, mirroring poolAckSink's behaviour when the consumer stops draining.
+type chanAckSink struct {
+	acks    chan *pb.PieceAck
+	ended   chan error
+	timeout time.Duration
+}
+
+func newChanAckSink(ackBufSize int, timeout time.Duration) *chanAckSink {
+	if timeout <= 0 {
+		timeout = ackDeliverTimeout
+	}
+	return &chanAckSink{
+		acks:    make(chan *pb.PieceAck, ackBufSize),
+		ended:   make(chan error, 1),
+		timeout: timeout,
+	}
+}
+
+func (s *chanAckSink) deliverAck(ctx context.Context, ack *pb.PieceAck) bool {
+	timer := time.NewTimer(s.timeout)
+	defer timer.Stop()
+	select {
+	case s.acks <- ack:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return false
+	}
+}
+
+func (s *chanAckSink) streamEnded(err error) {
+	select {
+	case s.ended <- err:
+	default:
 	}
 }
 
@@ -104,8 +126,9 @@ func newAdaptiveScalingTestPool(
 // tests where the stream is meaningfully exercised but isolation from a real
 // gRPC transport is desired.
 func newDrainTestStream(ctx context.Context, id int) *PooledStream {
+	stream, _ := newTestPieceStream(ctx, &mockBidiStream{})
 	return &PooledStream{
-		stream: newTestPieceStream(ctx, &mockBidiStream{}),
+		stream: stream,
 		window: congestion.NewAdaptiveWindow(congestion.Config{
 			InitialWindow: 10, MinWindow: 2, MaxWindow: 10,
 		}),
@@ -129,40 +152,38 @@ func newDrainTestPool(ctx context.Context, cancel context.CancelFunc, ps *Pooled
 // newTestPieceStream creates a PieceStream with a mock stream for testing.
 // The mock's ctx is set to the derived stream context so its default Recv
 // unblocks when the stream is closed.
-func newTestPieceStream(parentCtx context.Context, mock *mockBidiStream) *PieceStream {
+func newTestPieceStream(parentCtx context.Context, mock *mockBidiStream) (*PieceStream, *chanAckSink) {
 	return newTestPieceStreamWithOptions(parentCtx, mock, DefaultAckChannelSize, 0, 0)
 }
 
-// newTestPieceStreamWithOptions creates a PieceStream with configurable ack channel
-// buffer size and timeout overrides. Zero timeout means use the package-level const.
+// newTestPieceStreamWithOptions creates a PieceStream with configurable sink ack
+// buffer size and timeout overrides. Zero timeout means use the package-level
+// const. Returns the stream and the sink its receive loop feeds.
 func newTestPieceStreamWithOptions(
 	parentCtx context.Context,
 	mock *mockBidiStream,
 	ackBufSize int,
 	ackTimeout, sndTimeout time.Duration,
-) *PieceStream {
+) (*PieceStream, *chanAckSink) {
 	streamCtx, streamCancel := context.WithCancel(parentCtx)
 	mock.ctx = streamCtx
 
 	ps := &PieceStream{
-		ctx:                     streamCtx,
-		cancel:                  streamCancel,
-		stream:                  mock,
-		logger:                  testLogger,
-		acks:                    make(chan *pb.PieceAck, ackBufSize),
-		ackReady:                make(chan struct{}, 1),
-		done:                    make(chan struct{}),
-		errors:                  make(chan error, 1),
-		sendCh:                  make(chan *sendRequest),
-		stopSend:                make(chan struct{}),
-		sendDone:                make(chan struct{}),
-		ackWriteTimeoutOverride: ackTimeout,
-		sendTimeoutOverride:     sndTimeout,
+		ctx:                 streamCtx,
+		cancel:              streamCancel,
+		stream:              mock,
+		logger:              testLogger,
+		done:                make(chan struct{}),
+		sendCh:              make(chan *sendRequest),
+		stopSend:            make(chan struct{}),
+		sendDone:            make(chan struct{}),
+		sendTimeoutOverride: sndTimeout,
 	}
 
-	go ps.receiveAcks()
+	sink := newChanAckSink(ackBufSize, ackTimeout)
+	go ps.receiveAcks(sink)
 	go ps.sendLoop()
-	return ps
+	return ps, sink
 }
 
 // TestSend_NormalSendSucceeds verifies that a non-blocking Send returns
@@ -174,7 +195,7 @@ func TestSend_NormalSendSucceeds(t *testing.T) {
 		sendFunc: func(*pb.WritePieceRequest) error { return nil },
 	}
 
-	ps := newTestPieceStream(context.Background(), mock)
+	ps, _ := newTestPieceStream(context.Background(), mock)
 	defer ps.Close()
 
 	if err := ps.Send(&pb.WritePieceRequest{TorrentHash: "test"}); err != nil {
@@ -192,7 +213,7 @@ func TestSend_StreamErrorPropagates(t *testing.T) {
 		sendFunc: func(*pb.WritePieceRequest) error { return expectedErr },
 	}
 
-	ps := newTestPieceStream(context.Background(), mock)
+	ps, _ := newTestPieceStream(context.Background(), mock)
 	defer ps.Close()
 
 	err := ps.Send(&pb.WritePieceRequest{TorrentHash: "test"})
@@ -211,7 +232,7 @@ func TestSend_AfterCloseSendReturnsError(t *testing.T) {
 		sendFunc: func(*pb.WritePieceRequest) error { return nil },
 	}
 
-	ps := newTestPieceStream(context.Background(), mock)
+	ps, _ := newTestPieceStream(context.Background(), mock)
 	defer ps.Close()
 
 	// Close the send side first.
@@ -257,7 +278,7 @@ func TestSend_ReceiveExitUnblocksSend(t *testing.T) {
 		return nil, errors.New("stream reset by peer")
 	}
 
-	ps := newTestPieceStream(context.Background(), mock)
+	ps, _ := newTestPieceStream(context.Background(), mock)
 	defer ps.Close()
 
 	start := time.Now()
@@ -276,13 +297,14 @@ func TestSend_ReceiveExitUnblocksSend(t *testing.T) {
 	t.Logf("Send unblocked in %v with error: %v", elapsed, err)
 }
 
-// TestReceiveAcks_AckChannelBlockedTimeout verifies that when the ack channel
-// is full and nobody is draining it, receiveAcks exits after the ack write
-// timeout, calling ps.cancel() to unblock any stuck Send().
+// TestReceiveAcks_AckChannelBlockedTimeout verifies that when the sink stops
+// accepting acks, receiveAcks exits, calling ps.cancel() to unblock any stuck
+// Send().
 //
-// This covers the deadlock scenario where forwardAcks is slow → ps.acks fills
-// → receiveAcks blocks on channel write → never calls Recv() again → can't
-// detect stream death → ps.cancel() never fires → Send() stuck forever.
+// This covers the deadlock scenario where the ack consumer stalls → the sink
+// stops accepting → receiveAcks would otherwise block and never call Recv()
+// again → can't detect stream death → ps.cancel() never fires → Send() stuck
+// forever.
 func TestReceiveAcks_AckChannelBlockedTimeout(t *testing.T) {
 	t.Parallel()
 
@@ -296,14 +318,14 @@ func TestReceiveAcks_AckChannelBlockedTimeout(t *testing.T) {
 		},
 	}
 
-	// Unbuffered ack channel: first ack write blocks immediately.
-	ps := newTestPieceStreamWithOptions(context.Background(), mock, 0, testTimeout, 0)
+	// Unbuffered sink: the first ack delivery blocks immediately.
+	ps, _ := newTestPieceStreamWithOptions(context.Background(), mock, 0, testTimeout, 0)
 	defer ps.Close()
 
 	start := time.Now()
 	select {
 	case <-ps.done:
-		// receiveAcks exited due to ack write timeout — correct.
+		// receiveAcks exited because the sink stopped accepting — correct.
 	case <-time.After(5 * time.Second):
 		t.Fatal("receiveAcks didn't exit after ack channel blocked")
 	}
@@ -328,7 +350,7 @@ func TestReceiveAcks_AckChannelBlockedTimeout(t *testing.T) {
 //
 // This covers the deadlock scenario where both paths are stuck:
 // - Send() blocked on HTTP/2 flow control (destination not consuming)
-// - receiveAcks() blocked on ack channel write (forwardAcks slow)
+// - receiveAcks() blocked delivering an ack (the ack processor is slow)
 // The send timeout is the independent safety net that breaks the cycle.
 func TestSend_TimeoutCancelsStream(t *testing.T) {
 	t.Parallel()
@@ -345,7 +367,7 @@ func TestSend_TimeoutCancelsStream(t *testing.T) {
 	// Default recvFunc blocks until context cancel — simulates receiveAcks
 	// being stuck (unable to detect stream death independently).
 
-	ps := newTestPieceStreamWithOptions(context.Background(), mock, DefaultAckChannelSize, 0, testTimeout)
+	ps, _ := newTestPieceStreamWithOptions(context.Background(), mock, DefaultAckChannelSize, 0, testTimeout)
 	defer ps.Close()
 
 	start := time.Now()
@@ -396,13 +418,13 @@ func TestReceiveAcks_NoTimeoutWhenAcksConsumed(t *testing.T) {
 	}
 
 	// Small buffer to create backpressure, but we drain fast enough.
-	ps := newTestPieceStreamWithOptions(context.Background(), mock, 5, testTimeout, 0)
+	ps, sink := newTestPieceStreamWithOptions(context.Background(), mock, 5, testTimeout, 0)
 	defer ps.Close()
 
 	// Consume all acks.
 	for range numAcks {
 		select {
-		case <-ps.acks:
+		case <-sink.acks:
 		case <-time.After(2 * time.Second):
 			t.Fatal("timed out waiting for ack")
 		}
@@ -412,36 +434,73 @@ func TestReceiveAcks_NoTimeoutWhenAcksConsumed(t *testing.T) {
 	close(received)
 	<-ps.done
 
-	// If the ack write timeout fired spuriously, the context would be cancelled
-	// with no error on the errors channel. Check that the stream ended due to
-	// the Recv error, not the timeout.
+	// If the delivery timeout fired spuriously, the stream would have ended with
+	// no error reported. Check that it ended on the Recv error instead.
 	select {
-	case err := <-ps.errors:
+	case err := <-sink.ended:
 		if err == nil || err.Error() != "done" {
 			t.Fatalf("expected 'done' error from Recv, got %v", err)
 		}
 	default:
-		// No error means receiveAcks saw context cancel or EOF — also acceptable
-		// since we closed the mock.
+		t.Fatal("stream ended without reporting the Recv error to the sink")
 	}
 }
 
-// TestForwardAcks_NotifiesPoolOnSilentStreamDeath verifies that when a stream's
-// Done() fires but no error is pending on the Errors() channel (e.g., send
-// timeout cancelled the context), forwardAcks sends a synthetic error to
-// pool.errs so the ack processor can trigger reconnection.
-//
-// Without this fix, forwardAcks exits silently and the ack processor never
-// learns the stream died, causing a permanent sender deadlock.
-func TestForwardAcks_NotifiesPoolOnSilentStreamDeath(t *testing.T) {
+// newAckSinkFor builds a poolAckSink for a bare PooledStream with the given id.
+func newAckSinkFor(pool *StreamPool, id int) *poolAckSink {
+	return newPoolAckSink(pool, &PooledStream{id: id})
+}
+
+// TestDeliverAck_StreamCancelReleasesBlockedDelivery verifies that a delivery
+// parked on a full aggregated channel is released by the stream's own context,
+// not only by the pool's. drainAndRemoveStream closes a scaled-down stream
+// while the pool keeps running, and Close waits on the receive loop - without
+// the stream-context escape that wait would park for the whole delivery
+// timeout.
+func TestDeliverAck_StreamCancelReleasesBlockedDelivery(t *testing.T) {
 	t.Parallel()
 
-	// Stream done, no error pending.
-	ps := newClosedDonePooledStream(42, make(chan error, 1))
-	pool := newForwardAcksTestPool(t.Context())
+	pool := newAckSinkTestPool(t.Context())
+	pool.ackDeliveryTimeoutOverride = time.Hour // Only a cancel can release this.
+	for len(pool.acks) < cap(pool.acks) {
+		pool.acks <- AckEnvelope{}
+	}
 
-	pool.wg.Add(1)
-	go pool.forwardAcks(ps)
+	streamCtx, streamCancel := context.WithCancel(context.Background())
+	sink := newAckSinkFor(pool, 5)
+
+	returned := make(chan bool, 1)
+	go func() { returned <- sink.deliverAck(streamCtx, &pb.PieceAck{}) }()
+
+	select {
+	case <-returned:
+		t.Fatal("deliverAck returned before the stream was cancelled")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	streamCancel()
+	select {
+	case ok := <-returned:
+		if ok {
+			t.Fatal("deliverAck reported success without delivering the ack")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("deliverAck stayed parked after the stream was cancelled")
+	}
+}
+
+// TestStreamEnded_NotifiesPoolOnSilentStreamDeath verifies that when a stream's
+// receive loop exits without an error of its own (e.g. a send timeout cancelled
+// the context), the sink publishes a synthetic error to pool.errs so the ack
+// processor can trigger reconnection.
+//
+// Without it the stream dies silently and the ack processor never learns, which
+// is a permanent sender deadlock.
+func TestStreamEnded_NotifiesPoolOnSilentStreamDeath(t *testing.T) {
+	t.Parallel()
+
+	pool := newAckSinkTestPool(t.Context())
+	newAckSinkFor(pool, 42).streamEnded(nil)
 
 	select {
 	case err := <-pool.errs:
@@ -449,30 +508,23 @@ func TestForwardAcks_NotifiesPoolOnSilentStreamDeath(t *testing.T) {
 			t.Fatal("expected non-nil synthetic error")
 		}
 		t.Logf("received synthetic error: %v", err)
-	case <-time.After(1 * time.Second):
-		t.Fatal("timed out waiting for synthetic error — forwardAcks exited silently")
+	default:
+		t.Fatal("stream died silently — no error published to the pool")
 	}
 }
 
-// TestForwardAcks_NoSpuriousErrorOnCleanShutdown verifies that when the pool
-// context is cancelled (clean shutdown via pool.Close), forwardAcks does NOT
-// send a synthetic error to pool.errs. Only unexpected stream deaths should
-// generate errors.
-func TestForwardAcks_NoSpuriousErrorOnCleanShutdown(t *testing.T) {
+// TestStreamEnded_NoSpuriousErrorOnCleanShutdown verifies that when the pool
+// context is cancelled (clean shutdown via pool.Close), a stream ending without
+// an error of its own does NOT produce a synthetic error. Only unexpected
+// stream deaths should generate errors.
+func TestStreamEnded_NoSpuriousErrorOnCleanShutdown(t *testing.T) {
 	t.Parallel()
 
-	// Stream done, no error pending.
-	ps := newClosedDonePooledStream(7, make(chan error, 1))
-
-	// Pool context already cancelled — simulates clean shutdown.
 	poolCtx, poolCancel := context.WithCancel(context.Background())
 	poolCancel()
 
-	pool := newForwardAcksTestPool(poolCtx)
-
-	pool.wg.Add(1)
-	go pool.forwardAcks(ps)
-	pool.wg.Wait()
+	pool := newAckSinkTestPool(poolCtx)
+	newAckSinkFor(pool, 7).streamEnded(nil)
 
 	select {
 	case err := <-pool.errs:
@@ -482,48 +534,41 @@ func TestForwardAcks_NoSpuriousErrorOnCleanShutdown(t *testing.T) {
 	}
 }
 
-// TestForwardAcks_DrainsErrorOnStreamClose verifies that forwardAcks drains
-// any pending error from the stream's error channel after Done() fires.
-//
-// Without the error drain fix, when both Done() and Errors() are ready
-// simultaneously, Go's select picks randomly. If Done() wins, forwardAcks
-// returns without forwarding the error, leaving the ack processor unaware
-// of stream death. The fix makes the Done() case explicitly drain pending
-// errors before returning.
-//
-// Multiple iterations make the select race deterministic: without the fix,
-// ~50% of iterations would miss the error.
-func TestForwardAcks_DrainsErrorOnStreamClose(t *testing.T) {
+// TestStreamEnded_ForwardsRealStreamError verifies that a stream error is
+// published verbatim rather than replaced by the synthetic one, and that it is
+// published even while the pool context is cancelled — a real failure racing
+// shutdown still has to reach the ack processor.
+func TestStreamEnded_ForwardsRealStreamError(t *testing.T) {
 	t.Parallel()
 
-	const iterations = 50
-
-	for i := range iterations {
-		func() {
-			// Create a PieceStream with a pending error and closed done channel.
-			streamErrors := make(chan error, 1)
-			streamErrors <- errors.New("stream reset by peer")
-			ps := newClosedDonePooledStream(i, streamErrors)
+	for _, tc := range []struct {
+		name       string
+		cancelPool bool
+	}{
+		{name: "pool_running"},
+		{name: "pool_closing", cancelPool: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
 			poolCtx, poolCancel := context.WithCancel(context.Background())
 			defer poolCancel()
+			if tc.cancelPool {
+				poolCancel()
+			}
 
-			pool := newForwardAcksTestPool(poolCtx)
+			pool := newAckSinkTestPool(poolCtx)
+			newAckSinkFor(pool, 3).streamEnded(errors.New("stream reset by peer"))
 
-			pool.wg.Add(1)
-			go pool.forwardAcks(ps)
-
-			// forwardAcks should forward the error regardless of select ordering.
 			select {
 			case err := <-pool.errs:
 				if err == nil || err.Error() != "stream reset by peer" {
-					t.Errorf("iteration %d: expected 'stream reset by peer', got %v", i, err)
+					t.Fatalf("expected 'stream reset by peer', got %v", err)
 				}
-			case <-time.After(1 * time.Second):
-				t.Fatalf("iteration %d: timed out waiting for error to be forwarded "+
-					"(select race dropped the error)", i)
+			default:
+				t.Fatal("stream error was dropped instead of published to the pool")
 			}
-		}()
+		})
 	}
 }
 
@@ -535,10 +580,7 @@ func newTestPoolWithWindow(windowCfg congestion.Config) (*StreamPool, *PooledStr
 	ctx, cancel := context.WithCancel(context.Background())
 	ps := &PooledStream{
 		stream: &PieceStream{
-			done:     make(chan struct{}),
-			errors:   make(chan error, 1),
-			acks:     make(chan *pb.PieceAck, 10),
-			ackReady: make(chan struct{}, 1),
+			done: make(chan struct{}),
 		},
 		window: congestion.NewAdaptiveWindow(windowCfg),
 		id:     0,
@@ -615,7 +657,7 @@ func TestSenderLoop_PollingFallbackUnblocks(t *testing.T) {
 // before the ack processor has called OnAck.
 //
 // The race:
-//  1. forwardAcks enqueues ack → signals ackReady
+//  1. deliverAck enqueues ack → signals ackReady
 //  2. Sender wakes, checks CanSend()=false (OnAck hasn't fired yet)
 //  3. Sender goes back to waiting — signal consumed
 //  4. Ack processor calls OnAck → CanSend()=true
@@ -642,7 +684,7 @@ func TestSenderLoop_NotifyAckProcessedUnblocks(t *testing.T) {
 	// Simulate the race: enqueue-time signal arrives first, sender consumes
 	// it, then ack processor calls OnAck + NotifyAckProcessed.
 	go func() {
-		// Step 1: forwardAcks signals ackReady (enqueue-time).
+		// Step 1: deliverAck signals ackReady (enqueue-time).
 		pool.ackReady <- struct{}{}
 
 		// Small delay to ensure the sender wakes and re-checks CanSend()=false.
@@ -776,21 +818,17 @@ func TestSenderLoop_SignalRaceWithoutNotify(t *testing.T) {
 	_ = "test uses fmt" // Ensure fmt import is used.
 }
 
-// TestForwardAcks_SilentExitOnRemovedFlag verifies that when a stream's Done()
-// fires and the removed flag is set (graceful drain), forwardAcks exits silently
-// without sending any error to pool.errs.
-func TestForwardAcks_SilentExitOnRemovedFlag(t *testing.T) {
+// TestStreamEnded_SilentExitOnRemovedFlag verifies that a stream the pool
+// deliberately drained out reports nothing, even though closing it produces a
+// context error the receive loop hands to the sink.
+func TestStreamEnded_SilentExitOnRemovedFlag(t *testing.T) {
 	t.Parallel()
 
-	ps := newClosedDonePooledStream(99, make(chan error, 1))
-	// Mark as intentionally removed
-	ps.removed.Store(true)
+	pool := newAckSinkTestPool(t.Context())
+	ps := &PooledStream{id: 99}
+	ps.removed.Store(true) // Mark as intentionally removed
 
-	pool := newForwardAcksTestPool(t.Context())
-
-	pool.wg.Add(1)
-	go pool.forwardAcks(ps)
-	pool.wg.Wait()
+	newPoolAckSink(pool, ps).streamEnded(context.Canceled)
 
 	select {
 	case err := <-pool.errs:
@@ -1003,9 +1041,6 @@ func newStubPooledStreams(n int) []*PooledStream {
 			stream: &PieceStream{
 				connIdx:  0,
 				done:     make(chan struct{}),
-				errors:   make(chan error, 1),
-				acks:     make(chan *pb.PieceAck, 1),
-				ackReady: make(chan struct{}, 1),
 				sendCh:   make(chan *sendRequest),
 				stopSend: make(chan struct{}),
 				sendDone: make(chan struct{}),

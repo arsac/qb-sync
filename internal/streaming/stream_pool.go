@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
-	"runtime/debug"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -69,7 +68,7 @@ type PooledStream struct {
 
 	// Graceful drain lifecycle
 	draining atomic.Bool // Set true to stop sending new pieces; stream drains in-flight
-	removed  atomic.Bool // Set true when fully drained; forwardAcks exits silently
+	removed  atomic.Bool // Set true when fully drained; its receive loop then ends silently
 
 	// Stats - atomic for lock-free reads
 	bytesSent  atomic.Int64
@@ -100,6 +99,9 @@ type StreamPool struct {
 	acks     chan AckEnvelope
 	ackReady chan struct{}
 	errs     chan error // Aggregated errors from all streams
+
+	// Test-overridable ack delivery timeout. Zero means the package const.
+	ackDeliveryTimeoutOverride time.Duration
 
 	// Adaptive scaling state (protected by mu)
 	adaptive          bool // Whether adaptive scaling is enabled
@@ -241,105 +243,100 @@ func (p *StreamPool) Open(ctx context.Context, numStreams int) error {
 	return nil
 }
 
-// forwardAcks reads acks from a single stream and forwards them to the pool's
-// aggregated channels. Also forwards errors from the stream.
-func (p *StreamPool) forwardAcks(ps *PooledStream) { //nolint:gocognit // complexity from panic recovery
-	defer p.wg.Done()
-	defer func() {
-		if r := recover(); r != nil {
-			p.logger.Error("panic in forwardAcks",
-				"streamID", ps.id,
-				"panic", r,
-				"stack", string(debug.Stack()),
-			)
-			select {
-			case p.errs <- fmt.Errorf("panic in forwardAcks (stream %d): %v", ps.id, r):
-			default:
-			}
-		}
-	}()
+// poolAckSink routes one stream's receive loop into the pool's aggregated
+// channels. It owns the delivery timer so the per-ack path allocates nothing.
+type poolAckSink struct {
+	p     *StreamPool
+	ps    *PooledStream
+	timer *time.Timer
+}
 
-	for {
+// newPoolAckSink builds the sink for one stream. The timer starts stopped and
+// is reset per delivery.
+func newPoolAckSink(p *StreamPool, ps *PooledStream) *poolAckSink {
+	timer := time.NewTimer(p.ackDeliveryTimeout())
+	timer.Stop()
+	return &poolAckSink{p: p, ps: ps, timer: timer}
+}
+
+// deliverAck forwards an ack to the pool's aggregated channel, paired with its
+// source stream so processAck can update the right congestion window without a
+// separate piece-to-stream map.
+//
+// Returning false stops the stream's receive loop. That is the intended
+// response to an ack processor that has stopped draining: blocking here would
+// leave nobody calling Recv, so stream death could never be detected and a
+// Send stuck on HTTP/2 flow control would never be unblocked. ctx is the
+// stream's own context, so closing a drained stream also releases a delivery
+// waiting on a full channel instead of parking it for the whole timeout.
+func (s *poolAckSink) deliverAck(ctx context.Context, ack *pb.PieceAck) bool {
+	timeout := s.p.ackDeliveryTimeout()
+	s.timer.Reset(timeout)
+
+	select {
+	case s.p.acks <- AckEnvelope{Ack: ack, Stream: s.ps}:
+		// In Go 1.23+, Stop guarantees the channel is drained.
+		s.timer.Stop()
+		// Signal that an ack is ready (non-blocking)
 		select {
-		case <-p.ctx.Done():
-			return
-
-		case <-ps.stream.Done():
-			// Intentionally removed stream — exit silently without error.
-			if ps.removed.Load() {
-				return
-			}
-
-			// Stream ended. Drain any pending error so it gets forwarded
-			// to the pool. Without this, a select race between Done() and
-			// Errors() can silently drop the stream error, leaving the
-			// ack processor unaware that the stream died.
-			select {
-			case err := <-ps.stream.Errors():
-				select {
-				case p.errs <- err:
-				default:
-					p.logger.WarnContext(p.ctx, "error channel full, dropping error on stream close",
-						"streamID", ps.id,
-						"error", err,
-					)
-				}
-			default:
-				// Stream closed without an explicit error (e.g., send timeout
-				// cancelled context). Notify pool so ack processor can trigger
-				// reconnection. Skip during clean shutdown (pool.Close cancels p.ctx).
-				if p.ctx.Err() == nil {
-					select {
-					case p.errs <- fmt.Errorf("stream %d closed unexpectedly", ps.id):
-					case <-p.ctx.Done():
-						// Pool closing between the check and send — no need to report.
-					default:
-						p.logger.WarnContext(
-							p.ctx,
-							"error channel full, dropping synthetic error on silent stream close",
-							"streamID",
-							ps.id,
-						)
-					}
-				}
-			}
-			return
-
-		case err, ok := <-ps.stream.Errors():
-			if !ok {
-				continue
-			}
-			// Forward error to aggregated error channel (non-blocking)
-			select {
-			case p.errs <- err:
-			default:
-				// Error channel full, log and continue
-				p.logger.WarnContext(p.ctx, "error channel full, dropping error",
-					"streamID", ps.id,
-					"error", err,
-				)
-			}
-
-		case ack, ok := <-ps.stream.Acks():
-			if !ok {
-				return
-			}
-
-			// Forward to pool's aggregated ack channel (blocking with context).
-			// Pair the ack with its source stream so processAck can update the
-			// right window without a separate piece-to-stream map.
-			select {
-			case p.acks <- AckEnvelope{Ack: ack, Stream: ps}:
-				// Signal that an ack is ready (non-blocking)
-				select {
-				case p.ackReady <- struct{}{}:
-				default:
-				}
-			case <-p.ctx.Done():
-				return
-			}
+		case s.p.ackReady <- struct{}{}:
+		default:
 		}
+		return true
+
+	case <-ctx.Done():
+		metrics.ReceiveAcksExitTotal.WithLabelValues(metrics.ReasonContextCancel).Inc()
+		return false
+
+	case <-s.p.ctx.Done():
+		metrics.ReceiveAcksExitTotal.WithLabelValues(metrics.ReasonContextCancel).Inc()
+		return false
+
+	case <-s.timer.C:
+		metrics.ReceiveAcksExitTotal.WithLabelValues(metrics.ReasonAckChannelBlocked).Inc()
+		metrics.AckChannelBlockedTotal.Inc()
+		s.p.logger.WarnContext(s.p.ctx, "ack channel blocked, closing stream",
+			"streamID", s.ps.id,
+			"timeout", timeout,
+		)
+		return false
 	}
+}
+
+// streamEnded publishes the reason a stream's receive loop exited so the ack
+// processor can tear the pool down and reconnect. err is nil when the stream
+// ended without reporting one - a clean EOF, or a context cancelled by the
+// send timeout - and a silent death still has to reach the processor, so it
+// gets a synthetic error. The two cases that are not failures are a stream
+// this pool deliberately drained out and a pool that is shutting down.
+func (s *poolAckSink) streamEnded(err error) {
+	if s.ps.removed.Load() {
+		return
+	}
+	if err == nil {
+		if s.p.ctx.Err() != nil {
+			return
+		}
+		err = fmt.Errorf("stream %d closed unexpectedly", s.ps.id)
+	}
+
+	select {
+	case s.p.errs <- err:
+	default:
+		s.p.logger.WarnContext(s.p.ctx, "error channel full, dropping stream error",
+			"streamID", s.ps.id,
+			"error", err,
+		)
+	}
+}
+
+// ackDeliveryTimeout is how long deliverAck waits for the aggregated ack
+// channel before declaring the stream stuck. Zero means the package default.
+func (p *StreamPool) ackDeliveryTimeout() time.Duration {
+	if p.ackDeliveryTimeoutOverride > 0 {
+		return p.ackDeliveryTimeoutOverride
+	}
+	return ackDeliverTimeout
 }
 
 // addStreamLocked adds a new stream to the pool. Must hold p.mu write lock.
@@ -362,9 +359,11 @@ func (p *StreamPool) addStreamLocked() error {
 	p.nextID++
 	p.streams = append(p.streams, ps)
 
-	// Start ack forwarder for this stream
-	p.wg.Add(1)
-	go p.forwardAcks(ps)
+	// Start this stream's ack receive loop, which delivers straight into the
+	// pool's aggregated channels.
+	p.wg.Go(func() {
+		stream.receiveAcks(newPoolAckSink(p, ps))
+	})
 
 	return nil
 }
@@ -686,7 +685,7 @@ func (p *StreamPool) removeConnectionStreams(connIdx int) {
 }
 
 // removeStreamLocked initiates graceful drain of the last stream. Must hold p.mu write lock.
-// The stream stays in the slice during drain (so forwardAcks keeps running and acks flow back)
+// The stream stays in the slice during drain (so its receive loop keeps acks flowing back)
 // but findLeastLoadedStream skips it. drainAndRemoveStream removes it after drain completes.
 func (p *StreamPool) removeStreamLocked() error {
 	if len(p.streams) <= MinPoolSize {
@@ -857,7 +856,7 @@ func (p *StreamPool) AckReady() <-chan struct{} {
 // NotifyAckProcessed signals that an ack has been processed and inflight
 // count reduced. This wakes the sender to re-check CanSend().
 //
-// forwardAcks signals ackReady when an ack is enqueued, but the sender
+// deliverAck signals ackReady when an ack is enqueued, but the sender
 // checks CanSend() which depends on OnAck having reduced inflight. Without
 // this post-processing signal, the sender can consume the enqueue signal
 // before OnAck fires, see CanSend()=false, and wait forever.

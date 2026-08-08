@@ -44,11 +44,12 @@ const (
 	// can exceed finalizeConnTimeout and prevent recovery after a server restart.
 	maxReconnectBackoff = 5 * time.Second
 
-	// ackWriteTimeout is how long receiveAcks waits to write an ack to the channel
-	// before treating the stream as stuck. If forwardAcks is slow draining the channel,
-	// this prevents receiveAcks from blocking forever and never calling Recv() again
-	// (which is the only way to detect stream death and trigger ps.cancel()).
-	ackWriteTimeout = 30 * time.Second
+	// ackDeliverTimeout is how long the pool waits to hand an ack to its
+	// aggregated channel before treating the stream as stuck. If the ack
+	// processor stops draining, this prevents the receive loop from blocking
+	// forever and never calling Recv() again (which is the only way to detect
+	// stream death and trigger ps.cancel()).
+	ackDeliverTimeout = 30 * time.Second
 
 	// sendTimeout is how long Send waits for the gRPC stream.Send to complete.
 	// gRPC Send() blocks on HTTP/2 flow control when the receiver stops consuming.
@@ -338,6 +339,10 @@ func (d *GRPCDestination) CheckTorrentStatus(ctx context.Context, hash string) (
 // OpenStream opens a bidirectional stream for high-throughput piece transfer.
 // Each stream gets its own cancellable context so a stuck Send() can be
 // unblocked without tearing down the entire pool.
+//
+// Only the send side is started here. The caller must run receiveAcks with a
+// sink of its own - it is what detects stream death, and Close waits on the
+// done channel it closes.
 func (d *GRPCDestination) OpenStream(ctx context.Context, logger *slog.Logger) (*PieceStream, error) {
 	connIdx := d.streamConnIdx()
 
@@ -358,16 +363,12 @@ func (d *GRPCDestination) OpenStream(ctx context.Context, logger *slog.Logger) (
 		cancel:   streamCancel,
 		stream:   stream,
 		logger:   logger,
-		acks:     make(chan *pb.PieceAck, DefaultAckChannelSize),
-		ackReady: make(chan struct{}, 1), // Signal when acks are processed
 		done:     make(chan struct{}),
-		errors:   make(chan error, 1),
 		sendCh:   make(chan *sendRequest), // unbuffered: natural backpressure
 		stopSend: make(chan struct{}),
 		sendDone: make(chan struct{}),
 	}
 
-	go ps.receiveAcks()
 	go ps.sendLoop()
 
 	return ps, nil
