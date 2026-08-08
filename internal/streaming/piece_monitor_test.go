@@ -1211,3 +1211,112 @@ func TestPollTorrentPieces_ReusesStatesTheSourceCannotChange(t *testing.T) {
 		}
 	})
 }
+
+// streamAll queues and acks every piece so the scan cursor reaches the end of
+// the torrent, which is where a resync has to be able to rewind it from.
+func streamAll(t *testing.T, monitor *PieceMonitor, st *torrentState, current []PieceState) {
+	t.Helper()
+	ctx := context.Background()
+	hash := st.meta.GetTorrentHash()
+	monitor.torrents[hash] = st
+
+	if got := monitor.queueCompletedPieces(ctx, st, current); got != len(current) {
+		t.Fatalf("initial scan queued %d pieces, want %d", got, len(current))
+	}
+	for len(monitor.completed) > 0 {
+		monitor.MarkStreamed(hash, int((<-monitor.completed).GetIndex()))
+	}
+	if got := monitor.queueCompletedPieces(ctx, st, current); got != 0 {
+		t.Fatalf("scan after full streaming queued %d pieces, want 0", got)
+	}
+	if st.firstUnstreamedScanIdx != len(current) {
+		t.Fatalf("cursor at %d after full streaming, want %d", st.firstUnstreamedScanIdx, len(current))
+	}
+}
+
+// queuedIndices drains the completed channel and returns what the scan offered.
+func queuedIndices(monitor *PieceMonitor) []int32 {
+	var indices []int32
+	for len(monitor.completed) > 0 {
+		indices = append(indices, (<-monitor.completed).GetIndex())
+	}
+	return indices
+}
+
+// A resync is how the destination's verification-failure recovery reaches the
+// source: it clears the written bits of the corrupted pieces, answers
+// FINALIZE_ERROR_INCOMPLETE, and the source un-marks them so the next poll
+// re-offers them. The scan cursor only moves forward on its own, so without a
+// rewind the re-offer never happens and the torrent stalls until the retry
+// guard quarantines it as sync-failed.
+func TestResyncStreamed_ReOffersPiecesBelowTheScanCursor(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("a piece the destination lost is offered again", func(t *testing.T) {
+		monitor := newTestMonitor()
+		st, current := newBacklogState(10)
+		streamAll(t, monitor, st, current)
+
+		destHas := make([]bool, len(current))
+		for i := range destHas {
+			destHas[i] = true
+		}
+		destHas[3] = false
+
+		if reset := monitor.ResyncStreamed(st.meta.GetTorrentHash(), destHas); reset != 1 {
+			t.Fatalf("resync reset %d pieces, want 1", reset)
+		}
+		monitor.queueCompletedPieces(ctx, st, current)
+		if got := queuedIndices(monitor); !slices.Equal(got, []int32{3}) {
+			t.Errorf("re-offered %v, want [3]", got)
+		}
+	})
+
+	t.Run("the cursor rewinds to the lowest lost piece", func(t *testing.T) {
+		monitor := newTestMonitor()
+		st, current := newBacklogState(10)
+		streamAll(t, monitor, st, current)
+
+		destHas := make([]bool, len(current))
+		for i := range destHas {
+			destHas[i] = true
+		}
+		destHas[2], destHas[7] = false, false
+
+		if reset := monitor.ResyncStreamed(st.meta.GetTorrentHash(), destHas); reset != 2 {
+			t.Fatalf("resync reset %d pieces, want 2", reset)
+		}
+		if st.firstUnstreamedScanIdx != 2 {
+			t.Errorf("cursor at %d, want 2 (the lowest un-marked piece)", st.firstUnstreamedScanIdx)
+		}
+		monitor.queueCompletedPieces(ctx, st, current)
+		if got := queuedIndices(monitor); !slices.Equal(got, []int32{2, 7}) {
+			t.Errorf("re-offered %v, want [2 7]", got)
+		}
+	})
+
+	// The cursor is what keeps the per-tick scan off the streamed prefix, so a
+	// resync that un-marks nothing must leave it where it was rather than
+	// rewinding defensively.
+	t.Run("a resync that loses nothing leaves the cursor alone", func(t *testing.T) {
+		monitor := newTestMonitor()
+		st, current := newBacklogState(10)
+		streamAll(t, monitor, st, current)
+
+		destHas := make([]bool, len(current))
+		for i := range destHas {
+			destHas[i] = true
+		}
+
+		if reset := monitor.ResyncStreamed(st.meta.GetTorrentHash(), destHas); reset != 0 {
+			t.Fatalf("resync reset %d pieces, want 0", reset)
+		}
+		if st.firstUnstreamedScanIdx != len(current) {
+			t.Errorf("cursor at %d, want %d", st.firstUnstreamedScanIdx, len(current))
+		}
+		monitor.queueCompletedPieces(ctx, st, current)
+		if got := queuedIndices(monitor); got != nil {
+			t.Errorf("re-offered %v, want nothing", got)
+		}
+	})
+}

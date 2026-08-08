@@ -67,9 +67,10 @@ type torrentState struct {
 	idleTicks  int    // consecutive polls with no new pieces completed
 	// firstUnstreamedScanIdx is the lowest index that *might* still be
 	// un-streamed. queueCompletedPieces uses it to avoid re-scanning the
-	// long prefix of already-streamed pieces on every poll. Pieces complete
-	// monotonically once written, so the cursor only ever moves forward.
-	// Updated under mu (write) by queueCompletedPieces; read by the same.
+	// long prefix of already-streamed pieces on every poll, so nothing below
+	// it is ever offered again: every path that clears a streamed bit must go
+	// through [torrentState.unmarkStreamed] to rewind it. Written under mu by
+	// queueCompletedPieces (forwards) and unmarkStreamed (backwards).
 	firstUnstreamedScanIdx int
 
 	// lastAdvance is when the streamed count last increased. The orchestrator
@@ -128,6 +129,18 @@ func allDownloaded(states []PieceState) bool {
 // lock.
 func (s *torrentState) noteAdvance() {
 	s.lastAdvance = time.Now()
+}
+
+// unmarkStreamed returns piece i to the un-streamed set and rewinds the scan
+// cursor so queueCompletedPieces offers it again. Caller must hold the write
+// lock.
+//
+// The rewind is the whole point: the cursor is what makes the per-tick scan
+// cheap, and without it a piece un-marked below the cursor is never re-offered,
+// so the torrent silently never completes.
+func (s *torrentState) unmarkStreamed(i int) {
+	s.streamed[i] = false
+	s.firstUnstreamedScanIdx = min(s.firstUnstreamedScanIdx, i)
 }
 
 // PieceMonitor monitors piece completion and queues pieces for streaming.
@@ -291,7 +304,7 @@ func (t *PieceMonitor) ResyncStreamed(hash string, writtenOnCold []bool) int {
 			state.failed[i] = false
 		} else if state.streamed[i] {
 			// Was marked streamed but destination doesn't have it — un-mark for re-streaming
-			state.streamed[i] = false
+			state.unmarkStreamed(i)
 			reset++
 		}
 	}
