@@ -12,6 +12,13 @@ import (
 	"github.com/arsac/qb-sync/internal/streaming"
 )
 
+// errSourceTorrentGone reports that source qB answered the lookup and does not
+// have the torrent. Distinct from a fetch failure: qB was reachable, so the
+// torrent really is gone rather than momentarily unreachable. Finalization
+// cannot succeed without the source record, so retrying is pointless - the
+// torrent is handled as a removal instead.
+var errSourceTorrentGone = errors.New("torrent not found")
+
 // collectProgress takes one progress snapshot per tracked torrent for the
 // cycle. Both the finalization pass and the stall pass need it, and GetProgress
 // scans the whole piece bitmap under the monitor's read lock, so sampling twice
@@ -106,6 +113,15 @@ func (t *QBTask) handleFinalizeError(ctx context.Context, hash string, finalizeE
 		return false
 	case errors.Is(finalizeErr, streaming.ErrFinalizeNotFound):
 		t.handleNotFoundFinalization(ctx, hash)
+		return false
+	case errors.Is(finalizeErr, errSourceTorrentGone):
+		// The source record is finalization's input, so no number of retries
+		// makes this one succeed; without it the destination's data can't be
+		// added to qB either. Hand it to the removal path, which prefers a
+		// handoff when the torrent already completed and only aborts when the
+		// data is unusable. Matches PieceMonitor, which treats a source 404 as
+		// a removal rather than a fault.
+		t.handleTorrentRemoval(ctx, hash)
 		return false
 	}
 
@@ -260,7 +276,7 @@ func (t *QBTask) finalizeTorrent(ctx context.Context, hash string) error {
 		return fmt.Errorf("getting torrent info: %w", err)
 	}
 	if len(torrents) == 0 {
-		return fmt.Errorf("torrent not found: %s", hash)
+		return fmt.Errorf("%w: %s", errSourceTorrentGone, hash)
 	}
 
 	return t.finalizeKnownTorrent(ctx, torrents[0])

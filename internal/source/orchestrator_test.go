@@ -3753,3 +3753,79 @@ func TestFinalizeCompletedStreams_ServedFromTheCycleTorrentList(t *testing.T) {
 		}
 	})
 }
+
+// TestHandleFinalizeError_SourceGoneIsHandledAsRemoval pins that a finalize
+// error meaning "source qB answered and does not have this torrent" is routed
+// to the removal path instead of the generic retry branch.
+//
+// Before this, the bare not-found error fell through handleFinalizeError's
+// switch into RecordFailure and was retried until the quarantine guard, even
+// though finalization takes the source record as its input and so could never
+// succeed. AbortTorrent was never reached, leaving the destination's .partial
+// files and meta directory for the slow orphan sweep to reclaim - the leak
+// TestE2E_OrphanCleanupOnTorrentRemoval reports as a meta directory that is
+// never cleaned up.
+func TestHandleFinalizeError_SourceGoneIsHandledAsRemoval(t *testing.T) {
+	logger := testLogger(t)
+
+	newGoneTask := func(hash string) (*QBTask, *mockDest) {
+		dest := &mockDest{}
+		task := &QBTask{
+			cfg:       &config.SourceConfig{SourceRemovedTag: "source-removed"},
+			logger:    logger,
+			srcClient: &mockQBClient{},
+			grpcDest:  dest,
+			source:    qbclient.NewSource(nil, ""),
+			tracker: streaming.NewPieceMonitor(
+				nil, &mockPieceSource{numPieces: 1}, logger, streaming.DefaultPieceMonitorConfig(),
+			),
+			store: newTorrentStore("", 0, logger),
+		}
+		task.store.Track(hash, TrackedTorrent{Name: "gone-torrent"})
+		return task, dest
+	}
+
+	goneErr := fmt.Errorf("%w: %s", errSourceTorrentGone, "gone-hash")
+
+	t.Run("partially streamed torrent is aborted so its data is reclaimed", func(t *testing.T) {
+		hash := "gone-hash"
+		task, dest := newGoneTask(hash)
+		// No CheckTorrentStatus entry: tryFinalizeFullyStreamed can't confirm a
+		// complete stream, so the data is not worth keeping and abort runs.
+
+		if stop := task.handleFinalizeError(context.Background(), hash, goneErr); stop {
+			t.Error("a single gone torrent must not stop the cycle's remaining finalizations")
+		}
+
+		if !dest.abortCalled {
+			t.Fatal("AbortTorrent must run: retrying finalize without the source record can never succeed")
+		}
+		if dest.abortHash != hash {
+			t.Errorf("aborted hash = %q, want %q", dest.abortHash, hash)
+		}
+		if !dest.abortDeleteFiles {
+			t.Error("abort must delete files: without source metadata the partial data is unusable")
+		}
+		if task.store.IsTracked(hash) {
+			t.Error("torrent must leave tracked; leaving it inflates the active-torrents gauge")
+		}
+	})
+
+	t.Run("torrent already complete on destination is handed off, never aborted", func(t *testing.T) {
+		hash := "gone-hash"
+		task, dest := newGoneTask(hash)
+		task.store.MarkComplete(hash, "")
+
+		task.handleFinalizeError(context.Background(), hash, goneErr)
+
+		if dest.abortCalled {
+			t.Fatal("aborting a torrent the destination already finalized would delete good data")
+		}
+		if !dest.startCalled {
+			t.Fatal("a completed torrent must be started on the destination as the new seeder")
+		}
+		if dest.startTag != "source-removed" {
+			t.Errorf("start tag = %q, want %q", dest.startTag, "source-removed")
+		}
+	})
+}
