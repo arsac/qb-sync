@@ -82,6 +82,9 @@ const (
 	// verifyConcurrency() clamps defensively in case the two ever drift.
 	maxVerifyConcurrencyCap  = 16
 	parentDirSyncConcurrency = 8 // Concurrent fsyncs of unique parent dirs during finalize (each is a separate NFS commit RTT)
+	// verifyChunkPieces caps the run of consecutive pieces a verify worker
+	// claims per turn - see verifyChunkSize for why runs beat one-at-a-time.
+	verifyChunkPieces = 32
 
 	// verifyIdleTimeout is how long verification can go without verifying a piece
 	// before it is considered stalled. Resets on each successfully verified piece.

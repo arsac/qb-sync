@@ -885,7 +885,9 @@ func (s *Server) verifyFinalizedPieces(
 // a per-goroutine FdCache that reuses file handles across all the pieces it
 // processes, plus one pieceLength buffer resliced per piece. Reusing fds removes
 // an open+close (LOOKUP+OPEN+CLOSE) RTT per piece per file region - the dominant
-// verify cost on NFS for multi-file torrents.
+// verify cost on NFS for multi-file torrents. Work is handed out in runs of
+// consecutive pieces (see verifyChunkSize) so each worker reads one file
+// forwards rather than striding through every file in the set.
 //
 // Fails closed on cancellation: the pass stops reading but still reports every
 // piece it never got to as failed, so "absent from the result" always means
@@ -899,38 +901,90 @@ func (s *Server) verifyPieceSet(
 	pieces []int,
 	onVerified func(),
 ) []int {
-	var (
-		next     atomic.Int64
-		failedMu sync.Mutex
-		failed   []int
-		wg       sync.WaitGroup
-	)
+	workers := min(s.verifyConcurrency(), len(pieces))
+	job := &verifyJob{
+		hash:       hash,
+		state:      state,
+		regions:    regions,
+		pieces:     pieces,
+		onVerified: onVerified,
+		chunk:      verifyChunkSize(len(pieces), workers),
+	}
 
-	for range min(s.verifyConcurrency(), len(pieces)) {
-		wg.Go(func() {
-			cache := utils.NewFdCache()
-			defer cache.Close()
-			buf := make([]byte, state.pieceLength)
-			for {
-				i := int(next.Add(1)) - 1
-				if i >= len(pieces) {
-					return
-				}
-				if !s.verifyOnePiece(ctx, cache, hash, state, regions, buf, pieces[i]) {
-					failedMu.Lock()
-					failed = append(failed, pieces[i])
-					failedMu.Unlock()
-				}
-				if onVerified != nil {
-					onVerified()
-				}
-			}
-		})
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Go(func() { s.verifyWorker(ctx, job) })
 	}
 	wg.Wait()
 
-	sort.Ints(failed)
-	return failed
+	sort.Ints(job.failed)
+	return job.failed
+}
+
+// verifyJob is the state one read-back verify pass shares across its workers:
+// the inputs (immutable for the pass), the cursor workers claim runs of pieces
+// off, and the collector for the pieces that failed.
+type verifyJob struct {
+	hash       string
+	state      *serverTorrentState
+	regions    []utils.FileRegion
+	pieces     []int
+	onVerified func()
+
+	chunk int
+	next  atomic.Int64
+
+	failedMu sync.Mutex
+	failed   []int
+}
+
+// verifyWorker claims runs of consecutive pieces off the job's cursor until the
+// set is exhausted, reading each through its own fd cache and piece buffer -
+// both of which must stay this goroutine's own.
+func (s *Server) verifyWorker(ctx context.Context, job *verifyJob) {
+	cache := utils.NewFdCache()
+	defer cache.Close()
+	buf := make([]byte, job.state.pieceLength)
+
+	for {
+		start := int(job.next.Add(int64(job.chunk))) - job.chunk
+		if start >= len(job.pieces) {
+			return
+		}
+		for _, p := range job.pieces[start:min(start+job.chunk, len(job.pieces))] {
+			if !s.verifyOnePiece(ctx, cache, job.hash, job.state, job.regions, buf, p) {
+				job.failedMu.Lock()
+				job.failed = append(job.failed, p)
+				job.failedMu.Unlock()
+			}
+			if job.onVerified != nil {
+				job.onVerified()
+			}
+		}
+	}
+}
+
+// verifyChunkSize returns how many consecutive pieces one verify worker claims
+// per turn from the shared cursor.
+//
+// Claiming a single piece per turn hands each worker a stride-W read pattern:
+// its reads on any one file land pieceLength*W apart, which is not a sequential
+// stream to either the NFS client's readahead or the server's, so every read
+// pays the full round trip with nothing prefetched behind it. On a multi-file
+// torrent it also spreads every worker across every file, so the per-goroutine
+// FdCache opens W handles per file (W*F LOOKUP+OPEN round trips, and that many
+// fds held open for the pass) instead of one.
+//
+// A run keeps a worker inside one file reading forwards. The cap is what keeps
+// the cursor doing its other job: with several chunks per worker, a run that
+// hits slow storage is absorbed by the others instead of extending the pass.
+// Below the cap the split is exactly one run per worker, which is still
+// balanced because every piece costs the same read.
+func verifyChunkSize(pieces, workers int) int {
+	if workers <= 0 {
+		return 1
+	}
+	return max(1, min(verifyChunkPieces, pieces/workers))
 }
 
 // verifyOnePiece reads piece p through regions into buf (resliced to the piece's

@@ -1694,3 +1694,103 @@ func TestResolvePendingHardlinks_FirstFailureCancelsWaits(t *testing.T) {
 		t.Fatal("resolvePendingHardlinks did not return: siblings still waiting on their timeout")
 	}
 }
+
+// TestVerifyChunkSize pins the work-run sizing: every worker gets a run, the
+// run is capped once there are enough of them to keep the cursor balancing, and
+// it never drops to the one-piece-per-claim stride the runs exist to replace.
+func TestVerifyChunkSize(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		pieces, workers, want int
+	}{
+		{pieces: 0, workers: 0, want: 1},    // empty set: no division by zero
+		{pieces: 3, workers: 3, want: 1},    // one piece each is all there is
+		{pieces: 7, workers: 3, want: 2},    // below the cap: one run per worker
+		{pieces: 100, workers: 4, want: 25}, // below the cap: one run per worker
+		{pieces: 130, workers: 4, want: verifyChunkPieces},
+		{pieces: 40000, workers: 4, want: verifyChunkPieces},
+		{pieces: 1000, workers: 1, want: verifyChunkPieces},
+	}
+
+	for _, tc := range cases {
+		if got := verifyChunkSize(tc.pieces, tc.workers); got != tc.want {
+			t.Errorf("verifyChunkSize(%d, %d) = %d, want %d", tc.pieces, tc.workers, got, tc.want)
+		}
+	}
+}
+
+// TestVerifyPieceSet_ChunkedClaimsCoverEveryPieceExactlyOnce pins the run
+// arithmetic against the two ways it can go wrong: a claim that skips or
+// repeats pieces at a run boundary, and a final short run that overruns the
+// slice. Piece counts are chosen so the last run is partial in every case.
+func TestVerifyPieceSet_ChunkedClaimsCoverEveryPieceExactlyOnce(t *testing.T) {
+	t.Parallel()
+
+	const pieceLength = 16
+
+	cases := []struct{ pieces, workers int }{
+		{pieces: 3, workers: 16},  // fewer pieces than workers
+		{pieces: 7, workers: 3},   // run of 2, last run short
+		{pieces: 130, workers: 4}, // capped run, last run short
+		{pieces: 200, workers: 4}, // capped run, several runs per worker
+	}
+
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("pieces=%d/workers=%d", tc.pieces, tc.workers), func(t *testing.T) {
+			t.Parallel()
+
+			totalSize := int64(tc.pieces * pieceLength)
+			full := make([]byte, totalSize)
+			for i := range full {
+				full[i] = byte(i * 31)
+			}
+			hashes := make([]string, tc.pieces)
+			for p := range tc.pieces {
+				hashes[p] = utils.ComputeSHA1(full[p*pieceLength : (p+1)*pieceLength])
+			}
+
+			// Corrupt a scattered set so more than one run has to report, and
+			// so a run that silently skips pieces loses a known failure.
+			var want []int
+			onDisk := append([]byte(nil), full...)
+			for p := range tc.pieces {
+				if p%7 == 3 {
+					onDisk[p*pieceLength] ^= 0xff
+					want = append(want, p)
+				}
+			}
+
+			path := filepath.Join(t.TempDir(), "chunked.bin")
+			if err := os.WriteFile(path, onDisk, 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			state := &serverTorrentState{torrentMeta: torrentMeta{
+				pieceHashes: hashes,
+				pieceLength: pieceLength,
+				totalSize:   totalSize,
+			}}
+			regions := []utils.FileRegion{{Path: path, Offset: 0, Size: totalSize}}
+			pieces := make([]int, tc.pieces)
+			for i := range pieces {
+				pieces[i] = i
+			}
+
+			s, _ := newTestDestServer(t)
+			s.config.VerifyConcurrency = tc.workers
+
+			var disposed atomic.Int64
+			got := s.verifyPieceSet(t.Context(), "h", state, regions, pieces, func() {
+				disposed.Add(1)
+			})
+
+			if fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Errorf("failed pieces = %v, want %v", got, want)
+			}
+			if n := disposed.Load(); n != int64(tc.pieces) {
+				t.Errorf("pieces disposed of = %d, want %d", n, tc.pieces)
+			}
+		})
+	}
+}
