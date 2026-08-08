@@ -10,6 +10,7 @@ import (
 
 	"github.com/autobrr/go-qbittorrent"
 	"github.com/failsafe-go/failsafe-go"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/arsac/qb-sync/internal/metrics"
 	"github.com/arsac/qb-sync/internal/utils"
@@ -31,6 +32,12 @@ const (
 	idleSlowFactor = 5 // poll idle torrents every Nth tick (2.5s instead of 500ms)
 
 	queueFullLogInterval = 30 * time.Second // minimum interval between "queue full" warnings
+
+	// pollPieceStatesConcurrency bounds how many torrents have their piece
+	// states fetched at once. High enough to hide the per-call round-trip for a
+	// realistic active set, low enough that a poll tick never puts more than a
+	// handful of concurrent requests on the source qBittorrent's WebUI API.
+	pollPieceStatesConcurrency = 8
 )
 
 // PieceMonitorConfig configures the piece tracker.
@@ -590,6 +597,14 @@ func (t *PieceMonitor) startTracking(ctx context.Context, hash string, alreadyWr
 }
 
 // pollActiveTorrents fetches piece states for all tracked torrents.
+//
+// The fetches run concurrently: each is a qBittorrent API round-trip, so run
+// serially they cost the tick N x RTT and a source with dozens of active
+// torrents polls far slower than PollInterval. That interval is also the
+// re-offer latency for any piece a sender declined (window full) or a stale
+// ack requeued, so stretching it directly slows the transfer. Per-torrent
+// state is mutex-guarded and already mutated concurrently by the sender
+// workers, so the fan-out needs no extra synchronization.
 func (t *PieceMonitor) pollActiveTorrents(ctx context.Context) {
 	t.tickCount++
 
@@ -600,25 +615,44 @@ func (t *PieceMonitor) pollActiveTorrents(ctx context.Context) {
 	}
 	t.mu.RUnlock()
 
+	var g errgroup.Group
+	g.SetLimit(pollPieceStatesConcurrency)
+
 	for _, hash := range hashes {
 		if t.shouldSkipIdleTorrent(hash) {
 			metrics.IdlePollSkipsTotal.Inc()
 			continue
 		}
 
-		if err := t.pollTorrentPieces(ctx, hash); err != nil {
-			// If the torrent is no longer found, treat it as removed.
-			// This handles cases where the torrent was deleted between maindata syncs.
-			if errors.Is(err, ErrTorrentNotFound) {
-				t.handleTorrentNotFound(ctx, hash)
-				continue
-			}
-			t.logger.WarnContext(ctx, "failed to poll torrent pieces",
-				"hash", hash,
-				"error", err,
-			)
-		}
+		g.Go(func() error {
+			t.pollOneTorrent(ctx, hash)
+			return nil
+		})
 	}
+
+	_ = g.Wait() // pollOneTorrent handles every failure itself.
+}
+
+// pollOneTorrent fetches and applies one torrent's piece states. Failures are
+// handled here rather than propagated so one unreachable torrent neither
+// aborts the tick nor cancels its siblings' in-flight requests.
+func (t *PieceMonitor) pollOneTorrent(ctx context.Context, hash string) {
+	err := t.pollTorrentPieces(ctx, hash)
+	if err == nil {
+		return
+	}
+
+	// A torrent that is no longer found was deleted between maindata syncs;
+	// treat it as removed.
+	if errors.Is(err, ErrTorrentNotFound) {
+		t.handleTorrentNotFound(ctx, hash)
+		return
+	}
+
+	t.logger.WarnContext(ctx, "failed to poll torrent pieces",
+		"hash", hash,
+		"error", err,
+	)
 }
 
 // shouldSkipIdleTorrent returns true if the torrent has been idle long enough

@@ -3,7 +3,9 @@ package streaming
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -755,5 +757,167 @@ func TestGetProgress_ReportsTheStallSignal(t *testing.T) {
 	if progress.Available != numPieces {
 		t.Errorf("Available = %d, want %d: every piece is downloaded on the source and unstreamed",
 			progress.Available, numPieces)
+	}
+}
+
+// fanoutProbeSource records the concurrency pollActiveTorrents achieves and
+// returns a piece-state pattern derived from the requested hash, so a poll that
+// applied one torrent's states to another's state is detectable.
+//
+// Each call parks until releaseTarget calls are simultaneously in flight. A
+// serial poll can never reach that, so a watchdog started on the first call
+// releases everyone after fanoutProbeTimeout - long enough that the fan-out
+// wins the race on any machine, short enough that a regression fails rather
+// than hangs.
+type fanoutProbeSource struct {
+	numPieces     int
+	releaseTarget int64
+
+	inFlight atomic.Int64
+	maxSeen  atomic.Int64
+
+	releaseOnce sync.Once
+	release     chan struct{}
+	armOnce     sync.Once
+
+	callsMu sync.Mutex
+	calls   map[string]int
+}
+
+const fanoutProbeTimeout = 2 * time.Second
+
+func newFanoutProbeSource(numPieces int, releaseTarget int64) *fanoutProbeSource {
+	return &fanoutProbeSource{
+		numPieces:     numPieces,
+		releaseTarget: releaseTarget,
+		release:       make(chan struct{}),
+		calls:         make(map[string]int),
+	}
+}
+
+func (s *fanoutProbeSource) releaseAll() {
+	s.releaseOnce.Do(func() { close(s.release) })
+}
+
+// downloadedPiece maps a hash to the single piece index it reports as
+// downloaded: "t03" -> 3. Distinct per torrent so a cross-wired result is a
+// mismatch rather than an indistinguishable duplicate.
+func (s *fanoutProbeSource) downloadedPiece(hash string) int {
+	idx := 0
+	for _, c := range hash[1:] {
+		idx = idx*10 + int(c-'0')
+	}
+	return idx
+}
+
+func (s *fanoutProbeSource) GetPieceStates(_ context.Context, hash string) ([]PieceState, error) {
+	s.armOnce.Do(func() { time.AfterFunc(fanoutProbeTimeout, s.releaseAll) })
+
+	n := s.inFlight.Add(1)
+	for {
+		seen := s.maxSeen.Load()
+		if n <= seen || s.maxSeen.CompareAndSwap(seen, n) {
+			break
+		}
+	}
+	if n >= s.releaseTarget {
+		s.releaseAll()
+	}
+	<-s.release
+	s.inFlight.Add(-1)
+
+	s.callsMu.Lock()
+	s.calls[hash]++
+	s.callsMu.Unlock()
+
+	states := make([]PieceState, s.numPieces)
+	states[s.downloadedPiece(hash)] = PieceStateDownloaded
+	return states, nil
+}
+
+func (s *fanoutProbeSource) GetPieceHashes(context.Context, string) ([]string, error) {
+	return make([]string, s.numPieces), nil
+}
+
+func (s *fanoutProbeSource) GetTorrentMetadata(context.Context, string) (*TorrentMetadata, error) {
+	return nil, errors.New("not used")
+}
+
+func (s *fanoutProbeSource) ReadPiece(context.Context, *pb.Piece) ([]byte, error) {
+	return nil, errors.New("not used")
+}
+
+// TestPollActiveTorrents_FansOutWithoutCrossWiring pins both halves of the
+// concurrent poll: the per-torrent piece-state fetches overlap (a serial loop
+// only ever reaches an in-flight count of 1), and every torrent's states are
+// applied to its own torrentState.
+func TestPollActiveTorrents_FansOutWithoutCrossWiring(t *testing.T) {
+	t.Parallel()
+
+	const (
+		numTorrents = 20
+		numPieces   = 32
+	)
+
+	src := newFanoutProbeSource(numPieces, pollPieceStatesConcurrency)
+	monitor := newTestMonitor()
+	monitor.source = src
+
+	hashes := make([]string, numTorrents)
+	for i := range numTorrents {
+		hash := fmt.Sprintf("t%02d", i)
+		hashes[i] = hash
+		state := newTestState(numPieces)
+		state.meta.TorrentHash = hash
+		state.meta.PieceSize = 1
+		state.meta.TotalSize = numPieces
+		monitor.torrents[hash] = state
+	}
+
+	monitor.pollActiveTorrents(context.Background())
+
+	if got := src.maxSeen.Load(); got < pollPieceStatesConcurrency {
+		t.Errorf("max concurrent GetPieceStates = %d, want %d: piece-state polls did not overlap",
+			got, pollPieceStatesConcurrency)
+	}
+
+	src.callsMu.Lock()
+	calls := len(src.calls)
+	src.callsMu.Unlock()
+	if calls != numTorrents {
+		t.Errorf("polled %d distinct torrents, want %d", calls, numTorrents)
+	}
+
+	for _, hash := range hashes {
+		state := monitor.torrents[hash]
+		want := src.downloadedPiece(hash)
+		for i, ps := range state.lastStates {
+			downloaded := ps == PieceStateDownloaded
+			if downloaded != (i == want) {
+				t.Fatalf("%s: piece %d downloaded=%v, want downloaded only at %d "+
+					"(states applied to the wrong torrent)", hash, i, downloaded, want)
+			}
+		}
+	}
+
+	// Each torrent queues exactly its own downloaded piece.
+	queued := make(map[string]int32)
+	for range numTorrents {
+		select {
+		case piece := <-monitor.Completed():
+			queued[piece.GetTorrentHash()] = piece.GetIndex()
+		default:
+			t.Fatalf("expected %d queued pieces, got %d", numTorrents, len(queued))
+		}
+	}
+	for _, hash := range hashes {
+		idx, ok := queued[hash]
+		if !ok {
+			t.Errorf("%s queued no piece", hash)
+			continue
+		}
+		if int(idx) != src.downloadedPiece(hash) {
+			t.Errorf("%s queued piece %d, want %d", hash, idx, src.downloadedPiece(hash))
+		}
 	}
 }
