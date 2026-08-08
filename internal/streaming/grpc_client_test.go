@@ -943,13 +943,16 @@ func TestHandlePlateau_TriggersConnectionAdd(t *testing.T) {
 		t.Fatalf("expected 2 connections after plateau, got %d", dest.ConnectionCount())
 	}
 
-	// Verify state was set for diminishing returns check
+	// Verify the connection was added on trial, not kept unconditionally
 	pool.mu.Lock()
-	if !pool.connectionScaleCheckPending {
-		t.Error("connectionScaleCheckPending should be true after connection add")
+	if pool.probe == nil {
+		t.Fatal("a probe should be armed after connection add")
 	}
-	if pool.preConnectionThroughput != 100.0 {
-		t.Errorf("preConnectionThroughput = %f, want 100.0", pool.preConnectionThroughput)
+	if pool.probe.unit != unitConnection {
+		t.Errorf("probe unit = %q, want %q", pool.probe.unit, unitConnection)
+	}
+	if pool.probe.baseline != 100.0 {
+		t.Errorf("probe baseline = %f, want 100.0", pool.probe.baseline)
 	}
 	if pool.plateauCount != 0 {
 		t.Errorf("plateauCount should be reset to 0, got %d", pool.plateauCount)
@@ -1059,6 +1062,128 @@ func TestUpdateThroughput_ScalesOnMeasuredChange(t *testing.T) {
 	})
 }
 
+// TestScaleUp_ProbedStreamMustPayForItself pins the mechanism that keeps the
+// pool from ratcheting: a stream added because throughput rose is on trial, and
+// the interval after it settles decides whether it stays. Without the trial the
+// pool adds above +5% but only sheds below -15%, so link noise alone walks it
+// to maxStreams regardless of what the added streams carry.
+func TestScaleUp_ProbedStreamMustPayForItself(t *testing.T) {
+	t.Parallel()
+
+	addr := startTestGRPCServerAddr(t, func(stream pb.QBSyncService_StreamPiecesBidiServer) error {
+		<-stream.Context().Done()
+		return stream.Context().Err()
+	})
+
+	// scaleUpFromBaseline drives the two measurement intervals that add a stream
+	// and arm its probe, and returns the pool sitting on that pending verdict.
+	scaleUpFromBaseline := func(t *testing.T) *StreamPool {
+		t.Helper()
+
+		dest, err := NewGRPCDestination(addr, 1, 4)
+		if err != nil {
+			t.Fatalf("NewGRPCDestination: %v", err)
+		}
+		t.Cleanup(func() { _ = dest.Close() })
+
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+
+		pool := newAdaptiveScalingTestPool(ctx, cancel, dest, newStubPooledStreams(MinPoolSize))
+
+		measureInterval(pool, 10<<20) // baseline: 5 MB/s
+		measureInterval(pool, 30<<20) // 10 MB/s, +100% -> probe a stream
+
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+		if len(pool.streams) != MinPoolSize+1 {
+			t.Fatalf("streams = %d, want %d after scale-up", len(pool.streams), MinPoolSize+1)
+		}
+		if pool.probe == nil || pool.probe.unit != unitStream {
+			t.Fatalf("probe = %+v, want a stream probe", pool.probe)
+		}
+		return pool
+	}
+
+	// settleProbe backdates the pending probe past its settle window so the next
+	// measurement delivers the verdict.
+	settleProbe := func(pool *StreamPool) {
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+		pool.probe.addedAt = time.Now().Add(-(probeSettleIntervals + 1) * defaultScaleInterval)
+	}
+
+	t.Run("verdict waits out the settle window", func(t *testing.T) {
+		t.Parallel()
+
+		pool := scaleUpFromBaseline(t)
+
+		// A doubling one interval in is not yet attributable to the new stream,
+		// and acting on it would add a second stream whose contribution then
+		// pollutes the first one's verdict.
+		measureInterval(pool, 70<<20)
+
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+		if got := len(pool.streams); got != MinPoolSize+1 {
+			t.Errorf("streams = %d, want %d: the pool scaled while a probe was pending", got, MinPoolSize+1)
+		}
+		if pool.probe == nil {
+			t.Error("probe should still be pending before its settle window elapses")
+		}
+	})
+
+	t.Run("unhelpful add is undone", func(t *testing.T) {
+		t.Parallel()
+
+		pool := scaleUpFromBaseline(t)
+		settleProbe(pool)
+
+		measureInterval(pool, 50<<20) // still 10 MB/s: the added stream carried nothing
+
+		// drainAndRemoveStream runs as a goroutine. Poll rather than joining
+		// pool.wg, which also holds the added stream's receive loop and so would
+		// hang instead of failing if the stream is never drained.
+		deadline := time.Now().Add(2 * time.Second)
+		for pool.StreamCount() > MinPoolSize && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+		if got := len(pool.streams); got != MinPoolSize {
+			t.Errorf("streams = %d, want %d: a stream that added no throughput was kept", got, MinPoolSize)
+		}
+		if pool.probe != nil {
+			t.Error("probe should be cleared once its verdict is in")
+		}
+		if !pool.scalingPaused {
+			t.Error("scaling should be paused after an add is undone")
+		}
+	})
+
+	t.Run("paying add is kept and earns another", func(t *testing.T) {
+		t.Parallel()
+
+		pool := scaleUpFromBaseline(t)
+		settleProbe(pool)
+
+		measureInterval(pool, 70<<20) // 20 MB/s: the added stream doubled throughput
+
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+		if got := len(pool.streams); got != MinPoolSize+2 {
+			t.Errorf("streams = %d, want %d: an effective add did not earn a staircase step", got, MinPoolSize+2)
+		}
+		if pool.probe == nil || pool.probe.unit != unitStream {
+			t.Fatalf("probe = %+v, want a fresh stream probe", pool.probe)
+		}
+		if pool.scalingPaused {
+			t.Error("scaling should not be paused while the staircase is still climbing")
+		}
+	})
+}
+
 // TestHandlePlateau_FullSaturationPauses verifies that when at max connections
 // and max streams, handlePlateau pauses scaling unconditionally.
 func TestHandlePlateau_FullSaturationPauses(t *testing.T) {
@@ -1120,20 +1245,22 @@ func TestDiminishingReturns_TriggersScaleDown(t *testing.T) {
 
 	pool.mu.Lock()
 
-	// Simulate: connection was added, check pending, barely any improvement
-	pool.connectionScaleCheckPending = true
-	pool.preConnectionThroughput = 100.0
-	pool.connectionAddedTime = time.Now().Add(-3 * defaultScaleInterval) // Past check window
+	// Simulate: connection was added on trial, barely any improvement since
+	pool.probe = &scaleProbe{
+		unit:     unitConnection,
+		baseline: 100.0,
+		addedAt:  time.Now().Add(-3 * defaultScaleInterval), // Past check window
+	}
 
-	// Current throughput: 102 MB/s, only 2% above preConnectionThroughput,
+	// Current throughput: 102 MB/s, only 2% above the probe's baseline,
 	// below the 5% threshold that would call the connection add effective.
 	pool.applyScalingDecision(102.0, 102.0)
 
 	if !pool.scalingPaused {
 		t.Error("scaling should be paused after diminishing returns")
 	}
-	if pool.connectionScaleCheckPending {
-		t.Error("connectionScaleCheckPending should be cleared")
+	if pool.probe != nil {
+		t.Error("probe should be cleared")
 	}
 	pool.mu.Unlock()
 
@@ -1146,8 +1273,9 @@ func TestDiminishingReturns_TriggersScaleDown(t *testing.T) {
 	}
 }
 
-// TestDiminishingReturns_GoodImprovement verifies that when a connection
-// add yields >= 5% improvement, scaling continues normally.
+// TestDiminishingReturns_GoodImprovement verifies that a connection add
+// yielding >= 5% improvement is kept and earns another step of the staircase:
+// a second connection, itself on trial against the improved baseline.
 func TestDiminishingReturns_GoodImprovement(t *testing.T) {
 	t.Parallel()
 
@@ -1169,20 +1297,32 @@ func TestDiminishingReturns_GoodImprovement(t *testing.T) {
 
 	pool.mu.Lock()
 
-	// Simulate: connection added, 10% improvement (above 5% threshold)
-	pool.connectionScaleCheckPending = true
-	pool.preConnectionThroughput = 100.0
-	pool.connectionAddedTime = time.Now().Add(-3 * defaultScaleInterval)
+	// Simulate: connection added on trial, 10% improvement (above 5% threshold)
+	pool.probe = &scaleProbe{
+		unit:     unitConnection,
+		baseline: 100.0,
+		addedAt:  time.Now().Add(-3 * defaultScaleInterval),
+	}
 
 	pool.applyScalingDecision(110.0, 110.0)
 
 	if pool.scalingPaused {
 		t.Error("scaling should NOT be paused after good improvement")
 	}
-	if pool.connectionScaleCheckPending {
-		t.Error("connectionScaleCheckPending should be cleared after check")
+	if pool.probe == nil {
+		t.Fatal("an effective add should earn another probe, not clear scaling state")
+	}
+	if pool.probe.unit != unitConnection {
+		t.Errorf("next probe unit = %q, want %q", pool.probe.unit, unitConnection)
+	}
+	if pool.probe.baseline != 110.0 {
+		t.Errorf("next probe baseline = %f, want 110.0 (the improved throughput)", pool.probe.baseline)
 	}
 	pool.mu.Unlock()
+
+	if dest.ConnectionCount() != 2 {
+		t.Fatalf("connections = %d, want 2 after the staircase step", dest.ConnectionCount())
+	}
 }
 
 // stubClient is a minimal QBSyncServiceClient for testing round-robin distribution.

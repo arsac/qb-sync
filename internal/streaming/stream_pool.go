@@ -38,6 +38,7 @@ const (
 	defaultPlateauThreshold   = 0.03             // <3% change considered plateau
 	defaultPlateauCount       = 3                // Consecutive plateaus before stopping
 	scalingCooldownPeriod     = 30 * time.Second // Cooldown before resuming scaling (was 2min)
+	probeSettleIntervals      = 2                // Measurement intervals a capacity add gets to prove itself
 
 	// streamDrainTimeout is how long drainAndRemoveStream waits for in-flight
 	// pieces to complete before closing the stream anyway.
@@ -115,14 +116,10 @@ type StreamPool struct {
 	lastBytesSent     int64   // Total bytes at last measurement
 	removedBytesSent  int64   // Cumulative bytes from removed streams
 	lastMeasureTime   time.Time
-	plateauCount      int       // Consecutive intervals with <5% change
-	scalingPaused     bool      // Stop scaling after saturation detected
-	scalingPausedTime time.Time // When scaling was paused (for cooldown)
-
-	// Connection-level scaling state (protected by mu)
-	preConnectionThroughput     float64   // Throughput before last connection add
-	connectionAddedTime         time.Time // When last connection was added
-	connectionScaleCheckPending bool      // Awaiting diminishing returns check
+	plateauCount      int         // Consecutive intervals with <5% change
+	scalingPaused     bool        // Stop scaling after saturation detected
+	scalingPausedTime time.Time   // When scaling was paused (for cooldown)
+	probe             *scaleProbe // Capacity unit on trial, nil when none
 
 	// Lifecycle
 	ctx       context.Context
@@ -130,6 +127,29 @@ type StreamPool struct {
 	wg        sync.WaitGroup
 	closed    atomic.Bool
 	closeOnce sync.Once
+}
+
+// scaleUnit names the kind of capacity a probe added.
+type scaleUnit string
+
+const (
+	unitStream     scaleUnit = "stream"
+	unitConnection scaleUnit = "connection"
+)
+
+// scaleProbe records a capacity unit added on trial. Every add - a stream or a
+// TCP connection - is a probe: the pool keeps the unit only if the throughput
+// measured probeSettleIntervals later beats the throughput measured just before
+// the add, and undoes it otherwise.
+//
+// Without that check an add is a ratchet rather than a decision. The pool adds
+// a stream on any interval measuring more than +5% but only sheds one below
+// -15%, so on a noisy link the asymmetry alone walks the pool to maxStreams
+// whatever the added streams actually carry.
+type scaleProbe struct {
+	unit     scaleUnit
+	baseline float64   // Throughput measured immediately before the add
+	addedAt  time.Time // When the unit was added
 }
 
 // StreamPoolConfig configures the stream pool. The initial stream count is not
@@ -500,26 +520,11 @@ func (p *StreamPool) measureThroughput() (float64, bool) {
 // previousThroughput to currentThroughput, both in bytes/sec.
 // Must hold p.mu.
 func (p *StreamPool) applyScalingDecision(currentThroughput, previousThroughput float64) {
-	// Check diminishing returns from recent connection add
-	if p.connectionScaleCheckPending && time.Since(p.connectionAddedTime) >= 2*p.scaleInterval {
-		p.connectionScaleCheckPending = false
-		var improvement float64
-		if p.preConnectionThroughput > 0 {
-			improvement = (currentThroughput - p.preConnectionThroughput) / p.preConnectionThroughput
-		}
-		if improvement < defaultScaleUpThreshold {
-			p.logger.InfoContext(p.ctx, "diminishing returns from connection add",
-				"improvementPercent", improvement*percentMultiple,
-				"connections", p.dest.ConnectionCount(),
-			)
-			p.tryConnectionScaleDown()
-			p.pauseScaling("diminishing returns")
-			return
-		}
-		p.logger.InfoContext(p.ctx, "connection add effective",
-			"improvementPercent", improvement*percentMultiple,
-			"connections", p.dest.ConnectionCount(),
-		)
+	// A capacity unit on trial owns the pool until its verdict lands: a second
+	// add in the meantime would be measured as part of the first one's payoff.
+	if p.probe != nil {
+		p.evaluateProbe(currentThroughput)
+		return
 	}
 
 	var changeRatio float64
@@ -539,7 +544,7 @@ func (p *StreamPool) applyScalingDecision(currentThroughput, previousThroughput 
 
 	switch {
 	case changeRatio > defaultScaleUpThreshold && streamCount < p.maxStreams:
-		p.tryScaleUp()
+		p.probeStream(currentThroughput)
 
 	case changeRatio < -defaultScaleDownThreshold && streamCount > MinPoolSize:
 		p.tryScaleDown()
@@ -553,19 +558,106 @@ func (p *StreamPool) applyScalingDecision(currentThroughput, previousThroughput 
 	}
 }
 
-// tryScaleUp attempts to add a stream. Must hold p.mu.
-func (p *StreamPool) tryScaleUp() {
+// evaluateProbe decides the fate of the capacity unit currently on trial, once
+// it has had probeSettleIntervals to show up in a measurement. A unit that beat
+// its baseline earns another of the same kind - the staircase - and one that did
+// not is removed again. Must hold p.mu.
+func (p *StreamPool) evaluateProbe(currentThroughput float64) {
+	probe := p.probe
+	if time.Since(probe.addedAt) < probeSettleIntervals*p.scaleInterval {
+		return
+	}
+	p.probe = nil
+
+	var improvement float64
+	if probe.baseline > 0 {
+		improvement = (currentThroughput - probe.baseline) / probe.baseline
+	}
+
+	if improvement < defaultScaleUpThreshold {
+		p.logger.InfoContext(p.ctx, "diminishing returns from capacity add",
+			"unit", string(probe.unit),
+			"improvementPercent", improvement*percentMultiple,
+			"streams", len(p.streams),
+			"connections", p.dest.ConnectionCount(),
+		)
+		p.undoProbe(probe.unit)
+		p.pauseScaling("diminishing returns")
+		return
+	}
+
+	p.logger.InfoContext(p.ctx, "capacity add effective",
+		"unit", string(probe.unit),
+		"improvementPercent", improvement*percentMultiple,
+		"streams", len(p.streams),
+		"connections", p.dest.ConnectionCount(),
+	)
+
+	switch probe.unit {
+	case unitStream:
+		p.probeStream(currentThroughput)
+	case unitConnection:
+		p.probeConnection(currentThroughput)
+	}
+}
+
+// undoProbe gives back a capacity unit of the kind the probe added. It sheds
+// the pool's last such unit rather than the exact one, since a stream can die
+// on its own while its probe is pending; the counts are what the next
+// measurement reflects either way, and both floors still apply.
+// Must hold p.mu.
+func (p *StreamPool) undoProbe(unit scaleUnit) {
+	switch unit {
+	case unitStream:
+		if err := p.removeStreamLocked(); err != nil {
+			p.logger.WarnContext(p.ctx, "failed to remove probed stream", "error", err)
+		}
+	case unitConnection:
+		p.tryConnectionScaleDown()
+	}
+}
+
+// probeStream adds a stream on trial, with currentThroughput as its baseline.
+// A pool already at maxStreams simply ends the climb: nothing is armed, so the
+// next measurement scales normally. Must hold p.mu.
+func (p *StreamPool) probeStream(currentThroughput float64) {
+	if len(p.streams) >= p.maxStreams {
+		return
+	}
 	if err := p.addStreamLocked(); err != nil {
 		metrics.StreamOpenErrorsTotal.WithLabelValues(metrics.ModeSource).Inc()
 		p.logger.WarnContext(p.ctx, "failed to add stream", "error", err)
 		return
 	}
+	p.probe = &scaleProbe{unit: unitStream, baseline: currentThroughput, addedAt: time.Now()}
 	metrics.StreamPoolSize.Set(float64(len(p.streams)))
 	p.logger.InfoContext(p.ctx, "scaled up",
 		"streams", len(p.streams),
 		"reason", "throughput increased",
 	)
 	p.plateauCount = 0
+}
+
+// probeConnection adds a TCP connection on trial, with currentThroughput as its
+// baseline, and reports whether one was added. Must hold p.mu.
+func (p *StreamPool) probeConnection(currentThroughput float64) bool {
+	if p.dest.ConnectionCount() >= p.dest.MaxConnections() {
+		return false
+	}
+	if err := p.dest.AddConnection(); err != nil {
+		p.logger.WarnContext(p.ctx, "failed to add connection", "error", err)
+		return false
+	}
+	p.probe = &scaleProbe{unit: unitConnection, baseline: currentThroughput, addedAt: time.Now()}
+
+	connCount := p.dest.ConnectionCount()
+	metrics.GRPCConnectionsActive.Set(float64(connCount))
+	metrics.ConnectionScaleEventsTotal.WithLabelValues(metrics.DirectionUp).Inc()
+	p.logger.InfoContext(p.ctx, "added TCP connection",
+		"connections", connCount,
+		"throughputMBps", currentThroughput/grpcutil.BytesPerMB,
+	)
+	return true
 }
 
 // tryScaleDown attempts to remove a stream. If streams are at minimum,
@@ -598,26 +690,15 @@ func (p *StreamPool) handlePlateau(currentThroughput float64) {
 		return
 	}
 
-	// Try connection-level scaling before giving up
+	// Try connection-level scaling before giving up. probeConnection re-checks
+	// the ceiling, but it reports only a bool, so the caller has to know which
+	// side of the ceiling it is on to pick the right pause reason.
 	if p.dest.ConnectionCount() < p.dest.MaxConnections() {
-		if err := p.dest.AddConnection(); err != nil {
-			p.logger.WarnContext(p.ctx, "failed to add connection", "error", err)
+		if !p.probeConnection(currentThroughput) {
 			p.pauseScaling("connection add failed")
 			return
 		}
-
-		p.preConnectionThroughput = currentThroughput
-		p.connectionAddedTime = time.Now()
-		p.connectionScaleCheckPending = true
 		p.plateauCount = 0 // Resume stream scaling on new baseline
-
-		connCount := p.dest.ConnectionCount()
-		metrics.GRPCConnectionsActive.Set(float64(connCount))
-		metrics.ConnectionScaleEventsTotal.WithLabelValues(metrics.DirectionUp).Inc()
-		p.logger.InfoContext(p.ctx, "added TCP connection",
-			"connections", connCount,
-			"throughputMBps", currentThroughput/grpcutil.BytesPerMB,
-		)
 		return
 	}
 
