@@ -265,7 +265,26 @@ func (s *Server) initNewTorrent(
 		"piecesHave", haveCount,
 	)
 
+	s.startPreVerify(hash, state)
+
 	return state.buildReadyResponse()
+}
+
+// startPreVerify kicks off the read-back verification of files that were already
+// complete on disk at init, so it overlaps the transfer instead of the finalize
+// stall. Nothing downstream depends on it finishing: it only ever adds skips for
+// verifyFinalizedPieces, so a cancelled or never-launched pass just leaves the
+// pre-change amount of work at finalize.
+func (s *Server) startPreVerify(hash string, state *serverTorrentState) {
+	if s.config.DryRun || len(state.pieceHashes) == 0 || len(preVerifyCandidates(state)) == 0 {
+		return
+	}
+	if s.bgCtx.Err() != nil {
+		return
+	}
+	s.bgWg.Go(func() {
+		s.preVerifyCompleteFiles(s.bgCtx, hash, state)
+	})
 }
 
 // maybeRelocateSubPath checks whether the persisted sub-path differs from the

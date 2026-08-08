@@ -824,13 +824,116 @@ func TestVerifyFilePieces_ScatteredCorruption(t *testing.T) {
 			}
 			defer fh.Close()
 
-			if got := s.verifyFilePieces(state, fi, fh); !slices.Equal(got, want) {
+			if got, _ := s.verifyFilePieces(t.Context(), state, fi, fh); !slices.Equal(got, want) {
 				t.Errorf("shared handle: failed pieces = %v, want %v", got, want)
 			}
 			// nil handle exercises the self-open path for every worker.
-			if got := s.verifyFilePieces(state, fi, nil); !slices.Equal(got, want) {
+			if got, _ := s.verifyFilePieces(t.Context(), state, fi, nil); !slices.Equal(got, want) {
 				t.Errorf("self-opened: failed pieces = %v, want %v", got, want)
 			}
+
+			// A cancelled pass must fail closed: callers read "not in the
+			// failed set" as proof a piece was read back and matched, so it
+			// reports every piece it never got to rather than shrinking its
+			// coverage silently.
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			got, interrupted := s.verifyFilePieces(ctx, state, fi, fh)
+			if !interrupted {
+				t.Error("cancelled pass reported interrupted = false")
+			}
+			if allInterior := []int{1, 2, 3, 4, 5, 6, 7, 8, 9}; !slices.Equal(got, allInterior) {
+				t.Errorf("cancelled: failed pieces = %v, want %v", got, allInterior)
+			}
 		})
+	}
+}
+
+// TestPreVerifyCompleteFiles pins the init-time read-back pass to exactly the
+// files whose data is already on disk and immutable: pre-existing/hardlinked
+// (hlStateComplete) selected files. Everything else - a streamed .partial, a
+// pending hardlink whose file doesn't exist yet, an unselected file - must be
+// left for verifyFinalizedPieces, as must boundary pieces and any piece that
+// fails to read back. The written bitmap must come out untouched: these files
+// are skipForWriteData, so clearing a bit here would ask the source to
+// re-stream data writePieceData would drop.
+func TestPreVerifyCompleteFiles(t *testing.T) {
+	t.Parallel()
+
+	const (
+		pieceLength = 16
+		numPieces   = 11
+	)
+	totalSize := int64(pieceLength * numPieces)
+
+	full := make([]byte, totalSize)
+	for i := range full {
+		full[i] = byte(i * 7)
+	}
+	hashes := make([]string, numPieces)
+	for p := range numPieces {
+		hashes[p] = utils.ComputeSHA1(full[p*pieceLength : (p+1)*pieceLength])
+	}
+
+	dir := t.TempDir()
+	// write drops file content at [offset, offset+size) onto disk, optionally
+	// flipping a byte so one piece fails its read-back.
+	write := func(name string, offset, size int64, corruptAt int64) string {
+		path := filepath.Join(dir, name)
+		content := slices.Clone(full[offset : offset+size])
+		if corruptAt >= 0 {
+			content[corruptAt-offset] ^= 0xff
+		}
+		if err := os.WriteFile(path, content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	complete := hardlinkInfo{state: hlStateComplete}
+	files := []*serverFileInfo{
+		// Candidate, clean: pieces 0-2 interior.
+		{path: write("a.bin", 0, 48, -1), offset: 0, size: 48, selected: true, hardlink: complete},
+		// Candidate with piece 4 corrupted; piece 5 spans into the next file.
+		{path: write("b.bin", 48, 40, 4*pieceLength), offset: 48, size: 40, selected: true, hardlink: complete},
+		// Streamed .partial: readable and correct, but not a candidate.
+		{path: write("c.bin.partial", 88, 24, -1), offset: 88, size: 24, selected: true},
+		// Pending hardlink: file does not exist yet.
+		{path: filepath.Join(dir, "d.bin"), offset: 112, size: 32, selected: true,
+			hardlink: hardlinkInfo{state: hlStatePending}},
+		// Unselected: no data on disk at all.
+		{path: filepath.Join(dir, "e.bin"), offset: 144, size: 32},
+	}
+
+	meta := torrentMeta{
+		pieceHashes: hashes,
+		pieceLength: pieceLength,
+		totalSize:   totalSize,
+		files:       files,
+	}
+	meta.computeFilePieceRanges()
+
+	written := bitset.New(numPieces)
+	written.FlipRange(0, numPieces)
+	state := &serverTorrentState{
+		torrentMeta: meta,
+		written:     written,
+		verified:    bitset.New(numPieces),
+	}
+
+	s, _ := newTestDestServer(t)
+	s.preVerifyCompleteFiles(t.Context(), "hash", state)
+
+	var got []int
+	for p := range numPieces {
+		if state.verified.Test(uint(p)) {
+			got = append(got, p)
+		}
+	}
+	if want := []int{0, 1, 2, 3}; !slices.Equal(got, want) {
+		t.Errorf("verified pieces = %v, want %v", got, want)
+	}
+	if state.written.Count() != numPieces {
+		t.Errorf("written pieces = %d, want %d (pass must not clear bits)", state.written.Count(), numPieces)
 	}
 }

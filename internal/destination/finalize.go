@@ -894,8 +894,8 @@ func computeDiskStageTimeout(totalSize int64) time.Duration {
 }
 
 // verifyConcurrency returns the operator-configured per-piece read concurrency
-// for a read-back verify pass (verifyFinalizedPieces and the early-finalize
-// verifyFilePieces alike), falling back to the default. Higher values speed up
+// for a read-back verify pass (verifyFinalizedPieces plus verifyFilePieces, at
+// both init pre-verification and early finalization), falling back to the default. Higher values speed up
 // verification on healthy storage; on undersized NFS exports they can compound
 // queue depth on the server.
 // Clamped to maxVerifyConcurrencyCap defensively: ServerConfig.Validate is

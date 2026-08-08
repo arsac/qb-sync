@@ -144,7 +144,7 @@ type ServerConfig struct {
 	SavePath           string        // Path as destination qBittorrent sees it (container mount, e.g., "/downloads"). Defaults to BasePath.
 	StateFlushInterval time.Duration // How often to flush dirty state (0 = use default)
 	StreamWorkers      int           // Number of concurrent piece writers (0 = use default)
-	VerifyConcurrency  int           // Concurrent piece-read goroutines per read-back verify pass, early and full finalization alike (0 = use default 4). Raise on healthy storage to speed verification; lower if your NFS server can't handle the burst.
+	VerifyConcurrency  int           // Concurrent piece-read goroutines per read-back verify pass - init pre-verify, early finalization, and full finalization alike (0 = use default 4). Raise on healthy storage to speed verification; lower if your NFS server can't handle the burst.
 
 	// Arr configures the Sonarr/Radarr instances consulted by
 	// CheckArrRejections. Zero instances disable the filter, and the server then

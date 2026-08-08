@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -139,8 +140,9 @@ func (s *Server) writePiece(ctx context.Context, req *pb.WritePieceRequest) writ
 
 // verifyFilePieces reads back interior pieces from a synced .partial file and
 // verifies their hashes. Returns indices of pieces that failed verification,
-// ascending. Boundary pieces (spanning adjacent files) are skipped - they are
-// deferred to verifyFinalizedPieces.
+// ascending, and whether ctx cancellation cut the pass short. Boundary pieces
+// (spanning adjacent files) are skipped - they are deferred to
+// verifyFinalizedPieces.
 //
 // If fh is non-nil, reads go through it directly (saves NFS open round-trips
 // per piece). If fh is nil, opens fi.path for the duration of the verify pass.
@@ -148,12 +150,13 @@ func (s *Server) writePiece(ctx context.Context, req *pb.WritePieceRequest) writ
 // Safe to call without state.mu: all accessed fields (pieceHashes, pieceLength,
 // totalSize, fi geometry) are immutable after initialization.
 func (s *Server) verifyFilePieces(
+	ctx context.Context,
 	state *serverTorrentState,
 	fi *serverFileInfo,
 	fh *os.File,
-) []int {
+) ([]int, bool) {
 	if len(state.pieceHashes) == 0 {
-		return nil
+		return nil, false
 	}
 
 	var pieces []int
@@ -161,7 +164,7 @@ func (s *Server) verifyFilePieces(
 		pieces = append(pieces, p)
 	})
 	if len(pieces) == 0 {
-		return nil
+		return nil, false
 	}
 
 	if fh == nil {
@@ -170,13 +173,13 @@ func (s *Server) verifyFilePieces(
 			// Can't read anything - treat every interior piece as failed so
 			// the caller re-streams them. Boundary pieces are deferred to
 			// verifyFinalizedPieces regardless.
-			return pieces
+			return pieces, false
 		}
 		defer f.Close()
 		fh = f
 	}
 
-	return s.verifyPiecesParallel(state, fi, fh, pieces)
+	return s.verifyPiecesParallel(ctx, state, fi, fh, pieces), ctx.Err() != nil
 }
 
 // verifyPiecesParallel read-back-verifies pieces with the same worker-pool
@@ -190,7 +193,13 @@ func (s *Server) verifyFilePieces(
 // hashes it) and, past the first, its own read fd: the per-file open cost is
 // paid once, not per piece, and mirrors the per-goroutine FdCache rule that
 // verify workers never share a handle.
+//
+// Cancelling ctx stops the reads but the pass still drains the queue, reporting
+// every piece it never got to as failed. Callers act on "not in the failed set"
+// as proof a piece was read back and matched, so an interrupted pass has to fail
+// closed rather than silently shrink its coverage.
 func (s *Server) verifyPiecesParallel(
+	ctx context.Context,
 	state *serverTorrentState,
 	fi *serverFileInfo,
 	fh *os.File,
@@ -220,11 +229,13 @@ func (s *Server) verifyPiecesParallel(
 				if i >= len(pieces) {
 					return
 				}
-				if p := pieces[i]; !verifyOneFilePiece(state, fi, rf, buf, p) {
-					failedMu.Lock()
-					failed = append(failed, p)
-					failedMu.Unlock()
+				p := pieces[i]
+				if ctx.Err() == nil && verifyOneFilePiece(state, fi, rf, buf, p) {
+					continue
 				}
+				failedMu.Lock()
+				failed = append(failed, p)
+				failedMu.Unlock()
 			}
 		})
 	}
@@ -255,16 +266,81 @@ func verifyOneFilePiece(state *serverTorrentState, fi *serverFileInfo, rf *os.Fi
 }
 
 // markInteriorVerified marks every interior piece of fi as verified post-flush
-// so verifyFinalizedPieces can skip them. Boundary pieces span adjacent files
-// and remain unverified — they'll be checked at finalize. Caller must hold
-// state.mu.
-func markInteriorVerified(state *serverTorrentState, fi *serverFileInfo) {
+// so verifyFinalizedPieces can skip them, except the pieces in failed (ascending,
+// as returned by verifyFilePieces). Boundary pieces span adjacent files and remain
+// unverified - they'll be checked at finalize. Caller must hold state.mu.
+func markInteriorVerified(state *serverTorrentState, fi *serverFileInfo, failed []int) {
 	if state.verified == nil {
 		return
 	}
 	forEachInteriorPiece(state, fi, func(p int) {
-		state.verified.Set(uint(p))
+		if _, bad := slices.BinarySearch(failed, p); !bad {
+			state.verified.Set(uint(p))
+		}
 	})
+}
+
+// preVerifyCandidates returns the files whose data is already complete on disk
+// at init: files found pre-existing at their final path (a prior session
+// early-finalized them) and files hardlinked from another torrent. Both reach
+// FinalizeTorrent with nothing in state.verified, so verifyFinalizedPieces
+// re-reads and re-hashes every byte of them.
+//
+// Restricted to hlStateComplete because that is also the one file state whose
+// fi.path is never rewritten afterwards - neither earlyFinalizeFile nor
+// renamePartialFiles touches these - so the pass can read the path without
+// holding state.mu for its whole duration.
+func preVerifyCandidates(state *serverTorrentState) []*serverFileInfo {
+	var out []*serverFileInfo
+	for _, fi := range state.files {
+		if fi.selected && fi.size > 0 && fi.hardlink.state == hlStateComplete {
+			out = append(out, fi)
+		}
+	}
+	return out
+}
+
+// preVerifyCompleteFiles read-back-verifies files that were already complete on
+// disk when the torrent initialized, marking their interior pieces so
+// verifyFinalizedPieces can skip them. Resuming an interrupted transfer
+// otherwise re-reads and re-hashes everything a prior session already wrote,
+// and a cross-seeded torrent re-reads every hardlinked file - both entirely
+// inside the finalize stall the source is blocked on. Reading concurrently with
+// the transfer trades NFS read bandwidth (which the network-bound stream is not
+// using) for that stall.
+//
+// Purely additive: bits are only ever set, only for pieces that read back and
+// hashed correctly. A piece that fails here is left for verifyFinalizedPieces,
+// which is also the only path that may act on the failure - these files are
+// skipForWriteData, so clearing their written bits here would ask the source to
+// re-stream data writePieceData would then drop.
+func (s *Server) preVerifyCompleteFiles(ctx context.Context, hash string, state *serverTorrentState) {
+	if state.verified == nil {
+		return
+	}
+	files := preVerifyCandidates(state)
+	start := time.Now()
+	pieces := 0
+
+	for _, fi := range files {
+		if ctx.Err() != nil {
+			return
+		}
+		failed, _ := s.verifyFilePieces(ctx, state, fi, nil)
+
+		state.mu.Lock()
+		before := state.verified.Count()
+		markInteriorVerified(state, fi, failed)
+		pieces += int(state.verified.Count() - before)
+		state.mu.Unlock()
+	}
+
+	s.logger.InfoContext(ctx, "pre-verified pieces already on disk at init",
+		"hash", hash,
+		"files", len(files),
+		"pieces", pieces,
+		"duration", time.Since(start).Round(time.Millisecond),
+	)
 }
 
 // forEachInteriorPiece invokes fn for each piece fully contained within fi
@@ -404,7 +480,7 @@ func (s *Server) earlyFinalizeFile(
 		return
 	}
 
-	markInteriorVerified(state, fi)
+	markInteriorVerified(state, fi, nil)
 
 	fi.path = targetPath(fi)
 	metrics.FilesEarlyFinalizedTotal.Inc()
@@ -441,7 +517,16 @@ func (s *Server) syncVerifyClose(
 	}
 
 	if firstErr == nil {
-		failedPieces = s.verifyFilePieces(state, fi, fh)
+		var interrupted bool
+		failedPieces, interrupted = s.verifyFilePieces(ctx, state, fi, fh)
+		if interrupted {
+			// An interrupted pass reports the pieces it never read as failed,
+			// which is the right answer for a caller that only adds skips but
+			// the wrong one here: clearing them would re-stream a file that is
+			// almost certainly intact. Defer the whole file to finalizeFiles.
+			failedPieces = nil
+			firstErr = fmt.Errorf("verifying %s: %w", fi.path, ctx.Err())
+		}
 	}
 
 	if fh != nil {
