@@ -91,6 +91,13 @@ type Server struct {
 	// wait of torrent N doesn't block the disk verification of torrent N+1.
 	qbStageSem *semaphore.Weighted
 
+	// earlyFinalizeSem bounds how many completed files are read back and
+	// verified at once across all torrents. Early finalization used to run on
+	// the stream worker that wrote the file's last piece, so the stream worker
+	// count capped it; now that it runs in the background, this restores the
+	// same ceiling on concurrent verify buffers and outstanding NFS reads.
+	earlyFinalizeSem *semaphore.Weighted
+
 	// finalizeQueueWait overrides finalizeQueueTimeout in tests (0 = default).
 	finalizeQueueWait time.Duration
 
@@ -126,15 +133,16 @@ func NewServer(config ServerConfig, logger *slog.Logger) *Server {
 	)
 
 	s := &Server{
-		config:       config,
-		logger:       logger,
-		store:        newTorrentStore(config.BasePath, logger),
-		memBudget:    semaphore.NewWeighted(bufferBytes),
-		finalizeSem:  semaphore.NewWeighted(1),
-		qbStageSem:   semaphore.NewWeighted(int64(config.GetQBFinalizeConcurrency())),
-		bgCtx:        bgCtx,
-		bgCancel:     bgCancel,
-		processStart: time.Now(),
+		config:           config,
+		logger:           logger,
+		store:            newTorrentStore(config.BasePath, logger),
+		memBudget:        semaphore.NewWeighted(bufferBytes),
+		finalizeSem:      semaphore.NewWeighted(1),
+		qbStageSem:       semaphore.NewWeighted(int64(config.GetQBFinalizeConcurrency())),
+		earlyFinalizeSem: semaphore.NewWeighted(int64(config.streamWorkers())),
+		bgCtx:            bgCtx,
+		bgCancel:         bgCancel,
+		processStart:     time.Now(),
 	}
 
 	s.arrFilter, s.arrEnabled = buildArrFilter(config.Arr, logger)

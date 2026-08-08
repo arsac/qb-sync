@@ -538,6 +538,10 @@ func TestFinalizeTorrent_PartialSelection(t *testing.T) {
 		t.Errorf("writtenCount = %d, want 2", wc)
 	}
 
+	// FinalizeTorrent defers with BUSY while an early finalization is still
+	// reading a completed file back, so let those land first.
+	waitEarlyFinalize(t, state)
+
 	// FinalizeTorrent should succeed with only selected pieces written
 	fResp, fErr := s.FinalizeTorrent(ctx, &pb.FinalizeTorrentRequest{
 		TorrentHash: hash,

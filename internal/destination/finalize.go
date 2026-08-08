@@ -51,6 +51,22 @@ func (s *Server) FinalizeTorrent(
 		state.mu.Unlock()
 		return s.handleExistingFinalization(hash, state, result, done)
 	}
+	// Background early finalizations own their files' handles, paths and
+	// written bits until they land. Defer rather than race them: the source
+	// retries a BUSY response without penalty, and the count can only fall,
+	// since activating finalization below is what stops new ones starting.
+	if state.earlyFinalizing > 0 {
+		inFlight := state.earlyFinalizing
+		state.mu.Unlock()
+		s.logger.InfoContext(ctx, "finalization deferred: early finalizations in flight",
+			"hash", hash, "files", inFlight)
+		metrics.FinalizeBusyTotal.WithLabelValues(metrics.ReasonEarlyFinalizing).Inc()
+		return &pb.FinalizeTorrentResponse{
+			Success:   false,
+			Error:     fmt.Sprintf("early finalization in progress for %d file(s)", inFlight),
+			ErrorCode: pb.FinalizeErrorCode_FINALIZE_ERROR_BUSY,
+		}, nil
+	}
 	// Create finalizeDone immediately so concurrent polls always see it.
 	done := state.finalization.start()
 	writtenCount := int(state.written.Count())

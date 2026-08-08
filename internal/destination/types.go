@@ -165,8 +165,24 @@ type serverTorrentState struct {
 	// Use start()/reset()/storeResult() methods for transitions.
 	finalization finalizationState
 
+	// earlyFinalizing counts background early finalizations in flight. Each
+	// owns its file's handle, path and written bits for the duration, so
+	// FinalizeTorrent refuses to start while any is running. Incremented and
+	// read under mu, which is also what makes the refusal airtight: a
+	// WritePiece can only launch one while holding mu with finalization
+	// inactive, and finalization can only activate while holding mu with the
+	// count at zero.
+	earlyFinalizing int
+
 	// Cached for re-initialization (hardlink info for logging)
 	hardlinkResults []*pb.HardlinkResult
+}
+
+// finishEarlyFinalize retires one background early finalization.
+func (s *serverTorrentState) finishEarlyFinalize() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.earlyFinalizing--
 }
 
 // touch records that a source has just asked about this torrent.

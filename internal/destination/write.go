@@ -121,7 +121,7 @@ func (s *Server) writePiece(ctx context.Context, req *pb.WritePieceRequest) writ
 	}
 
 	markPieceWritten(state, pieceIndex)
-	s.checkFileCompletions(ctx, torrentHash, state, pieceIndex)
+	s.checkFileCompletions(torrentHash, state, pieceIndex)
 	metrics.PieceWriteDuration.Observe(time.Since(writeStart).Seconds())
 
 	metrics.PiecesReceivedTotal.Inc()
@@ -357,11 +357,9 @@ func forEachInteriorPiece(state *serverTorrentState, fi *serverFileInfo, fn func
 }
 
 // checkFileCompletions checks if the just-written piece completes any file's
-// piece coverage. If so, immediately syncs, closes, verifies interior pieces,
-// and renames that file from .partial to its final path. Caller must hold state.mu.
-// Note: earlyFinalizeFile temporarily releases state.mu during I/O operations.
+// piece coverage. If so, it hands that file's sync, verify and rename to a
+// background early finalization. Caller must hold state.mu.
 func (s *Server) checkFileCompletions(
-	ctx context.Context,
 	hash string,
 	state *serverTorrentState,
 	pieceIndex int32,
@@ -387,47 +385,80 @@ func (s *Server) checkFileCompletions(
 		if fi.piecesWritten < fi.piecesTotal {
 			continue
 		}
-		s.earlyFinalizeFile(ctx, hash, state, fi, i)
+		s.startEarlyFinalize(hash, state, fi, i)
 	}
+}
+
+// startEarlyFinalize hands a completed file's fsync, read-back verification and
+// rename to a background goroutine.
+//
+// That work is NFS-bound and proportional to the file's size, so running it
+// inline held the ack for the piece that completed the file: on a multi-GB file
+// it outlasts the source's 60s in-flight piece timeout, which marks the piece
+// stale, halves the stream's congestion window and re-sends data the
+// destination already has. It also parked one of the destination's stream
+// workers and that piece's memory budget for the whole read-back. Both are
+// released immediately now.
+//
+// Caller must hold state.mu. The handle snapshot and earlyFinalized flag are
+// taken here, under the lock, so no concurrent WritePiece can reopen the file
+// or re-enter this path, and the in-flight count is raised before the lock is
+// dropped so FinalizeTorrent cannot start underneath the goroutine.
+func (s *Server) startEarlyFinalize(
+	hash string,
+	state *serverTorrentState,
+	fi *serverFileInfo,
+	fileIndex int,
+) {
+	if s.bgCtx.Err() != nil {
+		// Shutting down: bgWg may already be past its Wait. Leave the file
+		// untouched for finalizeFiles to sync and rename.
+		return
+	}
+
+	fh := fi.file
+	fi.file = nil
+	fi.earlyFinalized = true
+
+	state.earlyFinalizing++
+	s.bgWg.Go(func() {
+		defer state.finishEarlyFinalize()
+		s.earlyFinalizeFile(s.bgCtx, hash, state, fi, fileIndex, fh)
+	})
 }
 
 // earlyFinalizeFile syncs, verifies, and renames a completed .partial file.
 // On verification failure, marks failed pieces as unwritten for re-streaming.
 //
-// Caller must hold state.mu. This method temporarily releases state.mu during
-// fsync, close, and piece verification to avoid blocking concurrent WritePiece
-// calls. It is safe because all pieces overlapping this file are already marked
-// written, so no concurrent WritePiece will access fi.file.
+// Runs without state.mu and takes it only for the bookkeeping at the end. Safe
+// because all pieces overlapping this file are already marked written, so no
+// concurrent WritePiece will touch fi, and FinalizeTorrent defers while the
+// early finalization is counted in flight.
+//
+// fh is the write handle snapshotted by startEarlyFinalize. Verifying through
+// it skips re-opening the file per piece, which on NFS saves two round-trips
+// (LOOKUP + OPEN) per piece.
 func (s *Server) earlyFinalizeFile(
 	ctx context.Context,
 	hash string,
 	state *serverTorrentState,
 	fi *serverFileInfo,
 	fileIndex int,
+	fh *os.File,
 ) {
-	// Snapshot the file handle and prevent concurrent access.
-	fh := fi.file
-	fi.file = nil
-	fi.earlyFinalized = true // Block re-entry from concurrent checkFileCompletions
-
-	// Release lock for I/O: fsync, verify (via the same fd), then close.
-	// Verifying through the still-open fd skips re-opening the file per piece,
-	// which on NFS saves two round-trips (LOOKUP + OPEN) per piece.
-	state.mu.Unlock()
+	// Bound concurrent read-back verifications, each of which holds up to
+	// verifyConcurrency piece buffers and that many outstanding NFS reads. A
+	// failed acquire means shutdown, and dropping through is right: the
+	// cancelled ctx makes syncVerifyClose close the handle and report the
+	// verify as interrupted, which defers the file to finalizeFiles.
+	if acqErr := s.earlyFinalizeSem.Acquire(ctx, 1); acqErr == nil {
+		defer s.earlyFinalizeSem.Release(1)
+	}
 
 	failedPieces, syncCloseErr := s.syncVerifyClose(ctx, hash, state, fi, fh)
 
 	state.mu.Lock()
-
-	// If FinalizeTorrent started while we released the lock, bail out.
-	// Background verification (verifyFinalizedPieces) will catch any corruption,
-	// and modifying state.written here could double-decrement with
-	// recoverVerificationFailure which doesn't guard against already-false entries.
-	if state.finalization.active {
-		s.logger.InfoContext(ctx, "finalization started during early finalize I/O, deferring",
-			"hash", hash, "file", fi.path)
-		return
-	}
+	defer state.mu.Unlock()
 
 	if syncCloseErr != nil {
 		fi.earlyFinalized = false

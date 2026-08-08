@@ -82,6 +82,9 @@ const (
 	ReasonQueueTimeout = "queue_timeout"
 	// ReasonQBChecking marks BUSY caused by qB still checking at budget expiry.
 	ReasonQBChecking = "qb_checking"
+	// ReasonEarlyFinalizing marks BUSY caused by background early finalizations
+	// still reading back a completed file.
+	ReasonEarlyFinalizing = "early_finalizing"
 
 	// ReasonSkipNotSyncable and its siblings label SkippedTorrents: why a source
 	// torrent is not eligible for sync. Without these, a torrent broken on the

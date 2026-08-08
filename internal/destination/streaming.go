@@ -16,10 +16,7 @@ import (
 func (s *Server) StreamPiecesBidi(stream pb.QBSyncService_StreamPiecesBidiServer) error {
 	ctx := stream.Context()
 
-	numWorkers := s.config.StreamWorkers
-	if numWorkers <= 0 {
-		numWorkers = defaultStreamWorkers
-	}
+	numWorkers := s.config.streamWorkers()
 
 	// Buffer 2x workers so the gRPC receiver can stay ahead of NFS write
 	// latency. Memory is still bounded by the memBudget semaphore, so the

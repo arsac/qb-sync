@@ -200,6 +200,15 @@ func (c *ServerConfig) GetQBFinalizeConcurrency() int {
 	return min(c.QBFinalizeConcurrency, maxQBFinalizeConcurrency)
 }
 
+// streamWorkers returns the configured number of concurrent piece writers,
+// falling back to the default when unset.
+func (c *ServerConfig) streamWorkers() int {
+	if c.StreamWorkers <= 0 {
+		return defaultStreamWorkers
+	}
+	return c.StreamWorkers
+}
+
 // Validate validates the server configuration.
 func (c *ServerConfig) Validate() error {
 	if c.BasePath == "" {

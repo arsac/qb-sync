@@ -212,10 +212,10 @@ func TestCheckFileCompletions(t *testing.T) {
 			torrentMeta: torrentMeta{files: []*serverFileInfo{fi}},
 		}
 
-		ctx := context.Background()
 		state.mu.Lock()
-		s.checkFileCompletions(ctx, "test-hash", state, 0)
+		s.checkFileCompletions("test-hash", state, 0)
 		state.mu.Unlock()
+		waitEarlyFinalize(t, state)
 
 		if !fi.earlyFinalized {
 			t.Error("file should be marked as earlyFinalized")
@@ -266,10 +266,10 @@ func TestCheckFileCompletions(t *testing.T) {
 		}
 		state := &serverTorrentState{torrentMeta: torrentMeta{files: files}}
 
-		ctx := context.Background()
 		state.mu.Lock()
-		s.checkFileCompletions(ctx, "test-hash", state, 0)
+		s.checkFileCompletions("test-hash", state, 0)
 		state.mu.Unlock()
+		waitEarlyFinalize(t, state)
 
 		if !files[0].earlyFinalized {
 			t.Error("file 0 should be early-finalized")
@@ -294,10 +294,10 @@ func TestCheckFileCompletions(t *testing.T) {
 		}
 		state := &serverTorrentState{torrentMeta: torrentMeta{files: []*serverFileInfo{fi}}}
 
-		ctx := context.Background()
 		state.mu.Lock()
-		s.checkFileCompletions(ctx, "test-hash", state, 0)
+		s.checkFileCompletions("test-hash", state, 0)
 		state.mu.Unlock()
+		waitEarlyFinalize(t, state)
 
 		if fi.earlyFinalized {
 			t.Error("file should NOT be early-finalized with only 1/2 pieces")
@@ -318,10 +318,10 @@ func TestCheckFileCompletions(t *testing.T) {
 		}
 		state := &serverTorrentState{torrentMeta: torrentMeta{files: []*serverFileInfo{fi}}}
 
-		ctx := context.Background()
 		state.mu.Lock()
-		s.checkFileCompletions(ctx, "test-hash", state, 0)
+		s.checkFileCompletions("test-hash", state, 0)
 		state.mu.Unlock()
+		waitEarlyFinalize(t, state)
 
 		if fi.piecesWritten != 0 {
 			t.Error("hardlinked file should not have piecesWritten incremented")
@@ -339,10 +339,10 @@ func TestCheckFileCompletions(t *testing.T) {
 		}
 		state := &serverTorrentState{torrentMeta: torrentMeta{files: []*serverFileInfo{fi}}}
 
-		ctx := context.Background()
 		state.mu.Lock()
-		s.checkFileCompletions(ctx, "test-hash", state, 0)
+		s.checkFileCompletions("test-hash", state, 0)
 		state.mu.Unlock()
+		waitEarlyFinalize(t, state)
 
 		if fi.piecesWritten != 0 {
 			t.Error("already-finalized file should not have piecesWritten incremented")
@@ -359,10 +359,10 @@ func TestCheckFileCompletions(t *testing.T) {
 		}
 		state := &serverTorrentState{torrentMeta: torrentMeta{files: []*serverFileInfo{fi}}}
 
-		ctx := context.Background()
 		state.mu.Lock()
-		s.checkFileCompletions(ctx, "test-hash", state, 0) // piece 0 doesn't overlap
+		s.checkFileCompletions("test-hash", state, 0) // piece 0 doesn't overlap
 		state.mu.Unlock()
+		waitEarlyFinalize(t, state)
 
 		if fi.piecesWritten != 0 {
 			t.Error("out-of-range piece should not increment piecesWritten")
@@ -383,10 +383,10 @@ func TestCheckFileCompletions(t *testing.T) {
 		}
 		state := &serverTorrentState{torrentMeta: torrentMeta{files: []*serverFileInfo{fi}}}
 
-		ctx := context.Background()
 		state.mu.Lock()
-		s.checkFileCompletions(ctx, "test-hash", state, 0)
+		s.checkFileCompletions("test-hash", state, 0)
 		state.mu.Unlock()
+		waitEarlyFinalize(t, state)
 
 		// rename should fail (parent dir doesn't exist), so earlyFinalized should be false
 		if fi.earlyFinalized {
@@ -500,6 +500,7 @@ func TestWritePiece_EarlyFinalizesCompletedFile(t *testing.T) {
 	if !result.success {
 		t.Fatalf("writePiece failed: %s", result.errMsg)
 	}
+	waitEarlyFinalize(t, state)
 
 	// Verify the file was early-finalized
 	fi := state.files[0]
@@ -559,10 +560,10 @@ func TestCheckFileCompletions_VerifyFailure(t *testing.T) {
 		statePath: filepath.Join(tmpDir, ".state"),
 	}
 
-	ctx := context.Background()
 	state.mu.Lock()
-	s.checkFileCompletions(ctx, hash, state, 0)
+	s.checkFileCompletions(hash, state, 0)
 	state.mu.Unlock()
+	waitEarlyFinalize(t, state)
 
 	// File should NOT be early-finalized (verification failed).
 	if fi.earlyFinalized {
@@ -632,10 +633,10 @@ func TestCheckFileCompletions_VerifySkipsBoundaryPieces(t *testing.T) {
 		written: boolSliceToBitSet([]bool{true}),
 	}
 
-	ctx := context.Background()
 	state.mu.Lock()
-	s.checkFileCompletions(ctx, hash, state, 0)
+	s.checkFileCompletions(hash, state, 0)
 	state.mu.Unlock()
+	waitEarlyFinalize(t, state)
 
 	// Both files should be early-finalized (boundary piece was skipped, not failed).
 	if !files[0].earlyFinalized {
@@ -686,11 +687,11 @@ func TestCheckFileCompletions_VerifyPartialCorruption(t *testing.T) {
 		statePath: filepath.Join(tmpDir, ".state"),
 	}
 
-	ctx := context.Background()
 	state.mu.Lock()
 	// Piece 2 is the "completing" piece.
-	s.checkFileCompletions(ctx, hash, state, 2)
+	s.checkFileCompletions(hash, state, 2)
 	state.mu.Unlock()
+	waitEarlyFinalize(t, state)
 
 	// File should NOT be early-finalized.
 	if fi.earlyFinalized {
@@ -742,13 +743,123 @@ func TestCheckFileCompletions_VerifyNoPieceHashes(t *testing.T) {
 		written: boolSliceToBitSet([]bool{true}),
 	}
 
-	ctx := context.Background()
 	state.mu.Lock()
-	s.checkFileCompletions(ctx, hash, state, 0)
+	s.checkFileCompletions(hash, state, 0)
 	state.mu.Unlock()
+	waitEarlyFinalize(t, state)
 
 	if !fi.earlyFinalized {
 		t.Error("file should be early-finalized when no piece hashes are available")
+	}
+}
+
+// TestCheckFileCompletions_DefersIOToBackground pins that completing a file no
+// longer costs the write path its fsync, read-back verify and rename. Those are
+// proportional to the file's size on NFS and used to run before the piece was
+// acked, which stalls a stream worker and can outlast the source's in-flight
+// piece timeout.
+//
+// The assertions run while the test still holds state.mu, which the background
+// pass needs for its bookkeeping, so "not renamed yet" is a fact rather than a
+// race: pre-change, checkFileCompletions returned with the rename already done.
+func TestCheckFileCompletions_DefersIOToBackground(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+
+	pieceData := []byte("payload")
+	partialPath := filepath.Join(tmpDir, "movie.bin"+partialSuffix)
+	if err := os.WriteFile(partialPath, pieceData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fi := &serverFileInfo{
+		path: partialPath, size: int64(len(pieceData)), offset: 0,
+		firstPiece: 0, lastPiece: 0, piecesTotal: 1, selected: true,
+	}
+	state := &serverTorrentState{
+		torrentMeta: torrentMeta{
+			pieceHashes: []string{utils.ComputeSHA1(pieceData)},
+			pieceLength: int64(len(pieceData)),
+			totalSize:   int64(len(pieceData)),
+			files:       []*serverFileInfo{fi},
+		},
+		written: boolSliceToBitSet([]bool{true}),
+	}
+
+	state.mu.Lock()
+	s.checkFileCompletions("bg-hash", state, 0)
+	if state.earlyFinalizing != 1 {
+		t.Errorf("earlyFinalizing = %d, want 1 background pass registered", state.earlyFinalizing)
+	}
+	if fi.path != partialPath {
+		t.Errorf("file renamed on the write path: %s", fi.path)
+	}
+	if fi.file != nil {
+		t.Error("write handle should be handed to the background pass")
+	}
+	state.mu.Unlock()
+
+	waitEarlyFinalize(t, state)
+
+	finalPath := filepath.Join(tmpDir, "movie.bin")
+	if fi.path != finalPath {
+		t.Errorf("path = %s, want %s", fi.path, finalPath)
+	}
+	if _, err := os.Stat(finalPath); err != nil {
+		t.Errorf("final file should exist: %v", err)
+	}
+}
+
+// TestFinalizeTorrent_DefersWhileEarlyFinalizing pins the guard that keeps
+// FinalizeTorrent from racing a background early finalization, which owns its
+// file's handle, path and written bits until it lands. BUSY is retried by the
+// source without penalty, so deferring costs one poll interval.
+func TestFinalizeTorrent_DefersWhileEarlyFinalizing(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+
+	const hash = "busy-hash"
+	partialPath := filepath.Join(tmpDir, "movie.bin"+partialSuffix)
+	if err := os.WriteFile(partialPath, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	state := &serverTorrentState{
+		torrentMeta: torrentMeta{
+			pieceLength: 7,
+			totalSize:   7,
+			files: []*serverFileInfo{{
+				path: partialPath, size: 7, offset: 0,
+				firstPiece: 0, lastPiece: 0, piecesTotal: 1, piecesWritten: 1, selected: true,
+			}},
+		},
+		written:         boolSliceToBitSet([]bool{true}),
+		earlyFinalizing: 1,
+	}
+	s.store.mu.Lock()
+	s.store.entries[hash] = state
+	s.store.mu.Unlock()
+
+	resp, err := s.FinalizeTorrent(context.Background(), &pb.FinalizeTorrentRequest{TorrentHash: hash})
+	if err != nil {
+		t.Fatalf("FinalizeTorrent error: %v", err)
+	}
+	if resp.GetSuccess() {
+		t.Fatal("FinalizeTorrent should defer while an early finalization is in flight")
+	}
+	if resp.GetErrorCode() != pb.FinalizeErrorCode_FINALIZE_ERROR_BUSY {
+		t.Errorf("errorCode = %v, want BUSY so the source retries without penalty", resp.GetErrorCode())
+	}
+
+	// Nothing may have been claimed or moved: a later call has to be able to
+	// run the whole finalization.
+	state.mu.Lock()
+	active := state.finalization.active
+	state.mu.Unlock()
+	if active {
+		t.Error("finalization must stay inactive after deferring")
+	}
+	if _, statErr := os.Stat(partialPath); statErr != nil {
+		t.Errorf(".partial file should be untouched: %v", statErr)
 	}
 }
 

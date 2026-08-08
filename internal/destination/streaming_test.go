@@ -60,17 +60,26 @@ func newTestServer(t *testing.T, budgetBytes int64) *Server {
 	t.Helper()
 	tmpDir := t.TempDir()
 	logger := testLogger(t)
-	return &Server{
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+	s := &Server{
 		config: ServerConfig{
 			BasePath:      tmpDir,
 			ListenAddr:    ":50051",
 			StreamWorkers: 2,
 		},
-		logger:      logger,
-		store:       newTorrentStore(tmpDir, logger),
-		memBudget:   semaphore.NewWeighted(budgetBytes),
-		finalizeSem: semaphore.NewWeighted(1),
+		logger:           logger,
+		store:            newTorrentStore(tmpDir, logger),
+		memBudget:        semaphore.NewWeighted(budgetBytes),
+		finalizeSem:      semaphore.NewWeighted(1),
+		earlyFinalizeSem: semaphore.NewWeighted(defaultStreamWorkers),
+		bgCtx:            bgCtx,
+		bgCancel:         bgCancel,
 	}
+	t.Cleanup(func() {
+		bgCancel()
+		s.bgWg.Wait()
+	})
+	return s
 }
 
 func TestStreamReceiver_AcquiresBudget(t *testing.T) {
