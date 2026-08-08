@@ -58,6 +58,11 @@ func DefaultPieceMonitorConfig() PieceMonitorConfig {
 }
 
 // torrentState tracks the streaming state for a single torrent.
+//
+// The three per-piece slices are only ever mutated through markStreamed,
+// unmarkStreamed, markFailed and setPieceStates, which keep the derived
+// counts below in step with them. Assigning into them directly silently
+// desynchronises what [PieceMonitor.GetProgress] reports.
 type torrentState struct {
 	meta       *TorrentMetadata
 	hashes     []string // SHA1 hash per piece
@@ -72,6 +77,20 @@ type torrentState struct {
 	// through [torrentState.unmarkStreamed] to rewind it. Written under mu by
 	// queueCompletedPieces (forwards) and unmarkStreamed (backwards).
 	firstUnstreamedScanIdx int
+
+	// Counts derived from the slices above, maintained incrementally so
+	// GetProgress is O(1). It runs on every maindata tick (twice a second per
+	// tracked torrent, for the whole transfer and the finalization wait after
+	// it), and rescanning the slices under mu there measured 11us per call on a
+	// 40k-piece torrent - held as a read lock the sender path's MarkStreamed
+	// then has to queue behind.
+	//
+	//	streamedCount   = |{i : streamed[i]}|
+	//	failedCount     = |{i : failed[i]}|, and failed[i] implies !streamed[i]
+	//	availableCount  = |{i : !streamed[i] and the source holds piece i}|
+	streamedCount  int
+	failedCount    int
+	availableCount int
 
 	// lastAdvance is when the streamed count last increased. The orchestrator
 	// uses it, together with the count of downloaded-but-unstreamed pieces, to
@@ -131,16 +150,79 @@ func (s *torrentState) noteAdvance() {
 	s.lastAdvance = time.Now()
 }
 
+// sourceHasPiece reports whether the last fetched piece-state array says the
+// source holds piece i. Caller must hold the lock.
+func (s *torrentState) sourceHasPiece(i int) bool {
+	return i < len(s.lastStates) && s.lastStates[i] == PieceStateDownloaded
+}
+
+// markStreamed adds piece i to the streamed set, clearing any failure recorded
+// against it, and reports whether that was a change. Caller must hold the write
+// lock.
+func (s *torrentState) markStreamed(i int) bool {
+	if s.failed[i] {
+		s.failed[i] = false
+		s.failedCount--
+	}
+	if s.streamed[i] {
+		return false
+	}
+	s.streamed[i] = true
+	s.streamedCount++
+	if s.sourceHasPiece(i) {
+		s.availableCount--
+	}
+	return true
+}
+
 // unmarkStreamed returns piece i to the un-streamed set and rewinds the scan
 // cursor so queueCompletedPieces offers it again. Caller must hold the write
 // lock.
 //
 // The rewind is the whole point: the cursor is what makes the per-tick scan
 // cheap, and without it a piece un-marked below the cursor is never re-offered,
-// so the torrent silently never completes.
+// so the torrent silently never completes. It happens whether or not the piece
+// was actually streamed, so a caller cannot lose the rewind by guessing wrong.
 func (s *torrentState) unmarkStreamed(i int) {
-	s.streamed[i] = false
 	s.firstUnstreamedScanIdx = min(s.firstUnstreamedScanIdx, i)
+	if !s.streamed[i] {
+		return
+	}
+	s.streamed[i] = false
+	s.streamedCount--
+	if s.sourceHasPiece(i) {
+		s.availableCount++
+	}
+}
+
+// markFailed records that piece i could not be sent. Already-streamed pieces
+// are ignored: the failure set exists to report pieces still owed to the
+// destination, and a streamed piece is not one. Caller must hold the write lock.
+func (s *torrentState) markFailed(i int) {
+	if s.streamed[i] || s.failed[i] {
+		return
+	}
+	s.failed[i] = true
+	s.failedCount++
+}
+
+// setPieceStates installs a freshly fetched piece-state array and recomputes
+// the derived state that depends on it. Caller must hold the write lock.
+//
+// availableCount is the only count that cannot be maintained incrementally
+// here, since every entry may have changed; the rescan is free next to the
+// round-trip and JSON decode that produced the array.
+func (s *torrentState) setPieceStates(states []PieceState, fetchedAt time.Time) {
+	s.lastStates = states
+	s.statesFetchedAt = fetchedAt
+	s.sourceComplete = allDownloaded(states)
+
+	s.availableCount = 0
+	for i := range s.streamed {
+		if !s.streamed[i] && s.sourceHasPiece(i) {
+			s.availableCount++
+		}
+	}
 }
 
 // PieceMonitor monitors piece completion and queues pieces for streaming.
@@ -235,11 +317,9 @@ func (t *PieceMonitor) MarkStreamed(hash string, pieceIndex int) {
 	}
 
 	state.mu.Lock()
-	if !state.streamed[pieceIndex] {
+	if state.markStreamed(pieceIndex) {
 		state.noteAdvance()
 	}
-	state.streamed[pieceIndex] = true
-	state.failed[pieceIndex] = false
 	state.mu.Unlock()
 }
 
@@ -261,11 +341,7 @@ func (t *PieceMonitor) MarkStreamedBatch(hash string, written []bool) int {
 	advanced := false
 	for i, isWritten := range written {
 		if isWritten && i < len(state.streamed) {
-			if !state.streamed[i] {
-				advanced = true
-			}
-			state.streamed[i] = true
-			state.failed[i] = false
+			advanced = state.markStreamed(i) || advanced
 			count++
 		}
 	}
@@ -300,8 +376,7 @@ func (t *PieceMonitor) ResyncStreamed(hash string, writtenOnCold []bool) int {
 	for i := range state.streamed {
 		coldHas := i < len(writtenOnCold) && writtenOnCold[i]
 		if coldHas {
-			state.streamed[i] = true
-			state.failed[i] = false
+			state.markStreamed(i)
 		} else if state.streamed[i] {
 			// Was marked streamed but destination doesn't have it — un-mark for re-streaming
 			state.unmarkStreamed(i)
@@ -323,7 +398,7 @@ func (t *PieceMonitor) MarkFailed(hash string, pieceIndex int) {
 	}
 
 	state.mu.Lock()
-	state.failed[pieceIndex] = true
+	state.markFailed(pieceIndex)
 	state.mu.Unlock()
 }
 
@@ -340,32 +415,18 @@ func (t *PieceMonitor) GetProgress(hash string) (StreamProgress, error) {
 	state.mu.RLock()
 	defer state.mu.RUnlock()
 
-	var streamed, failed, available int
-	for i := range state.streamed {
-		if state.streamed[i] {
-			streamed++
-			continue
-		}
-		if state.failed[i] {
-			failed++
-		}
-		// Un-streamed but the source says it has the data: this piece could be
-		// moving and is not.
-		if i < len(state.lastStates) && state.lastStates[i] == PieceStateDownloaded {
-			available++
-		}
-	}
-
 	numPieces := int(state.meta.GetNumPieces())
 
 	return StreamProgress{
 		TorrentHash: hash,
 		TotalPieces: numPieces,
-		Streamed:    streamed,
-		Failed:      failed,
-		Available:   available,
+		Streamed:    state.streamedCount,
+		Failed:      state.failedCount,
+		// Un-streamed but the source says it has the data: these pieces could
+		// be moving and are not.
+		Available:   state.availableCount,
 		LastAdvance: state.lastAdvance,
-		Complete:    streamed == numPieces,
+		Complete:    state.streamedCount == numPieces,
 	}, nil
 }
 
@@ -600,28 +661,27 @@ func (t *PieceMonitor) startTracking(ctx context.Context, hash string, alreadyWr
 	}
 
 	numPieces := int(meta.GetNumPieces())
+	now := time.Now()
 
 	state := &torrentState{
-		meta:            meta,
-		hashes:          hashes,
-		lastStates:      states,
-		statesFetchedAt: time.Now(),
-		sourceComplete:  allDownloaded(states),
-		streamed:        make([]bool, numPieces),
-		failed:          make([]bool, numPieces),
+		meta:     meta,
+		hashes:   hashes,
+		streamed: make([]bool, numPieces),
+		failed:   make([]bool, numPieces),
 		// Start the clock now rather than at the zero time, so a torrent that
 		// never streams a single piece still measures how long it has failed to
 		// advance. That is precisely the stalled case, and leaving this zero
 		// would exclude it from stall detection entirely.
-		lastAdvance: time.Now(),
+		lastAdvance: now,
 	}
+	state.setPieceStates(states, now)
 
 	// Apply already-written pieces BEFORE adding to map and queuing.
 	// This prevents queueCompletedPieces from sending pieces that destination already has.
 	resumedCount := 0
 	for i, written := range alreadyWritten {
 		if written && i < numPieces {
-			state.streamed[i] = true
+			state.markStreamed(i)
 			resumedCount++
 		}
 	}
@@ -634,8 +694,7 @@ func (t *PieceMonitor) startTracking(ctx context.Context, hash string, alreadyWr
 		meta.GetFiles(), meta.GetNumPieces(), meta.GetPieceSize(), meta.GetTotalSize(),
 	); mask != nil {
 		for i, d := range mask {
-			if d && i < numPieces && !state.streamed[i] {
-				state.streamed[i] = true
+			if d && i < numPieces && state.markStreamed(i) {
 				deselectedCount++
 			}
 		}
@@ -770,9 +829,7 @@ func (t *PieceMonitor) pollTorrentPieces(ctx context.Context, hash string) error
 
 	state.mu.Lock()
 	if fetched {
-		state.lastStates = states
-		state.statesFetchedAt = now
-		state.sourceComplete = allDownloaded(states)
+		state.setPieceStates(states, now)
 	}
 	if newPieces > 0 {
 		state.idleTicks = 0

@@ -228,7 +228,7 @@ func TestPieceMonitor_MarkStreamed(t *testing.T) {
 
 		// Set failed flag first
 		state := monitor.torrents[hash]
-		state.failed[3] = true
+		state.markFailed(3)
 
 		// Mark as streamed
 		monitor.MarkStreamed(hash, 3)
@@ -325,10 +325,10 @@ func TestPieceMonitor_GetProgress(t *testing.T) {
 
 		// Mark some pieces as streamed and failed
 		state := monitor.torrents[hash]
-		state.streamed[0] = true
-		state.streamed[1] = true
-		state.streamed[2] = true
-		state.failed[3] = true
+		state.markStreamed(0)
+		state.markStreamed(1)
+		state.markStreamed(2)
+		state.markFailed(3)
 
 		progress, err := monitor.GetProgress(hash)
 		if err != nil {
@@ -365,7 +365,7 @@ func TestPieceMonitor_GetProgress(t *testing.T) {
 		numPieces := 5
 		state := newTestState(numPieces)
 		for i := range state.streamed {
-			state.streamed[i] = true
+			state.markStreamed(i)
 		}
 		monitor.torrents[hash] = state
 
@@ -428,7 +428,7 @@ func TestPieceMonitor_ResyncStreamed(t *testing.T) {
 		// Simulate: source thinks all 10 are streamed
 		state := monitor.torrents[hash]
 		for i := range state.streamed {
-			state.streamed[i] = true
+			state.markStreamed(i)
 		}
 
 		// Destination only has 7 pieces (0-6)
@@ -461,8 +461,8 @@ func TestPieceMonitor_ResyncStreamed(t *testing.T) {
 
 		state := monitor.torrents[hash]
 		// Pieces 2 and 3 are failed
-		state.failed[2] = true
-		state.failed[3] = true
+		state.markFailed(2)
+		state.markFailed(3)
 
 		// Destination has piece 2 but not 3
 		writtenOnCold := []bool{false, false, true, false, false}
@@ -486,8 +486,8 @@ func TestPieceMonitor_ResyncStreamed(t *testing.T) {
 		monitor.torrents[hash] = newTestState(numPieces)
 
 		state := monitor.torrents[hash]
-		state.streamed[0] = true
-		state.streamed[2] = true
+		state.markStreamed(0)
+		state.markStreamed(2)
 
 		writtenOnCold := []bool{true, false, true, false, false}
 		reset := monitor.ResyncStreamed(hash, writtenOnCold)
@@ -505,7 +505,7 @@ func TestPieceMonitor_ResyncStreamed(t *testing.T) {
 
 		state := monitor.torrents[hash]
 		for i := range state.streamed {
-			state.streamed[i] = true
+			state.markStreamed(i)
 		}
 
 		// Destination reports fewer pieces than tracker has
@@ -1019,7 +1019,7 @@ func TestQueueCompletedPieces_StopsWhenTheQueueIsFull(t *testing.T) {
 		monitor := newTestMonitor()
 		st, current := newBacklogState(6)
 		current[1] = PieceStateNotDownloaded
-		st.streamed[3] = true
+		st.markStreamed(3)
 
 		if got := monitor.queueCompletedPieces(ctx, st, current); got != 4 {
 			t.Fatalf("queued %d pieces, want 4", got)
@@ -1319,4 +1319,165 @@ func TestResyncStreamed_ReOffersPiecesBelowTheScanCursor(t *testing.T) {
 			t.Errorf("re-offered %v, want nothing", got)
 		}
 	})
+}
+
+// progressByScan recomputes the three progress counts the way GetProgress did
+// before torrentState maintained them incrementally: one pass over the
+// per-piece slices. It is the oracle the counters must agree with, and shares
+// no code with them.
+func progressByScan(s *torrentState) (int, int, int) {
+	var streamed, failed, available int
+	for i := range s.streamed {
+		if s.streamed[i] {
+			streamed++
+			continue
+		}
+		if s.failed[i] {
+			failed++
+		}
+		if i < len(s.lastStates) && s.lastStates[i] == PieceStateDownloaded {
+			available++
+		}
+	}
+	return streamed, failed, available
+}
+
+// assertCountsMatchScan fails if any derived count has drifted from the slices.
+func assertCountsMatchScan(t *testing.T, step string, s *torrentState) {
+	t.Helper()
+	streamed, failed, available := progressByScan(s)
+	if s.streamedCount != streamed {
+		t.Errorf("%s: streamedCount %d, scan says %d", step, s.streamedCount, streamed)
+	}
+	if s.failedCount != failed {
+		t.Errorf("%s: failedCount %d, scan says %d", step, s.failedCount, failed)
+	}
+	if s.availableCount != available {
+		t.Errorf("%s: availableCount %d, scan says %d", step, s.availableCount, available)
+	}
+}
+
+// pieceStatesFromSeed builds a deterministic downloaded/not-downloaded pattern.
+func pieceStatesFromSeed(numPieces, seed int) []PieceState {
+	states := make([]PieceState, numPieces)
+	for i := range states {
+		states[i] = PieceStateNotDownloaded
+		if (i*seed+seed)%3 != 0 {
+			states[i] = PieceStateDownloaded
+		}
+	}
+	return states
+}
+
+// TestTorrentState_CountsTrackTheSlices drives every mutator through a
+// deterministic sequence that interleaves marking, un-marking, failing and
+// replacing the source's piece-state array, checking after each step that the
+// incrementally maintained counts still equal a full rescan.
+func TestTorrentState_CountsTrackTheSlices(t *testing.T) {
+	const numPieces = 24
+	now := time.Now()
+
+	state := newTestState(numPieces)
+	state.setPieceStates(pieceStatesFromSeed(numPieces, 1), now)
+	assertCountsMatchScan(t, "initial states", state)
+
+	// A failure on an un-streamed piece, then the same piece streaming: the
+	// failure must be counted and then given back.
+	state.markFailed(4)
+	assertCountsMatchScan(t, "failed 4", state)
+	state.markStreamed(4)
+	assertCountsMatchScan(t, "streamed 4 (was failed)", state)
+
+	// Failing an already-streamed piece is ignored, so nothing is owed twice.
+	state.markFailed(4)
+	assertCountsMatchScan(t, "failed 4 again while streamed", state)
+
+	// A spread of marks, including repeats and pieces the source does not hold.
+	for _, i := range []int{0, 1, 2, 2, 7, 9, 12, 12, 20, 23} {
+		state.markStreamed(i)
+		assertCountsMatchScan(t, fmt.Sprintf("streamed %d", i), state)
+	}
+
+	for _, i := range []int{3, 5, 11, 18} {
+		state.markFailed(i)
+		assertCountsMatchScan(t, fmt.Sprintf("failed %d", i), state)
+	}
+
+	// Un-marking must return pieces to available when the source still has them,
+	// including pieces that were never streamed (a no-op for the counts).
+	for _, i := range []int{2, 2, 9, 15, 23} {
+		state.unmarkStreamed(i)
+		assertCountsMatchScan(t, fmt.Sprintf("unmarked %d", i), state)
+	}
+
+	// A refetch that changes which pieces the source holds; availableCount is
+	// the one count that cannot be carried over.
+	for seed := 2; seed <= 4; seed++ {
+		state.setPieceStates(pieceStatesFromSeed(numPieces, seed), now)
+		assertCountsMatchScan(t, fmt.Sprintf("refetched states seed %d", seed), state)
+		state.markStreamed(seed)
+		state.unmarkStreamed(seed + 1)
+		assertCountsMatchScan(t, fmt.Sprintf("marks after refetch seed %d", seed), state)
+	}
+}
+
+// TestGetProgress_MatchesAFullScanThroughThePublicAPI runs the same agreement
+// check through the exported entry points a live transfer uses, so a mutator
+// reached only from one of them cannot drift unnoticed.
+func TestGetProgress_MatchesAFullScanThroughThePublicAPI(t *testing.T) {
+	const numPieces = 16
+	hash := "abc123"
+
+	monitor := newTestMonitor()
+	state := newTestState(numPieces)
+	state.setPieceStates(pieceStatesFromSeed(numPieces, 1), time.Now())
+	monitor.torrents[hash] = state
+
+	check := func(step string) {
+		t.Helper()
+		progress, err := monitor.GetProgress(hash)
+		if err != nil {
+			t.Fatalf("%s: GetProgress: %v", step, err)
+		}
+		streamed, failed, available := progressByScan(state)
+		if progress.Streamed != streamed || progress.Failed != failed || progress.Available != available {
+			t.Errorf("%s: progress (%d streamed, %d failed, %d available), scan says (%d, %d, %d)",
+				step, progress.Streamed, progress.Failed, progress.Available, streamed, failed, available)
+		}
+		if want := streamed == numPieces; progress.Complete != want {
+			t.Errorf("%s: Complete %v, want %v", step, progress.Complete, want)
+		}
+	}
+
+	check("fresh")
+
+	monitor.MarkFailed(hash, 5)
+	monitor.MarkFailed(hash, 6)
+	check("after MarkFailed")
+
+	monitor.MarkStreamed(hash, 5)
+	check("after MarkStreamed of a failed piece")
+
+	written := make([]bool, numPieces)
+	for _, i := range []int{0, 1, 2, 3, 6} {
+		written[i] = true
+	}
+	monitor.MarkStreamedBatch(hash, written)
+	check("after MarkStreamedBatch")
+
+	destHas := make([]bool, numPieces)
+	for i := range destHas {
+		destHas[i] = i%2 == 0
+	}
+	monitor.ResyncStreamed(hash, destHas)
+	check("after ResyncStreamed")
+
+	// Every piece streamed: the completion flag the maindata poll reads on every
+	// tick must come out of the same counter.
+	all := make([]bool, numPieces)
+	for i := range all {
+		all[i] = true
+	}
+	monitor.MarkStreamedBatch(hash, all)
+	check("after marking every piece")
 }
