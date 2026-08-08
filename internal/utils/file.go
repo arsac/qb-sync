@@ -140,15 +140,19 @@ func (c *FdCache) Close() {
 	c.fds = nil
 }
 
-// ReadPieceFromFilesCached is the cached variant of ReadPieceFromFiles. The
-// caller-supplied FdCache must be used by exactly one goroutine. Honors ctx
+// ReadPieceFromFilesCached is the cached variant of ReadPieceFromFiles. It
+// fills the caller-supplied buf (its length is the piece size) so a verify
+// worker can reuse one buffer across every piece it processes instead of
+// allocating a piece-sized buffer per read.
+//
+// The caller-supplied FdCache must be used by exactly one goroutine. Honors ctx
 // cancellation between file regions (regular-file ReadAt on Unix can't be
 // interrupted mid-syscall, but the regular cancellation check prevents
 // queueing further work after the verify-idle watchdog fires).
 func ReadPieceFromFilesCached(
-	ctx context.Context, cache *FdCache, files []FileRegion, pieceOffset, pieceSize int64,
-) ([]byte, error) {
-	buf := make([]byte, pieceSize)
+	ctx context.Context, cache *FdCache, files []FileRegion, pieceOffset int64, buf []byte,
+) error {
+	pieceSize := int64(len(buf))
 	written := int64(0)
 	currentOffset := pieceOffset
 
@@ -157,7 +161,7 @@ func ReadPieceFromFilesCached(
 			break
 		}
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return err
 		}
 
 		fileEnd := f.Offset + f.Size
@@ -171,10 +175,10 @@ func ReadPieceFromFilesCached(
 
 		fd, openErr := cache.Open(f.Path)
 		if openErr != nil {
-			return nil, fmt.Errorf("opening %s: %w", f.Path, openErr)
+			return fmt.Errorf("opening %s: %w", f.Path, openErr)
 		}
 		if err := readAtFull(fd, buf[written:written+toRead], fileReadOffset, f.Path); err != nil {
-			return nil, fmt.Errorf("reading from %s at offset %d: %w", f.Path, fileReadOffset, err)
+			return fmt.Errorf("reading from %s at offset %d: %w", f.Path, fileReadOffset, err)
 		}
 
 		written += toRead
@@ -182,9 +186,9 @@ func ReadPieceFromFilesCached(
 	}
 
 	if written < pieceSize {
-		return nil, fmt.Errorf("short read: got %d bytes, want %d", written, pieceSize)
+		return fmt.Errorf("short read: got %d bytes, want %d", written, pieceSize)
 	}
-	return buf, nil
+	return nil
 }
 
 // AreHardlinked reports whether two paths refer to the same underlying file (i.e., share an inode).

@@ -96,7 +96,7 @@ func TestReadPieceFromFilesCached_HonorsContextCancel(t *testing.T) {
 	cancel() // immediately cancelled
 
 	regions := []FileRegion{{Path: path, Offset: 0, Size: 1024}}
-	_, err := ReadPieceFromFilesCached(ctx, cache, regions, 0, 100)
+	err := ReadPieceFromFilesCached(ctx, cache, regions, 0, make([]byte, 100))
 	require.Error(t, err, "cancelled context must surface from the read loop, not silently complete")
 	assert.ErrorIs(t, err, context.Canceled)
 }
@@ -130,8 +130,8 @@ func TestReadPieceFromFilesCached_MatchesUncachedResult(t *testing.T) {
 
 	cache := NewFdCache()
 	defer cache.Close()
-	cached, err := ReadPieceFromFilesCached(context.Background(), cache, regions, 256, 512)
-	require.NoError(t, err)
+	cached := make([]byte, 512)
+	require.NoError(t, ReadPieceFromFilesCached(context.Background(), cache, regions, 256, cached))
 
 	assert.Equal(t, uncached, cached, "cached read must match uncached for boundary-spanning piece")
 }

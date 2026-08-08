@@ -109,8 +109,38 @@ func (c *fileHandleCache) evictPath(hash, path string) {
 
 // cachedMeta holds per-torrent cached metadata for ReadPiece.
 type cachedMeta struct {
-	files      []*pb.FileInfo
-	contentDir string // read directory for this torrent
+	files []*pb.FileInfo
+	// regions mirrors files with paths pre-joined against the torrent's content
+	// directory. ReadPiece runs once per piece (thousands of times per torrent),
+	// so building this per call cost a slice allocation plus one filepath.Join
+	// string allocation per file every time.
+	regions []utils.FileRegion
+}
+
+// newCachedMeta precomputes the per-piece read regions for a torrent. files
+// must be offset-sorted, which GetTorrentMetadata guarantees by assigning
+// offsets as a running sum over index-sorted qBittorrent files.
+func newCachedMeta(files []*pb.FileInfo, contentDir string) *cachedMeta {
+	regions := make([]utils.FileRegion, len(files))
+	for i, f := range files {
+		regions[i] = utils.FileRegion{
+			Path:   filepath.Join(contentDir, f.GetPath()),
+			Offset: f.GetOffset(),
+			Size:   f.GetSize(),
+		}
+	}
+	return &cachedMeta{files: files, regions: regions}
+}
+
+// firstFileAt returns the index of the first file whose data extends past
+// offset. Files are offset-sorted and contiguous, so everything before this
+// index is irrelevant to a piece starting at offset; binary searching keeps
+// per-piece work proportional to the files a piece actually spans instead of
+// the torrent's total file count.
+func firstFileAt(files []*pb.FileInfo, offset int64) int {
+	return sort.Search(len(files), func(i int) bool {
+		return files[i].GetOffset()+files[i].GetSize() > offset
+	})
 }
 
 // Source implements streaming.PieceSource using qBittorrent API.
@@ -445,7 +475,7 @@ func (s *Source) ReadPiece(ctx context.Context, piece *pb.Piece) ([]byte, error)
 	readStart := time.Now()
 	defer func() { metrics.PieceReadDuration.Observe(time.Since(readStart).Seconds()) }()
 
-	data, readErr := s.readPieceMultiFile(hash, cached.contentDir, cached.files, piece.GetOffset(), piece.GetSize())
+	data, readErr := s.readPieceMultiFile(hash, cached, piece.GetOffset(), piece.GetSize())
 	if readErr == nil || !errors.Is(readErr, os.ErrNotExist) {
 		return data, readErr
 	}
@@ -461,7 +491,7 @@ func (s *Source) ReadPiece(ctx context.Context, piece *pb.Piece) ([]byte, error)
 	if err != nil {
 		return nil, err
 	}
-	return s.readPieceMultiFile(hash, cached.contentDir, cached.files, piece.GetOffset(), piece.GetSize())
+	return s.readPieceMultiFile(hash, cached, piece.GetOffset(), piece.GetSize())
 }
 
 // cachedTorrentMeta returns the cached metadata for a torrent, fetching on first access.
@@ -478,10 +508,7 @@ func (s *Source) cachedTorrentMeta(ctx context.Context, hash string) (*cachedMet
 		return nil, err
 	}
 
-	cm := &cachedMeta{
-		files:      meta.GetFiles(),
-		contentDir: meta.ContentDir,
-	}
+	cm := newCachedMeta(meta.GetFiles(), meta.ContentDir)
 	s.fileCache.Store(hash, cm)
 	return cm, nil
 }
@@ -562,36 +589,23 @@ func (s *Source) readPieceFromRegions(
 	return buf, nil
 }
 
-func (s *Source) readPieceMultiFile(
-	hash string,
-	basePath string,
-	files []*pb.FileInfo,
-	offset, size int64,
-) ([]byte, error) {
-	// Check if any deselected file overlaps this piece range.
+func (s *Source) readPieceMultiFile(hash string, cm *cachedMeta, offset, size int64) ([]byte, error) {
+	// Only files overlapping [offset, pieceEnd) matter, and they are contiguous
+	// in the slice starting at first.
 	pieceEnd := offset + size
+	first := firstFileAt(cm.files, offset)
+
 	hasDeselected := false
-	for _, f := range files {
-		if !f.GetSelected() {
-			fEnd := f.GetOffset() + f.GetSize()
-			if f.GetOffset() < pieceEnd && fEnd > offset {
-				hasDeselected = true
-				break
-			}
+	for i := first; i < len(cm.files) && cm.files[i].GetOffset() < pieceEnd; i++ {
+		if !cm.files[i].GetSelected() {
+			hasDeselected = true
+			break
 		}
 	}
 
 	if !hasDeselected {
 		// Fast path: all overlapping files are selected.
-		regions := make([]utils.FileRegion, len(files))
-		for i, f := range files {
-			regions[i] = utils.FileRegion{
-				Path:   filepath.Join(basePath, f.GetPath()),
-				Offset: f.GetOffset(),
-				Size:   f.GetSize(),
-			}
-		}
-		return s.readPieceFromRegions(hash, regions, offset, size)
+		return s.readPieceFromRegions(hash, cm.regions[first:], offset, size)
 	}
 
 	// Boundary piece overlapping a deselected file.
@@ -602,10 +616,11 @@ func (s *Source) readPieceMultiFile(
 	data := make([]byte, size) // zero-initialized
 	remaining := size
 	currentOffset := offset
-	for _, f := range files {
+	for i := first; i < len(cm.files); i++ {
 		if remaining <= 0 {
 			break
 		}
+		f := cm.files[i]
 		fEnd := f.GetOffset() + f.GetSize()
 		if fEnd <= currentOffset {
 			continue
@@ -615,7 +630,7 @@ func (s *Source) readPieceMultiFile(
 		toRead := min(remaining, availableInFile)
 
 		if f.GetSelected() {
-			path := filepath.Join(basePath, f.GetPath())
+			path := cm.regions[i].Path
 			dataOffset := currentOffset - offset
 			dst := data[dataOffset : dataOffset+toRead]
 			if chunkErr := s.readChunkIntoCached(hash, path, fileReadOffset, dst); chunkErr != nil {

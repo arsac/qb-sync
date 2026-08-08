@@ -759,34 +759,16 @@ func (s *Server) verifyFinalizedPieces(
 
 	go s.verifyIdleWatchdog(ctx, gCtx, hash, numPieces, &verified, &lastProgress, idleCancel)
 
-	pieceCh := make(chan int, len(state.pieceHashes))
-	for i, expectedHash := range state.pieceHashes {
-		if expectedHash == "" {
-			continue
-		}
-		// Boundary pieces (spanning selected + unselected) can't be read back
-		// — the unselected file's data doesn't exist on disk. Those were
-		// hash-verified at write time.
-		if state.classifyPiece(i) != pieceFullySelected {
-			continue
-		}
-		// Pieces already verified post-flush via earlyFinalizeFile are skipped.
-		// Pieces NOT in that set still need a finalize-time read-back:
-		// hardlinked-file pieces (skipForWriteData skipped writePiece's hash
-		// check) and pieces in files that didn't go through earlyFinalizeFile.
-		if state.verified != nil && state.verified.Test(uint(i)) {
-			verified.Add(1)
-			lastProgress.Store(time.Now())
-			continue
-		}
-		pieceCh <- i
-	}
-	close(pieceCh)
+	regions := finalizedRegions(state)
+	pieceCh := queuePiecesNeedingReadBack(state, &verified, &lastProgress)
 
 	for range s.verifyConcurrency() {
 		g.Go(func() error {
 			cache := utils.NewFdCache()
 			defer cache.Close()
+			// One buffer per worker, resliced per piece: the final piece is the
+			// only short one, so a pieceSize buffer covers every read.
+			buf := make([]byte, pieceSize)
 			for i := range pieceCh {
 				if err := gCtx.Err(); err != nil {
 					return err
@@ -799,7 +781,7 @@ func (s *Server) verifyFinalizedPieces(
 				// gCtx (not ctx): the idle watchdog cancels gCtx, and
 				// ReadPieceFromFilesCached checks it between file regions —
 				// using ctx would let a hung NFS read outlive the watchdog.
-				if !s.verifyOnePiece(gCtx, cache, hash, state, i, offset, size, state.pieceHashes[i]) {
+				if !s.verifyOnePiece(gCtx, cache, hash, regions, i, offset, buf[:size], state.pieceHashes[i]) {
 					failedMu.Lock()
 					failedPieces = append(failedPieces, i)
 					failedMu.Unlock()
@@ -832,21 +814,22 @@ func (s *Server) verifyFinalizedPieces(
 	return nil, nil
 }
 
-// verifyOnePiece reads a single piece from finalized files and verifies its hash.
-// Returns true if the piece is valid, false if it's corrupted or unreadable.
-// The cache is used to reuse fds across pieces processed by the same worker
-// goroutine — must be the worker's own cache, not shared.
+// verifyOnePiece reads a single piece from finalized files into data (whose
+// length sets the read size) and verifies its hash. Returns true if the piece
+// is valid, false if it's corrupted or unreadable. The cache and data buffer
+// are reused across the pieces processed by one worker goroutine — both must
+// be that worker's own, not shared.
 func (s *Server) verifyOnePiece(
 	ctx context.Context,
 	cache *utils.FdCache,
 	hash string,
-	state *serverTorrentState,
+	regions []utils.FileRegion,
 	pieceIdx int,
-	offset, size int64,
+	offset int64,
+	data []byte,
 	expectedHash string,
 ) bool {
-	data, readErr := s.readPieceFromFinalizedFiles(ctx, cache, state, offset, size)
-	if readErr != nil {
+	if readErr := utils.ReadPieceFromFilesCached(ctx, cache, regions, offset, data); readErr != nil {
 		metrics.VerificationErrorsTotal.WithLabelValues(metrics.ModeDestination).Inc()
 		s.logger.WarnContext(ctx, "piece read failed during verification",
 			"hash", hash, "piece", pieceIdx, "error", readErr,
@@ -1073,14 +1056,47 @@ func (s *Server) handleExistingFinalization(
 	}, nil
 }
 
-// readPieceFromFinalizedFiles reads piece data from finalized (non-.partial)
-// files using the supplied cache for fd reuse.
-func (s *Server) readPieceFromFinalizedFiles(
-	ctx context.Context, cache *utils.FdCache, state *serverTorrentState, offset, size int64,
-) ([]byte, error) {
+// queuePiecesNeedingReadBack returns a closed, fully-buffered channel of the
+// piece indices that still need a finalize-time read-back. Pieces skipped
+// because they were already verified count as progress immediately, so the
+// idle watchdog doesn't fire on a torrent that needs few or no re-reads.
+func queuePiecesNeedingReadBack(
+	state *serverTorrentState, verified *atomic.Int64, lastProgress *atomic.Value,
+) chan int {
+	pieceCh := make(chan int, len(state.pieceHashes))
+	for i, expectedHash := range state.pieceHashes {
+		if expectedHash == "" {
+			continue
+		}
+		// Boundary pieces (spanning selected + unselected) can't be read back
+		// - the unselected file's data doesn't exist on disk. Those were
+		// hash-verified at write time.
+		if state.classifyPiece(i) != pieceFullySelected {
+			continue
+		}
+		// Pieces already verified post-flush via earlyFinalizeFile are skipped.
+		// Pieces NOT in that set still need a finalize-time read-back:
+		// hardlinked-file pieces (skipForWriteData skipped writePiece's hash
+		// check) and pieces in files that didn't go through earlyFinalizeFile.
+		if state.verified != nil && state.verified.Test(uint(i)) {
+			verified.Add(1)
+			lastProgress.Store(time.Now())
+			continue
+		}
+		pieceCh <- i
+	}
+	close(pieceCh)
+	return pieceCh
+}
+
+// finalizedRegions maps a torrent's files to their finalized (non-.partial)
+// read regions. Safe to build once per verify pass because state.files is
+// immutable while finalizing; doing it per piece cost a slice allocation plus
+// a targetPath string allocation per file on every read.
+func finalizedRegions(state *serverTorrentState) []utils.FileRegion {
 	regions := make([]utils.FileRegion, len(state.files))
 	for i, fi := range state.files {
 		regions[i] = utils.FileRegion{Path: targetPath(fi), Offset: fi.offset, Size: fi.size}
 	}
-	return utils.ReadPieceFromFilesCached(ctx, cache, regions, offset, size)
+	return regions
 }
