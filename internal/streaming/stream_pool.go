@@ -96,9 +96,14 @@ type StreamPool struct {
 	// Aggregated channels from all streams. Each ack carries the source
 	// stream so the consumer can update the right window without an external
 	// piece-to-stream lookup.
-	acks     chan AckEnvelope
-	ackReady chan struct{}
-	errs     chan error // Aggregated errors from all streams
+	acks chan AckEnvelope
+	errs chan error // Aggregated errors from all streams
+
+	// capacityWait is closed and replaced every time the pool may have gained
+	// room for another piece. It has its own mutex so publishing never touches
+	// the stream-slice lock, which addStreamLocked already holds.
+	capacityMu   sync.Mutex
+	capacityWait chan struct{}
 
 	// Test-overridable ack delivery timeout. Zero means the package const.
 	ackDeliveryTimeoutOverride time.Duration
@@ -193,8 +198,8 @@ func NewStreamPool(
 		maxStreams:    maxStreams,
 		streams:       make([]*PooledStream, 0, maxStreams),
 		acks:          make(chan AckEnvelope, ackChannelSize*maxStreams),
-		ackReady:      make(chan struct{}, maxStreams),
 		errs:          make(chan error, maxStreams), // Aggregated error channel
+		capacityWait:  make(chan struct{}),
 		adaptive:      config.Adaptive,
 		scaleInterval: scaleInterval,
 	}
@@ -277,11 +282,6 @@ func (s *poolAckSink) deliverAck(ctx context.Context, ack *pb.PieceAck) bool {
 	case s.p.acks <- AckEnvelope{Ack: ack, Stream: s.ps}:
 		// In Go 1.23+, Stop guarantees the channel is drained.
 		s.timer.Stop()
-		// Signal that an ack is ready (non-blocking)
-		select {
-		case s.p.ackReady <- struct{}{}:
-		default:
-		}
 		return true
 
 	case <-ctx.Done():
@@ -364,6 +364,10 @@ func (p *StreamPool) addStreamLocked() error {
 	p.wg.Go(func() {
 		stream.receiveAcks(newPoolAckSink(p, ps))
 	})
+
+	// A fresh stream arrives with an empty window, so senders parked because
+	// every existing stream was full can proceed straight away.
+	p.publishCapacity()
 
 	return nil
 }
@@ -848,23 +852,41 @@ type AckEnvelope struct {
 	Stream *PooledStream
 }
 
-// AckReady returns a channel that signals when acks are available.
-func (p *StreamPool) AckReady() <-chan struct{} {
-	return p.ackReady
+// CapacityWait returns a channel closed the next time the pool may be able to
+// accept another piece. Take it before testing CanSend: a release published in
+// between closes the channel the caller is already holding, so a waiter that
+// then selects on it wakes immediately instead of missing the signal.
+func (p *StreamPool) CapacityWait() <-chan struct{} {
+	p.capacityMu.Lock()
+	defer p.capacityMu.Unlock()
+	return p.capacityWait
 }
 
-// NotifyAckProcessed signals that an ack has been processed and inflight
-// count reduced. This wakes the sender to re-check CanSend().
-//
-// deliverAck signals ackReady when an ack is enqueued, but the sender
-// checks CanSend() which depends on OnAck having reduced inflight. Without
-// this post-processing signal, the sender can consume the enqueue signal
-// before OnAck fires, see CanSend()=false, and wait forever.
-func (p *StreamPool) NotifyAckProcessed() {
-	select {
-	case p.ackReady <- struct{}{}:
-	default:
-	}
+// publishCapacity wakes every sender parked on CapacityWait. Nothing polls
+// behind it, so every path that releases a congestion-window slot or adds a
+// stream has to call it - which is why AckPiece, FailPiece, ClearAllInflight
+// and addStreamLocked are the only places a window is released or a stream
+// appears.
+func (p *StreamPool) publishCapacity() {
+	p.capacityMu.Lock()
+	defer p.capacityMu.Unlock()
+
+	close(p.capacityWait)
+	p.capacityWait = make(chan struct{})
+}
+
+// AckPiece retires an acknowledged piece from its stream's congestion window,
+// freeing the slot for a waiting sender.
+func (p *StreamPool) AckPiece(ps *PooledStream, key string) {
+	ps.window.OnAck(key)
+	p.publishCapacity()
+}
+
+// FailPiece retires a piece that will not be acknowledged - failed, stale, or
+// abandoned before it was sent - from its stream's congestion window.
+func (p *StreamPool) FailPiece(ps *PooledStream, key string) {
+	ps.window.OnFail(key)
+	p.publishCapacity()
 }
 
 // Done returns a channel that's closed when any stream fails.
@@ -941,6 +963,7 @@ func (p *StreamPool) ClearAllInflight() []string {
 		keys := ps.window.ClearInflight()
 		allKeys = append(allKeys, keys...)
 	}
+	p.publishCapacity()
 	return allKeys
 }
 
@@ -987,9 +1010,11 @@ func (p *StreamPool) Close() {
 		// This ensures no more sends to channels after this point
 		p.wg.Wait()
 
-		// Now safe to close channels
+		// Now safe to close channels. capacityWait is deliberately left open:
+		// publishCapacity replaces it rather than reusing it, so closing here
+		// would race a late publisher into a double close. Senders leave via
+		// their own context or the stop signal, not via this channel.
 		close(p.acks)
-		close(p.ackReady)
 		close(p.errs)
 	})
 }

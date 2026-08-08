@@ -53,11 +53,11 @@ var testLogger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Le
 // tests with channel buffers sized for "small but non-blocking" use.
 func newAckSinkTestPool(ctx context.Context) *StreamPool {
 	return &StreamPool{
-		ctx:      ctx,
-		errs:     make(chan error, 10),
-		acks:     make(chan AckEnvelope, 10),
-		ackReady: make(chan struct{}, 10),
-		logger:   testLogger,
+		ctx:          ctx,
+		errs:         make(chan error, 10),
+		acks:         make(chan AckEnvelope, 10),
+		capacityWait: make(chan struct{}),
+		logger:       testLogger,
 	}
 }
 
@@ -116,7 +116,7 @@ func newAdaptiveScalingTestPool(
 		streams:       streams,
 		errs:          make(chan error, 10),
 		acks:          make(chan AckEnvelope, 10),
-		ackReady:      make(chan struct{}, 10),
+		capacityWait:  make(chan struct{}),
 		maxStreams:    MaxPoolSize,
 	}
 }
@@ -637,236 +637,107 @@ func newTestPoolWithWindow(windowCfg congestion.Config) (*StreamPool, *PooledStr
 		id:     0,
 	}
 	pool := &StreamPool{
-		ctx:      ctx,
-		cancel:   cancel,
-		errs:     make(chan error, 10),
-		acks:     make(chan AckEnvelope, 10),
-		ackReady: make(chan struct{}, 4),
-		logger:   testLogger,
-		streams:  []*PooledStream{ps},
+		ctx:          ctx,
+		cancel:       cancel,
+		errs:         make(chan error, 10),
+		acks:         make(chan AckEnvelope, 10),
+		capacityWait: make(chan struct{}),
+		logger:       testLogger,
+		streams:      []*PooledStream{ps},
 	}
 	return pool, ps, cancel
 }
 
-// TestSenderLoop_PollingFallbackUnblocks verifies that the sender's polling
-// fallback wakes it up when CanSend() becomes true without any AckReady
-// signal. This is the safety net for missed signals. The test's replicated
-// wait loop uses a 1s timer (rather than the production senderRetryBackoff)
-// so the wake source is unambiguously the timer rather than scheduling.
-//
-// Setup: window=2, 2 pieces in-flight (CanSend=false). After 200ms, OnFail
-// frees a slot (CanSend=true) but nobody signals ackReady. The wait loop
-// should unblock via the timer, not immediately and not never.
-func TestSenderLoop_PollingFallbackUnblocks(t *testing.T) {
+// TestCapacityWait_ClosesTheChannelHandedOutBefore pins the close-and-replace
+// contract awaitCapacity relies on: the channel a sender took before testing
+// CanSend is the one a later release closes, so a release published between
+// that test and the sender's select cannot be missed.
+func TestCapacityWait_ClosesTheChannelHandedOutBefore(t *testing.T) {
 	t.Parallel()
 
-	pool, ps, cancel := newTestPoolWithWindow(congestion.Config{
-		InitialWindow: 2, MinWindow: 2, MaxWindow: 2,
-	})
+	pool, _, cancel := newTestPoolWithWindow(congestion.DefaultConfig())
 	defer cancel()
 
-	// Fill window: 2 TrySend calls → CanSend()=false.
-	ps.window.TrySend("a")
-	ps.window.TrySend("b")
-	if pool.CanSend() {
-		t.Fatal("expected CanSend()=false after filling window")
+	held := pool.CapacityWait()
+	select {
+	case <-held:
+		t.Fatal("capacity channel was already closed before any release")
+	default:
 	}
 
-	// After 200ms, free capacity without signaling ackReady.
-	go func() {
-		time.Sleep(200 * time.Millisecond)
-		ps.window.OnFail("a")
-	}()
+	pool.publishCapacity()
 
-	// Replicate the sender's wait loop.
-	start := time.Now()
-	for !pool.CanSend() {
-		select {
-		case <-pool.AckReady():
-			// Should NOT fire — nobody signals it.
-			t.Fatal("unexpected AckReady signal")
-		case <-time.After(1 * time.Second):
-			// Polling fallback — this is the expected wake path.
-		}
+	select {
+	case <-held:
+	default:
+		t.Fatal("release did not close the channel the waiter was already holding")
 	}
-	elapsed := time.Since(start)
 
-	// Should unblock between ~1s (timer) and ~2s. If it took <500ms, the
-	// timer wasn't the wake source. If it took >3s, something is wrong.
-	if elapsed < 500*time.Millisecond {
-		t.Fatalf("unblocked too fast (%v) — polling fallback didn't fire", elapsed)
+	select {
+	case <-pool.CapacityWait():
+		t.Fatal("replacement channel is closed, so the next wait would spin")
+	default:
 	}
-	if elapsed > 3*time.Second {
-		t.Fatalf("took too long (%v) — polling fallback didn't work", elapsed)
-	}
-	t.Logf("sender unblocked via polling fallback in %v", elapsed)
 }
 
-// TestSenderLoop_NotifyAckProcessedUnblocks verifies that NotifyAckProcessed
-// wakes the sender immediately after OnAck reduces inflight, preventing the
-// signal race where the sender consumes the enqueue-time ackReady signal
-// before the ack processor has called OnAck.
-//
-// The race:
-//  1. deliverAck enqueues ack → signals ackReady
-//  2. Sender wakes, checks CanSend()=false (OnAck hasn't fired yet)
-//  3. Sender goes back to waiting — signal consumed
-//  4. Ack processor calls OnAck → CanSend()=true
-//  5. NotifyAckProcessed() signals ackReady again ← THIS is the fix
-//  6. Sender wakes, checks CanSend()=true → proceeds
-//
-// Without NotifyAckProcessed, step 5 never happens and the sender waits
-// until the 1s polling fallback fires.
-func TestSenderLoop_NotifyAckProcessedUnblocks(t *testing.T) {
+// TestAwaitCapacity_EveryReleasePathWakesAParkedSender covers each pool
+// operation that frees a congestion-window slot. Nothing polls behind
+// awaitCapacity, so a path that releases capacity without publishing leaves
+// the sender parked forever - which is what each subtest fails on.
+func TestAwaitCapacity_EveryReleasePathWakesAParkedSender(t *testing.T) {
 	t.Parallel()
 
-	pool, ps, cancel := newTestPoolWithWindow(congestion.Config{
-		InitialWindow: 2, MinWindow: 2, MaxWindow: 2,
-	})
-	defer cancel()
-
-	// Fill window.
-	ps.window.TrySend("a")
-	ps.window.TrySend("b")
-	if pool.CanSend() {
-		t.Fatal("expected CanSend()=false after filling window")
+	cases := []struct {
+		name    string
+		release func(pool *StreamPool, ps *PooledStream)
+	}{
+		{"ack", func(pool *StreamPool, ps *PooledStream) { pool.AckPiece(ps, "a") }},
+		{"fail", func(pool *StreamPool, ps *PooledStream) { pool.FailPiece(ps, "a") }},
+		{"clear inflight", func(pool *StreamPool, _ *PooledStream) { pool.ClearAllInflight() }},
 	}
 
-	// Simulate the race: enqueue-time signal arrives first, sender consumes
-	// it, then ack processor calls OnAck + NotifyAckProcessed.
-	go func() {
-		// Step 1: deliverAck signals ackReady (enqueue-time).
-		pool.ackReady <- struct{}{}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-		// Small delay to ensure the sender wakes and re-checks CanSend()=false.
-		time.Sleep(50 * time.Millisecond)
+			pool, ps, cancel := newTestPoolWithWindow(congestion.Config{
+				InitialWindow: 2, MinWindow: 2, MaxWindow: 2,
+			})
+			defer cancel()
 
-		// Step 4-5: Ack processor calls OnAck, then NotifyAckProcessed.
-		ps.window.OnFail("a") // Simulates OnAck reducing inflight.
-		pool.NotifyAckProcessed()
-	}()
+			ps.window.TrySend("a")
+			ps.window.TrySend("b")
+			if pool.CanSend() {
+				t.Fatal("window should be full before the sender parks")
+			}
 
-	// Replicate the sender's wait loop.
-	start := time.Now()
-	for !pool.CanSend() {
-		select {
-		case <-pool.AckReady():
-			// May fire from either the enqueue signal or NotifyAckProcessed.
-		case <-time.After(1 * time.Second):
-			// Polling fallback — if we reach here, NotifyAckProcessed didn't work.
-		}
+			q := &BidiQueue{logger: testLogger}
+			stopSender := make(chan struct{})
+			defer close(stopSender)
+
+			returned := make(chan bool, 1)
+			go func() {
+				returned <- q.awaitCapacity(context.Background(), pool, stopSender)
+			}()
+
+			select {
+			case <-returned:
+				t.Fatal("awaitCapacity returned while the window was still full")
+			case <-time.After(100 * time.Millisecond):
+			}
+
+			tc.release(pool, ps)
+
+			select {
+			case ok := <-returned:
+				if !ok {
+					t.Fatal("awaitCapacity reported worker exit, want capacity available")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("awaitCapacity stayed parked: this release path published no capacity signal")
+			}
+		})
 	}
-	elapsed := time.Since(start)
-
-	// Should unblock within ~100ms (50ms goroutine delay + scheduling), NOT
-	// after the 1s polling fallback.
-	if elapsed > 500*time.Millisecond {
-		t.Fatalf("took %v — NotifyAckProcessed didn't wake the sender (fell through to polling fallback)", elapsed)
-	}
-	t.Logf("sender unblocked via NotifyAckProcessed in %v", elapsed)
-}
-
-// TestSenderLoop_NotifyAckProcessedWithoutPolling verifies that removing the
-// polling fallback, the sender still unblocks via NotifyAckProcessed alone.
-// This proves NotifyAckProcessed is sufficient for correctness independent
-// of the polling safety net.
-func TestSenderLoop_NotifyAckProcessedWithoutPolling(t *testing.T) {
-	t.Parallel()
-
-	pool, ps, cancel := newTestPoolWithWindow(congestion.Config{
-		InitialWindow: 2, MinWindow: 2, MaxWindow: 2,
-	})
-	defer cancel()
-
-	ps.window.TrySend("a")
-	ps.window.TrySend("b")
-
-	// Simulate: enqueue signal consumed, then OnAck + NotifyAckProcessed.
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		ps.window.OnFail("a")
-		pool.NotifyAckProcessed()
-	}()
-
-	// Wait loop WITHOUT polling fallback — only AckReady.
-	start := time.Now()
-	for !pool.CanSend() {
-		select {
-		case <-pool.AckReady():
-		case <-time.After(5 * time.Second):
-			t.Fatal("sender stuck — NotifyAckProcessed didn't fire")
-		}
-	}
-	elapsed := time.Since(start)
-
-	if elapsed > 500*time.Millisecond {
-		t.Fatalf("took %v — too slow for NotifyAckProcessed alone", elapsed)
-	}
-	t.Logf("sender unblocked via NotifyAckProcessed (no polling) in %v", elapsed)
-}
-
-// TestSenderLoop_SignalRaceWithoutNotify demonstrates that without
-// NotifyAckProcessed, the signal race causes the sender to miss the
-// state change and fall through to the polling fallback (1s+ delay).
-// This is a regression test — if NotifyAckProcessed were removed, this
-// test would show the latency penalty.
-func TestSenderLoop_SignalRaceWithoutNotify(t *testing.T) {
-	t.Parallel()
-
-	pool, ps, cancel := newTestPoolWithWindow(congestion.Config{
-		InitialWindow: 2, MinWindow: 2, MaxWindow: 2,
-	})
-	defer cancel()
-
-	ps.window.TrySend("a")
-	ps.window.TrySend("b")
-
-	// Simulate the race WITHOUT NotifyAckProcessed:
-	// 1. Enqueue signal fires
-	// 2. Sender wakes, CanSend()=false (OnAck hasn't happened)
-	// 3. OnAck fires, but no new signal
-	go func() {
-		// Enqueue-time signal.
-		pool.ackReady <- struct{}{}
-		// Delay, then free capacity without signaling.
-		time.Sleep(50 * time.Millisecond)
-		ps.window.OnFail("a")
-		// Deliberately NO NotifyAckProcessed() call.
-	}()
-
-	// Wait loop — will consume the enqueue signal, re-check CanSend()=false,
-	// then fall through to the 1s polling timer.
-	start := time.Now()
-	attempts := 0
-	for !pool.CanSend() {
-		attempts++
-		if attempts > 10 {
-			t.Fatal("too many loop iterations")
-		}
-		select {
-		case <-pool.AckReady():
-			// Consumes the enqueue signal — but CanSend() is still false.
-		case <-time.After(1 * time.Second):
-			// Polling fallback rescues us.
-		}
-	}
-	elapsed := time.Since(start)
-
-	// Without NotifyAckProcessed, sender falls through to the 1s timer.
-	// This proves the polling fallback is needed as a safety net.
-	if elapsed < 500*time.Millisecond {
-		// This can happen if scheduling allows OnFail to complete before
-		// the sender re-checks — non-deterministic but acceptable.
-		t.Logf("sender unblocked quickly (%v) — race went the other way this time", elapsed)
-	} else {
-		t.Logf("sender fell through to polling fallback (%v) — demonstrates the race", elapsed)
-	}
-	// Key assertion: must eventually unblock (not hang forever).
-	if elapsed > 3*time.Second {
-		t.Fatalf("took too long (%v) — polling fallback didn't work", elapsed)
-	}
-
-	_ = "test uses fmt" // Ensure fmt import is used.
 }
 
 // TestStreamEnded_SilentExitOnRemovedFlag verifies that a stream the pool

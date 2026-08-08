@@ -23,10 +23,6 @@ const (
 	// streamingRateLimiterBurst is the burst size for rate limiting (1MB).
 	streamingRateLimiterBurst = grpcutil.BytesPerMB
 
-	// senderRetryBackoff is the safety-net polling interval for sender workers
-	// when no stream has capacity. Handles missed AckReady signals and stale-cleanup capacity changes.
-	senderRetryBackoff = 50 * time.Millisecond
-
 	drainTimeout                  = 30 * time.Second
 	reconnectBaseDelay            = 1 * time.Second
 	reconnectMaxDelay             = 30 * time.Second
@@ -372,26 +368,30 @@ func (q *BidiQueue) senderWorker(ctx context.Context, pool *StreamPool, stopSend
 
 // awaitCapacity blocks until some stream in the pool can accept a piece.
 // Returns false when the worker should exit.
+//
+// The wakeup channel is taken before each capacity test, so a slot released in
+// between closes the channel this worker already holds and the select returns
+// at once. That ordering is what makes a periodic re-check unnecessary: no
+// release can land in a window where nobody is listening for it.
 func (q *BidiQueue) awaitCapacity(ctx context.Context, pool *StreamPool, stopSender <-chan struct{}) bool {
 	if pool.CanSend() {
 		return true
 	}
 
 	metrics.WindowFullTotal.Inc()
-	for !pool.CanSend() {
+	for {
+		capacity := pool.CapacityWait()
+		if pool.CanSend() {
+			return true
+		}
 		select {
 		case <-ctx.Done():
 			return false
 		case <-stopSender:
 			return false
-		case <-pool.AckReady():
-			// Fast path: woken by ack arrival.
-		case <-time.After(senderRetryBackoff):
-			// Safety net: recheck capacity periodically.
-			// Handles missed AckReady signals and stale-cleanup capacity changes.
+		case <-capacity:
 		}
 	}
-	return true
 }
 
 // deliverPiece sends one dequeued piece, re-attempting for as long as the only
@@ -522,13 +522,13 @@ func (q *BidiQueue) sendPiecePool(ctx context.Context, pool *StreamPool, piece *
 
 	data, err := q.source.ReadPiece(ctx, piece)
 	if err != nil {
-		ps.window.OnFail(key)
+		pool.FailPiece(ps, key)
 		return fmt.Errorf("reading piece: %w", err)
 	}
 
 	if q.limiter != nil {
 		if waitErr := q.waitForRateLimit(ctx, len(data)); waitErr != nil {
-			ps.window.OnFail(key)
+			pool.FailPiece(ps, key)
 			return fmt.Errorf("rate limit: %w", waitErr)
 		}
 	}
@@ -542,7 +542,7 @@ func (q *BidiQueue) sendPiecePool(ctx context.Context, pool *StreamPool, piece *
 	}
 
 	if sendErr := ps.stream.Send(req); sendErr != nil {
-		ps.window.OnFail(key)
+		pool.FailPiece(ps, key)
 		return fmt.Errorf("sending: %w", sendErr)
 	}
 
@@ -599,8 +599,7 @@ func (q *BidiQueue) runAckProcessorPool(
 			q.handleStalePiecesPool(ctx, pool)
 
 		case env := <-pool.Acks():
-			q.processAck(ctx, env)
-			pool.NotifyAckProcessed()
+			q.processAck(ctx, pool, env)
 		}
 	}
 }
@@ -618,8 +617,8 @@ func (q *BidiQueue) handleStalePiecesPool(ctx context.Context, pool *StreamPool)
 	)
 
 	for _, sk := range staleKeys {
-		// OnFail on the stream that actually owns the key in its window.
-		sk.Stream.window.OnFail(sk.Key)
+		// Fail the piece on the stream that actually owns the key in its window.
+		pool.FailPiece(sk.Stream, sk.Key)
 		q.requeuePieceByKey(ctx, sk.Key)
 	}
 }
@@ -654,7 +653,7 @@ func (q *BidiQueue) markInFlightAsFailedPool(ctx context.Context, pool *StreamPo
 // processAck handles a single acknowledgment using the correct stream's window.
 // The envelope carries the source stream so no external piece-to-stream
 // lookup is needed.
-func (q *BidiQueue) processAck(ctx context.Context, env AckEnvelope) {
+func (q *BidiQueue) processAck(ctx context.Context, pool *StreamPool, env AckEnvelope) {
 	ack := env.Ack
 	ps := env.Stream
 	hash := ack.GetTorrentHash()
@@ -669,7 +668,7 @@ func (q *BidiQueue) processAck(ctx context.Context, env AckEnvelope) {
 	if ack.GetSuccess() {
 		// Update adaptive window with RTT measurement
 		if ps != nil {
-			ps.window.OnAck(key)
+			pool.AckPiece(ps, key)
 			ps.piecesOK.Add(1)
 		}
 
@@ -688,7 +687,7 @@ func (q *BidiQueue) processAck(ctx context.Context, env AckEnvelope) {
 	} else {
 		// Reduce window on failure
 		if ps != nil {
-			ps.window.OnFail(key)
+			pool.FailPiece(ps, key)
 			ps.piecesFail.Add(1)
 		}
 
@@ -805,7 +804,7 @@ func (q *BidiQueue) drainInFlightPool(ctx context.Context, pool *StreamPool) {
 			return
 
 		case env := <-pool.Acks():
-			q.processAck(ctx, env)
+			q.processAck(ctx, pool, env)
 		}
 	}
 

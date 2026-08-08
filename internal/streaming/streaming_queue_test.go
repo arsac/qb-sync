@@ -396,9 +396,9 @@ func TestDeliverPiece_RetriesAfterLosingWindowSlot(t *testing.T) {
 	go func() { returned <- q.deliverPiece(ctx, pool, stopSender, piece, 0) }()
 
 	// While the window stays full the piece must be held, not read and not
-	// counted as failed. Several backoff cycles is long enough for a
-	// drop-and-return regression to have finished the call.
-	time.Sleep(5 * senderRetryBackoff)
+	// counted as failed. Long enough for a drop-and-return regression to have
+	// finished the call.
+	time.Sleep(250 * time.Millisecond)
 	if got := source.read(); len(got) != 0 {
 		t.Fatalf("read the piece while the window was full: %v", got)
 	}
@@ -412,8 +412,7 @@ func TestDeliverPiece_RetriesAfterLosingWindowSlot(t *testing.T) {
 	}
 
 	// Free the slot: the retry should now claim it and read the same piece.
-	window.OnAck(occupant)
-	pool.NotifyAckProcessed()
+	pool.AckPiece(ps, occupant)
 
 	select {
 	case ok := <-returned:

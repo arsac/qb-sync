@@ -351,12 +351,12 @@ func newPooledTestStream(
 
 	poolCtx, poolCancel := context.WithCancel(context.Background())
 	pool := &StreamPool{
-		ctx:      poolCtx,
-		cancel:   poolCancel,
-		errs:     make(chan error, 10),
-		acks:     make(chan AckEnvelope, 100),
-		ackReady: make(chan struct{}, 10),
-		logger:   slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ctx:          poolCtx,
+		cancel:       poolCancel,
+		errs:         make(chan error, 10),
+		acks:         make(chan AckEnvelope, 100),
+		capacityWait: make(chan struct{}),
+		logger:       slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
 
 	streamCtx, streamCancel := context.WithCancel(context.Background())
