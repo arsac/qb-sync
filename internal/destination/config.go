@@ -57,6 +57,12 @@ const (
 	defaultInodeCleanupInterval = 6 * time.Hour // How often to check for stale inode entries
 	inodeRebuildWorkers         = 32            // Concurrent workers for startup inode rebuild from .meta (sized to hide NFS RTT)
 
+	// Concurrent workers for the per-file metadata probing at torrent init
+	// (setupFiles, clearStalePieces). Each file costs several NFS round-trips
+	// before a single piece can stream, and they are pure latency, so size this
+	// to hide RTT the same way inodeRebuildWorkers does.
+	fileSetupConcurrency = 32
+
 	// Default hardlink wait timeout.
 	defaultHardlinkWaitTimeout = 30 * time.Minute // Max time to wait for pending hardlink source
 

@@ -2,6 +2,7 @@ package destination
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -391,6 +392,74 @@ func TestSetupFile_UnselectedFile(t *testing.T) {
 			t.Error("unselected file should have no special flags in result")
 		}
 	})
+}
+
+// TestSetupFiles_ResultsAlignWithRequestOrder pins the invariant the parallel
+// fan-out in setupFiles could break: files[i] and results[i] must describe
+// reqFiles[i]. Every file gets a distinct on-disk shape (pre-existing, resumed
+// .partial, fresh, unselected) so a mis-indexed slot is visible rather than
+// hidden behind identical outcomes. Run under -race, the shared parent
+// directory also exercises concurrent MkdirAll of the same path.
+func TestSetupFiles_ResultsAlignWithRequestOrder(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+
+	const numFiles = 64
+	reqFiles := make([]*pb.FileInfo, numFiles)
+	for i := range numFiles {
+		rel := filepath.Join("pack", fmt.Sprintf("f%02d.bin", i))
+		size := int64(100 + i)
+		reqFiles[i] = &pb.FileInfo{
+			Path:     rel,
+			Size:     size,
+			Offset:   int64(i) * 1000,
+			Selected: i%4 != 3,
+		}
+		abs := filepath.Join(tmpDir, rel)
+		switch i % 4 {
+		case 0: // pre-existing at the final path
+			writeTestFile(t, abs, make([]byte, size))
+		case 1: // resumed .partial from an interrupted sync
+			writeTestFile(t, abs+partialSuffix, make([]byte, size))
+		}
+	}
+
+	files, results, err := s.setupFiles(context.Background(), "hash1", reqFiles, "")
+	if err != nil {
+		t.Fatalf("setupFiles: %v", err)
+	}
+	if len(files) != numFiles || len(results) != numFiles {
+		t.Fatalf("got %d files / %d results, want %d each", len(files), len(results), numFiles)
+	}
+
+	for i, f := range reqFiles {
+		fi := files[i]
+		if fi == nil {
+			t.Fatalf("file %d: nil entry", i)
+		}
+		if fi.size != f.GetSize() || fi.offset != f.GetOffset() || fi.selected != f.GetSelected() {
+			t.Errorf("file %d: got size=%d offset=%d selected=%v, want %d/%d/%v",
+				i, fi.size, fi.offset, fi.selected, f.GetSize(), f.GetOffset(), f.GetSelected())
+		}
+		if results[i].GetFileIndex() != int32(i) {
+			t.Errorf("file %d: result carries fileIndex %d", i, results[i].GetFileIndex())
+		}
+
+		final := filepath.Join(tmpDir, f.GetPath())
+		wantPath, wantPreExisting := final+partialSuffix, false
+		switch i % 4 {
+		case 0:
+			wantPath, wantPreExisting = final, true
+		case 3: // unselected: final path, no .partial
+			wantPath = final
+		}
+		if fi.path != wantPath {
+			t.Errorf("file %d: path = %q, want %q", i, fi.path, wantPath)
+		}
+		if results[i].GetPreExisting() != wantPreExisting {
+			t.Errorf("file %d: preExisting = %v, want %v", i, results[i].GetPreExisting(), wantPreExisting)
+		}
+	}
 }
 
 // --- FinalizeTorrent with partial selection ---

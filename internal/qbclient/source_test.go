@@ -10,7 +10,6 @@ import (
 
 	"github.com/autobrr/go-qbittorrent"
 
-	"github.com/arsac/qb-sync/internal/utils"
 	pb "github.com/arsac/qb-sync/proto"
 )
 
@@ -620,40 +619,6 @@ func TestReadPiece_ENOENTRetry(t *testing.T) {
 			t.Error("cache entry should have been evicted")
 		}
 	})
-}
-
-func TestReadChunkFromFile_Basic(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "data.bin")
-
-	content := []byte("hello world, this is test data!")
-	if err := os.WriteFile(path, content, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	// Read from middle
-	data, err := utils.ReadChunkFromFile(path, 6, 5)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if string(data) != "world" {
-		t.Errorf("got %q, want %q", string(data), "world")
-	}
-
-	// Read from start
-	data, err = utils.ReadChunkFromFile(path, 0, 5)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if string(data) != "hello" {
-		t.Errorf("got %q, want %q", string(data), "hello")
-	}
-
-	// Read past EOF returns an error (short reads are never valid in production)
-	_, err = utils.ReadChunkFromFile(path, int64(len(content)-3), 10)
-	if err == nil {
-		t.Fatal("expected error on short read, got nil")
-	}
 }
 
 func TestReadPieceMultiFile_SingleFile(t *testing.T) {

@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"github.com/bits-and-blooms/bitset"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/arsac/qb-sync/internal/metrics"
 	pb "github.com/arsac/qb-sync/proto"
@@ -497,13 +498,35 @@ func (s *Server) setupFiles(
 	files := make([]*serverFileInfo, len(reqFiles))
 	results := make([]*pb.HardlinkResult, len(reqFiles))
 
+	// Each file costs several independent NFS round-trips (MkdirAll, plus a
+	// stat of the final and .partial paths, plus any hardlink probing) and a
+	// season pack carries hundreds of them, so a serial pass puts seconds of
+	// pure latency in front of the first streamed piece. Slots are written by
+	// index, and concurrent hardlink resolution is already the normal case -
+	// the inode registry arbitrates it with an atomic RegisterInProgress.
+	//
+	// The group carries a context so the first MkdirAll failure short-circuits
+	// the files not yet started, matching the serial version's early return
+	// rather than registering in-progress inodes for a torrent that is about
+	// to be rejected.
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(fileSetupConcurrency)
 	for i, f := range reqFiles {
-		fileInfo, result, err := s.setupFile(ctx, hash, f, i, saveSubPath)
-		if err != nil {
-			return nil, nil, err
-		}
-		files[i] = fileInfo
-		results[i] = result
+		g.Go(func() error {
+			if ctxErr := gctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			fileInfo, result, err := s.setupFile(ctx, hash, f, i, saveSubPath)
+			if err != nil {
+				return err
+			}
+			files[i] = fileInfo
+			results[i] = result
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, nil, err
 	}
 
 	return files, results, nil

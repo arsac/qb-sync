@@ -57,15 +57,6 @@ func ReadPieceFromFiles(files []FileRegion, pieceOffset, pieceSize int64) ([]byt
 	return buf, nil
 }
 
-// ReadChunkFromFile reads a chunk of data from a file at a specific offset.
-func ReadChunkFromFile(path string, offset, size int64) ([]byte, error) {
-	data := make([]byte, size)
-	if err := readChunkInto(path, offset, data); err != nil {
-		return nil, err
-	}
-	return data, nil
-}
-
 // readChunkInto reads len(buf) bytes from path starting at offset directly
 // into buf. Returns an error on short read or any error other than [io.EOF]
 // at the end of the read.
