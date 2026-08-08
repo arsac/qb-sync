@@ -994,3 +994,81 @@ func TestPollActiveTorrents_FansOutWithoutCrossWiring(t *testing.T) {
 		}
 	}
 }
+
+// newBacklogState builds a torrentState whose pieces are all downloaded and
+// none streamed, i.e. the state of a torrent whose data is already on disk when
+// the sync starts.
+func newBacklogState(numPieces int) (*torrentState, []PieceState) {
+	st := newTestState(numPieces)
+	st.meta.InitTorrentRequest.TorrentHash = "backlog"
+	st.meta.InitTorrentRequest.PieceSize = 1 << 20
+	st.meta.InitTorrentRequest.TotalSize = int64(numPieces) << 20
+	st.hashes = make([]string, numPieces)
+
+	current := make([]PieceState, numPieces)
+	for i := range current {
+		current[i] = PieceStateDownloaded
+	}
+	return st, current
+}
+
+func TestQueueCompletedPieces_StopsWhenTheQueueIsFull(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("queues every eligible piece while there is room", func(t *testing.T) {
+		monitor := newTestMonitor()
+		st, current := newBacklogState(6)
+		current[1] = PieceStateNotDownloaded
+		st.streamed[3] = true
+
+		if got := monitor.queueCompletedPieces(ctx, st, current); got != 4 {
+			t.Fatalf("queued %d pieces, want 4", got)
+		}
+		var indices []int32
+		for len(monitor.completed) > 0 {
+			indices = append(indices, (<-monitor.completed).GetIndex())
+		}
+		if !slices.Equal(indices, []int32{0, 2, 4, 5}) {
+			t.Errorf("queued indices %v, want [0 2 4 5]", indices)
+		}
+	})
+
+	t.Run("fills the queue to capacity and stops there", func(t *testing.T) {
+		monitor := newTestMonitor()
+		monitor.completed = make(chan *pb.Piece, 3)
+		st, current := newBacklogState(500)
+
+		if got := monitor.queueCompletedPieces(ctx, st, current); got != 3 {
+			t.Fatalf("queued %d pieces, want 3", got)
+		}
+		var indices []int32
+		for len(monitor.completed) > 0 {
+			indices = append(indices, (<-monitor.completed).GetIndex())
+		}
+		if !slices.Equal(indices, []int32{0, 1, 2}) {
+			t.Errorf("queued indices %v, want [0 1 2]", indices)
+		}
+	})
+
+	// The scan is what holds the torrent's write lock, which every send and ack
+	// contends on, so a full queue has to cost O(1) rather than one discarded
+	// *pb.Piece per remaining index.
+	t.Run("an already-full queue costs constant work", func(t *testing.T) {
+		const numPieces = 2000
+		monitor := newTestMonitor()
+		monitor.completed = make(chan *pb.Piece, 1)
+		monitor.completed <- &pb.Piece{}
+		monitor.queueFullLogNano.Store(time.Now().UnixNano()) // suppress the rate-limited warn
+		st, current := newBacklogState(numPieces)
+
+		allocs := testing.AllocsPerRun(20, func() {
+			if got := monitor.queueCompletedPieces(ctx, st, current); got != 0 {
+				t.Fatalf("queued %d pieces into a full queue, want 0", got)
+			}
+		})
+		if allocs > 20 {
+			t.Errorf("full-queue scan of %d pieces made %.0f allocs, want <= 20 "+
+				"(scan does not stop at the full queue)", numPieces, allocs)
+		}
+	})
+}

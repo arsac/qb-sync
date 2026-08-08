@@ -731,7 +731,8 @@ func (t *PieceMonitor) queueCompletedPieces(ctx context.Context, state *torrentS
 	}
 	state.firstUnstreamedScanIdx = startIdx
 
-	var queued, skipped int
+	var queued int
+	stoppedAt := -1
 	for i := startIdx; i < len(current); i++ {
 		pieceState := current[i]
 		if pieceState != PieceStateDownloaded {
@@ -746,26 +747,41 @@ func (t *PieceMonitor) queueCompletedPieces(ctx context.Context, state *torrentS
 
 		piece := t.buildPiece(state, i)
 
-		switch {
-		case t.trySendCompletedNonBlocking(ctx, piece):
+		if t.trySendCompletedNonBlocking(ctx, piece) {
 			queued++
 			t.logger.DebugContext(ctx, "queued piece",
 				"hash", state.meta.GetTorrentHash(),
 				"piece", i,
 			)
-		case ctx.Err() != nil:
-			return queued
-		case !t.closed.Load():
-			skipped++
+			continue
 		}
+		if ctx.Err() != nil || t.closed.Load() {
+			return queued
+		}
+
+		// The queue is full. Everything past this index would be built and
+		// immediately discarded, and the cursor only advances past pieces that
+		// were actually streamed, so the next tick re-offers them anyway -
+		// scanning on produces the same queue contents at the cost of one
+		// *pb.Piece per remaining index. For a fully-downloaded 40k-piece
+		// torrent that was 40k allocations and ~2ms of this state's write lock
+		// every poll interval, contending with the MarkStreamed and
+		// IsPieceStreamed calls the sender workers make on every send and ack.
+		//
+		// Nothing is delayed by stopping: a full queue already holds
+		// completedChannelBufSize pieces, far more work than the senders can
+		// drain in one poll interval.
+		stoppedAt = i
+		break
 	}
 
-	if skipped > 0 {
+	if stoppedAt >= 0 {
 		lastLog := t.queueFullLogNano.Load()
 		if time.Duration(time.Now().UnixNano()-lastLog) >= queueFullLogInterval {
 			t.logger.WarnContext(ctx, "piece queue full, will retry",
 				"hash", state.meta.GetTorrentHash(),
-				"skipped", skipped,
+				"queued", queued,
+				"firstUnqueuedIndex", stoppedAt,
 			)
 			t.queueFullLogNano.Store(time.Now().UnixNano())
 		}
