@@ -620,6 +620,16 @@ func (q *BidiQueue) sendClaimedPiece(
 	data, err := q.source.ReadPiece(ctx, piece)
 	if err != nil {
 		pool.FailPiece(ps, key)
+		// A read that fails because source qB no longer has the torrent is
+		// proof of a removal, and the only proof available once the monitor
+		// has stopped polling this torrent - it stops as soon as every piece
+		// state is known, so a torrent deleted after that point is invisible
+		// to the poll path. Without this the senders requeue the same pieces
+		// indefinitely, hammering qB for a torrent that cannot come back.
+		// removeAndNotify is idempotent, so concurrent senders notify once.
+		if errors.Is(err, ErrTorrentNotFound) && q.tracker != nil {
+			q.tracker.handleTorrentNotFound(ctx, key.Hash)
+		}
 		return fmt.Errorf("reading piece: %w", err)
 	}
 

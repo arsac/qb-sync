@@ -368,11 +368,29 @@ func (s *Source) GetPieceHashes(ctx context.Context, hash string) ([]string, err
 	return hashes, nil
 }
 
+// torrentGone reports whether err means source qB no longer has the torrent, as
+// opposed to being unreachable. Prefers the library's typed sentinel and falls
+// back to the status text for the methods that wrap a coarser sentinel, the
+// same classification [utils.IsBenignError] applies.
+func torrentGone(err error) bool {
+	if errors.Is(err, qbittorrent.ErrTorrentNotFound) {
+		return true
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "404") || strings.Contains(errStr, "not found")
+}
+
 // GetTorrentMetadata returns metadata needed for streaming.
+// Returns ErrTorrentNotFound if the torrent no longer exists (e.g. was deleted),
+// so callers on the send path can treat it as a removal instead of retrying a
+// read that can never succeed.
 // Uses resilient client with automatic retry for transient errors.
 func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streaming.TorrentMetadata, error) {
 	props, err := s.client.GetTorrentPropertiesCtx(ctx, hash)
 	if err != nil {
+		if torrentGone(err) {
+			return nil, fmt.Errorf("getting torrent properties: %w", streaming.ErrTorrentNotFound)
+		}
 		return nil, fmt.Errorf("getting torrent properties: %w", err)
 	}
 
@@ -383,7 +401,7 @@ func (s *Source) GetTorrentMetadata(ctx context.Context, hash string) (*streamin
 		return nil, fmt.Errorf("getting torrent info: %w", err)
 	}
 	if len(torrents) == 0 {
-		return nil, fmt.Errorf("torrent not found: %s", hash)
+		return nil, fmt.Errorf("%w: %s", streaming.ErrTorrentNotFound, hash)
 	}
 	torrent := torrents[0]
 
