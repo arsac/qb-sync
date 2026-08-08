@@ -89,7 +89,7 @@ All flags can be set via environment variables with the prefix `QBSYNC_SOURCE_` 
 | `QBSYNC_DESTINATION_STREAM_WORKERS` | `--stream-workers` | Concurrent piece writers (0 = auto: 8) | `0` |
 | `QBSYNC_DESTINATION_MAX_STREAM_BUFFER` | `--max-stream-buffer` | Global memory budget for buffered pieces (MB) | `512` |
 | `QBSYNC_DESTINATION_QB_FINALIZE_CONCURRENCY` | `--qb-finalize-concurrency` | Max torrents concurrently in the qB add/recheck stage (0 = default 1, max 8). Raise only on SSD-backed storage | `0` |
-| `QBSYNC_DESTINATION_VERIFY_CONCURRENCY` | `--verify-concurrency` | Concurrent piece-read goroutines during finalize verification (0 = default 4). Raise on healthy storage; lower if your NFS server can't handle the burst | `0` |
+| `QBSYNC_DESTINATION_VERIFY_CONCURRENCY` | `--verify-concurrency` | Concurrent piece-read goroutines for read-back verification, at both early- and full finalization (0 = default 4). Raise on healthy storage; lower if your NFS server can't handle the burst | `0` |
 | `QBSYNC_DESTINATION_SYNCED_TAG` | `--synced-tag` | Tag for synced torrents (empty to disable) | `synced` |
 | `QBSYNC_DESTINATION_RADARR_URL` | `--radarr-url` | Radarr URL (empty disables the Radarr filter) | |
 | `QBSYNC_DESTINATION_RADARR_API_KEY` | `--radarr-api-key` | Radarr API key, sent via `X-Api-Key` | |

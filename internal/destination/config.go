@@ -68,7 +68,7 @@ const (
 
 	// Memory management.
 	defaultMaxStreamBufferMB = 512 // Default global memory budget for buffered piece data
-	maxVerifyConcurrency     = 4   // Default concurrent piece reads during finalization (caps transient memory)
+	maxVerifyConcurrency     = 4   // Default concurrent piece reads per verify pass (caps transient memory)
 	// maxVerifyConcurrencyCap bounds the --verify-concurrency knob. Each worker
 	// holds up to one max-size (32 MB) piece buffer: 16 workers = 512 MB
 	// transient worst case, matching the default stream memory budget. Keep in
@@ -138,7 +138,7 @@ type ServerConfig struct {
 	SavePath           string        // Path as destination qBittorrent sees it (container mount, e.g., "/downloads"). Defaults to BasePath.
 	StateFlushInterval time.Duration // How often to flush dirty state (0 = use default)
 	StreamWorkers      int           // Number of concurrent piece writers (0 = use default)
-	VerifyConcurrency  int           // Concurrent piece-read goroutines during finalize verification (0 = use default 4). Raise on healthy storage to speed finalize; lower if your NFS server can't handle the burst.
+	VerifyConcurrency  int           // Concurrent piece-read goroutines per read-back verify pass, early and full finalization alike (0 = use default 4). Raise on healthy storage to speed verification; lower if your NFS server can't handle the burst.
 
 	// Arr configures the Sonarr/Radarr instances consulted by
 	// CheckArrRejections. Zero instances disable the filter, and the server then

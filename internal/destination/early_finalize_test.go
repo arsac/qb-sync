@@ -2,8 +2,10 @@ package destination
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -760,5 +762,75 @@ func assertFileRange(t *testing.T, fi *serverFileInfo, firstPiece, lastPiece, pi
 	}
 	if fi.piecesTotal != piecesTotal {
 		t.Errorf("piecesTotal = %d, want %d", fi.piecesTotal, piecesTotal)
+	}
+}
+
+// TestVerifyFilePieces_ScatteredCorruption pins the early-finalize read-back
+// verify against the failure mode parallelizing it introduces: workers racing
+// on the shared failed slice, or a worker's own fd reading at the wrong
+// offset. Corruption is scattered so more than one worker must report, and the
+// same expectation must hold at every worker count.
+func TestVerifyFilePieces_ScatteredCorruption(t *testing.T) {
+	t.Parallel()
+
+	const (
+		pieceLength = 16
+		numPieces   = 10
+		fileOffset  = 8 // makes piece 0 a boundary piece that must be skipped
+	)
+	totalSize := int64(pieceLength * numPieces)
+
+	full := make([]byte, totalSize)
+	for i := range full {
+		full[i] = byte(i)
+	}
+	hashes := make([]string, numPieces)
+	for p := range numPieces {
+		hashes[p] = utils.ComputeSHA1(full[p*pieceLength : (p+1)*pieceLength])
+	}
+
+	want := []int{2, 5, 9}
+	onDisk := slices.Clone(full)
+	for _, p := range want {
+		onDisk[p*pieceLength] ^= 0xff
+	}
+
+	path := filepath.Join(t.TempDir(), "scattered.bin.partial")
+	if err := os.WriteFile(path, onDisk[fileOffset:], 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fi := &serverFileInfo{
+		path: path, offset: fileOffset, size: totalSize - fileOffset,
+		firstPiece: 0, lastPiece: numPieces - 1, selected: true,
+	}
+	state := &serverTorrentState{torrentMeta: torrentMeta{
+		pieceHashes: hashes,
+		pieceLength: pieceLength,
+		totalSize:   totalSize,
+		files:       []*serverFileInfo{fi},
+	}}
+
+	for _, workers := range []int{1, 3, 16} {
+		t.Run(fmt.Sprintf("workers=%d", workers), func(t *testing.T) {
+			t.Parallel()
+
+			s, _ := newTestDestServer(t)
+			s.config.VerifyConcurrency = workers
+
+			fh, openErr := os.Open(path)
+			if openErr != nil {
+				t.Fatal(openErr)
+			}
+			defer fh.Close()
+
+			if got := s.verifyFilePieces(state, fi, fh); !slices.Equal(got, want) {
+				t.Errorf("shared handle: failed pieces = %v, want %v", got, want)
+			}
+			// nil handle exercises the self-open path for every worker.
+			if got := s.verifyFilePieces(state, fi, nil); !slices.Equal(got, want) {
+				t.Errorf("self-opened: failed pieces = %v, want %v", got, want)
+			}
+		})
 	}
 }

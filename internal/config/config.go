@@ -211,7 +211,7 @@ type DestinationConfig struct {
 	// Streaming tuning
 	StreamWorkers     int // Number of concurrent piece writers (0 = use default 8)
 	MaxStreamBufferMB int // Global memory budget in MB for buffered piece data (default: 512)
-	VerifyConcurrency int // Concurrent piece-read goroutines during finalize verification (0 = use default 4)
+	VerifyConcurrency int // Concurrent piece-read goroutines for read-back verification (0 = use default 4)
 
 	// QBFinalizeConcurrency is how many torrents may concurrently occupy the
 	// destination qB add/recheck stage (0 = default 1, max 8).
@@ -387,7 +387,7 @@ func SetupDestinationFlags(cmd *cobra.Command) {
 	flags.Int(
 		"verify-concurrency",
 		0,
-		"Concurrent piece-read goroutines during finalize verification (0 = default 4, max 16). Raise on healthy storage to speed finalize; lower if your NFS server can't handle the burst.",
+		"Concurrent piece-read goroutines for read-back verification, at both early- and full finalization (0 = default 4, max 16). Raise on healthy storage to speed verification; lower if your NFS server can't handle the burst.",
 	)
 	addArrFlags(flags)
 }
