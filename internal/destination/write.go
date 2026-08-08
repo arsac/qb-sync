@@ -171,6 +171,11 @@ func (s *Server) verifyFilePieces(
 	}
 
 	var failed []int
+	// One buffer for the whole pass: a per-piece allocation churns pieceLength
+	// bytes (commonly 4-16 MiB) per iteration, which forces GC cycles right when
+	// finalization is competing with in-flight writes for bandwidth. The buffer
+	// never escapes: VerifyPieceHash only hashes it.
+	buf := make([]byte, state.pieceLength)
 	for p := fi.firstPiece; p <= fi.lastPiece; p++ {
 		if state.pieceHashes[p] == "" {
 			continue
@@ -188,14 +193,14 @@ func (s *Server) verifyFilePieces(
 		pieceSize := pieceEnd - pieceStart
 		fileOffset := pieceStart - fi.offset
 
-		buf := make([]byte, pieceSize)
-		n, readErr := fh.ReadAt(buf, fileOffset)
+		pieceBuf := buf[:pieceSize]
+		n, readErr := fh.ReadAt(pieceBuf, fileOffset)
 		if readErr != nil || int64(n) != pieceSize {
 			failed = append(failed, p)
 			continue
 		}
 
-		if err := utils.VerifyPieceHash(buf, state.pieceHashes[p]); err != nil {
+		if err := utils.VerifyPieceHash(pieceBuf, state.pieceHashes[p]); err != nil {
 			failed = append(failed, p)
 		}
 	}
