@@ -97,6 +97,17 @@ const (
 
 	ReasonOrphanInQB          = "in_qb"          // OrphanCleanupSkippedTotal: torrent in destination qB but not healable (non-seeding state, <100%, or savepath is not qb-sync's copy)
 	ReasonOrphanQBUnreachable = "qb_unreachable" // OrphanCleanupSkippedTotal: destination qB unreachable during safety check
+
+	// ReasonRecheckPostAddError labels QBRechecksTotal: a freshly-added torrent
+	// landed in an error state. Typical cause: the destination qB's mount
+	// (commonly NFS) has a stale attribute cache and hasn't yet seen the renames
+	// we just performed; a recheck forces qB to re-walk the savepath and pick up
+	// the correct file sizes.
+	ReasonRecheckPostAddError = "post_add_error"
+	// ReasonRecheckParked labels QBRechecksTotal: destination qB already held the
+	// torrent in a state the qB stage cannot move on its own, so nothing would
+	// have advanced it before the wait timed out.
+	ReasonRecheckParked = "parked"
 )
 
 // Counters track cumulative values that only increase.
@@ -564,17 +575,15 @@ var (
 		},
 	)
 
-	// PostAddRechecksTotal counts auto-triggered qB rechecks fired when a
-	// freshly-added torrent landed in an error state. Typical cause: the
-	// destination qB's mount (commonly NFS) has a stale attribute cache and
-	// hasn't yet seen the renames we just performed; a recheck forces qB to
-	// re-walk the savepath and pick up the correct file sizes.
-	PostAddRechecksTotal = promauto.NewCounter(
+	// QBRechecksTotal counts qB rechecks the finalization path triggers on its
+	// own, labelled by what made one necessary. See the ReasonRecheck* consts.
+	QBRechecksTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: namespace,
-			Name:      "post_add_rechecks_total",
-			Help:      "Auto-triggered qB rechecks for torrents that landed in an error state right after AddTorrent",
+			Name:      "qb_rechecks_total",
+			Help:      "Auto-triggered qB rechecks during finalization, by reason",
 		},
+		[]string{LabelReason},
 	)
 
 	// ExcludeSyncAbortTotal counts torrents aborted due to exclude-sync tag applied mid-sync.

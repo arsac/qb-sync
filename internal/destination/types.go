@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/autobrr/go-qbittorrent"
 	"github.com/bits-and-blooms/bitset"
 
 	pb "github.com/arsac/qb-sync/proto"
@@ -185,8 +186,32 @@ type serverTorrentState struct {
 	preVerifyCancel context.CancelFunc
 	preVerifyDone   chan struct{}
 
+	// parkedRecheckedFrom records the state this torrent was last rechecked out
+	// of. A recheck that completes and lands back in the same state means qB
+	// disagrees about the data, and re-issuing it every finalize retry re-hashes
+	// the whole torrent each time - an expensive failing loop in place of a cheap
+	// one. Keyed on the state rather than latched outright because a torrent that
+	// moves between parked states has not been answered yet: stopping a started
+	// torrent mid-check leaves it stopped, and that one does deserve its own
+	// recheck.
+	parkedRecheckedFrom qbittorrent.TorrentState
+
 	// Cached for re-initialization (hardlink info for logging)
 	hardlinkResults []*pb.HardlinkResult
+}
+
+// claimParkedRecheck reports whether this call owns the recheck for a torrent
+// parked in the given state, recording it so a later attempt finding the same
+// state does not re-issue one.
+func (s *serverTorrentState) claimParkedRecheck(parkedIn qbittorrent.TorrentState) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.parkedRecheckedFrom == parkedIn {
+		return false
+	}
+	s.parkedRecheckedFrom = parkedIn
+	return true
 }
 
 // stopPreVerify cancels the init-time pre-verification pass and waits for it to

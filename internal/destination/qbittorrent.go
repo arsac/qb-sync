@@ -60,10 +60,15 @@ func (s *Server) isTorrentInQB(ctx context.Context, hash string) bool {
 }
 
 // addAndVerifyTorrent adds the torrent to qBittorrent and waits for verification.
-// On exit the torrent is always stopped on destination qB (best-effort): source
-// is the canonical seeder until handoff via StartTorrent. Without this, a crash
-// mid-finalization followed by recovery can leave the torrent already running
-// in destination qB, producing a dual-seeding window.
+//
+// On exit the torrent is left stopped on destination qB (best-effort): source is
+// the canonical seeder until handoff via StartTorrent, and without this a crash
+// mid-finalization followed by recovery can leave the torrent already running in
+// destination qB, producing a dual-seeding window.
+//
+// The exception is a torrent still checking when the budget runs out that was
+// stopped going into the check: stopping it mid-pass is what parks it in
+// stoppedDL for every later attempt to trip over. See stoppedBeforeCheck.
 func (s *Server) addAndVerifyTorrent(
 	ctx context.Context,
 	hash string,
@@ -79,31 +84,67 @@ func (s *Server) addAndVerifyTorrent(
 		return existingTorrent.State, fmt.Errorf("torrent in error state: %s", existingTorrent.State)
 	}
 
-	// Fast path: torrent is already verified and seeding-ready. Just stop
-	// (source remains canonical seeder until handoff) and return.
-	if found && existingTorrent.Progress >= 1.0 && isReadyState(existingTorrent.State) {
+	finalState, resumed, waitErr := s.driveTorrentToReady(ctx, hash, state, req, existingTorrent)
+
+	if isCheckingState(finalState) && safeToLeaveChecking(existingTorrent, resumed) {
+		s.logger.InfoContext(ctx, "leaving torrent checking rather than stopping it mid-pass",
+			"hash", hash,
+			"state", finalState,
+		)
+	} else {
 		s.stopTorrentBestEffort(ctx, hash)
-		return existingTorrent.State, nil
 	}
 
-	if !found {
+	return finalState, waitErr
+}
+
+// safeToLeaveChecking reports whether a torrent left mid-check cannot seed when
+// the check finishes. Both conditions are required.
+//
+// It must have been stopped going into the check: a recheck preserves qB's
+// started/stopped flag, which covers a torrent we added (we add with
+// stopped=true) and one qB held in a download-side stopped state. A started
+// torrent - queuedDL, say - completes its check into uploading.
+//
+// And this call must not have started it. applyAndVerifyDeselectedPriorities
+// resumes the torrent once the priorities verify, so on the partial-selection
+// paths the state we observed at entry says nothing about what the check will
+// complete into.
+func safeToLeaveChecking(existing *qbittorrent.Torrent, resumed bool) bool {
+	if resumed {
+		return false
+	}
+	return existing == nil || isDownloadStoppedState(existing.State)
+}
+
+// driveTorrentToReady adds the torrent when qB does not have it, clears whatever
+// is holding it back, then waits. Returns the last state observed and whether
+// this call started the torrent, both of which addAndVerifyTorrent needs to
+// decide whether stopping it is safe.
+//
+// A nil existing means qB does not have the torrent. getQBTorrent returns the
+// pointer and its found flag together, so the pointer already carries that.
+func (s *Server) driveTorrentToReady(
+	ctx context.Context,
+	hash string,
+	state *serverTorrentState,
+	req *pb.FinalizeTorrentRequest,
+	existing *qbittorrent.Torrent,
+) (qbittorrent.TorrentState, bool, error) {
+	// Fast path: torrent is already verified and seeding-ready.
+	if existing != nil && existing.Progress >= 1.0 && isReadyState(existing.State) {
+		return existing.State, false, nil
+	}
+
+	if existing == nil {
 		if addErr := s.addTorrentToQB(ctx, hash, state, req); addErr != nil {
-			return "", addErr
+			return "", false, addErr
 		}
 	}
 
-	if needsPartialSelectionRecovery(found, existingTorrent, state.files) {
-		if found {
-			s.logger.InfoContext(ctx, "existing torrent stuck stopped near zero progress, re-applying priorities",
-				"hash", hash,
-				"state", existingTorrent.State,
-				"progress", existingTorrent.Progress,
-			)
-		}
-		if priErr := s.applyAndVerifyDeselectedPriorities(ctx, hash, state.files); priErr != nil {
-			s.stopTorrentBestEffort(ctx, hash)
-			return "", fmt.Errorf("applying deselected priorities: %w", priErr)
-		}
+	resumed, prepErr := s.prepareForVerification(ctx, hash, existing, state)
+	if prepErr != nil {
+		return "", resumed, prepErr
 	}
 
 	finalState, waitErr := s.waitForTorrentReady(ctx, hash, state.totalSize)
@@ -121,16 +162,80 @@ func (s *Server) addAndVerifyTorrent(
 			"hash", hash,
 			"state", finalState,
 		)
-		metrics.PostAddRechecksTotal.Inc()
+		metrics.QBRechecksTotal.WithLabelValues(metrics.ReasonRecheckPostAddError).Inc()
 		if recheckErr := s.qbClient.RecheckCtx(ctx, []string{hash}); recheckErr != nil {
-			s.stopTorrentBestEffort(ctx, hash)
-			return finalState, fmt.Errorf("triggering recheck after error state %s: %w", finalState, recheckErr)
+			return finalState, resumed,
+				fmt.Errorf("triggering recheck after error state %s: %w", finalState, recheckErr)
 		}
 		finalState, waitErr = s.waitForTorrentReady(ctx, hash, state.totalSize)
 	}
 
-	s.stopTorrentBestEffort(ctx, hash)
-	return finalState, waitErr
+	return finalState, resumed, waitErr
+}
+
+// prepareForVerification nudges the torrent into a state waitForTorrentReady
+// can actually resolve. A fresh add needs its deselected priorities applied; a
+// torrent qB already holds may need those re-applied, or a recheck when it sits
+// in a state nothing else in this stage would move it out of.
+//
+// Reports whether it started the torrent: applying deselected priorities ends in
+// a resume, and the caller cannot judge the torrent's post-check state from what
+// it saw at entry once that has happened.
+func (s *Server) prepareForVerification(
+	ctx context.Context,
+	hash string,
+	existing *qbittorrent.Torrent,
+	state *serverTorrentState,
+) (bool, error) {
+	switch {
+	case needsPartialSelectionRecovery(existing, state.files):
+		if existing != nil {
+			s.logger.InfoContext(ctx, "existing torrent stuck stopped near zero progress, re-applying priorities",
+				"hash", hash,
+				"state", existing.State,
+				"progress", existing.Progress,
+			)
+		}
+		// Resumes on success - see applyAndVerifyDeselectedPriorities.
+		if priErr := s.applyAndVerifyDeselectedPriorities(ctx, hash, state.files); priErr != nil {
+			return false, fmt.Errorf("applying deselected priorities: %w", priErr)
+		}
+		return true, nil
+
+	case isTorrentParked(existing):
+		if !state.claimParkedRecheck(existing.State) {
+			return false, nil // qB already answered for this state; re-hashing buys nothing
+		}
+		// AddTorrent is skipped for a torrent qB already has, so nothing else in
+		// this stage moves it out of a download-side stopped state. Without a
+		// recheck, waitForTorrentReady polls a state that never changes, the wait
+		// times out, and every retry repeats it identically until the source's
+		// guard tags the torrent sync-failed. Recheck is what an operator would
+		// do by hand.
+		s.logger.InfoContext(ctx, "existing torrent parked in a non-ready state, triggering recheck",
+			"hash", hash,
+			"state", existing.State,
+			"progress", existing.Progress,
+		)
+		metrics.QBRechecksTotal.WithLabelValues(metrics.ReasonRecheckParked).Inc()
+		if recheckErr := s.qbClient.RecheckCtx(ctx, []string{hash}); recheckErr != nil {
+			return false, fmt.Errorf("triggering recheck for parked torrent %s: %w", existing.State, recheckErr)
+		}
+	}
+
+	return false, nil
+}
+
+// isTorrentParked reports whether a torrent destination qB already holds is
+// stuck in a state the qB stage cannot move on its own, because AddTorrent is
+// skipped for a torrent qB already has.
+//
+// Allow-list, deliberately. "Not checking and not ready" also covers
+// downloading, stalledDL, metaDL, allocating and moving, all of which advance on
+// their own - throwing a recheck at a torrent an operator already had
+// downloading, or at one qB is mid-move, re-hashes it for nothing.
+func isTorrentParked(t *qbittorrent.Torrent) bool {
+	return t != nil && (isDownloadStoppedState(t.State) || t.State == qbittorrent.TorrentStateQueuedDl)
 }
 
 // addTorrentToQB issues the actual AddTorrent against destination qB with the
@@ -204,11 +309,11 @@ func (s *Server) addTorrentToQB(
 //     actively making progress (mid-recheck, partial download) — don't disrupt
 //     by re-issuing SetFilePriority, and don't override an operator who paused
 //     a torrent mid-progress for investigation.
-func needsPartialSelectionRecovery(found bool, t *qbittorrent.Torrent, files []*serverFileInfo) bool {
+func needsPartialSelectionRecovery(t *qbittorrent.Torrent, files []*serverFileInfo) bool {
 	if deselectedFileIDs(files) == "" {
 		return false
 	}
-	if !found {
+	if t == nil {
 		return true
 	}
 	return t.Progress < 0.001 && isDownloadStoppedState(t.State)

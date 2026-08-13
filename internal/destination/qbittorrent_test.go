@@ -77,6 +77,7 @@ type mockQBClient struct {
 	// torrentsAfterAdd, when non-nil, swaps the torrent list on the next
 	// AddTorrentFromMemoryCtx call. Lets tests model "torrent not present →
 	// add → torrent now in some state" without manual mid-test mutation.
+	addCalled        bool
 	torrentsAfterAdd []qbittorrent.Torrent
 }
 
@@ -176,6 +177,7 @@ func (m *mockQBClient) CreateCategoryCtx(_ context.Context, category, path strin
 	return m.createCategoryErr
 }
 func (m *mockQBClient) AddTorrentFromMemoryCtx(context.Context, []byte, map[string]string) error {
+	m.addCalled = true
 	if m.torrentsAfterAdd != nil {
 		m.torrents = m.torrentsAfterAdd
 	}
@@ -874,28 +876,24 @@ func TestNeedsPartialSelectionRecovery(t *testing.T) {
 	}{
 		{
 			name:  "fresh add with deselected files: apply",
-			found: false,
 			t:     nil,
 			files: withDeselected,
 			want:  true,
 		},
 		{
 			name:  "fresh add with no deselected files: skip",
-			found: false,
 			t:     nil,
 			files: allSelected,
 			want:  false,
 		},
 		{
 			name:  "existing stoppedDl at 0% with deselected files: recover",
-			found: true,
 			t:     &qbittorrent.Torrent{State: qbittorrent.TorrentStateStoppedDl, Progress: 0},
 			files: withDeselected,
 			want:  true,
 		},
 		{
 			name:  "existing pausedDl at 0% with deselected files: recover",
-			found: true,
 			t:     &qbittorrent.Torrent{State: qbittorrent.TorrentStatePausedDl, Progress: 0},
 			files: withDeselected,
 			want:  true,
@@ -903,7 +901,6 @@ func TestNeedsPartialSelectionRecovery(t *testing.T) {
 		{
 			// Skeptic #1 regression: don't disrupt mid-recheck torrents.
 			name:  "existing stoppedDl at 50%: skip (mid-recheck)",
-			found: true,
 			t:     &qbittorrent.Torrent{State: qbittorrent.TorrentStateStoppedDl, Progress: 0.5},
 			files: withDeselected,
 			want:  false,
@@ -911,7 +908,6 @@ func TestNeedsPartialSelectionRecovery(t *testing.T) {
 		{
 			// Skeptic #2 regression: don't disrupt actively checking torrents.
 			name:  "existing checking at 0%: skip",
-			found: true,
 			t:     &qbittorrent.Torrent{State: qbittorrent.TorrentStateCheckingDl, Progress: 0},
 			files: withDeselected,
 			want:  false,
@@ -919,14 +915,12 @@ func TestNeedsPartialSelectionRecovery(t *testing.T) {
 		{
 			// Guardian #6 add: full-selection stuck torrents shouldn't trigger recovery.
 			name:  "existing stoppedDl at 0% with all files selected: skip",
-			found: true,
 			t:     &qbittorrent.Torrent{State: qbittorrent.TorrentStateStoppedDl, Progress: 0},
 			files: allSelected,
 			want:  false,
 		},
 		{
 			name:  "existing seeding at 100%: skip (already done)",
-			found: true,
 			t:     &qbittorrent.Torrent{State: qbittorrent.TorrentStateUploading, Progress: 1.0},
 			files: withDeselected,
 			want:  false,
@@ -934,7 +928,6 @@ func TestNeedsPartialSelectionRecovery(t *testing.T) {
 		{
 			// Boundary: exactly at the 0.001 threshold is excluded (qB has begun progressing).
 			name:  "existing stoppedDl at 0.001%: skip (FP threshold boundary)",
-			found: true,
 			t:     &qbittorrent.Torrent{State: qbittorrent.TorrentStateStoppedDl, Progress: 0.001},
 			files: withDeselected,
 			want:  false,
@@ -944,7 +937,7 @@ func TestNeedsPartialSelectionRecovery(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := needsPartialSelectionRecovery(tt.found, tt.t, tt.files)
+			got := needsPartialSelectionRecovery(tt.t, tt.files)
 			if got != tt.want {
 				t.Errorf("needsPartialSelectionRecovery() = %v, want %v", got, tt.want)
 			}
@@ -1089,6 +1082,150 @@ func TestAddAndVerifyTorrent_AutoRechecksOnErrorState(t *testing.T) {
 	})
 }
 
+// A torrent destination qB already holds in a download-side stopped state is
+// the "data was already on the destination" case: something else (an *arr,
+// cross-seed automation, a hand add, or an earlier attempt that stopped the
+// torrent mid-recheck) added it pointing at existing files. checkTorrentInQB
+// reports it as absent, AddTorrent is skipped because qB has it, and nothing
+// else in the qB stage moves it - so without a recheck the wait times out
+// identically on every retry until the source tags the torrent sync-failed.
+func TestAddAndVerifyTorrent_RechecksParkedTorrent(t *testing.T) {
+	t.Parallel()
+
+	parked := []struct {
+		name     string
+		state    qbittorrent.TorrentState
+		progress float64
+	}{
+		{"stoppedDL at 100%", qbittorrent.TorrentStateStoppedDl, 1.0},
+		{"stoppedDL at 0%", qbittorrent.TorrentStateStoppedDl, 0.0},
+		{"pausedDL at 100%", qbittorrent.TorrentStatePausedDl, 1.0},
+		{"queuedDL", qbittorrent.TorrentStateQueuedDl, 0.5},
+	}
+
+	for _, tc := range parked {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			mock := &mockQBClient{
+				torrents: []qbittorrent.Torrent{
+					{Hash: "abc123", State: tc.state, Progress: tc.progress},
+				},
+				torrentsAfterRecheck: []qbittorrent.Torrent{
+					{Hash: "abc123", State: qbittorrent.TorrentStateStoppedUp, Progress: 1.0},
+				},
+			}
+			s := newTestServerWithQB(t, mock)
+			s.config.QB = &QBConfig{PollInterval: 5 * time.Millisecond, PollTimeout: 2 * time.Second}
+
+			state := &serverTorrentState{torrentMeta: torrentMeta{
+				files: []*serverFileInfo{{selected: true}},
+			}, torrentFile: []byte("fake")}
+
+			finalState, err := s.addAndVerifyTorrent(context.Background(), "abc123", state,
+				&pb.FinalizeTorrentRequest{TorrentHash: "abc123"})
+			if err != nil {
+				t.Fatalf("expected recheck to recover parked torrent, got: %v", err)
+			}
+			if !mock.recheckCalled {
+				t.Fatal("RecheckCtx must be called for a torrent parked in a non-ready state")
+			}
+			if mock.addCalled {
+				t.Error("AddTorrent must not be issued for a torrent qB already has")
+			}
+			if finalState != qbittorrent.TorrentStateStoppedUp {
+				t.Errorf("final state = %v, want stoppedUP after recheck", finalState)
+			}
+			if !mock.stopCalled {
+				t.Error("torrent must be left stopped: source is canonical seeder until handoff")
+			}
+		})
+	}
+
+	t.Run("a torrent we added is left checking", func(t *testing.T) {
+		t.Parallel()
+		// We added it with stopped=true, so the check completes into a stopped
+		// state and cannot seed. Stopping it mid-pass is what parks it in
+		// stoppedDL and sends the next attempt into the same dead end.
+		mock := &mockQBClient{
+			torrents: nil, // qB does not have it: we add it
+			torrentsAfterAdd: []qbittorrent.Torrent{
+				{Hash: "abc123", State: qbittorrent.TorrentStateCheckingUp, Progress: 0.4},
+			},
+		}
+		s := newTestServerWithQB(t, mock)
+		s.config.QB = &QBConfig{PollInterval: 5 * time.Millisecond, PollTimeout: 50 * time.Millisecond}
+
+		state := &serverTorrentState{torrentMeta: torrentMeta{
+			files: []*serverFileInfo{{selected: true}},
+		}, torrentFile: []byte("fake")}
+
+		finalState, err := s.addAndVerifyTorrent(context.Background(), "abc123", state,
+			&pb.FinalizeTorrentRequest{TorrentHash: "abc123"})
+		if !mock.addCalled {
+			t.Fatal("expected the torrent to be added")
+		}
+		if !isBusyWaitError(finalState, err) {
+			t.Errorf("still-checking at budget expiry should classify as BUSY, got state=%v err=%v",
+				finalState, err)
+		}
+		if mock.stopCalled {
+			t.Error("must not stop a torrent we added mid-check")
+		}
+	})
+
+	t.Run("a torrent qB already held is stopped even mid-check", func(t *testing.T) {
+		t.Parallel()
+		// We never saw how this one was configured. Its check can complete into
+		// uploading behind our back, and the source is the canonical seeder
+		// until handoff, so the dual-seed window has to be closed.
+		mock := &mockQBClient{
+			torrents: []qbittorrent.Torrent{
+				{Hash: "abc123", State: qbittorrent.TorrentStateCheckingUp, Progress: 0.4},
+			},
+		}
+		s := newTestServerWithQB(t, mock)
+		s.config.QB = &QBConfig{PollInterval: 5 * time.Millisecond, PollTimeout: 50 * time.Millisecond}
+
+		state := &serverTorrentState{torrentMeta: torrentMeta{
+			files: []*serverFileInfo{{selected: true}},
+		}, torrentFile: []byte("fake")}
+
+		_, _ = s.addAndVerifyTorrent(context.Background(), "abc123", state,
+			&pb.FinalizeTorrentRequest{TorrentHash: "abc123"})
+		if mock.recheckCalled {
+			t.Fatal("must not recheck a torrent qB is already checking")
+		}
+		if !mock.stopCalled {
+			t.Error("a torrent qB already held must be stopped: we cannot vouch for how it was added")
+		}
+	})
+
+	t.Run("ready torrent skips recheck", func(t *testing.T) {
+		t.Parallel()
+		mock := &mockQBClient{
+			torrents: []qbittorrent.Torrent{
+				{Hash: "abc123", State: qbittorrent.TorrentStateStoppedUp, Progress: 1.0},
+			},
+		}
+		s := newTestServerWithQB(t, mock)
+
+		state := &serverTorrentState{torrentMeta: torrentMeta{
+			files: []*serverFileInfo{{selected: true}},
+		}, torrentFile: []byte("fake")}
+
+		if _, err := s.addAndVerifyTorrent(context.Background(), "abc123", state,
+			&pb.FinalizeTorrentRequest{TorrentHash: "abc123"}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if mock.recheckCalled {
+			t.Error("a seeding-ready torrent needs no recheck")
+		}
+		if !mock.stopCalled {
+			t.Error("fast path must still leave the torrent stopped")
+		}
+	})
+}
+
 func TestQBStageTimeout(t *testing.T) {
 	const gb = int64(1024 * 1024 * 1024)
 
@@ -1185,5 +1322,231 @@ func TestQBFinalizeConcurrencyValidation(t *testing.T) {
 	cfg.QBFinalizeConcurrency = 99
 	if got := cfg.GetQBFinalizeConcurrency(); got != maxQBFinalizeConcurrency {
 		t.Errorf("out-of-range value must clamp to %d, got %d", maxQBFinalizeConcurrency, got)
+	}
+}
+
+// TestIsTorrentParked pins the allow-list. "Not checking and not ready" would
+// also catch states that advance on their own, and throwing a recheck at those
+// re-hashes a torrent for nothing.
+func TestIsTorrentParked(t *testing.T) {
+	t.Parallel()
+
+	parked := []qbittorrent.TorrentState{
+		qbittorrent.TorrentStateStoppedDl,
+		qbittorrent.TorrentStatePausedDl,
+		qbittorrent.TorrentStateQueuedDl,
+	}
+	selfAdvancing := []qbittorrent.TorrentState{
+		qbittorrent.TorrentStateDownloading,
+		qbittorrent.TorrentStateStalledDl,
+		qbittorrent.TorrentStateMetaDl,
+		qbittorrent.TorrentStateAllocating,
+		qbittorrent.TorrentStateMoving,
+		qbittorrent.TorrentStateCheckingDl,
+		qbittorrent.TorrentStateStoppedUp,
+	}
+
+	for _, st := range parked {
+		if !isTorrentParked(&qbittorrent.Torrent{State: st}) {
+			t.Errorf("%s should be parked: nothing in the qB stage moves it", st)
+		}
+	}
+	for _, st := range selfAdvancing {
+		if isTorrentParked(&qbittorrent.Torrent{State: st}) {
+			t.Errorf("%s advances on its own or is terminal, a recheck would be wasted work", st)
+		}
+	}
+	if isTorrentParked(nil) {
+		t.Error("a torrent qB does not have is added, not rechecked")
+	}
+}
+
+// TestClaimParkedRecheck pins the latch, which is keyed on the parked state
+// rather than set once. Repeating a recheck that already answered re-hashes the
+// whole torrent on every finalize attempt, but a torrent that has moved to a
+// different parked state has not been answered yet - and stopping a started
+// torrent mid-check leaves it in a state its earlier recheck never saw.
+func TestClaimParkedRecheck(t *testing.T) {
+	t.Parallel()
+
+	state := &serverTorrentState{}
+	if !state.claimParkedRecheck(qbittorrent.TorrentStateQueuedDl) {
+		t.Fatal("the first attempt owns the recheck")
+	}
+	if state.claimParkedRecheck(qbittorrent.TorrentStateQueuedDl) {
+		t.Error("the same parked state was already answered, re-issuing re-hashes for nothing")
+	}
+	if !state.claimParkedRecheck(qbittorrent.TorrentStateStoppedDl) {
+		t.Error("a different parked state has not been answered and deserves its own recheck")
+	}
+}
+
+// TestAddAndVerifyTorrent_SlowRecheckSurvivesRetry pins the interaction between
+// the parked recheck and the mid-check stop, which together once reopened the
+// wedge they were each written to close.
+//
+// A torrent qB already held in stoppedDL gets a recheck. If that recheck outlasts
+// the qB-stage budget, the pass ends mid-check. Stopping it there returns it to
+// stoppedDL, and if the recheck were latched outright the next attempt would find
+// it parked with no recheck left to issue, wait for a state nothing moves, and
+// time out until the source's guard tagged it sync-failed.
+func TestAddAndVerifyTorrent_SlowRecheckSurvivesRetry(t *testing.T) {
+	t.Parallel()
+
+	newAttempt := func(t *testing.T, mock *mockQBClient) *Server {
+		t.Helper()
+		s := newTestServerWithQB(t, mock)
+		s.config.QB = &QBConfig{PollInterval: 5 * time.Millisecond, PollTimeout: 50 * time.Millisecond}
+		return s
+	}
+	newState := func() *serverTorrentState {
+		return &serverTorrentState{
+			torrentMeta: torrentMeta{files: []*serverFileInfo{{selected: true}}},
+			torrentFile: []byte("fake"),
+		}
+	}
+
+	t.Run("a stopped torrent is left checking so the recheck can finish", func(t *testing.T) {
+		t.Parallel()
+		mock := &mockQBClient{
+			torrents: []qbittorrent.Torrent{
+				{Hash: "abc123", State: qbittorrent.TorrentStateStoppedDl, Progress: 1.0},
+			},
+			// The recheck starts but does not finish inside the budget.
+			torrentsAfterRecheck: []qbittorrent.Torrent{
+				{Hash: "abc123", State: qbittorrent.TorrentStateCheckingDl, Progress: 1.0},
+			},
+		}
+		s := newAttempt(t, mock)
+
+		_, _ = s.addAndVerifyTorrent(context.Background(), "abc123", newState(),
+			&pb.FinalizeTorrentRequest{TorrentHash: "abc123"})
+
+		if !mock.recheckCalled {
+			t.Fatal("a parked torrent should have been rechecked")
+		}
+		if mock.stopCalled {
+			t.Error("stopping mid-check returns it to stoppedDL and wastes the recheck")
+		}
+	})
+
+	t.Run("the latch does not lock out a torrent that moved parked states", func(t *testing.T) {
+		t.Parallel()
+		state := newState()
+
+		// Attempt 1: queuedDL. Started, so it is stopped after the check, which
+		// leaves it in stoppedDL - a state its recheck never covered.
+		queued := &mockQBClient{
+			torrents: []qbittorrent.Torrent{
+				{Hash: "abc123", State: qbittorrent.TorrentStateQueuedDl, Progress: 1.0},
+			},
+			torrentsAfterRecheck: []qbittorrent.Torrent{
+				{Hash: "abc123", State: qbittorrent.TorrentStateCheckingDl, Progress: 1.0},
+			},
+		}
+		_, _ = newAttempt(t, queued).addAndVerifyTorrent(context.Background(), "abc123", state,
+			&pb.FinalizeTorrentRequest{TorrentHash: "abc123"})
+		if !queued.recheckCalled {
+			t.Fatal("queuedDL is parked and should have been rechecked")
+		}
+		if !queued.stopCalled {
+			t.Error("a started torrent must not be left checking: it completes into uploading")
+		}
+
+		// Attempt 2, same state object: now stoppedDL.
+		stopped := &mockQBClient{
+			torrents: []qbittorrent.Torrent{
+				{Hash: "abc123", State: qbittorrent.TorrentStateStoppedDl, Progress: 1.0},
+			},
+			torrentsAfterRecheck: []qbittorrent.Torrent{
+				{Hash: "abc123", State: qbittorrent.TorrentStateStoppedUp, Progress: 1.0},
+			},
+		}
+		_, err := newAttempt(t, stopped).addAndVerifyTorrent(context.Background(), "abc123", state,
+			&pb.FinalizeTorrentRequest{TorrentHash: "abc123"})
+
+		if !stopped.recheckCalled {
+			t.Fatal("the torrent is parked in a state no earlier recheck answered: it must get one")
+		}
+		if err != nil {
+			t.Errorf("the retry should recover the torrent, got %v", err)
+		}
+	})
+
+	t.Run("the same parked state is not rechecked twice", func(t *testing.T) {
+		t.Parallel()
+		state := newState()
+
+		for attempt := range 2 {
+			mock := &mockQBClient{
+				torrents: []qbittorrent.Torrent{
+					{Hash: "abc123", State: qbittorrent.TorrentStateStoppedDl, Progress: 0.5},
+				},
+			}
+			_, _ = newAttempt(t, mock).addAndVerifyTorrent(context.Background(), "abc123", state,
+				&pb.FinalizeTorrentRequest{TorrentHash: "abc123"})
+
+			if attempt == 1 && mock.recheckCalled {
+				t.Error("qB already answered for this state, re-hashing the torrent again buys nothing")
+			}
+		}
+	})
+}
+
+// TestSafeToLeaveChecking pins the arbiter of the dual-seed window. Leaving a
+// torrent mid-check is only safe when it cannot seed on completion, and the
+// entry state alone does not answer that: applyAndVerifyDeselectedPriorities
+// resumes the torrent once priorities verify, so a partial-selection add we
+// observed as stopped completes its check into uploading.
+func TestSafeToLeaveChecking(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		existing *qbittorrent.Torrent
+		resumed  bool
+		want     bool
+	}{
+		{
+			name:     "we added it, still stopped",
+			existing: nil,
+			want:     true,
+		},
+		{
+			name:     "qB held it stopped",
+			existing: &qbittorrent.Torrent{State: qbittorrent.TorrentStateStoppedDl},
+			want:     true,
+		},
+		{
+			name:     "qB held it paused",
+			existing: &qbittorrent.Torrent{State: qbittorrent.TorrentStatePausedDl},
+			want:     true,
+		},
+		{
+			name:     "queuedDL is started and completes into uploading",
+			existing: &qbittorrent.Torrent{State: qbittorrent.TorrentStateQueuedDl},
+			want:     false,
+		},
+		{
+			name:     "we added it but resumed it for partial selection",
+			existing: nil,
+			resumed:  true,
+			want:     false,
+		},
+		{
+			name:     "qB held it stopped but we resumed it",
+			existing: &qbittorrent.Torrent{State: qbittorrent.TorrentStateStoppedDl},
+			resumed:  true,
+			want:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := safeToLeaveChecking(tt.existing, tt.resumed); got != tt.want {
+				t.Errorf("safeToLeaveChecking() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
