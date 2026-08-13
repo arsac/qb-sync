@@ -461,6 +461,29 @@ func TestSweepEmptyMetaDir(t *testing.T) {
 		require.False(t, s.sweepEmptyMetaDir(context.Background(), hash))
 		require.DirExists(t, metaDir)
 	})
+
+	// A reserved hash marks an init inside setupMetadataDir's window between
+	// MkdirAll and the .meta write, when its directory is legitimately empty.
+	// Sweeping it there takes the directory from under the .meta write.
+	t.Run("keeps a directory whose init holds the reservation", func(t *testing.T) {
+		t.Parallel()
+		s, _ := newTestDestServer(t)
+		metaDir := newDir(t, s)
+		require.NoError(t, s.store.Reserve(hash))
+
+		require.False(t, s.sweepEmptyMetaDir(context.Background(), hash))
+		require.DirExists(t, metaDir)
+	})
+
+	t.Run("releases its registration after sweeping", func(t *testing.T) {
+		t.Parallel()
+		s, _ := newTestDestServer(t)
+		newDir(t, s)
+
+		require.True(t, s.sweepEmptyMetaDir(context.Background(), hash))
+		require.NoError(t, s.store.Reserve(hash),
+			"a completed sweep must not leave a cleanup registered against the hash")
+	})
 }
 
 // TestCleanupOrphanedTorrents_SweepsEmptyDirs pins that the sweep is actually

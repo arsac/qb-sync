@@ -101,10 +101,21 @@ func (ts *torrentStore) Len() int {
 }
 
 // Reserve inserts a sentinel to prevent concurrent initialization.
-// Returns error if hash is already tracked or initializing.
+// Returns error if hash is already tracked, initializing, or being cleaned up.
+//
+// The cleanup check closes a TOCTOU with BeginReclaim/BeginAbort: InitTorrent's
+// abort-wait only sees cleanups registered before it ran, and a reclaim that
+// begins during the qB round-trips between that wait and this reserve would
+// delete the very files initNewTorrent is about to create. Both maps share
+// ts.mu, so the check is atomic with the sentinel insert; the reverse order is
+// already safe because a reclaim's staleness predicate rejects a sentinel
+// (initializing means its files are being created right now).
 func (ts *torrentStore) Reserve(hash string) error {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
+	if _, busy := ts.aborting[hash]; busy {
+		return fmt.Errorf("torrent %s cleanup in progress", hash)
+	}
 	if state, exists := ts.entries[hash]; exists {
 		if state.initializing.Load() {
 			return fmt.Errorf("torrent %s initialization already in progress", hash)
@@ -221,13 +232,23 @@ func (ts *torrentStore) Drain() map[string]*serverTorrentState {
 }
 
 // BeginAbort atomically removes the torrent from the store and registers a
-// cleanup channel. If an abort is already in progress, returns (nil, existingCh).
+// cleanup channel. If an abort is already in progress, returns (nil, existingCh, nil).
 // Caller closes ch after cleanup, then calls EndCleanup.
-func (ts *torrentStore) BeginAbort(hash string, ch chan struct{}) (*serverTorrentState, chan struct{}) {
+//
+// An init sentinel is refused with an error instead of taken: initNewTorrent is
+// creating the very files and metadata the abort would delete, and it never
+// consults the aborting map mid-flight. Refusing here mirrors the staleness
+// predicate that shields sentinels from BeginReclaim; the orphan cleaner is the
+// backstop if the caller never retries.
+func (ts *torrentStore) BeginAbort(hash string, ch chan struct{}) (*serverTorrentState, chan struct{}, error) {
 	ts.mu.Lock()
 	if existing, alreadyAborting := ts.aborting[hash]; alreadyAborting {
 		ts.mu.Unlock()
-		return nil, existing
+		return nil, existing, nil
+	}
+	if state, exists := ts.entries[hash]; exists && state.initializing.Load() {
+		ts.mu.Unlock()
+		return nil, nil, fmt.Errorf("torrent %s initialization in progress", hash)
 	}
 	ts.aborting[hash] = ch
 	state, exists := ts.dropEntryLocked(hash)
@@ -240,7 +261,7 @@ func (ts *torrentStore) BeginAbort(hash string, ch chan struct{}) (*serverTorren
 		ts.retireState(hash, state)
 	}
 
-	return state, nil
+	return state, nil, nil
 }
 
 // BeginReclaim registers a cleanup channel for orphan reclamation, dropping the

@@ -180,6 +180,12 @@ func (s *Server) forEachTorrentMetaDir(ctx context.Context, fn func(hash, metaDi
 //
 // [os.Remove] rather than RemoveAll: it fails harmlessly on a directory that has
 // since been repopulated, so this can never race a live torrent's metadata.
+//
+// Remove's non-empty check cannot cover setupMetadataDir's window between
+// MkdirAll and the .meta write, when the directory an init owns is legitimately
+// empty. The reclaim registration covers that: an init past Reserve holds an
+// entry, which makes the registration fail here, and while the registration is
+// held Reserve refuses the hash, so no init can enter the window.
 func (s *Server) sweepEmptyMetaDir(ctx context.Context, hash string) bool {
 	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
 	for _, name := range []string{finalizedFileName, metaFileName, stateFileName} {
@@ -187,6 +193,18 @@ func (s *Server) sweepEmptyMetaDir(ctx context.Context, hash string) bool {
 			return false
 		}
 	}
+
+	cleanupCh := make(chan struct{})
+	if !s.store.BeginReclaim(hash, cleanupCh, func(*serverTorrentState) bool {
+		// A live entry owns its directory, empty or not.
+		return false
+	}) {
+		return false
+	}
+	defer func() {
+		close(cleanupCh)
+		s.store.EndCleanup(hash)
+	}()
 
 	if err := os.Remove(metaDir); err != nil {
 		// Non-empty (repopulated, or holding something we do not know about) or

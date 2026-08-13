@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/bits-and-blooms/bitset"
+
+	pb "github.com/arsac/qb-sync/proto"
 )
 
 // ---------- Bug A: Inode reuse — size guard on hardlink ----------
@@ -861,5 +863,126 @@ func TestFinalizeTorrent_RelocatesWhenSubPathBecomesEmpty(t *testing.T) {
 	expectedPath := filepath.Join(tmpDir, "torrent", "file.mkv"+partialSuffix)
 	if newPath != expectedPath {
 		t.Fatalf("file path should be %q, got %q", expectedPath, newPath)
+	}
+}
+
+// ---------- BeginReclaim vs Reserve TOCTOU ----------
+
+// TestReserve_RefusesDuringCleanup pins the closing of the reclaim/init race:
+// a cleanup that registers between InitTorrent's abort-wait and its Reserve
+// must make the Reserve fail - otherwise init creates the very files the
+// reclaim is concurrently deleting. An untracked hash is the dangerous case,
+// because BeginReclaim never consults its predicate when there is no entry.
+func TestReserve_RefusesDuringCleanup(t *testing.T) {
+	t.Parallel()
+	store := newTorrentStore(t.TempDir(), testLogger(t))
+
+	ch := make(chan struct{})
+	if !store.BeginReclaim("hash", ch, func(*serverTorrentState) bool { return true }) {
+		t.Fatal("BeginReclaim on an untracked hash must succeed")
+	}
+
+	if err := store.Reserve("hash"); err == nil {
+		t.Fatal("Reserve must refuse while a cleanup is registered")
+	}
+
+	close(ch)
+	store.EndCleanup("hash")
+
+	if err := store.Reserve("hash"); err != nil {
+		t.Fatalf("Reserve after EndCleanup should succeed: %v", err)
+	}
+}
+
+// TestBeginReclaim_StalenessPredRejectsSentinel pins the other half of the
+// safety argument: when Reserve wins the race, the reclaim's staleness
+// predicate must reject the sentinel it finds, so the two orders compose into
+// mutual exclusion rather than each side needing the other to go first.
+func TestBeginReclaim_StalenessPredRejectsSentinel(t *testing.T) {
+	t.Parallel()
+	store := newTorrentStore(t.TempDir(), testLogger(t))
+	s := &Server{}
+
+	if err := store.Reserve("hash"); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	registered := store.BeginReclaim("hash", make(chan struct{}), func(st *serverTorrentState) bool {
+		return s.isStaleState(st, time.Minute)
+	})
+	if registered {
+		t.Fatal("BeginReclaim must be rejected while an init holds the sentinel")
+	}
+}
+
+// TestAbortTorrent_WaiterDoesNotDeregisterForeignCleanup pins that an
+// AbortTorrent which merely waited on another cleanup's channel leaves the
+// aborting map alone. Its own channel was never registered, and an EndCleanup
+// from a non-owner deletes whatever registration occupies the slot by then -
+// the registration Reserve relies on to keep InitTorrent out of a cleanup
+// still deleting files.
+func TestAbortTorrent_WaiterDoesNotDeregisterForeignCleanup(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestDestServer(t)
+	const hash = "waiter-vs-owner"
+
+	ownerCh := make(chan struct{})
+	state, existing, beginErr := s.store.BeginAbort(hash, ownerCh)
+	if state != nil || existing != nil || beginErr != nil {
+		t.Fatalf("owner registration should be first: state=%v existing=%v err=%v", state, existing, beginErr)
+	}
+
+	// The owner signals completion but has not deregistered yet - the
+	// straggler window every cleanup path passes through.
+	close(ownerCh)
+
+	resp, abortErr := s.AbortTorrent(context.Background(), &pb.AbortTorrentRequest{TorrentHash: hash})
+	if abortErr != nil || !resp.GetSuccess() {
+		t.Fatalf("waiting abort should succeed: resp=%v err=%v", resp, abortErr)
+	}
+
+	if _, stillRegistered := s.store.AbortCh(hash); !stillRegistered {
+		t.Fatal("the waiter deregistered a cleanup it does not own")
+	}
+}
+
+// TestAbortTorrent_RefusedWhileInitHoldsSentinel pins that an abort landing
+// mid-init is refused rather than racing it. Taking the sentinel would pass
+// the nil-state check and delete the metadata directory initNewTorrent is
+// writing, leaving the committed torrent unrecoverable across a restart.
+func TestAbortTorrent_RefusedWhileInitHoldsSentinel(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+	const hash = "mid-init-abort"
+
+	if reserveErr := s.store.Reserve(hash); reserveErr != nil {
+		t.Fatalf("Reserve: %v", reserveErr)
+	}
+	metaDir := filepath.Join(tmpDir, metaDirName, hash)
+	if err := os.MkdirAll(metaDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	metaPath := filepath.Join(metaDir, metaFileName)
+	if err := os.WriteFile(metaPath, []byte("meta"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, abortErr := s.AbortTorrent(context.Background(),
+		&pb.AbortTorrentRequest{TorrentHash: hash, DeleteFiles: true})
+	if abortErr != nil {
+		t.Fatalf("AbortTorrent: %v", abortErr)
+	}
+	if resp.GetSuccess() {
+		t.Fatal("an abort during init must be refused, not reported successful")
+	}
+
+	if _, exists := s.store.GetWithSentinel(hash); !exists {
+		t.Fatal("the init's sentinel must survive the refused abort")
+	}
+	if _, statErr := os.Stat(metaPath); statErr != nil {
+		t.Fatalf("the init's metadata must survive the refused abort: %v", statErr)
+	}
+	if _, registered := s.store.AbortCh(hash); registered {
+		t.Fatal("a refused abort must not leave a cleanup registered")
 	}
 }

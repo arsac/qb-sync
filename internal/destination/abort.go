@@ -208,17 +208,28 @@ func (s *Server) AbortTorrent(
 	// Register this abort to prevent concurrent InitTorrent from racing with cleanup.
 	// Create a channel that InitTorrent can wait on.
 	abortCh := make(chan struct{})
+	state, existingCh, beginErr := s.store.BeginAbort(hash, abortCh)
+	if beginErr != nil {
+		// Refused rather than raced: an InitTorrent is mid-flight and owns the
+		// files this abort would delete. The source does not retry a failed
+		// abort - it logs and moves on - so the orphan cleaner is what
+		// eventually reclaims the torrent.
+		s.logger.WarnContext(ctx, "abort refused, initialization in progress", "hash", hash)
+		return &pb.AbortTorrentResponse{Success: false, Error: beginErr.Error()}, nil
+	}
+	if existingCh != nil {
+		// Wait for existing abort to complete, then return success. No
+		// deregistration here: abortCh was never registered, and an EndCleanup
+		// from a non-owner deletes whatever registration occupies the slot by
+		// then - the very registration Reserve relies on to keep InitTorrent
+		// out of a cleanup still deleting files.
+		<-existingCh
+		return abortResponse(0, nil), nil
+	}
 	defer func() {
 		close(abortCh) // Signal waiting InitTorrent calls before deregistering
 		s.store.EndCleanup(hash)
 	}()
-
-	state, existingCh := s.store.BeginAbort(hash, abortCh)
-	if existingCh != nil {
-		// Wait for existing abort to complete, then return success
-		<-existingCh
-		return abortResponse(0, nil), nil
-	}
 
 	if state == nil {
 		s.logger.InfoContext(ctx, "torrent not found for abort (may already be cleaned up)",

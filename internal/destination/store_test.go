@@ -259,7 +259,10 @@ func TestTorrentStore_BeginAbort(t *testing.T) {
 	commitTestTorrent(t, ts, "abc", "data/file.txt")
 
 	ch := make(chan struct{})
-	state, existingCh := ts.BeginAbort("abc", ch)
+	state, existingCh, beginErr := ts.BeginAbort("abc", ch)
+	if beginErr != nil {
+		t.Fatalf("BeginAbort: unexpected error: %v", beginErr)
+	}
 	if state == nil {
 		t.Fatal("BeginAbort: expected non-nil state")
 	}
@@ -291,7 +294,10 @@ func TestTorrentStore_BeginAbort(t *testing.T) {
 
 	// Second BeginAbort returns existing channel.
 	ch2 := make(chan struct{})
-	state2, existingCh2 := ts.BeginAbort("abc", ch2)
+	state2, existingCh2, beginErr2 := ts.BeginAbort("abc", ch2)
+	if beginErr2 != nil {
+		t.Fatalf("BeginAbort second: unexpected error: %v", beginErr2)
+	}
 	if state2 != nil {
 		t.Fatal("BeginAbort second: expected nil state")
 	}
@@ -400,7 +406,7 @@ func TestTorrentStore_AbortThenReAbort(t *testing.T) {
 	_ = commitTestTorrent(t, ts, "h1", "data/file1.txt")
 
 	ch1 := make(chan struct{})
-	_, _ = ts.BeginAbort("h1", ch1)
+	_, _, _ = ts.BeginAbort("h1", ch1)
 
 	// Simulate concurrent abort arriving just as first abort completes.
 	// After EndCleanup, the channel must already be closed so a waiter
@@ -409,7 +415,7 @@ func TestTorrentStore_AbortThenReAbort(t *testing.T) {
 	go func() {
 		defer close(done)
 		ch2 := make(chan struct{})
-		_, existingCh := ts.BeginAbort("h1", ch2)
+		_, existingCh, _ := ts.BeginAbort("h1", ch2)
 		if existingCh != nil {
 			<-existingCh // Must unblock
 		}
@@ -543,7 +549,8 @@ func TestTorrentStore_DropRetiresPreVerify(t *testing.T) {
 			ts.Drain()
 		},
 		"BeginAbort": func(ts *torrentStore, hash string) {
-			if state, existing := ts.BeginAbort(hash, make(chan struct{})); state == nil || existing != nil {
+			state, existing, err := ts.BeginAbort(hash, make(chan struct{}))
+			if state == nil || existing != nil || err != nil {
 				t.Errorf("BeginAbort(%q) did not take the entry", hash)
 			}
 		},
