@@ -474,3 +474,183 @@ func TestStartPreVerify_Idempotent(t *testing.T) {
 		t.Error("a pass restarted after stopPreVerify retired it")
 	}
 }
+
+// TestInodeRegistrySurvivesFinalization pins that a finalized torrent's files
+// stay linkable across a restart.
+//
+// The registry maps a source file's device+inode to this server's copy, which is
+// what lets a later cross-seeded torrent hardlink instead of re-transferring.
+// markFinalized used to delete .meta, leaving rebuildInodeMap able to see only
+// in-flight torrents - so every restart silently dropped every previously synced
+// file and re-streamed what it could have linked, looking exactly like normal
+// syncing but slower and with duplicated storage.
+func TestInodeRegistrySurvivesFinalization(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+	ctx := context.Background()
+
+	hash := "beefcafe567890abcdef1234567890abcdef1234"
+	fileSize := int64(4096)
+	sourceID := FileID{Dev: 66, Ino: 987654}
+
+	dataPath := filepath.Join(tmpDir, "downloads", "movie.mkv")
+	if err := os.MkdirAll(filepath.Dir(dataPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dataPath, make([]byte, fileSize), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	req := &pb.InitTorrentRequest{
+		TorrentHash: hash,
+		Name:        "movie",
+		PieceSize:   testPieceLen,
+		TotalSize:   fileSize,
+		NumPieces:   int32((fileSize + testPieceLen - 1) / testPieceLen),
+		SaveSubPath: "downloads",
+		PieceHashes: buildTestPieceHashes(t, fileSize),
+		TorrentFile: buildTestTorrentBytes(t, "movie.mkv", fileSize),
+		Files: []*pb.FileInfo{{
+			Path:     "movie.mkv",
+			Size:     fileSize,
+			Selected: true,
+			Device:   sourceID.Dev,
+			Inode:    sourceID.Ino,
+		}},
+	}
+	metaDir := setupRecoveryMetaDir(t, tmpDir, hash, req, nil)
+
+	s.markFinalized(metaDir, hash)
+
+	// The working state is gone; the inode record is not.
+	for _, gone := range []string{stateFileName, ".torrent"} {
+		if _, err := os.Stat(filepath.Join(metaDir, gone)); err == nil {
+			t.Errorf("%s should not survive finalization", gone)
+		}
+	}
+	trimmed, loadErr := loadPersistedMeta(filepath.Join(metaDir, metaFileName))
+	if loadErr != nil {
+		t.Fatalf("finalized torrent must keep a .meta for the inode rebuild: %v", loadErr)
+	}
+	if len(trimmed.GetPieceHashes()) != 0 || len(trimmed.GetTorrentFile()) != 0 {
+		t.Error("piece hashes and the torrent blob are dead after verification and should be trimmed")
+	}
+
+	// Restart.
+	s.rebuildInodeMap(ctx)
+
+	got, found := s.store.Inodes().GetRegistered(sourceID)
+	if !found {
+		t.Fatal("a finalized torrent's file must stay linkable across a restart")
+	}
+	if got != filepath.Join("downloads", "movie.mkv") {
+		t.Errorf("registered path = %q, want downloads/movie.mkv", got)
+	}
+}
+
+// TestRegisterInodes_AdmitsAdoptedFiles pins that a file adopted from
+// pre-existing data is indexed. It is skipForWriteData - nothing streams into it
+// - but the content is present and linkable, which is the only thing the
+// registry claims.
+func TestRegisterInodes_AdmitsAdoptedFiles(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+
+	streamed := &serverFileInfo{
+		path: filepath.Join(tmpDir, "streamed.mkv"), size: 10, selected: true,
+		hardlink: hardlinkInfo{state: hlStateNone, sourceFileID: FileID{Dev: 66, Ino: 111}},
+	}
+	adopted := &serverFileInfo{
+		path: filepath.Join(tmpDir, "adopted.mkv"), size: 10, selected: true,
+		hardlink: hardlinkInfo{state: hlStateComplete, sourceFileID: FileID{Dev: 66, Ino: 222}},
+	}
+	unselected := &serverFileInfo{
+		path: filepath.Join(tmpDir, "unselected.mkv"), size: 10, selected: false,
+		hardlink: hardlinkInfo{state: hlStateNone, sourceFileID: FileID{Dev: 66, Ino: 333}},
+	}
+
+	s.store.RegisterInodes(context.Background(), "h", []*serverFileInfo{streamed, adopted, unselected})
+
+	if _, ok := s.store.Inodes().GetRegistered(FileID{Dev: 66, Ino: 111}); !ok {
+		t.Error("a streamed file must be registered")
+	}
+	if _, ok := s.store.Inodes().GetRegistered(FileID{Dev: 66, Ino: 222}); !ok {
+		t.Error("an adopted file holds the content too and must be registered")
+	}
+	if _, ok := s.store.Inodes().GetRegistered(FileID{Dev: 66, Ino: 333}); ok {
+		t.Error("a deselected file was never written here, so nothing links to it")
+	}
+}
+
+// TestMarkFinalized_TrimsOnlyAfterMarker pins the ordering that keeps a crash
+// survivable. Trimming strips the piece hashes, and a torrent recovered without
+// them can never finalize: verifyFinalizedPieces refuses, and resumeTorrent
+// adopts a resuming source's torrent file but not its hashes. So a trimmed .meta
+// with no marker is a torrent wedged until someone re-syncs it. The marker must
+// land first, leaving only two possible crash states: full .meta with no marker
+// (recovers and re-streams), or marker present (finalized either way).
+func TestMarkFinalized_TrimsOnlyAfterMarker(t *testing.T) {
+	t.Parallel()
+
+	hash := "cafe1234567890abcdef1234567890abcdef1234"
+	buildMeta := func(t *testing.T, tmpDir string) string {
+		t.Helper()
+		req := &pb.InitTorrentRequest{
+			TorrentHash: hash,
+			Name:        "movie",
+			PieceSize:   testPieceLen,
+			TotalSize:   4096,
+			NumPieces:   4,
+			SaveSubPath: "downloads",
+			PieceHashes: buildTestPieceHashes(t, 4096),
+			TorrentFile: buildTestTorrentBytes(t, "movie.mkv", 4096),
+			Files: []*pb.FileInfo{{
+				Path: "movie.mkv", Size: 4096, Selected: true, Device: 66, Inode: 42,
+			}},
+		}
+		return setupRecoveryMetaDir(t, tmpDir, hash, req, nil)
+	}
+
+	t.Run("marker written, meta trimmed", func(t *testing.T) {
+		t.Parallel()
+		s, tmpDir := newTestDestServer(t)
+		metaDir := buildMeta(t, tmpDir)
+
+		s.markFinalized(metaDir, hash)
+
+		if _, err := os.Stat(filepath.Join(metaDir, finalizedFileName)); err != nil {
+			t.Fatalf("marker should exist: %v", err)
+		}
+		meta, err := loadPersistedMeta(filepath.Join(metaDir, metaFileName))
+		if err != nil {
+			t.Fatalf(".meta must survive for the inode rebuild: %v", err)
+		}
+		if len(meta.GetPieceHashes()) != 0 || len(meta.GetTorrentFile()) != 0 {
+			t.Error("piece hashes and torrent blob should be trimmed once the marker is down")
+		}
+		if len(meta.GetFiles()) != 1 || meta.GetFiles()[0].GetSourceInode() != 42 {
+			t.Error("the inode mapping must survive trimming")
+		}
+	})
+
+	t.Run("marker write fails: meta keeps its piece hashes", func(t *testing.T) {
+		t.Parallel()
+		s, tmpDir := newTestDestServer(t)
+		metaDir := buildMeta(t, tmpDir)
+
+		// Force the marker write to fail by occupying its path with a directory.
+		if err := os.MkdirAll(filepath.Join(metaDir, finalizedFileName), 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		s.markFinalized(metaDir, hash)
+
+		meta, err := loadPersistedMeta(filepath.Join(metaDir, metaFileName))
+		if err != nil {
+			t.Fatalf(".meta must survive a failed marker write: %v", err)
+		}
+		if len(meta.GetPieceHashes()) == 0 {
+			t.Error("without a marker this torrent recovers, and it needs its piece hashes to finalize")
+		}
+	})
+}

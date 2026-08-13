@@ -311,7 +311,14 @@ func (ts *torrentStore) Inodes() *InodeRegistry {
 func (ts *torrentStore) RegisterInodes(ctx context.Context, hash string, files []*serverFileInfo) {
 	var registered int
 	for _, fi := range files {
-		if fi.skipForWriteData() || fi.hardlink.sourceFileID.IsZero() {
+		// Admission is "this server holds the bytes for that source file", the
+		// only thing the registry claims - which includes files adopted from
+		// pre-existing data. Publishing those is safe because the disk stage
+		// calls this only after verifyFinalizedPieces, so the bytes have been
+		// read back and hashed; earlier would offer unverified content to every
+		// later cross-seed. No stat, unlike the rebuild in collectInodeEntries:
+		// finalizeFiles has just put every one of these at its final path.
+		if fi.hardlink.sourceFileID.IsZero() || !fi.selected {
 			continue
 		}
 
