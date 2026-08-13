@@ -1111,6 +1111,15 @@ func (s *Server) recoverVerificationFailure(
 		s.recoverAffectedFile(ctx, hash, state, fi, failedPieces)
 	}
 
+	// Recount only once every file has been recovered: removing a file clears its
+	// whole piece range, and a piece on either boundary is also counted by the
+	// neighbouring file, which may not have been recovered yet.
+	for _, fi := range state.files {
+		if fi.size > 0 {
+			fi.recalcPiecesWritten(state.written)
+		}
+	}
+
 	// Persist the recovered state.
 	state.dirty = true
 	if saveErr := s.persistWritten(state); saveErr != nil {
@@ -1156,10 +1165,7 @@ func (s *Server) recoverAffectedFile(
 		return
 	}
 
-	defer func() {
-		fi.readmitWrites()
-		fi.recalcPiecesWritten(state.written)
-	}()
+	defer fi.readmitWrites()
 
 	// Hardlinked or pre-existing files with wrong content: break the hardlink
 	// by deleting the file. Writing to a renamed hardlink would corrupt the
@@ -1173,14 +1179,20 @@ func (s *Server) recoverAffectedFile(
 				"hash", hash, "path", fi.path, "error", removeErr)
 		}
 
+		// The file is gone, so every piece it held is unwritten - not just the
+		// ones that failed verification. Leaving the rest marked written would
+		// have source re-stream only the failures into an empty file.
+		for p := fi.firstPiece; p <= fi.lastPiece; p++ {
+			state.written.Clear(uint(p))
+		}
+
 		fi.setHardlinkState(hlStateNone)
 		fi.setPath(targetPath(fi) + partialSuffix)
 		return
 	}
 
 	// Normal (streamed) files: rename back to .partial (skip if already .partial).
-	// Even if rename fails, the deferred cleanup keeps earlyFinalized and
-	// piecesWritten consistent with state.written.
+	// Even if rename fails, the deferred cleanup re-admits writes.
 	if !atFinalPath(fi) {
 		return
 	}

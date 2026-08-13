@@ -443,6 +443,14 @@ func TestRecoverAffectedFile_BreaksHardlink(t *testing.T) {
 	if _, err := os.Stat(filePath); !os.IsNotExist(err) {
 		t.Fatal("hardlinked file should be deleted from disk")
 	}
+
+	// Deleting the file loses piece 1 too, even though only piece 0 failed
+	// verification. Leaving it set would have the source re-stream piece 0
+	// alone into a freshly truncated file, so the gap at piece 1 would only
+	// surface on the next finalize - one wasted verify round per hole.
+	if written.Test(1) {
+		t.Fatal("removing the file must clear its whole piece range, not just the failed pieces")
+	}
 }
 
 func TestRecoverAffectedFile_NormalFile(t *testing.T) {
