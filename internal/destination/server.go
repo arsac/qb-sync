@@ -146,7 +146,7 @@ func NewServer(config ServerConfig, logger *slog.Logger) *Server {
 		finalizeSem:      semaphore.NewWeighted(1),
 		qbStageSem:       semaphore.NewWeighted(int64(config.GetQBFinalizeConcurrency())),
 		earlyFinalizeSem: semaphore.NewWeighted(int64(config.streamWorkers())),
-		preVerifySem:     semaphore.NewWeighted(int64(config.preVerifyConcurrency())),
+		preVerifySem:     semaphore.NewWeighted(defaultPreVerifyConcurrency),
 		bgCtx:            bgCtx,
 		bgCancel:         bgCancel,
 		processStart:     time.Now(),

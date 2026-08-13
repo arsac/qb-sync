@@ -89,8 +89,8 @@ const (
 	// all torrents. Each pass reads and rehashes whole files, so without a cap a
 	// burst of InitTorrent calls fans out to one full-file read per torrent and
 	// saturates the NFS mount everything else on the server shares. Multiplies
-	// with VerifyConcurrency for the total in-flight reads, which is why both
-	// ends of that product are tunable.
+	// with VerifyConcurrency for the total in-flight reads; tune that side if the
+	// product needs adjusting.
 	defaultPreVerifyConcurrency = 4
 
 	// verifyIdleTimeout is how long verification can go without verifying a piece
@@ -149,13 +149,12 @@ type QBConfig struct {
 
 // ServerConfig configures the gRPC piece receiver server.
 type ServerConfig struct {
-	ListenAddr           string        // Address to listen on (e.g., ":50051")
-	BasePath             string        // Base path for writing torrent data
-	SavePath             string        // Path as destination qBittorrent sees it (container mount, e.g., "/downloads"). Defaults to BasePath.
-	StateFlushInterval   time.Duration // How often to flush dirty state (0 = use default)
-	StreamWorkers        int           // Number of concurrent piece writers (0 = use default)
-	PreVerifyConcurrency int           // Concurrent init-time pre-verification passes across all torrents (0 = use default 4)
-	VerifyConcurrency    int           // Concurrent piece-read goroutines per read-back verify pass - init pre-verify, early finalization, and full finalization alike (0 = use default 4). Raise on healthy storage to speed verification; lower if your NFS server can't handle the burst.
+	ListenAddr         string        // Address to listen on (e.g., ":50051")
+	BasePath           string        // Base path for writing torrent data
+	SavePath           string        // Path as destination qBittorrent sees it (container mount, e.g., "/downloads"). Defaults to BasePath.
+	StateFlushInterval time.Duration // How often to flush dirty state (0 = use default)
+	StreamWorkers      int           // Number of concurrent piece writers (0 = use default)
+	VerifyConcurrency  int           // Concurrent piece-read goroutines per read-back verify pass - init pre-verify, early finalization, and full finalization alike (0 = use default 4). Raise on healthy storage to speed verification; lower if your NFS server can't handle the burst.
 
 	// Arr configures the Sonarr/Radarr instances consulted by
 	// CheckArrRejections. Zero instances disable the filter, and the server then
@@ -209,15 +208,6 @@ func (c *ServerConfig) GetQBFinalizeConcurrency() int {
 		return 1
 	}
 	return min(c.QBFinalizeConcurrency, maxQBFinalizeConcurrency)
-}
-
-// preVerifyConcurrency returns the configured bound on concurrent init-time
-// pre-verification passes, falling back to the default when unset.
-func (c *ServerConfig) preVerifyConcurrency() int {
-	if c.PreVerifyConcurrency <= 0 {
-		return defaultPreVerifyConcurrency
-	}
-	return c.PreVerifyConcurrency
 }
 
 // streamWorkers returns the configured number of concurrent piece writers,
