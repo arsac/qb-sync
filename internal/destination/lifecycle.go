@@ -11,6 +11,7 @@ import (
 	"github.com/autobrr/go-qbittorrent"
 
 	"github.com/arsac/qb-sync/internal/metrics"
+	pb "github.com/arsac/qb-sync/proto"
 )
 
 // runPeriodic runs fn periodically, waiting interval before each execution.
@@ -132,28 +133,69 @@ func (s *Server) cleanupOrphanedTorrents(ctx context.Context) {
 		timeout = defaultOrphanTimeout
 	}
 
-	metaDir := filepath.Join(s.config.BasePath, metaDirName)
+	s.forEachTorrentMetaDir(ctx, func(hash, _ string) {
+		// A finalized torrent is not an orphan, and its .meta is the inode
+		// registry's durable record rather than leftover working state. Retiring
+		// it belongs to the inode cleaner, which judges on whether the files it
+		// describes still exist.
+		if s.isFinalized(hash) {
+			return
+		}
+		if s.sweepEmptyMetaDir(ctx, hash) {
+			return
+		}
+		if s.isOrphanedTorrent(ctx, hash, timeout) {
+			s.cleanupOrphan(ctx, hash, timeout)
+		}
+	})
+}
 
-	entries, readErr := os.ReadDir(metaDir)
+// forEachTorrentMetaDir invokes fn with the hash and directory of every
+// per-torrent metadata directory. A missing metadata root is not an error:
+// nothing has synced yet.
+func (s *Server) forEachTorrentMetaDir(ctx context.Context, fn func(hash, metaDir string)) {
+	entries, readErr := os.ReadDir(filepath.Join(s.config.BasePath, metaDirName))
 	if readErr != nil {
 		if !os.IsNotExist(readErr) {
-			s.logger.WarnContext(ctx, "failed to read meta directory for orphan cleanup",
-				"error", readErr,
-			)
+			s.logger.WarnContext(ctx, "failed to read metadata root", "error", readErr)
 		}
 		return
 	}
 
+	metaRoot := filepath.Join(s.config.BasePath, metaDirName)
 	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-
-		hash := entry.Name()
-		if s.isOrphanedTorrent(ctx, hash, timeout) {
-			s.cleanupOrphan(ctx, hash, timeout)
+		if entry.IsDir() {
+			fn(entry.Name(), filepath.Join(metaRoot, entry.Name()))
 		}
 	}
+}
+
+// sweepEmptyMetaDir removes a metadata directory holding none of the files that
+// give it meaning, reporting whether it handled the hash.
+//
+// Nothing else collects one: without .finalized isFinalized is false, and
+// without .state or .meta statOrphanMetadata returns ErrNotExist, which
+// isOrphanedTorrent reads as "not an orphan" - so it is warned about at every
+// startup and reclaimed by nobody.
+//
+// [os.Remove] rather than RemoveAll: it fails harmlessly on a directory that has
+// since been repopulated, so this can never race a live torrent's metadata.
+func (s *Server) sweepEmptyMetaDir(ctx context.Context, hash string) bool {
+	metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
+	for _, name := range []string{finalizedFileName, metaFileName, stateFileName} {
+		if _, err := os.Stat(filepath.Join(metaDir, name)); err == nil {
+			return false
+		}
+	}
+
+	if err := os.Remove(metaDir); err != nil {
+		// Non-empty (repopulated, or holding something we do not know about) or
+		// already gone. Either way it is not ours to force.
+		return false
+	}
+
+	s.logger.InfoContext(ctx, "swept metadata directory with no metadata in it", "hash", hash)
+	return true
 }
 
 // isStaleState reports whether in-memory state shows no source interest for
@@ -392,7 +434,95 @@ func (s *Server) runInodeCleaner(ctx context.Context) {
 
 	runPeriodic(ctx, interval, s.logger, "inode-cleaner", func(ctx context.Context) {
 		s.store.Inodes().CleanupStale(ctx)
+		s.retireVanishedMetadata(ctx)
 	})
+}
+
+// retireVanishedMetadata removes a finalized torrent's metadata once every file
+// it describes is gone from disk - an *arr upgrade replaced them, an operator
+// pruned them. The record's only remaining purpose is to tell the inode registry
+// that this server holds those bytes, and it no longer does.
+//
+// Paired with CleanupStale, which drops the same entries from the in-memory
+// registry: this is the on-disk half of one computation, which is why it lives
+// here rather than in the orphan scan. The orphan scan judges torrents by
+// whether a source still cares about them; nothing about that says anything
+// about whether the bytes are still here.
+//
+// Keyed on the files vanishing, never on qBittorrent's opinion. qB reporting a
+// torrent present and seeding is the strongest evidence the record should be
+// kept, so any retirement that triggers on it deletes exactly the entries worth
+// most.
+//
+// Fail closed on anything other than ENOENT. An EIO or ESTALE from a mount that
+// blipped means "cannot tell", and treating that as "gone" would retire the
+// whole library in a single pass.
+func (s *Server) retireVanishedMetadata(ctx context.Context) {
+	timeout := s.config.OrphanTimeout
+	if timeout == 0 {
+		timeout = defaultOrphanTimeout
+	}
+
+	s.forEachTorrentMetaDir(ctx, func(hash, metaDir string) {
+		if !s.isFinalized(hash) {
+			return
+		}
+		// A torrent with live state owns its metadata, marker or no marker. A
+		// re-sync clears the marker before the .meta it is about to rebuild, so
+		// this pass would otherwise be relying on that ordering to stay put.
+		if _, live := s.store.peek(hash); live {
+			return
+		}
+
+		meta, loadErr := loadPersistedMeta(filepath.Join(metaDir, metaFileName))
+		if loadErr != nil {
+			return // no record to act on
+		}
+		if !allFilesVanished(s.config.BasePath, meta) {
+			return
+		}
+
+		// Exclude a concurrent init the same way cleanupOrphan does. peek alone
+		// is not enough: cleanupForResync clears the directory before Reserve
+		// installs the sentinel, so a re-sync starting during the stat walk above
+		// would have its freshly written .meta and .state taken by the RemoveAll.
+		cleanupCh := make(chan struct{})
+		if !s.store.BeginReclaim(hash, cleanupCh, func(st *serverTorrentState) bool {
+			return s.isStaleState(st, timeout)
+		}) {
+			return
+		}
+		defer func() {
+			close(cleanupCh)
+			s.store.EndCleanup(hash)
+		}()
+
+		if rmErr := os.RemoveAll(metaDir); rmErr != nil && !os.IsNotExist(rmErr) {
+			s.logger.WarnContext(ctx, "failed to retire metadata for vanished files",
+				"hash", hash, "path", metaDir, "error", rmErr)
+			return
+		}
+		s.logger.InfoContext(ctx, "retired metadata, every file it described is gone",
+			"hash", hash, "files", len(meta.GetFiles()))
+	})
+}
+
+// allFilesVanished reports whether every selected file the metadata describes is
+// confirmed absent. Any file still present, and any stat that fails for a reason
+// other than "not there", answers false.
+func allFilesVanished(basePath string, meta *pb.PersistedTorrentMeta) bool {
+	var sawSelected bool
+	for _, f := range meta.GetFiles() {
+		if !f.GetSelected() {
+			continue // never created here, so its absence proves nothing
+		}
+		sawSelected = true
+		_, statErr := os.Stat(filepath.Join(basePath, meta.GetSaveSubPath(), f.GetPath()))
+		if statErr == nil || !os.IsNotExist(statErr) {
+			return false
+		}
+	}
+	return sawSelected
 }
 
 // healOrphan converts a stale unfinalized orphan into a finalized torrent when

@@ -411,3 +411,178 @@ func TestDeleteOrphanFiles_OnlyRemovesPartials(t *testing.T) {
 	require.NoError(t, readErr)
 	require.Equal(t, "operator data", string(data), "operator data must be untouched, not just present")
 }
+
+// TestSweepEmptyMetaDir pins that the GC can collect its own crash mode - a
+// directory left empty by an interrupted RemoveAll, which no other path
+// reclaims. See sweepEmptyMetaDir for why.
+func TestSweepEmptyMetaDir(t *testing.T) {
+	t.Parallel()
+
+	const hash = "abc123"
+
+	newDir := func(t *testing.T, s *Server, files ...string) string {
+		t.Helper()
+		metaDir := filepath.Join(s.config.BasePath, metaDirName, hash)
+		require.NoError(t, os.MkdirAll(metaDir, 0o755))
+		for _, f := range files {
+			require.NoError(t, os.WriteFile(filepath.Join(metaDir, f), nil, 0o644))
+		}
+		return metaDir
+	}
+
+	t.Run("sweeps a directory holding no metadata", func(t *testing.T) {
+		t.Parallel()
+		s, _ := newTestDestServer(t)
+		metaDir := newDir(t, s)
+
+		require.True(t, s.sweepEmptyMetaDir(context.Background(), hash))
+		_, err := os.Stat(metaDir)
+		require.True(t, os.IsNotExist(err), "an empty meta directory must be collectable")
+	})
+
+	for _, keep := range []string{finalizedFileName, metaFileName, stateFileName} {
+		t.Run("keeps a directory holding "+keep, func(t *testing.T) {
+			t.Parallel()
+			s, _ := newTestDestServer(t)
+			metaDir := newDir(t, s, keep)
+
+			require.False(t, s.sweepEmptyMetaDir(context.Background(), hash))
+			require.DirExists(t, metaDir)
+		})
+	}
+
+	t.Run("leaves a directory repopulated with something unrecognised", func(t *testing.T) {
+		t.Parallel()
+		s, _ := newTestDestServer(t)
+		metaDir := newDir(t, s, "something-else")
+
+		// os.Remove, not RemoveAll: a non-empty directory fails harmlessly
+		// rather than taking a live torrent's files with it.
+		require.False(t, s.sweepEmptyMetaDir(context.Background(), hash))
+		require.DirExists(t, metaDir)
+	})
+}
+
+// TestCleanupOrphanedTorrents_SweepsEmptyDirs pins that the sweep is actually
+// wired into the periodic scan, not merely implemented. Without the call site,
+// an empty directory survives every cycle forever.
+func TestCleanupOrphanedTorrents_SweepsEmptyDirs(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+
+	empty := filepath.Join(tmpDir, metaDirName, "emptyhash")
+	require.NoError(t, os.MkdirAll(empty, 0o755))
+
+	kept := filepath.Join(tmpDir, metaDirName, "finalizedhash")
+	require.NoError(t, os.MkdirAll(kept, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(kept, finalizedFileName), nil, 0o644))
+
+	s.cleanupOrphanedTorrents(context.Background())
+
+	_, err := os.Stat(empty)
+	require.True(t, os.IsNotExist(err), "the scan must collect a directory holding no metadata")
+	require.DirExists(t, kept, "a finalized marker is not swept: no qB snapshot proves it redundant")
+}
+
+// TestRetireVanishedMetadata pins that a finalized torrent's metadata is retired
+// only once every file it describes is confirmed gone.
+//
+// This replaces an earlier version keyed on qBittorrent reporting the torrent
+// present and seeding, which was backwards: that is the strongest evidence the
+// record should be KEPT, since .meta is what tells the inode registry this
+// server holds those bytes.
+func TestRetireVanishedMetadata(t *testing.T) {
+	t.Parallel()
+
+	const hash = "abc123"
+
+	setup := func(t *testing.T, filesOnDisk []string) (*Server, string) {
+		t.Helper()
+		s, tmpDir := newTestDestServer(t)
+
+		metaDir := filepath.Join(tmpDir, metaDirName, hash)
+		require.NoError(t, os.MkdirAll(metaDir, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(metaDir, finalizedFileName), nil, 0o644))
+		require.NoError(t, savePersistedMeta(filepath.Join(metaDir, metaFileName), &pb.PersistedTorrentMeta{
+			TorrentHash: hash,
+			SaveSubPath: "downloads",
+			Files: []*pb.PersistedFileInfo{
+				{Path: "a.mkv", Size: 1, Selected: true, SourceDevice: 66, SourceInode: 1},
+				{Path: "b.mkv", Size: 1, Selected: true, SourceDevice: 66, SourceInode: 2},
+			},
+		}))
+
+		require.NoError(t, os.MkdirAll(filepath.Join(tmpDir, "downloads"), 0o755))
+		for _, f := range filesOnDisk {
+			require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "downloads", f), []byte("x"), 0o644))
+		}
+		return s, metaDir
+	}
+
+	t.Run("retires when every file is gone", func(t *testing.T) {
+		t.Parallel()
+		s, metaDir := setup(t, nil)
+
+		s.retireVanishedMetadata(context.Background())
+
+		_, err := os.Stat(metaDir)
+		require.True(t, os.IsNotExist(err), "nothing on disk means the record claims something untrue")
+	})
+
+	t.Run("keeps it while any file survives", func(t *testing.T) {
+		t.Parallel()
+		s, metaDir := setup(t, []string{"b.mkv"})
+
+		s.retireVanishedMetadata(context.Background())
+
+		require.DirExists(t, metaDir, "a surviving file is still a valid hardlink source")
+	})
+
+	t.Run("keeps it while all files survive", func(t *testing.T) {
+		t.Parallel()
+		s, metaDir := setup(t, []string{"a.mkv", "b.mkv"})
+
+		s.retireVanishedMetadata(context.Background())
+
+		require.DirExists(t, metaDir)
+	})
+
+	t.Run("leaves unfinalized torrents to the orphan scan", func(t *testing.T) {
+		t.Parallel()
+		s, metaDir := setup(t, nil)
+		require.NoError(t, os.Remove(filepath.Join(metaDir, finalizedFileName)))
+
+		s.retireVanishedMetadata(context.Background())
+
+		require.DirExists(t, metaDir, "an unfinalized torrent is the orphan scan's business, not this pass's")
+	})
+}
+
+// TestAllFilesVanished pins the fail-closed rule. Anything other than "not
+// there" means we cannot tell, and a mount that blipped must not be read as an
+// empty library.
+func TestAllFilesVanished(t *testing.T) {
+	t.Parallel()
+	tmpDir := t.TempDir()
+
+	meta := func(files ...*pb.PersistedFileInfo) *pb.PersistedTorrentMeta {
+		return &pb.PersistedTorrentMeta{Files: files}
+	}
+	selected := func(path string) *pb.PersistedFileInfo {
+		return &pb.PersistedFileInfo{Path: path, Selected: true}
+	}
+
+	require.True(t, allFilesVanished(tmpDir, meta(selected("gone.mkv"))))
+
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "here.mkv"), []byte("x"), 0o644))
+	require.False(t, allFilesVanished(tmpDir, meta(selected("here.mkv"))))
+	require.False(t, allFilesVanished(tmpDir, meta(selected("gone.mkv"), selected("here.mkv"))))
+
+	// A file the destination never creates proves nothing about the rest.
+	require.False(t, allFilesVanished(tmpDir, meta(&pb.PersistedFileInfo{Path: "skip.mkv"})),
+		"a metadata record with no selected files must not be read as vanished")
+
+	// Not-there vs cannot-tell: a path whose parent is a file yields ENOTDIR.
+	require.False(t, allFilesVanished(tmpDir, meta(selected("here.mkv/child.mkv"))),
+		"a stat failing for any reason other than ErrNotExist means we cannot tell")
+}
