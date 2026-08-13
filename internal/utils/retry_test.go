@@ -87,6 +87,19 @@ func TestIsCircuitBreakerFailure_Excluded(t *testing.T) {
 		{"context canceled", context.Canceled},
 		{"context deadline", context.DeadlineExceeded},
 		{"wrapped context canceled", fmt.Errorf("op: %w", context.Canceled)},
+		// The shape go-qbittorrent actually returns: its internal retry aggregates
+		// attempts into an error errors.Is cannot traverse, so only the string
+		// identifies the cancellation.
+		{
+			"qbt retry aggregate hiding cancellation",
+			errors.New(`get torrents error: error making get request: ` +
+				`http://qb:8080/api/v2/torrents/info: error making request: All attempts fail:` + "\n" +
+				`#1: Get "http://qb:8080/api/v2/torrents/info": context canceled`),
+		},
+		{
+			"qbt retry aggregate hiding deadline",
+			errors.New("All attempts fail:\n#1: context deadline exceeded"),
+		},
 		// Uppercase 'N' is intentional: verifies case-insensitive match (strings.ToLower in production code)
 		{
 			"qbt unmarshal quirk",
