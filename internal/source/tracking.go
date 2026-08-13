@@ -393,12 +393,15 @@ func (t *QBTask) findTorrentByHash(hash string) *qbittorrent.Torrent {
 // fetches the full list at the top of every runOnce, so any later pass in the
 // same cycle that needs it is served from memory.
 //
-// The fetch is the fallback for entry points reached before any cycle has run
-// (the exported test wrappers). Drain runs after the cycle loop has exited and
-// so inherits the last cycle's list, as it did before this was a shared helper.
+// The fetch is the fallback for out-of-cycle callers - the shutdown drain and
+// the exported test wrappers - which find the cache nil because runOnce clears
+// it at both ends. Fetching fresh there is the point: they run in response to
+// an event (a SIGTERM, a deletion) that the last cycle's snapshot predates.
 //
-// Runs on the runOnce goroutine only - cycleTorrents is unsynchronized, unlike
-// the cycleFiles map, which finalizeTorrent also reaches from listenForRemovals.
+// cycleTorrents is unsynchronized: in-cycle callers run on the runOnce
+// goroutine, and out-of-cycle callers only run once the cycle loop has exited.
+// The cycleFiles map is locked instead, since finalizeTorrent also reaches it
+// from listenForRemovals.
 func (t *QBTask) cycleTorrentList(ctx context.Context) ([]qbittorrent.Torrent, error) {
 	if t.cycleTorrents != nil {
 		metrics.CycleCacheHitsTotal.Inc()
@@ -440,12 +443,20 @@ func (t *QBTask) cycleFilesFor(ctx context.Context, hash string) (qbittorrent.To
 	return *filesPtr, nil
 }
 
-// resetCycleFiles clears the per-cycle file-information cache. Called at the
-// top of each runOnce cycle.
+// resetCycleFiles clears the per-cycle file-information cache. Called at both
+// ends of each runOnce cycle: the entry reset matters because finalizeTorrent
+// can populate the cache from listenForRemovals between cycles.
 func (t *QBTask) resetCycleFiles() {
 	t.cycleFilesMu.Lock()
 	t.cycleFiles = nil
 	t.cycleFilesMu.Unlock()
+}
+
+// resetCycleCaches clears both per-cycle caches. runOnce calls it on entry and
+// on exit; see there for the invariant each end carries.
+func (t *QBTask) resetCycleCaches() {
+	t.cycleTorrents = nil
+	t.resetCycleFiles()
 }
 
 // checkExcludedTorrents scans cycleTorrents for any tracked or completed torrents

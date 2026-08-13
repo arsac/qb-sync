@@ -97,8 +97,8 @@ type QBTask struct {
 
 	// Per-cycle cache of torrents to avoid redundant GetTorrentsCtx calls.
 	// Set by trackNewTorrents, read through cycleTorrentList and
-	// findTorrentByHash, reset each cycle. nil means not yet fetched this
-	// cycle; non-nil (even empty) means cached. Unsynchronized: only the
+	// findTorrentByHash, cleared when runOnce returns. nil means not fetched
+	// yet; non-nil (even empty) means cached. Unsynchronized: only the
 	// runOnce goroutine may touch it, unlike cycleFiles below.
 	cycleTorrents []qbittorrent.Torrent
 
@@ -106,7 +106,7 @@ type QBTask struct {
 	// GetFilesInformationCtx calls. A finalize cycle previously issued 3-4
 	// round-trips per torrent (finalize, fingerprint, label, cleanup); on a
 	// 50-torrent burst that's 200 sequential WebUI calls against
-	// single-threaded qBittorrent. Reset each cycle alongside cycleTorrents.
+	// single-threaded qBittorrent. Cleared on cycle exit alongside cycleTorrents.
 	// Guarded by cycleFilesMu: finalizeTorrent reaches the cache from the
 	// listenForRemovals goroutine as well as the runOnce goroutine.
 	cycleFiles   map[string]qbittorrent.TorrentFiles
@@ -254,8 +254,16 @@ func (t *QBTask) Run(ctx context.Context) error {
 }
 
 func (t *QBTask) runOnce(ctx context.Context) {
-	t.cycleTorrents = nil
-	t.resetCycleFiles()
+	// Cleared at both ends because the two resets enforce different invariants.
+	// The exit reset keeps this cycle's snapshot away from out-of-cycle callers
+	// (shutdown drain, exported test wrappers), which must fetch fresh. The
+	// entry reset keeps entries cached BETWEEN cycles out of this one:
+	// listenForRemovals finalizing a just-removed torrent reaches cycleFilesFor
+	// in the gap, and serving that entry here would let recheckFileSelections
+	// fingerprint a torrent that is gone from source - tearing down the
+	// completion-cache entry that is the removal path's only retry.
+	t.resetCycleCaches()
+	defer t.resetCycleCaches()
 
 	// Before tracking, not after: tracking is where the *arr routing is applied,
 	// and a torrent admitted while the routing is still unknown is never

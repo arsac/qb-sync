@@ -1778,6 +1778,103 @@ func TestPruneCompletedOnDest(t *testing.T) {
 	})
 }
 
+// TestRunOnce_CycleCachesDoNotOutliveCycle pins that runOnce clears the
+// per-cycle caches when it returns. Regression: a prune that ran after the
+// cycle loop exited read the last cycle's list, still saw the deleted torrent
+// there, and silently skipped the handoff.
+func TestRunOnce_CycleCachesDoNotOutliveCycle(t *testing.T) {
+	logger := testLogger(t)
+	dest := &mockDest{}
+	mockClient := &mockQBClient{
+		getTorrentsResult: []qbittorrent.Torrent{{
+			Hash:     "seed",
+			Name:     "seed-torrent",
+			State:    qbittorrent.TorrentStateUploading,
+			Progress: 1.0,
+			Tags:     "no-sync",
+		}},
+	}
+	task := &QBTask{
+		cfg: &config.SourceConfig{
+			ExcludeSyncTag:   "no-sync",
+			SourceRemovedTag: "source-removed",
+		},
+		logger:    logger,
+		srcClient: mockClient,
+		grpcDest:  dest,
+		store:     newTorrentStore("", 0, logger),
+	}
+
+	task.runOnce(context.Background())
+
+	if task.cycleTorrents != nil {
+		t.Fatal("cycleTorrents must be cleared when the cycle exits")
+	}
+	if task.cycleFiles != nil {
+		t.Fatal("cycleFiles must be cleared when the cycle exits")
+	}
+
+	// The regression shape: the torrent leaves source qB after the last cycle,
+	// then the out-of-cycle prune runs. It must see the deletion.
+	fetchesBefore := mockClient.getTorrentsCalls.Load()
+	mockClient.getTorrentsResult = nil
+	task.store.MarkComplete("seed", "")
+
+	task.PruneCompletedOnDest(context.Background())
+
+	if mockClient.getTorrentsCalls.Load() == fetchesBefore {
+		t.Fatal("out-of-cycle prune must fetch a fresh torrent list, not reuse the last cycle's")
+	}
+	if !dest.startCalled || dest.startHash != "seed" {
+		t.Fatalf("removed-from-source torrent must be handed off; startCalled=%v hash=%q",
+			dest.startCalled, dest.startHash)
+	}
+}
+
+// TestRunOnce_GapCachedFilesDoNotLeakIntoCycle pins the entry-side reset:
+// listenForRemovals can populate cycleFiles BETWEEN cycles (finalizing a
+// just-removed torrent), and a cycle that serves that entry lets
+// recheckFileSelections fingerprint a torrent that is gone from source -
+// tearing down the completion-cache entry that is the removal path's only
+// retry. The cycle must fetch fresh instead.
+func TestRunOnce_GapCachedFilesDoNotLeakIntoCycle(t *testing.T) {
+	logger := testLogger(t)
+
+	// The first runOnce calls recheckFileSelections with shard 1, so pick a
+	// hash that falls in that shard.
+	var hash string
+	for i := 0; ; i++ {
+		candidate := fmt.Sprintf("gap-leak-%d", i)
+		if selectionShard(candidate) == 1 {
+			hash = candidate
+			break
+		}
+	}
+
+	files := qbittorrent.TorrentFiles{{Index: 0, Name: hash + "/a.bin", Priority: 1}}
+	mockClient := &mockQBClient{filesByHash: map[string]qbittorrent.TorrentFiles{hash: files}}
+	store := newTorrentStore("", 0, logger)
+	store.MarkComplete(hash, selectedFingerprint(files))
+	task := &QBTask{
+		cfg:       &config.SourceConfig{},
+		logger:    logger,
+		srcClient: mockClient,
+		grpcDest:  &mockDest{},
+		store:     store,
+	}
+
+	// Simulate the between-cycles write from listenForRemovals.
+	task.cycleFilesMu.Lock()
+	task.cycleFiles = map[string]qbittorrent.TorrentFiles{hash: files}
+	task.cycleFilesMu.Unlock()
+
+	task.runOnce(context.Background())
+
+	if mockClient.getFilesCalls.Load() == 0 {
+		t.Fatal("recheckFileSelections served the gap-cached files instead of fetching fresh")
+	}
+}
+
 func TestCompletedCachePersistence(t *testing.T) {
 	logger := testLogger(t)
 
