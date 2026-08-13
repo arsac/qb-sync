@@ -72,6 +72,7 @@ func newTestServer(t *testing.T, budgetBytes int64) *Server {
 		memBudget:        semaphore.NewWeighted(budgetBytes),
 		finalizeSem:      semaphore.NewWeighted(1),
 		earlyFinalizeSem: semaphore.NewWeighted(defaultStreamWorkers),
+		preVerifySem:     semaphore.NewWeighted(defaultPreVerifyConcurrency),
 		bgCtx:            bgCtx,
 		bgCancel:         bgCancel,
 	}

@@ -7,12 +7,15 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	grpchealth "google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 
 	pb "github.com/arsac/qb-sync/proto"
 )
@@ -924,4 +927,77 @@ func TestIntegration_OpenStream_DistributesAcrossConns(t *testing.T) {
 	for _, s := range streams {
 		s.Close()
 	}
+}
+
+// startHealthOnlyServer serves just the gRPC health service, with the overall
+// (empty-name) status set to serving.
+func startHealthOnlyServer(t *testing.T, serving bool) *GRPCDestination {
+	t.Helper()
+
+	lis, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+
+	srv := grpc.NewServer()
+	hs := grpchealth.NewServer()
+	status := healthpb.HealthCheckResponse_NOT_SERVING
+	if serving {
+		status = healthpb.HealthCheckResponse_SERVING
+	}
+	hs.SetServingStatus("", status)
+	healthpb.RegisterHealthServer(srv, hs)
+
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+
+	dest, err := NewGRPCDestination(lis.Addr().String(), 2, 2)
+	if err != nil {
+		t.Fatalf("failed to create destination: %v", err)
+	}
+	t.Cleanup(func() { _ = dest.Close() })
+
+	return dest
+}
+
+// TestCheckHealth_HonoursServingStatus pins that the serving status is the
+// answer, not merely whether the RPC succeeded. A registered service replies
+// NOT_SERVING with a nil error, so treating "no error" as healthy would report a
+// destination that has explicitly declared itself out of service as ready.
+func TestCheckHealth_HonoursServingStatus(t *testing.T) {
+	t.Parallel()
+
+	t.Run("serving is reachable", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		if err := startHealthOnlyServer(t, true).ValidateConnection(ctx); err != nil {
+			t.Fatalf("expected a serving destination to validate, got %v", err)
+		}
+	})
+
+	t.Run("not serving is rejected", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		err := startHealthOnlyServer(t, false).ValidateConnection(ctx)
+		if err == nil {
+			t.Fatal("a destination reporting NOT_SERVING must not validate")
+		}
+		if !strings.Contains(err.Error(), "not serving") {
+			t.Errorf("error should name the serving status, got %v", err)
+		}
+	})
+
+	t.Run("WaitUntilReady does not hang on a serving destination", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		if err := startHealthOnlyServer(t, true).WaitUntilReady(ctx); err != nil {
+			t.Fatalf("expected WaitUntilReady to return on a serving destination, got %v", err)
+		}
+	})
 }

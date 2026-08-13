@@ -100,6 +100,11 @@ func (s *Server) InitTorrent(
 	// On error, clean up the sentinel
 	if !resp.GetSuccess() {
 		s.store.Unreserve(hash)
+		return resp, nil
+	}
+
+	if state, exists := s.store.Get(hash); exists {
+		s.startPreVerify(hash, state)
 	}
 
 	return resp, nil
@@ -119,7 +124,13 @@ func (s *Server) lookupExistingState(
 	if state.initializing.Load() {
 		return initErrorResponse("torrent initialization already in progress"), true
 	}
-	return s.resumeTorrent(state, req), true
+
+	resp := s.resumeTorrent(state, req)
+	// A torrent rebuilt by startup recovery has not pre-verified yet - this is
+	// the first point at which a source is known to be driving it. Idempotent,
+	// so the source's repeated resume polls launch at most one pass.
+	s.startPreVerify(hash, state)
+	return resp, true
 }
 
 // resumeTorrent handles resuming an existing torrent sync.
@@ -265,8 +276,6 @@ func (s *Server) initNewTorrent(
 		"piecesHave", haveCount,
 	)
 
-	s.startPreVerify(hash, state)
-
 	return state.buildReadyResponse()
 }
 
@@ -276,20 +285,46 @@ func (s *Server) initNewTorrent(
 // verifyFinalizedPieces, so a cancelled or never-launched pass just leaves the
 // pre-change amount of work at finalize.
 //
+// Call this only where a source is actually engaging with the torrent, never
+// from startup recovery: that scan runs ahead of the readiness signal, and a
+// pass per recovered torrent puts unbounded whole-file NFS reads in front of the
+// server accepting any traffic. A recovered torrent gets its pass on resume.
+//
 // The pass gets its own context, registered on the state, so finalization can
 // stop it once it starts reading the same bytes back itself - see stopPreVerify.
 func (s *Server) startPreVerify(hash string, state *serverTorrentState) {
-	if s.config.DryRun || len(state.pieceHashes) == 0 || len(preVerifyCandidates(state)) == 0 {
-		return
-	}
-	if s.bgCtx.Err() != nil {
+	if s.config.DryRun {
 		return
 	}
 
+	// Candidates are settled and the pass registered in one critical section:
+	// hardlink.state is state.mu-guarded, and a concurrent stopPreVerify must not
+	// slip between the decision and the registration.
+	//
+	// finalization.active is not redundant with preVerifyStarted. A torrent whose
+	// hardlinks were all pending at init has no candidates, so nothing is
+	// registered for stopPreVerify to stop; finalization then promotes them to
+	// hlStateComplete, and a later resume would start reading the same bytes the
+	// disk stage is verifying.
+	state.mu.Lock()
+	// Cheap tests first: a resuming source polls InitTorrent repeatedly, and
+	// preVerifyCandidates walks every file to build a slice each poll would
+	// discard. bgCtx is among them because a forced shutdown can run handlers
+	// past bgWg.Wait, and Add racing Wait panics - same guard the other two
+	// bgWg.Go sites keep.
+	if state.preVerifyStarted || state.finalization.active ||
+		len(state.pieceHashes) == 0 || s.bgCtx.Err() != nil {
+		state.mu.Unlock()
+		return
+	}
+	files := preVerifyCandidates(state)
+	if len(files) == 0 {
+		state.mu.Unlock()
+		return
+	}
 	ctx, cancel := context.WithCancel(s.bgCtx)
 	done := make(chan struct{})
-
-	state.mu.Lock()
+	state.preVerifyStarted = true
 	state.preVerifyCancel = cancel
 	state.preVerifyDone = done
 	state.mu.Unlock()
@@ -297,7 +332,21 @@ func (s *Server) startPreVerify(hash string, state *serverTorrentState) {
 	s.bgWg.Go(func() {
 		defer close(done)
 		defer cancel()
-		s.preVerifyCompleteFiles(ctx, hash, state)
+		// Drop the pass's context and channel from the state once it lands, so a
+		// finished pass stops pinning them for the torrent's remaining lifetime.
+		// stopPreVerify clears them too, and both are safe: it holds state.mu and
+		// only nils out what it captured.
+		defer state.clearPreVerify(done)
+
+		// Bound whole-file re-reads across torrents. Acquired inside the
+		// goroutine so the caller's InitTorrent response never waits on it, and
+		// released before stopPreVerify's waiters are unblocked by close(done).
+		if acqErr := s.preVerifySem.Acquire(ctx, 1); acqErr != nil {
+			return
+		}
+		defer s.preVerifySem.Release(1)
+
+		s.preVerifyCompleteFiles(ctx, hash, state, files)
 	})
 }
 

@@ -85,6 +85,13 @@ const (
 	// verifyChunkPieces caps the run of consecutive pieces a verify worker
 	// claims per turn - see verifyChunkSize for why runs beat one-at-a-time.
 	verifyChunkPieces = 32
+	// defaultPreVerifyConcurrency bounds init-time pre-verification passes across
+	// all torrents. Each pass reads and rehashes whole files, so without a cap a
+	// burst of InitTorrent calls fans out to one full-file read per torrent and
+	// saturates the NFS mount everything else on the server shares. Multiplies
+	// with VerifyConcurrency for the total in-flight reads; tune that side if the
+	// product needs adjusting.
+	defaultPreVerifyConcurrency = 4
 
 	// verifyIdleTimeout is how long verification can go without verifying a piece
 	// before it is considered stalled. Resets on each successfully verified piece.

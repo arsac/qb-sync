@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
@@ -60,6 +61,11 @@ const (
 	// gRPC connect backoff parameters.
 	backoffMultiplier = 1.6 // Exponential backoff multiplier between reconnect attempts
 	backoffJitter     = 0.2 // Randomization factor to prevent thundering herd
+
+	// minConnectTimeout is how long a single TCP + HTTP/2 handshake may take.
+	// Matches gRPC's own default; see the comment in WithConnectParams below for
+	// why it cannot be left unset.
+	minConnectTimeout = 20 * time.Second
 )
 
 var (
@@ -155,6 +161,12 @@ func NewGRPCDestination(addr string, minConns, maxConns int) (*GRPCDestination, 
 				Jitter:     backoffJitter,
 				MaxDelay:   maxReconnectBackoff,
 			},
+			// Must be set explicitly. WithConnectParams installs this field
+			// unconditionally, and grpc only falls back to its own 20s default
+			// when the option was never supplied - so leaving it zero here caps
+			// each handshake at the current backoff (1s, then maxReconnectBackoff),
+			// which a slow link cannot complete, on any attempt, ever.
+			MinConnectTimeout: minConnectTimeout,
 		}),
 		grpc.WithInitialWindowSize(grpcutil.InitialStreamWindowSize),
 		grpc.WithInitialConnWindowSize(grpcutil.InitialConnWindowSize),
@@ -212,20 +224,56 @@ func (d *GRPCDestination) streamConnIdx() int {
 
 // ValidateConnection checks that the destination server is reachable on all
 // connections using the standard gRPC health check protocol (grpc.health.v1.Health).
+// Fails fast: a channel that is not READY yields UNAVAILABLE rather than
+// blocking, which is what a readiness probe needs.
 func (d *GRPCDestination) ValidateConnection(ctx context.Context) error {
+	return d.checkHealth(ctx)
+}
+
+// WaitUntilReady blocks until the destination server answers its health check,
+// or ctx ends.
+//
+// grpc.WaitForReady queues the RPC on a channel that is not READY instead of
+// failing it UNAVAILABLE, so the wait and the retry schedule belong to the
+// channel: grpc.NewClient connects lazily and reconnects on the exponential
+// backoff configured in WithConnectParams above. That is the whole reason there
+// is no retry loop here.
+func (d *GRPCDestination) WaitUntilReady(ctx context.Context) error {
+	return d.checkHealth(ctx, grpc.WaitForReady(true))
+}
+
+// checkHealth runs the standard gRPC health check against every connection.
+//
+// Checks run concurrently because they share ctx: serially, the first
+// connection could spend the whole budget and leave the rest none, failing the
+// call over connections that were never actually given a chance.
+//
+// An empty service name asks for the server's overall status, per the gRPC
+// health checking protocol.
+func (d *GRPCDestination) checkHealth(ctx context.Context, opts ...grpc.CallOption) error {
 	d.mu.RLock()
 	conns := make([]*grpc.ClientConn, len(d.conns))
 	copy(conns, d.conns)
 	d.mu.RUnlock()
 
+	g, gctx := errgroup.WithContext(ctx)
 	for i, conn := range conns {
-		healthClient := healthpb.NewHealthClient(conn)
-		_, err := healthClient.Check(ctx, &healthpb.HealthCheckRequest{})
-		if err != nil {
-			return fmt.Errorf("destination server not reachable (conn %d): %w", i, err)
-		}
+		g.Go(func() error {
+			healthClient := healthpb.NewHealthClient(conn)
+			resp, err := healthClient.Check(gctx, &healthpb.HealthCheckRequest{}, opts...)
+			if err != nil {
+				return fmt.Errorf("destination server not reachable (conn %d): %w", i, err)
+			}
+			// A registered service answers NOT_SERVING with a nil error, so the
+			// status is the answer - the absence of an RPC error only means the
+			// server was reachable enough to say it is not serving.
+			if resp.GetStatus() != healthpb.HealthCheckResponse_SERVING {
+				return fmt.Errorf("destination server not serving (conn %d): %s", i, resp.GetStatus())
+			}
+			return nil
+		})
 	}
-	return nil
+	return g.Wait()
 }
 
 // InitTorrentResult contains the result of InitTorrent including sync status and hardlink information.

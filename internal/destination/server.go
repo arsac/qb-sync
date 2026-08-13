@@ -98,6 +98,12 @@ type Server struct {
 	// same ceiling on concurrent verify buffers and outstanding NFS reads.
 	earlyFinalizeSem *semaphore.Weighted
 
+	// preVerifySem bounds init-time pre-verification passes across all torrents.
+	// A pass reads and rehashes every file that was already complete on disk, so
+	// a batch of torrents initializing together would otherwise issue one
+	// full-file read each at once. See defaultPreVerifyConcurrency.
+	preVerifySem *semaphore.Weighted
+
 	// finalizeQueueWait overrides finalizeQueueTimeout in tests (0 = default).
 	finalizeQueueWait time.Duration
 
@@ -140,6 +146,7 @@ func NewServer(config ServerConfig, logger *slog.Logger) *Server {
 		finalizeSem:      semaphore.NewWeighted(1),
 		qbStageSem:       semaphore.NewWeighted(int64(config.GetQBFinalizeConcurrency())),
 		earlyFinalizeSem: semaphore.NewWeighted(int64(config.streamWorkers())),
+		preVerifySem:     semaphore.NewWeighted(defaultPreVerifyConcurrency),
 		bgCtx:            bgCtx,
 		bgCancel:         bgCancel,
 		processStart:     time.Now(),

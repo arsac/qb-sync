@@ -410,11 +410,20 @@ func (s *Server) storeSuccessResult(
 	s.logger.InfoContext(ctx, "torrent finalized (background)", "hash", hash, "state", stateStr)
 }
 
-// markFinalized replaces the metadata directory contents with a single
-// .finalized marker file. Removes .state, .torrent, and other working
-// files but keeps the directory so the marker persists.
+// markFinalized reduces the metadata directory to the .finalized marker plus a
+// trimmed .meta. Removes .state, .torrent and other working files.
+//
+// .meta survives finalization because it is the durable record the inode
+// registry rebuilds from, and that record stays true for as long as the file
+// exists here - well past the torrent's life. Only the piece hashes and the
+// .torrent blob are dropped: they are the bulk of it and are dead once
+// verification has passed.
+// The marker is written before the trim. A torrent recovered without piece
+// hashes can never finalize - verifyFinalizedPieces refuses, and resumeTorrent
+// adopts a resuming source's torrent file but not its hashes - so the only
+// states a crash may leave are "full .meta, no marker", which recovers and
+// re-streams, and "marker present", which is finalized either way.
 func (s *Server) markFinalized(metaDir, hash string) {
-	// Remove working files but keep the directory.
 	entries, err := os.ReadDir(metaDir)
 	if err != nil {
 		// Directory may not exist (already cleaned up). Create it for the marker.
@@ -425,7 +434,7 @@ func (s *Server) markFinalized(metaDir, hash string) {
 		}
 	} else {
 		for _, e := range entries {
-			if e.Name() == finalizedFileName {
+			if e.Name() == finalizedFileName || e.Name() == metaFileName {
 				continue
 			}
 			_ = os.RemoveAll(filepath.Join(metaDir, e.Name()))
@@ -434,8 +443,38 @@ func (s *Server) markFinalized(metaDir, hash string) {
 
 	markerPath := filepath.Join(metaDir, finalizedFileName)
 	if writeErr := atomicWriteFile(markerPath, nil); writeErr != nil {
+		// Leave .meta whole: without the marker this torrent recovers, and it
+		// needs its piece hashes to finalize when it does.
 		s.logger.Warn("failed to write finalized marker",
 			"hash", hash, "error", writeErr)
+		return
+	}
+
+	s.trimFinalizedMeta(metaDir, hash)
+}
+
+// trimFinalizedMeta rewrites .meta without the fields that only matter while a
+// torrent is still being written, keeping the file list that carries the inode
+// mapping. Only safe once the finalized marker is on disk - see markFinalized.
+//
+// Best-effort: an untrimmed .meta is merely larger, while a failure here leaves
+// the previous contents intact because savePersistedMeta writes atomically.
+func (s *Server) trimFinalizedMeta(metaDir, hash string) {
+	metaPath := filepath.Join(metaDir, metaFileName)
+
+	meta, loadErr := loadPersistedMeta(metaPath)
+	if loadErr != nil {
+		return
+	}
+	if len(meta.GetPieceHashes()) == 0 && len(meta.GetTorrentFile()) == 0 {
+		return // already trimmed
+	}
+
+	meta.PieceHashes = nil
+	meta.TorrentFile = nil
+	if saveErr := savePersistedMeta(metaPath, meta); saveErr != nil {
+		s.logger.Warn("failed to trim metadata for finalized torrent",
+			"hash", hash, "error", saveErr)
 	}
 }
 
@@ -1102,17 +1141,17 @@ func (s *Server) recoverVerificationFailure(
 	state.mu.Lock()
 	defer state.mu.Unlock()
 
-	for _, p := range failedPieces {
-		state.written.Clear(uint(p))
-	}
+	state.revokePieces(failedPieces)
 
 	// Find and recover affected files.
 	for _, fi := range state.files {
 		s.recoverAffectedFile(ctx, hash, state, fi, failedPieces)
 	}
 
+	// Only after every file has been recovered - see recountFilePieces.
+	state.recountFilePieces()
+
 	// Persist the recovered state.
-	state.dirty = true
 	if saveErr := s.persistWritten(state); saveErr != nil {
 		s.logger.ErrorContext(ctx, "failed to persist state after verification recovery",
 			"hash", hash,
@@ -1156,10 +1195,7 @@ func (s *Server) recoverAffectedFile(
 		return
 	}
 
-	defer func() {
-		fi.readmitWrites()
-		fi.recalcPiecesWritten(state.written)
-	}()
+	defer fi.readmitWrites()
 
 	// Hardlinked or pre-existing files with wrong content: break the hardlink
 	// by deleting the file. Writing to a renamed hardlink would corrupt the
@@ -1173,14 +1209,15 @@ func (s *Server) recoverAffectedFile(
 				"hash", hash, "path", fi.path, "error", removeErr)
 		}
 
+		state.revokeFileRange(fi)
+
 		fi.setHardlinkState(hlStateNone)
 		fi.setPath(targetPath(fi) + partialSuffix)
 		return
 	}
 
 	// Normal (streamed) files: rename back to .partial (skip if already .partial).
-	// Even if rename fails, the deferred cleanup keeps earlyFinalized and
-	// piecesWritten consistent with state.written.
+	// Even if rename fails, the deferred cleanup re-admits writes.
 	if !atFinalPath(fi) {
 		return
 	}

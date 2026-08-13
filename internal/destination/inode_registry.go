@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"golang.org/x/sync/errgroup"
 )
 
 // InodeRegistry manages inode-to-path mappings for hardlink deduplication.
@@ -146,12 +148,41 @@ func (r *InodeRegistry) CleanupStale(ctx context.Context) {
 		return
 	}
 
-	// Check each entry
-	var staleFileIDs []FileID
+	// Concurrent, because every entry is an independent NFS round-trip and the
+	// registry now holds one per file of every torrent ever synced - finalized
+	// metadata is kept so the index survives a restart, so this set no longer
+	// tracks the in-flight count. Sized like the startup rebuild, which walks the
+	// same corpus.
+	type staleResult struct {
+		fileID FileID
+		stale  bool
+	}
+	results := make([]staleResult, 0, len(entries))
+	var mu sync.Mutex
+
+	var g errgroup.Group
+	g.SetLimit(inodeRebuildWorkers)
 	for fileID, relPath := range entries {
-		fullPath := filepath.Join(r.basePath, relPath)
-		if _, err := os.Stat(fullPath); os.IsNotExist(err) {
-			staleFileIDs = append(staleFileIDs, fileID)
+		g.Go(func() error {
+			// Shutting down: a partial pass just leaves entries for next time.
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+			}
+			_, statErr := os.Stat(filepath.Join(r.basePath, relPath))
+			mu.Lock()
+			results = append(results, staleResult{fileID: fileID, stale: os.IsNotExist(statErr)})
+			mu.Unlock()
+			return nil
+		})
+	}
+	_ = g.Wait()
+
+	var staleFileIDs []FileID
+	for _, res := range results {
+		if res.stale {
+			staleFileIDs = append(staleFileIDs, res.fileID)
 		}
 	}
 

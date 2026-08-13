@@ -142,18 +142,24 @@ func TestE2E_QuarantineReleaseResumesRatherThanRecopies(t *testing.T) {
 		env.SourceClient().RemoveTagsCtx(ctx, []string{wiredCDHash}, defaultSyncFailedTag),
 		"removing the sync-failed tag releases the torrent")
 
-	// Story 19: the release resumes from the retained bytes. Tracking is seeded
-	// from the destination's persisted piece bitmap, so the first progress
-	// reading after re-tracking already reflects what survived.
+	// Story 19: the release resumes from the retained bytes. The quarantine's
+	// abort dropped the destination's in-memory entry, so a just-re-tracked
+	// torrent reads 0 until the streaming queue's lazy InitTorrent surfaces the
+	// persisted bitmap - skip those readings rather than judging them. The
+	// first non-zero reading still discriminates resume from re-copy: a resume
+	// jumps straight to the retained count in one in-memory pass, while a
+	// re-copy would climb through small counts across many polls at the
+	// throttled transfer rate.
 	var streamedAfterRelease int
 	require.Eventually(t, func() bool {
 		progress, retrackErr := task.Progress(ctx, wiredCDHash)
-		if retrackErr != nil {
+		if retrackErr != nil || progress.Streamed == 0 {
 			return false
 		}
 		streamedAfterRelease = progress.Streamed
 		return true
-	}, time.Minute, 250*time.Millisecond, "a released torrent must be tracked again")
+	}, time.Minute, 250*time.Millisecond,
+		"a released torrent must be tracked again and seeded from the destination")
 
 	assert.GreaterOrEqual(t, streamedAfterRelease, streamedBeforeQuarantine,
 		"a released torrent must resume from the destination's retained pieces, not re-copy from zero")

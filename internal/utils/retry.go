@@ -109,6 +109,15 @@ func classifyError(err error) errorClass {
 
 	errStr := strings.ToLower(err.Error())
 
+	// String fallback for the errors.Is check above: go-qbittorrent's internal
+	// retry aggregates its attempts into an error that defeats Is, so a canceled
+	// call classifies as permanent and a batch of polls canceled together at
+	// shutdown opens the breaker against the next legitimate caller.
+	// Cancellation is the caller's decision, never evidence about the service.
+	if strings.Contains(errStr, "context canceled") || strings.Contains(errStr, "context deadline exceeded") {
+		return errorBenign
+	}
+
 	// 404/not-found fallback: catches methods like GetTorrentPieceStatesCtx
 	// that return a coarser sentinel (ErrCannotGetTorrentPieceStates) wrapping
 	// the HTTP status in the message rather than ErrTorrentNotFound.

@@ -98,6 +98,11 @@ type inodeEntry struct {
 
 // rebuildInodeMap scans all .meta files (finalized and in-flight) and rebuilds
 // the in-memory inode registry. Uses a worker pool to manage NFS latency.
+//
+// Finalized torrents count: markFinalized keeps a trimmed .meta precisely so
+// their files stay linkable across a restart. Without that record this pass sees
+// only in-flight torrents and every previously synced file is re-transferred
+// rather than hardlinked.
 func (s *Server) rebuildInodeMap(ctx context.Context) {
 	metaRoot := filepath.Join(s.config.BasePath, metaDirName)
 	entries, err := os.ReadDir(metaRoot)
@@ -157,6 +162,12 @@ func (s *Server) collectInodeEntries(metaPath string) []inodeEntry {
 	subPath := meta.GetSaveSubPath()
 	var entries []inodeEntry
 	for _, f := range meta.GetFiles() {
+		// Same admission rule RegisterInodes applies on the live path: a source
+		// file we hold the bytes for. Both must agree or a restart rebuilds a
+		// different index than the one the server was running with.
+		if !f.GetSelected() {
+			continue
+		}
 		dev := f.GetSourceDevice()
 		ino := f.GetSourceInode()
 		if dev == 0 && ino == 0 {

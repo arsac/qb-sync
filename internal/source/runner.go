@@ -26,6 +26,9 @@ type Runner struct {
 	logger       *slog.Logger
 	healthServer *health.Server
 
+	// destWaitInterval overrides defaultDestWaitInterval in tests (0 = default).
+	destWaitInterval time.Duration
+
 	// checkAnnotation checks whether the drain annotation allows draining.
 	checkAnnotation func(ctx context.Context, annotationKey string) (bool, error)
 }
@@ -44,6 +47,52 @@ func (r *Runner) SetHealthServer(hs *health.Server) {
 	r.healthServer = hs
 }
 
+// defaultDestWaitInterval bounds a single WaitUntilReady attempt. It exists so a
+// destination that never arrives is visible in the log rather than silent - the
+// retry schedule itself belongs to the gRPC channel's own backoff.
+const defaultDestWaitInterval = 30 * time.Second
+
+// waitForDestination blocks until waitUntilReady reports the destination
+// healthy. Returns only on success or when ctx ends.
+func (r *Runner) waitForDestination(ctx context.Context, waitUntilReady func(context.Context) error) error {
+	interval := r.destWaitInterval
+	if interval <= 0 {
+		interval = defaultDestWaitInterval
+	}
+
+	// Each attempt gets its own window. WaitForReady blocks for the full budget
+	// while the channel is down, but errors it does not absorb come back at once
+	// - Unimplemented from a server with no health service, NotFound for an
+	// unknown service name, a credentials failure - so the window doubles as the
+	// pacing that stops those spinning.
+	attempt := func() error {
+		attemptCtx, cancel := context.WithTimeout(ctx, interval)
+		defer cancel()
+
+		if waitErr := waitUntilReady(attemptCtx); waitErr != nil {
+			<-attemptCtx.Done()
+			return waitErr
+		}
+		return nil
+	}
+
+	for n := 1; ctx.Err() == nil; n++ {
+		waitErr := attempt()
+		if waitErr == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		r.logger.WarnContext(ctx, "destination server not reachable yet, still waiting",
+			"addr", r.cfg.DestinationAddr,
+			"attempt", n,
+			"error", waitErr,
+		)
+	}
+	return ctx.Err()
+}
+
 // Run starts the source server orchestration.
 func (r *Runner) Run(ctx context.Context) error {
 	// Connect to destination server
@@ -58,9 +107,22 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	defer dest.Close()
 
-	// Validate connection before starting - fail fast if destination server is unreachable
-	if validateErr := dest.ValidateConnection(ctx); validateErr != nil {
-		return fmt.Errorf("destination server connection validation failed: %w", validateErr)
+	// Registered before the wait, not after: this is the check whose whole job is
+	// to tell an operator why we are not ready, and the wait is exactly when they
+	// need it. /readyz then carries the gRPC error for as long as the destination
+	// is missing, rather than the reason living only in the log.
+	if r.healthServer != nil {
+		r.healthServer.RegisterCheck("destination", health.GRPCHealthCheck(dest.ValidateConnection))
+	}
+
+	// A destination that is not up yet is a readiness condition, not a fatal
+	// error. The health server is already serving /readyz as not-ready (it starts
+	// before Run), so waiting here is what lets the two components roll in either
+	// order. Exiting instead turns a destination that is merely slow to start into
+	// a CrashLoopBackOff, and under a deploy timeout into a release that never
+	// converges.
+	if waitErr := r.waitForDestination(ctx, dest.WaitUntilReady); waitErr != nil {
+		return waitErr
 	}
 
 	metrics.GRPCConnectionsConfigured.Set(float64(maxConns))
@@ -86,9 +148,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 	}
 
-	// Register health checks if health server is configured
 	if r.healthServer != nil {
-		r.healthServer.RegisterCheck("destination", health.GRPCHealthCheck(dest.ValidateConnection))
 		r.healthServer.RegisterCheck("qbittorrent", health.QBHealthCheck(qbTask.QBLogin))
 		r.healthServer.SetReady(true)
 	}

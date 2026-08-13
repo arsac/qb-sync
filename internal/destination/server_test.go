@@ -652,13 +652,8 @@ func TestCleanupOrphanedTorrents(t *testing.T) {
 
 func newAbortTestServer(t *testing.T) *Server {
 	t.Helper()
-	logger := testLogger(t)
-	tmpDir := t.TempDir()
-	return &Server{
-		config: ServerConfig{BasePath: tmpDir},
-		logger: logger,
-		store:  newTorrentStore(tmpDir, logger),
-	}
+	s, _ := newTestDestServer(t)
+	return s
 }
 
 func TestAbortTorrent_NonExistent(t *testing.T) {
