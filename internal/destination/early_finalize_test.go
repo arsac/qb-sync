@@ -1101,7 +1101,7 @@ func TestPreVerifyCompleteFiles(t *testing.T) {
 	}
 
 	s, _ := newTestDestServer(t)
-	s.preVerifyCompleteFiles(t.Context(), "hash", state)
+	s.preVerifyCompleteFiles(t.Context(), "hash", state, preVerifyCandidates(state))
 
 	var got []int
 	for p := range numPieces {
@@ -1689,4 +1689,51 @@ func TestPiecesNowReadable_RequiresEveryBackingFileInPlace(t *testing.T) {
 			t.Errorf("piecesNowReadable = %v, want [1]", got)
 		}
 	})
+}
+
+// TestStartPreVerify_NotDuringFinalization pins that a resume cannot launch a
+// pass while the disk stage is verifying the same bytes.
+//
+// The reachable path is not obvious: a torrent whose hardlinks are all pending
+// at init has no candidates, so nothing is registered and stopPreVerify has
+// nothing to stop. Finalization promotes them to hlStateComplete, and a bare
+// CheckTorrentStatus then reaches startPreVerify with candidates and
+// preVerifyStarted still false.
+func TestStartPreVerify_NotDuringFinalization(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+
+	fileSize := int64(4096)
+	path := filepath.Join(tmpDir, "f.bin")
+	if err := os.WriteFile(path, make([]byte, fileSize), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	numPieces := uint((fileSize + testPieceLen - 1) / testPieceLen)
+	meta := torrentMeta{
+		pieceHashes: buildTestPieceHashes(t, fileSize),
+		pieceLength: testPieceLen,
+		totalSize:   fileSize,
+		files: []*serverFileInfo{{
+			path: path, offset: 0, size: fileSize, selected: true,
+			hardlink: hardlinkInfo{state: hlStateComplete},
+		}},
+	}
+	meta.computeFilePieceRanges()
+
+	state := &serverTorrentState{
+		torrentMeta: meta,
+		written:     bitset.New(numPieces),
+		verified:    bitset.New(numPieces),
+	}
+	// The disk stage owns these bytes from here.
+	state.finalization.start()
+
+	s.startPreVerify("hash", state)
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.preVerifyDone != nil {
+		t.Error("a pass started while finalization was active would race the disk stage's read-back")
+	}
 }

@@ -34,6 +34,7 @@ func newTestDestServer(t *testing.T) (*Server, string) {
 		finalizeSem:      semaphore.NewWeighted(1),
 		qbStageSem:       semaphore.NewWeighted(1),
 		earlyFinalizeSem: semaphore.NewWeighted(defaultStreamWorkers),
+		preVerifySem:     semaphore.NewWeighted(defaultPreVerifyConcurrency),
 		bgCtx:            bgCtx,
 		bgCancel:         bgCancel,
 		processStart:     time.Now(),

@@ -265,11 +265,12 @@ func preVerifyCandidates(state *serverTorrentState) []*serverFileInfo {
 // which is also the only path that may act on the failure - these files are
 // skipForWriteData, so clearing their written bits here would ask the source to
 // re-stream data writePieceData would then drop.
-func (s *Server) preVerifyCompleteFiles(ctx context.Context, hash string, state *serverTorrentState) {
+func (s *Server) preVerifyCompleteFiles(
+	ctx context.Context, hash string, state *serverTorrentState, files []*serverFileInfo,
+) {
 	if state.verified == nil {
 		return
 	}
-	files := preVerifyCandidates(state)
 	start := time.Now()
 	pieces := 0
 

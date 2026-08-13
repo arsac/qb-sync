@@ -196,6 +196,12 @@ type serverTorrentState struct {
 	// recheck.
 	parkedRecheckedFrom qbittorrent.TorrentState
 
+	// preVerifyStarted records that a pass was already launched for this state,
+	// so the repeated InitTorrent calls a source makes while resuming don't each
+	// start one. Never cleared: a second pass would re-read what the first
+	// already covered.
+	preVerifyStarted bool
+
 	// Cached for re-initialization (hardlink info for logging)
 	hardlinkResults []*pb.HardlinkResult
 }
@@ -212,6 +218,18 @@ func (s *serverTorrentState) claimParkedRecheck(parkedIn qbittorrent.TorrentStat
 	}
 	s.parkedRecheckedFrom = parkedIn
 	return true
+}
+
+// clearPreVerify drops the registration for a pass that has finished on its
+// own, leaving preVerifyStarted set so nothing restarts it. Nils nothing if
+// stopPreVerify already took the registration, or if a later pass owns it.
+func (s *serverTorrentState) clearPreVerify(done chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.preVerifyDone == done {
+		s.preVerifyCancel, s.preVerifyDone = nil, nil
+	}
 }
 
 // stopPreVerify cancels the init-time pre-verification pass and waits for it to

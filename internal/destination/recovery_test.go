@@ -333,3 +333,144 @@ func TestRecoverInFlightTorrents_MetaWithoutState(t *testing.T) {
 		t.Errorf("recovered written bitmap must be empty (no .state on disk), got %d bits set", state.written.Count())
 	}
 }
+
+// TestRecoverInFlightTorrents_DefersPreVerify pins that the startup scan leaves
+// read-back verification alone. The scan runs synchronously ahead of the
+// readiness signal, so a pass launched per recovered torrent puts an unbounded
+// number of whole-file NFS reads in front of the server accepting any traffic -
+// on a large library that is the difference between a sub-second scan and one
+// that never finishes. The pass a recovered torrent is owed starts when a
+// source reconnects and resumes it.
+func TestRecoverInFlightTorrents_DefersPreVerify(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+	ctx := context.Background()
+
+	hash := "beef1234567890abcdef1234567890abcdef1234"
+	fileSize := int64(4096)
+	numPieces := uint((fileSize + testPieceLen - 1) / testPieceLen)
+
+	written := bitset.New(numPieces)
+	written.FlipRange(0, numPieces)
+
+	req := &pb.InitTorrentRequest{
+		TorrentHash: hash,
+		Name:        "test-file",
+		PieceSize:   testPieceLen,
+		TotalSize:   fileSize,
+		NumPieces:   int32(numPieces),
+		Files: []*pb.FileInfo{{
+			Path:     "test-file",
+			Size:     fileSize,
+			Offset:   0,
+			Selected: true,
+		}},
+		PieceHashes: buildTestPieceHashes(t, fileSize),
+		SaveSubPath: "downloads",
+		TorrentFile: buildTestTorrentBytes(t, "test-file", fileSize),
+	}
+	setupRecoveryMetaDir(t, tmpDir, hash, req, written)
+
+	// A complete file at its final path is what setupFile adopts as
+	// hlStateComplete, which is precisely what makes it a pre-verify candidate.
+	finalPath := filepath.Join(tmpDir, "downloads", "test-file")
+	if err := os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(finalPath, make([]byte, fileSize), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.recoverInFlightTorrents(ctx); err != nil {
+		t.Fatalf("recoverInFlightTorrents failed: %v", err)
+	}
+
+	state, exists := s.store.Get(hash)
+	if !exists {
+		t.Fatal("torrent not found in store after recovery")
+	}
+
+	state.mu.Lock()
+	candidates := len(preVerifyCandidates(state))
+	startedByRecovery := state.preVerifyStarted
+	state.mu.Unlock()
+
+	if candidates == 0 {
+		t.Fatal("setup did not produce a pre-verify candidate, so the test proves nothing")
+	}
+	if startedByRecovery {
+		t.Error("startup recovery must not launch pre-verification")
+	}
+
+	// The source reconnecting is what owns the pass.
+	if _, err := s.InitTorrent(ctx, req); err != nil {
+		t.Fatalf("InitTorrent: %v", err)
+	}
+
+	state.mu.Lock()
+	startedByResume := state.preVerifyStarted
+	state.mu.Unlock()
+
+	if !startedByResume {
+		t.Error("resuming a recovered torrent must start the pass recovery deferred")
+	}
+	state.stopPreVerify()
+}
+
+// TestStartPreVerify_Idempotent pins that the repeated InitTorrent calls a
+// source makes while resuming launch at most one pass. A second would re-read
+// every byte the first already covered.
+func TestStartPreVerify_Idempotent(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+
+	fileSize := int64(4096)
+	path := filepath.Join(tmpDir, "f.bin")
+	if err := os.WriteFile(path, make([]byte, fileSize), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	numPieces := uint((fileSize + testPieceLen - 1) / testPieceLen)
+	meta := torrentMeta{
+		pieceHashes: buildTestPieceHashes(t, fileSize),
+		pieceLength: testPieceLen,
+		totalSize:   fileSize,
+		files: []*serverFileInfo{{
+			path: path, offset: 0, size: fileSize, selected: true,
+			hardlink: hardlinkInfo{state: hlStateComplete},
+		}},
+	}
+	meta.computeFilePieceRanges()
+
+	state := &serverTorrentState{
+		torrentMeta: meta,
+		written:     bitset.New(numPieces),
+		verified:    bitset.New(numPieces),
+	}
+
+	s.startPreVerify("hash", state)
+	state.mu.Lock()
+	first := state.preVerifyDone
+	state.mu.Unlock()
+	if first == nil {
+		t.Fatal("first call registered no pass")
+	}
+
+	s.startPreVerify("hash", state)
+	state.mu.Lock()
+	second := state.preVerifyDone
+	state.mu.Unlock()
+	if second != first {
+		t.Error("second call started another pass over the same files")
+	}
+
+	state.stopPreVerify()
+
+	// Still no restart once the first pass has been retired.
+	s.startPreVerify("hash", state)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.preVerifyDone != nil {
+		t.Error("a pass restarted after stopPreVerify retired it")
+	}
+}
