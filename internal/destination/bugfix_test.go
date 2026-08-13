@@ -453,6 +453,59 @@ func TestRecoverAffectedFile_BreaksHardlink(t *testing.T) {
 	}
 }
 
+// TestRecoverAffectedFile_ClearsStaleVerifiedBits pins that deleting a file
+// also revokes its verified bits. Pre-verification marks a hardlinked file's
+// interior pieces as read-back-verified; when the file is later deleted because
+// another of its pieces failed, those bits vouch for bytes that no longer
+// exist. Left set, piecesNeedingReadBack would skip the re-streamed
+// replacement's pieces at the next finalize, so the fresh bytes would never be
+// read back after the flush - the post-flush corruption check the finalize
+// read-back exists for would be silently skipped.
+func TestRecoverAffectedFile_ClearsStaleVerifiedBits(t *testing.T) {
+	t.Parallel()
+	s, tmpDir := newTestDestServer(t)
+
+	dir := filepath.Join(tmpDir, "torrent")
+	_ = os.MkdirAll(dir, 0o755)
+	filePath := filepath.Join(dir, "file.mkv")
+	_ = os.WriteFile(filePath, make([]byte, 300), 0o644)
+
+	fi := &serverFileInfo{
+		path:     filePath,
+		offset:   0,
+		size:     300,
+		selected: true,
+		hardlink: hardlinkInfo{
+			state:        hlStateComplete,
+			sourceFileID: FileID{Ino: 12345},
+		},
+		firstPiece:  0,
+		lastPiece:   2,
+		piecesTotal: 3,
+	}
+	state := &serverTorrentState{
+		torrentMeta: torrentMeta{
+			pieceLength: 100,
+			totalSize:   300,
+			files:       []*serverFileInfo{fi},
+		},
+		written:  bitset.New(3).Set(0).Set(1).Set(2),
+		verified: bitset.New(3).Set(0).Set(1), // pre-verify vouched for these bytes
+	}
+
+	// Piece 2 fails the finalize read-back; the whole file is deleted.
+	s.recoverAffectedFile(context.Background(), "hashTest", state, fi, []int{2})
+
+	for p := range uint(3) {
+		if state.verified.Test(p) {
+			t.Errorf(
+				"verified bit %d survived the file's deletion; the re-streamed replacement would skip its read-back",
+				p,
+			)
+		}
+	}
+}
+
 func TestRecoverAffectedFile_NormalFile(t *testing.T) {
 	t.Parallel()
 	s, tmpDir := newTestDestServer(t)

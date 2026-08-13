@@ -33,18 +33,6 @@ func writePieceError(msg string, code pb.PieceErrorCode) writeResult {
 	}
 }
 
-// markPieceWritten updates state tracking after a piece is written.
-// Caller must hold state.mu.
-func markPieceWritten(state *serverTorrentState, pieceIndex int32) {
-	if pieceIndex < 0 || uint(pieceIndex) >= state.written.Len() {
-		return
-	}
-
-	state.written.Set(uint(pieceIndex))
-	state.dirty = true
-	state.piecesSinceFlush++
-}
-
 // writePiece receives and writes a single piece.
 func (s *Server) writePiece(ctx context.Context, req *pb.WritePieceRequest) writeResult {
 	if s.config.DryRun {
@@ -162,7 +150,7 @@ func (s *Server) commitPiece(
 		return writePieceOK()
 	}
 
-	markPieceWritten(state, pieceIndex)
+	state.markPieceWritten(pieceIndex)
 	s.checkFileCompletions(hash, state, pieceIndex)
 	count, total := state.written.Count(), state.written.Len()
 	state.mu.Unlock()
@@ -221,12 +209,9 @@ func (s *Server) verifyFilePieces(
 // as returned by verifyFilePieces). Boundary pieces span adjacent files and remain
 // unverified - they'll be checked at finalize. Caller must hold state.mu.
 func markInteriorVerified(state *serverTorrentState, fi *serverFileInfo, failed []int) {
-	if state.verified == nil {
-		return
-	}
 	forEachInteriorPiece(state, fi, func(p int) {
 		if _, bad := slices.BinarySearch(failed, p); !bad {
-			state.verified.Set(uint(p))
+			state.markPieceVerified(p)
 		}
 	})
 }
@@ -453,11 +438,8 @@ func (s *Server) recordEarlyFinalize(
 
 	if len(failedPieces) > 0 {
 		fi.readmitWrites()
-		for _, p := range failedPieces {
-			state.written.Clear(uint(p))
-			fi.piecesWritten--
-		}
-		state.dirty = true
+		state.revokePieces(failedPieces)
+		fi.recalcPiecesWritten(state.written)
 		if saveErr := s.persistWritten(state); saveErr != nil {
 			s.logger.ErrorContext(ctx, "failed to persist state after verify failure",
 				"hash", hash, "file", fi.path, "error", saveErr)
@@ -537,7 +519,7 @@ func (s *Server) verifyPiecesNowReadable(
 		if _, bad := slices.BinarySearch(failed, p); bad {
 			continue
 		}
-		state.verified.Set(uint(p))
+		state.markPieceVerified(p)
 		marked++
 	}
 

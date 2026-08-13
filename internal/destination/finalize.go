@@ -1141,26 +1141,17 @@ func (s *Server) recoverVerificationFailure(
 	state.mu.Lock()
 	defer state.mu.Unlock()
 
-	for _, p := range failedPieces {
-		state.written.Clear(uint(p))
-	}
+	state.revokePieces(failedPieces)
 
 	// Find and recover affected files.
 	for _, fi := range state.files {
 		s.recoverAffectedFile(ctx, hash, state, fi, failedPieces)
 	}
 
-	// Recount only once every file has been recovered: removing a file clears its
-	// whole piece range, and a piece on either boundary is also counted by the
-	// neighbouring file, which may not have been recovered yet.
-	for _, fi := range state.files {
-		if fi.size > 0 {
-			fi.recalcPiecesWritten(state.written)
-		}
-	}
+	// Only after every file has been recovered - see recountFilePieces.
+	state.recountFilePieces()
 
 	// Persist the recovered state.
-	state.dirty = true
 	if saveErr := s.persistWritten(state); saveErr != nil {
 		s.logger.ErrorContext(ctx, "failed to persist state after verification recovery",
 			"hash", hash,
@@ -1218,12 +1209,7 @@ func (s *Server) recoverAffectedFile(
 				"hash", hash, "path", fi.path, "error", removeErr)
 		}
 
-		// The file is gone, so every piece it held is unwritten - not just the
-		// ones that failed verification. Leaving the rest marked written would
-		// have source re-stream only the failures into an empty file.
-		for p := fi.firstPiece; p <= fi.lastPiece; p++ {
-			state.written.Clear(uint(p))
-		}
+		state.revokeFileRange(fi)
 
 		fi.setHardlinkState(hlStateNone)
 		fi.setPath(targetPath(fi) + partialSuffix)
