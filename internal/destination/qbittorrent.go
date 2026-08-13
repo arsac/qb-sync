@@ -68,7 +68,7 @@ func (s *Server) isTorrentInQB(ctx context.Context, hash string) bool {
 //
 // The exception is a torrent still checking when the budget runs out that was
 // stopped going into the check: stopping it mid-pass is what parks it in
-// stoppedDL for every later attempt to trip over. See stoppedBeforeCheck.
+// stoppedDL for every later attempt to trip over. See safeToLeaveChecking.
 func (s *Server) addAndVerifyTorrent(
 	ctx context.Context,
 	hash string,
@@ -219,6 +219,7 @@ func (s *Server) prepareForVerification(
 		)
 		metrics.QBRechecksTotal.WithLabelValues(metrics.ReasonRecheckParked).Inc()
 		if recheckErr := s.qbClient.RecheckCtx(ctx, []string{hash}); recheckErr != nil {
+			state.releaseParkedRecheck(existing.State)
 			return false, fmt.Errorf("triggering recheck for parked torrent %s: %w", existing.State, recheckErr)
 		}
 	}

@@ -72,6 +72,7 @@ type mockQBClient struct {
 	// see the post-recheck state. Used by post-add error-state recovery tests.
 	recheckCalled        bool
 	recheckHashes        []string
+	recheckErr           error
 	torrentsAfterRecheck []qbittorrent.Torrent
 
 	// torrentsAfterAdd, when non-nil, swaps the torrent list on the next
@@ -192,6 +193,9 @@ func (m *mockQBClient) SetFilePriorityCtx(_ context.Context, _, ids string, prio
 func (m *mockQBClient) RecheckCtx(_ context.Context, hashes []string) error {
 	m.recheckCalled = true
 	m.recheckHashes = hashes
+	if m.recheckErr != nil {
+		return m.recheckErr
+	}
 	if m.torrentsAfterRecheck != nil {
 		m.torrents = m.torrentsAfterRecheck
 	}
@@ -1378,6 +1382,73 @@ func TestClaimParkedRecheck(t *testing.T) {
 	}
 	if !state.claimParkedRecheck(qbittorrent.TorrentStateStoppedDl) {
 		t.Error("a different parked state has not been answered and deserves its own recheck")
+	}
+
+	// A claim whose recheck never reached qB is handed back and can be re-taken.
+	state.releaseParkedRecheck(qbittorrent.TorrentStateStoppedDl)
+	if !state.claimParkedRecheck(qbittorrent.TorrentStateStoppedDl) {
+		t.Error("a released claim must be claimable again")
+	}
+	// Releasing a claim the state does not hold must not clear the one it does.
+	state.releaseParkedRecheck(qbittorrent.TorrentStateQueuedDl)
+	if state.claimParkedRecheck(qbittorrent.TorrentStateStoppedDl) {
+		t.Error("releasing an unheld claim cleared the held one")
+	}
+}
+
+// TestAddAndVerifyTorrent_FailedRecheckReleasesClaim pins that a RecheckCtx
+// failure hands the parked-recheck claim back. The claim is taken before the
+// recheck is issued, and it records that qB answered for this state - but a
+// failed RecheckCtx got no answer. Consuming it anyway would leave the torrent
+// with no recheck left: every later attempt would find the same parked state,
+// skip the recheck, and wait out a state nothing moves until the source's
+// guard tagged the torrent sync-failed - the exact wedge the parked recheck
+// exists to fix, reintroduced by a transient qB error.
+func TestAddAndVerifyTorrent_FailedRecheckReleasesClaim(t *testing.T) {
+	t.Parallel()
+
+	state := &serverTorrentState{
+		torrentMeta: torrentMeta{files: []*serverFileInfo{{selected: true}}},
+		torrentFile: []byte("fake"),
+	}
+	parked := []qbittorrent.Torrent{
+		{Hash: "abc123", State: qbittorrent.TorrentStateStoppedDl, Progress: 1.0},
+	}
+
+	// Attempt 1: the recheck never reaches qB.
+	failing := &mockQBClient{torrents: parked, recheckErr: errors.New("qB restarting")}
+	s := newTestServerWithQB(t, failing)
+	s.config.QB = &QBConfig{PollInterval: 5 * time.Millisecond, PollTimeout: 50 * time.Millisecond}
+
+	if _, err := s.addAndVerifyTorrent(context.Background(), "abc123", state,
+		&pb.FinalizeTorrentRequest{TorrentHash: "abc123"}); err == nil {
+		t.Fatal("a failed recheck must fail the attempt")
+	}
+	if !failing.recheckCalled {
+		t.Fatal("expected a recheck to be attempted")
+	}
+
+	// Attempt 2, same state object and same parked state: the recheck must be
+	// re-issued, and this time it recovers the torrent.
+	ok := &mockQBClient{
+		torrents: parked,
+		torrentsAfterRecheck: []qbittorrent.Torrent{
+			{Hash: "abc123", State: qbittorrent.TorrentStateStoppedUp, Progress: 1.0},
+		},
+	}
+	s2 := newTestServerWithQB(t, ok)
+	s2.config.QB = &QBConfig{PollInterval: 5 * time.Millisecond, PollTimeout: 2 * time.Second}
+
+	finalState, err := s2.addAndVerifyTorrent(context.Background(), "abc123", state,
+		&pb.FinalizeTorrentRequest{TorrentHash: "abc123"})
+	if !ok.recheckCalled {
+		t.Fatal("the failed recheck consumed the claim: the retry never re-issued one")
+	}
+	if err != nil {
+		t.Errorf("the retry should recover the torrent, got %v", err)
+	}
+	if finalState != qbittorrent.TorrentStateStoppedUp {
+		t.Errorf("final state = %v, want stoppedUP after recheck", finalState)
 	}
 }
 

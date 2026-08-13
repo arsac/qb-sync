@@ -220,6 +220,21 @@ func (s *serverTorrentState) claimParkedRecheck(parkedIn qbittorrent.TorrentStat
 	return true
 }
 
+// releaseParkedRecheck hands back a claim when RecheckCtx returned an error.
+// An errored call may still have reached qB (a deadline can expire after the
+// request was written), so releasing can cost one duplicate recheck on the next
+// attempt. That is the cheap side of the trade: keeping a claim for a recheck
+// that never happened makes every later attempt skip the recheck and wait out a
+// state nothing moves, until the source's guard tags the torrent sync-failed.
+func (s *serverTorrentState) releaseParkedRecheck(parkedIn qbittorrent.TorrentState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.parkedRecheckedFrom == parkedIn {
+		s.parkedRecheckedFrom = ""
+	}
+}
+
 // clearPreVerify drops the registration for a pass that has finished on its
 // own, leaving preVerifyStarted set so nothing restarts it. Nils nothing if
 // stopPreVerify already took the registration, or if a later pass owns it.
